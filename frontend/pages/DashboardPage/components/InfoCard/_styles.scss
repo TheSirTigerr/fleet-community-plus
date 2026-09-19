@@ -1,0 +1,45 @@
+.dashboard-info-card {
+  @include vertical-card-layout;
+
+  &__section-title-cta {
+    display: flex;
+    justify-content: space-between;
+    align-items: center;
+  }
+
+  &__section-title {
+    display: flex;
+    gap: $pad-xsmall;
+    span {
+      display: flex;
+      align-items: center;
+      background-color: $ui-fleet-black-75;
+      color: $core-fleet-white;
+      font-size: $xx-small;
+      font-weight: $bold;
+      padding: 2px 4px;
+      border-radius: 4px;
+      position: relative;
+    }
+  }
+
+  &__section-title-group {
+    display: flex;
+    gap: 0.75rem;
+    align-items: baseline;
+  }
+
+  &__section-title-detail {
+    display: flex;
+    flex-direction: row;
+    align-items: center;
+  }
+
+  &__section-description {
+    font-size: $x-small;
+
+    p {
+      margin: 8px 0 0 0;
+    }
+  }
+}

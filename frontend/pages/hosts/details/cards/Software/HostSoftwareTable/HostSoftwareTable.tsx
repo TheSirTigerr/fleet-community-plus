@@ -1,0 +1,316 @@
+import React, { useCallback } from "react";
+import { InjectedRouter } from "react-router";
+import { SingleValue } from "react-select-5";
+import { Row } from "react-table";
+
+import Button from "components/buttons/Button";
+import EmptyState from "components/EmptyState";
+import DropdownWrapper, {
+  CustomOptionType,
+} from "components/forms/fields/DropdownWrapper/DropdownWrapper";
+import TableContainer from "components/TableContainer";
+import { ITableQueryData } from "components/TableContainer/TableContainer";
+import TableCount from "components/TableContainer/TableCount";
+import TooltipWrapper from "components/TooltipWrapper";
+import {
+  HostPlatform,
+  PLATFORM_DISPLAY_NAMES,
+  isMacOS,
+  isVulnUnsupportedPlatform,
+} from "interfaces/platform";
+import { IHostSoftware } from "interfaces/software";
+import EmptySoftwareTable from "pages/SoftwarePage/components/tables/EmptySoftwareTable";
+import { VulnsNotSupported } from "pages/SoftwarePage/components/tables/SoftwareVulnerabilitiesTable/SoftwareVulnerabilitiesTable";
+import {
+  buildSoftwareVulnFiltersQueryParams,
+  getVulnFilterRenderDetails,
+  ISoftwareVulnFiltersParams,
+} from "pages/SoftwarePage/SoftwareInventory/SoftwareInventoryTable/helpers";
+import { IGetDeviceSoftwareResponse } from "services/entities/device_user";
+import { IGetHostSoftwareResponse } from "services/entities/hosts";
+import { getNextLocationPath } from "utilities/helpers";
+import { QueryParams } from "utilities/url";
+
+const DEFAULT_PAGE_SIZE = 20;
+
+const baseClass = "host-software-table";
+
+interface IHostSoftwareRowProps extends Row {
+  original: IHostSoftware;
+}
+
+interface IEmptyComponentProps {
+  hasVulnFilters: boolean;
+  platform: HostPlatform;
+  searchQuery: string;
+}
+
+const EmptyComponent = React.memo(
+  ({ hasVulnFilters, platform, searchQuery }: IEmptyComponentProps) => {
+    const vulnFilterAndNotSupported =
+      hasVulnFilters && isVulnUnsupportedPlatform(platform);
+    return vulnFilterAndNotSupported ? (
+      <VulnsNotSupported platformText={PLATFORM_DISPLAY_NAMES[platform]} />
+    ) : (
+      <EmptySoftwareTable
+        noSearchQuery={searchQuery === ""}
+        platform={platform}
+      />
+    );
+  }
+);
+
+interface IHostSoftwareTableProps {
+  tableConfig: any; // TODO: type
+  data?: IGetHostSoftwareResponse | IGetDeviceSoftwareResponse;
+  platform: HostPlatform;
+  isLoading: boolean;
+  router: InjectedRouter;
+  sortHeader: string;
+  sortDirection: "asc" | "desc";
+  searchQuery: string;
+  page: number;
+  pagePath: string;
+  vulnFilters: ISoftwareVulnFiltersParams;
+  teamId?: number;
+  /** Current value of the macOS /Applications filter. Only defined for macOS hosts. */
+  macosApplicationsFilter?: boolean;
+  onAddFiltersClick: () => void;
+  isMyDevicePage?: boolean;
+  onShowInventoryVersions: (software: IHostSoftware) => void;
+}
+
+const HostSoftwareTable = ({
+  tableConfig,
+  data,
+  platform,
+  isLoading,
+  router,
+  sortHeader,
+  sortDirection,
+  searchQuery,
+  page,
+  pagePath,
+  vulnFilters,
+  teamId,
+  macosApplicationsFilter,
+  onAddFiltersClick,
+  isMyDevicePage,
+  onShowInventoryVersions,
+}: IHostSoftwareTableProps) => {
+  const determineQueryParamChange = useCallback(
+    (newTableQuery: ITableQueryData) => {
+      const changedEntry = Object.entries(newTableQuery).find(([key, val]) => {
+        switch (key) {
+          case "searchQuery":
+            return val !== searchQuery;
+          case "sortDirection":
+            return val !== sortDirection;
+          case "sortHeader":
+            return val !== sortHeader;
+          case "pageIndex":
+            return val !== page;
+          default:
+            return false;
+        }
+      });
+      return changedEntry?.[0] ?? "";
+    },
+    [page, searchQuery, sortDirection, sortHeader]
+  );
+
+  const generateNewQueryParams = useCallback(
+    (newTableQuery: ITableQueryData, changedParam: string) => {
+      const newQueryParam: QueryParams = {
+        query: newTableQuery.searchQuery,
+        order_direction: newTableQuery.sortDirection,
+        order_key: newTableQuery.sortHeader,
+        page: changedParam === "pageIndex" ? newTableQuery.pageIndex : 0,
+        fleet_id: teamId,
+        ...(macosApplicationsFilter !== undefined && {
+          macos_applications: macosApplicationsFilter,
+        }),
+        ...buildSoftwareVulnFiltersQueryParams(vulnFilters),
+      };
+      return newQueryParam;
+    },
+    [vulnFilters, teamId, macosApplicationsFilter]
+  );
+
+  // TODO: Look into useDebounceCallback with dependencies
+  const onQueryChange = useCallback(
+    async (newTableQuery: ITableQueryData) => {
+      // we want to determine which query param has changed in order to
+      // reset the page index to 0 if any other param has changed.
+      const changedParam = determineQueryParamChange(newTableQuery);
+
+      // if nothing has changed, don't update the route. this can happen when
+      // this handler is called on the inital render. Can also happen when
+      // the filter dropdown is changed. That is handled on the onChange handler
+      // for the dropdown.
+      if (changedParam === "") return;
+
+      const newRoute = getNextLocationPath({
+        pathPrefix: pagePath,
+        routeTemplate: "",
+        queryParams: generateNewQueryParams(newTableQuery, changedParam),
+      });
+
+      router.replace(newRoute);
+    },
+    [determineQueryParamChange, pagePath, generateNewQueryParams, router]
+  );
+
+  const count = data?.count || data?.software?.length || 0;
+  const isSoftwareNotDetected = count === 0 && searchQuery === "";
+
+  // Determines if a user should be able to filter or search in the table
+  const hasData = data && data.software.length > 0;
+  const hasQuery = searchQuery !== "";
+  const vulnFilterDetails = getVulnFilterRenderDetails(vulnFilters);
+  const hasVulnFilters = vulnFilterDetails.filterCount > 0;
+
+  // Truly empty: no software at all, no active search/filters
+  const isTrulyEmpty = isSoftwareNotDetected && !hasVulnFilters;
+
+  const showFilterHeaders =
+    isTrulyEmpty || hasData || hasQuery || hasVulnFilters;
+
+  const memoizedSoftwareCount = useCallback(() => {
+    return <TableCount name="items" count={count} />;
+  }, [count]);
+
+  const onClickMyDeviceRow = useCallback(
+    (row: IHostSoftwareRowProps) => {
+      onShowInventoryVersions(row.original);
+    },
+    [onShowInventoryVersions]
+  );
+
+  const renderCustomFiltersButton = () => {
+    return (
+      <TooltipWrapper
+        className={`${baseClass}__filters`}
+        position="left"
+        underline={false}
+        showArrow
+        tipOffset={12}
+        tipContent={vulnFilterDetails.tooltipText}
+        disableTooltip={!hasVulnFilters}
+      >
+        <Button
+          variant="secondary"
+          onClick={onAddFiltersClick}
+          disabled={isTrulyEmpty}
+          icon="filter"
+        >
+          <span>{vulnFilterDetails.buttonText}</span>
+        </Button>
+      </TooltipWrapper>
+    );
+  };
+
+  // The /Applications filter is only relevant for macOS hosts.
+  const showApplicationsFilter =
+    isMacOS(platform) && macosApplicationsFilter !== undefined;
+
+  const applicationsFilterOptions: CustomOptionType[] = [
+    { label: "Full inventory", value: "false" },
+    { label: "Applications", value: "true" },
+  ];
+
+  const onApplicationsFilterChange = (
+    newValue: SingleValue<CustomOptionType>
+  ) => {
+    if (!newValue) return;
+    router.replace(
+      getNextLocationPath({
+        pathPrefix: pagePath,
+        routeTemplate: "",
+        queryParams: {
+          query: searchQuery,
+          order_direction: sortDirection,
+          order_key: sortHeader,
+          page: 0, // resets page index
+          fleet_id: teamId,
+          macos_applications: newValue.value,
+          ...buildSoftwareVulnFiltersQueryParams(vulnFilters),
+        },
+      })
+    );
+  };
+
+  const renderApplicationsFilter = () => (
+    <DropdownWrapper
+      name="host-software-applications-filter"
+      className={`${baseClass}__software-filter`}
+      options={applicationsFilterOptions}
+      value={macosApplicationsFilter ? "true" : "false"}
+      onChange={onApplicationsFilterChange}
+      variant="table-filter"
+      isSearchable={false}
+      iconName="filter-alt"
+    />
+  );
+
+  // Visual order is search, dropdown, filters button. The dropdown and filters
+  // button are rendered here in DOM order; the search (rendered by
+  // TableContainer after these controls) is moved ahead of them via CSS when
+  // the `--with-applications-filter` modifier is present.
+  const renderCustomControls = () => (
+    <>
+      {showApplicationsFilter && renderApplicationsFilter()}
+      {renderCustomFiltersButton()}
+    </>
+  );
+
+  return (
+    <div
+      className={`${baseClass}${
+        showApplicationsFilter ? ` ${baseClass}--with-applications-filter` : ""
+      }`}
+    >
+      <TableContainer
+        renderCount={memoizedSoftwareCount}
+        columnConfigs={tableConfig}
+        data={data?.software || []}
+        isLoading={isLoading}
+        defaultSortHeader={sortHeader}
+        defaultSortDirection={sortDirection}
+        defaultSearchQuery={searchQuery}
+        pageIndex={page}
+        disableNextPage={data?.meta.has_next_results === false}
+        pageSize={DEFAULT_PAGE_SIZE}
+        inputPlaceHolder="Search by name or vulnerability (CVE)"
+        onQueryChange={onQueryChange}
+        emptyComponent={() =>
+          isTrulyEmpty ? (
+            <EmptyState
+              header="No software found"
+              info="Expecting to see software? Check back later."
+            />
+          ) : (
+            <EmptyComponent
+              hasVulnFilters={hasVulnFilters}
+              platform={platform}
+              searchQuery={searchQuery}
+            />
+          )
+        }
+        customControl={showFilterHeaders ? renderCustomControls : undefined}
+        stackControls
+        showMarkAllPages={false}
+        isAllPagesSelected={false}
+        searchable={showFilterHeaders}
+        disableSearch={isTrulyEmpty}
+        manualSortBy
+        keyboardSelectableRows={isMyDevicePage}
+        // my device page row clickability
+        disableMultiRowSelect={isMyDevicePage}
+        onClickRow={isMyDevicePage ? onClickMyDeviceRow : undefined}
+      />
+    </div>
+  );
+};
+
+export default HostSoftwareTable;

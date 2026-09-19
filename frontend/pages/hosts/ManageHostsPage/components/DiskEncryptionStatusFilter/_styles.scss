@@ -1,0 +1,18 @@
+.disk-encryption-status-filter {
+  display: flex;
+  justify-content: flex-start;
+  align-items: center;
+
+  &__status-filter {
+    width: 240px;
+
+    .Select-menu-outer {
+      width: 240px;
+      max-height: 310px;
+
+      .Select-menu {
+        max-height: none;
+      }
+    }
+  }
+}

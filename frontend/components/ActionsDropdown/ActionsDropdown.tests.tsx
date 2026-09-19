@@ -1,0 +1,138 @@
+import { screen } from "@testing-library/react";
+import React from "react";
+
+import TableLayoutContext from "components/TableContainer/TableLayoutContext";
+import { renderWithSetup } from "test/test-utils";
+
+import ActionsDropdown from "./ActionsDropdown";
+
+const DROPDOWN_OPTIONS = [
+  { disabled: false, label: "Edit", value: "edit-query" },
+  { disabled: false, label: "Show query", value: "show-query" },
+  { disabled: true, label: "Delete", value: "delete-query" },
+];
+const PLACEHOLDER = "Actions";
+const ON_CHANGE = (value: string) => {
+  console.log(value);
+};
+
+describe("Actions dropdown", () => {
+  it("renders dropdown placeholder and options", async () => {
+    const { user } = renderWithSetup(
+      <ActionsDropdown
+        options={DROPDOWN_OPTIONS} // Test
+        placeholder={PLACEHOLDER}
+        onChange={ON_CHANGE}
+      />
+    );
+
+    await user.click(screen.getByText("Actions"));
+
+    expect(screen.queryAllByText(/edit/i)[1]).toBeInTheDocument(); // Aria shows Edit twice since it's focused
+    expect(screen.queryByText(/show query/i)).toBeInTheDocument();
+    expect(screen.queryByText(/delete/i)).toBeInTheDocument();
+  });
+
+  it("opens the icon-trigger menu with Enter (single toggle)", async () => {
+    const { user } = renderWithSetup(
+      <ActionsDropdown
+        options={DROPDOWN_OPTIONS}
+        placeholder={PLACEHOLDER}
+        onChange={ON_CHANGE}
+        triggerIcon="settings"
+      />
+    );
+
+    const trigger = screen.getByRole("button", { name: PLACEHOLDER });
+    expect(trigger).toHaveAttribute("aria-expanded", "false");
+
+    trigger.focus();
+    // Button fires onClick from its Enter-keydown handler AND the native
+    // click; a double toggle would leave the menu closed.
+    await user.keyboard("{Enter}");
+
+    expect(trigger).toHaveAttribute("aria-expanded", "true");
+    expect(screen.queryByText(/show query/i)).toBeInTheDocument();
+  });
+
+  it("renders dropdown as disabled when disabled prop is true", () => {
+    renderWithSetup(
+      <ActionsDropdown
+        options={DROPDOWN_OPTIONS}
+        placeholder={PLACEHOLDER}
+        onChange={ON_CHANGE}
+        disabled // Test
+      />
+    );
+    expect(screen.getByRole("combobox")).toBeDisabled();
+  });
+
+  it("calls onChange with correct value when an option is selected", async () => {
+    const mockOnChange = jest.fn();
+    const { user } = renderWithSetup(
+      <ActionsDropdown
+        options={DROPDOWN_OPTIONS}
+        placeholder={PLACEHOLDER}
+        onChange={mockOnChange}
+      />
+    );
+
+    await user.click(screen.getByText("Actions"));
+    await user.click(screen.getByText("Edit"));
+
+    expect(mockOnChange).toHaveBeenCalledWith("edit-query");
+  });
+
+  it("renders disabled option as non-selectable", async () => {
+    const { user } = renderWithSetup(
+      <ActionsDropdown
+        options={DROPDOWN_OPTIONS}
+        placeholder={PLACEHOLDER}
+        onChange={ON_CHANGE}
+      />
+    );
+
+    await user.click(screen.getByText("Actions"));
+    const deleteOption = screen.getByText("Delete");
+
+    expect(deleteOption).toHaveAttribute("aria-disabled", "true");
+  });
+
+  it("portals menu and fires onChange on option click when insideTable", async () => {
+    const mockOnChange = jest.fn();
+    const { user } = renderWithSetup(
+      <TableLayoutContext.Provider value={{ insideTable: true }}>
+        <ActionsDropdown
+          options={DROPDOWN_OPTIONS}
+          placeholder={PLACEHOLDER}
+          onChange={mockOnChange}
+        />
+      </TableLayoutContext.Provider>
+    );
+
+    await user.click(screen.getByText("Actions"));
+    // Menu portals to a sibling of body, not inside the wrapper div.
+    expect(
+      document.querySelector(".actions-dropdown-select__menu-portal")
+    ).not.toBeNull();
+    await user.click(screen.getByText("Edit"));
+
+    expect(mockOnChange).toHaveBeenCalledWith("edit-query");
+  });
+
+  it("closes the dropdown when clicking outside", async () => {
+    const { user } = renderWithSetup(
+      <ActionsDropdown
+        options={DROPDOWN_OPTIONS}
+        placeholder={PLACEHOLDER}
+        onChange={ON_CHANGE}
+      />
+    );
+
+    await user.click(screen.getByText("Actions"));
+    expect(screen.getByText("Edit")).toBeVisible();
+
+    await user.click(document.body);
+    expect(screen.queryByText(/edit/i)).not.toBeInTheDocument();
+  });
+});

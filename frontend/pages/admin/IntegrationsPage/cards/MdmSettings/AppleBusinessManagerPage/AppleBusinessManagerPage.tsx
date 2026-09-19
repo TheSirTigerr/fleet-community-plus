@@ -1,0 +1,317 @@
+import { AxiosError } from "axios";
+import React, { useCallback, useContext, useRef, useState } from "react";
+import { useQuery } from "react-query";
+import { InjectedRouter } from "react-router";
+
+import { getEarliestExpiry } from "components/App/App";
+import BackButton from "components/BackButton";
+import Button from "components/buttons/Button";
+import DataError from "components/DataError";
+import EmptyState from "components/EmptyState";
+import MainContent from "components/MainContent";
+import PremiumFeatureMessage from "components/PremiumFeatureMessage";
+import Spinner from "components/Spinner";
+import { notify } from "components/ToastNotification";
+import { AppContext } from "context/app";
+import { IMdmAbToken } from "interfaces/mdm";
+import PATHS from "router/paths";
+import mdmAbmAPI, {
+  IGetAbTokensResponse,
+} from "services/entities/mdm_apple_bm";
+
+import AddAbmModal from "./components/AddAbmModal";
+import AppleBusinessManagerTable from "./components/AppleBusinessManagerTable";
+import DeleteAbmModal from "./components/DeleteAbmModal";
+import EditTeamsAbmModal from "./components/EditTeamsAbmModal";
+import RenewAbmModal from "./components/RenewAbmModal";
+
+const baseClass = "apple-business-manager-page";
+
+interface IAddAbmMessageProps {
+  onAddAbm: () => void;
+}
+
+const AddAbmMessage = ({ onAddAbm }: IAddAbmMessageProps) => {
+  return (
+    <EmptyState
+      header="Add your AB"
+      info="Automatically enroll newly purchased Apple hosts when they're first unboxed and set up by your end users."
+      primaryButton={<Button onClick={onAddAbm}>Add AB</Button>}
+    />
+  );
+};
+
+const AppleBusinessManagerPage = ({ router }: { router: InjectedRouter }) => {
+  const { config, isPremiumTier, setABMExpiry } = useContext(AppContext);
+
+  const [showRenewModal, setShowRenewModal] = useState(false);
+  const [showDeleteModal, setShowDeleteModal] = useState(false);
+  const [showAddAbmModal, setShowAddAbmModal] = useState(false);
+  const [showEditTeamsModal, setShowEditTeamsModal] = useState(false);
+
+  const selectedToken = useRef<IMdmAbToken | null>(null);
+
+  const {
+    data: abTokens,
+    error: errorAbmTokens,
+    isLoading,
+    refetch,
+  } = useQuery<IGetAbTokensResponse, AxiosError, IMdmAbToken[]>(
+    ["abTokens"],
+    () => mdmAbmAPI.getTokens(),
+    {
+      refetchOnWindowFocus: false,
+      retry: (tries, error) =>
+        error.status !== 404 && error.status !== 400 && tries <= 3,
+      select: (data) => data?.ab_tokens,
+      onSuccess: (data) => {
+        // we need to call setABMExpiry here to update the expiry info so the terms banner
+        // displays correctly
+        if (data.length === 0) {
+          setABMExpiry({
+            earliestExpiry: "",
+            needsAbmTermsRenewal: false,
+            hasInvalidABMToken: false,
+            invalidAbmTokenOrgNames: [],
+          });
+        } else {
+          setABMExpiry({
+            earliestExpiry: getEarliestExpiry(data),
+            needsAbmTermsRenewal: data.some((token) => token.terms_expired),
+            hasInvalidABMToken: data.some((token) => token.token_invalid),
+            invalidAbmTokenOrgNames: data
+              .filter((token) => token.token_invalid)
+              .map((token) => token.org_name),
+          });
+        }
+      },
+      enabled: isPremiumTier,
+    }
+  );
+
+  const onEditTokenTeam = (abmToken: IMdmAbToken) => {
+    selectedToken.current = abmToken;
+    setShowEditTeamsModal(true);
+  };
+
+  const onCancelEditTeam = useCallback(() => {
+    selectedToken.current = null;
+    setShowEditTeamsModal(false);
+  }, []);
+
+  const onEditedTeam = useCallback(() => {
+    selectedToken.current = null;
+    refetch();
+    setShowEditTeamsModal(false);
+  }, [refetch]);
+
+  const onToggleTokenDefault = useCallback(
+    async (abmToken: IMdmAbToken) => {
+      try {
+        await mdmAbmAPI.updateTokenDefault(abmToken.id, !abmToken.default);
+        notify.success("Successfully updated default token.");
+      } catch (e) {
+        notify.error("Couldn't update default token. Please try again.", {
+          response: e,
+        });
+      }
+      refetch();
+    },
+    [refetch]
+  );
+
+  const onAddAbm = () => {
+    setShowAddAbmModal(true);
+  };
+
+  const onAdded = () => {
+    refetch();
+    setShowAddAbmModal(false);
+  };
+
+  const onRenewToken = (abmToken: IMdmAbToken) => {
+    selectedToken.current = abmToken;
+    setShowRenewModal(true);
+  };
+
+  const onCancelRenewToken = useCallback(() => {
+    selectedToken.current = null;
+    setShowRenewModal(false);
+  }, []);
+
+  const onRenewed = useCallback(async () => {
+    const renewedTokenId = selectedToken.current?.id;
+    selectedToken.current = null;
+    setShowRenewModal(false);
+
+    const { data: refetchedTokens } = await refetch();
+
+    // Override just the renewed token's invalid status on top of the
+    // refetch, rather than waiting on a reload to reflect it. A successful
+    // renewal is itself proof the new token is valid, even though the
+    // refetch above may still show it as invalid (the persisted flag isn't
+    // cleared until the next regular DEP cron tick, up to a minute later).
+    // Must run after the refetch resolves, and not before, since the
+    // refetch's own onSuccess otherwise clobbers an earlier optimistic
+    // update with this same stale data.
+    //
+    // Matched by id (not org_name) since that's the token's actual unique
+    // identifier -- org_name is unique in practice today (enforced by a DB
+    // constraint), but id doesn't depend on that holding.
+    if (renewedTokenId !== undefined && refetchedTokens?.length) {
+      const invalidAbmTokenOrgNames = Array.from(
+        new Set(
+          refetchedTokens
+            .filter(
+              (token) => token.token_invalid && token.id !== renewedTokenId
+            )
+            .map((token) => token.org_name)
+        )
+      );
+      setABMExpiry({
+        earliestExpiry: getEarliestExpiry(refetchedTokens),
+        needsAbmTermsRenewal: refetchedTokens.some(
+          (token) => token.terms_expired
+        ),
+        hasInvalidABMToken: invalidAbmTokenOrgNames.length > 0,
+        invalidAbmTokenOrgNames,
+      });
+    }
+  }, [refetch, setABMExpiry]);
+
+  const onDeleteToken = (abmToken: IMdmAbToken) => {
+    selectedToken.current = abmToken;
+    setShowDeleteModal(true);
+  };
+
+  const onCancelDeleteToken = useCallback(() => {
+    selectedToken.current = null;
+    setShowDeleteModal(false);
+  }, []);
+
+  const onDeleted = useCallback(() => {
+    selectedToken.current = null;
+    refetch();
+    setShowDeleteModal(false);
+  }, [refetch]);
+
+  // Only the initial load blanks the page; refetches (set/unset default,
+  // add, renew, delete) keep the table on screen and swap in fresh data,
+  // since setting the default is a bare menu click with no modal covering
+  // the refetch.
+  if (isLoading) {
+    return <Spinner />;
+  }
+
+  const showDataError = errorAbmTokens && errorAbmTokens.status !== 404;
+
+  const renderContent = () => {
+    if (!isPremiumTier) {
+      return <PremiumFeatureMessage />;
+    }
+
+    if (!config?.mdm.enabled_and_configured) {
+      return (
+        <EmptyState
+          header="Turn on Apple MDM"
+          info="To add your AB and enable automatic enrollment for macOS, iOS, and iPadOS hosts, first turn on Apple MDM."
+          primaryButton={
+            <Button onClick={() => router.push(PATHS.ADMIN_INTEGRATIONS_MDM)}>
+              Turn on
+            </Button>
+          }
+        />
+      );
+    }
+
+    if (isLoading) {
+      return <Spinner />;
+    }
+
+    // TODO: error UI
+    if (showDataError) {
+      return <DataError verticalPaddingSize="pad-xxxlarge" />;
+    }
+
+    if (abTokens?.length === 0) {
+      return <AddAbmMessage onAddAbm={onAddAbm} />;
+    }
+
+    if (abTokens) {
+      return (
+        <>
+          <p>
+            Add your AB to enable automatic enrollment for company-owned hosts
+            and enrollment, via a Managed Apple Account, for BYOD hosts.
+          </p>
+          <AppleBusinessManagerTable
+            abTokens={abTokens}
+            onEditTokenTeam={onEditTokenTeam}
+            onToggleTokenDefault={onToggleTokenDefault}
+            onRenewToken={onRenewToken}
+            onDeleteToken={onDeleteToken}
+          />
+        </>
+      );
+    }
+
+    return null;
+  };
+
+  return (
+    <MainContent className={baseClass}>
+      <>
+        <div className={`${baseClass}__header-links`}>
+          <BackButton
+            text="Back to MDM"
+            path={PATHS.ADMIN_INTEGRATIONS_MDM}
+            className={`${baseClass}__back-to-mdm`}
+          />
+        </div>
+        <div className={`${baseClass}__page-content`}>
+          <div className={`${baseClass}__page-header-section`}>
+            <h1>Apple Business (AB)</h1>
+            {isPremiumTier &&
+              abTokens?.length !== 0 &&
+              !!config?.mdm.enabled_and_configured && (
+                <Button onClick={onAddAbm}>Add AB</Button>
+              )}
+          </div>
+          <>{renderContent()}</>
+        </div>
+      </>
+      {showAddAbmModal && (
+        <AddAbmModal
+          onAdded={onAdded}
+          onCancel={() => setShowAddAbmModal(false)}
+        />
+      )}
+      {showRenewModal && selectedToken.current && (
+        <RenewAbmModal
+          tokenId={selectedToken.current.id}
+          onCancel={onCancelRenewToken}
+          onRenewedToken={onRenewed}
+        />
+      )}
+      {showDeleteModal && selectedToken.current && (
+        <DeleteAbmModal
+          tokenOrgName={selectedToken.current.org_name}
+          tokenId={selectedToken.current.id}
+          tokenIsDefault={selectedToken.current.default}
+          tokensCount={abTokens?.length ?? 0}
+          onCancel={onCancelDeleteToken}
+          onDeletedToken={onDeleted}
+        />
+      )}
+      {showEditTeamsModal && selectedToken.current && (
+        <EditTeamsAbmModal
+          token={selectedToken.current}
+          onCancel={onCancelEditTeam}
+          onSuccess={onEditedTeam}
+        />
+      )}
+    </MainContent>
+  );
+};
+
+export default AppleBusinessManagerPage;

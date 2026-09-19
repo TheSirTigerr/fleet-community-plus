@@ -1,0 +1,88 @@
+.host-software-section {
+  @include vertical-page-tab-panel-layout;
+
+  .table-container {
+    .stackable-header {
+      min-width: initial; // Fix card overflow on low widths
+    }
+  }
+
+  .table-container__search-input {
+    width: 100%;
+  }
+
+  @media (min-width: ($break-md)) {
+    min-width: 305px; // Custom to fit placeholder text
+  }
+
+  .table-container__search {
+    width: 100%;
+  }
+
+  .host-software-table {
+    // When the macOS /Applications dropdown is shown, lay the controls out as
+    // search (left) ... dropdown, filters button (right). The dropdown and
+    // filters render in that DOM order; the search is rendered last by
+    // TableContainer, so pull it to the front of the flex row. Keep the search
+    // a fixed size at the start of the line rather than stretching, and push
+    // the dropdown + filters button to the end of the line.
+    &--with-applications-filter {
+      .top-shift-header {
+        .table-container__search {
+          order: -1;
+          flex: 0 0 auto;
+          width: auto;
+        }
+
+        .host-software-table__software-filter {
+          margin-left: auto;
+        }
+      }
+    }
+
+    &__software-filter {
+      min-width: 240px;
+      width: 240px; // Override .form-field 100%
+    }
+
+    &__filters {
+      display: flex;
+      align-items: center;
+
+      .children-wrapper {
+        gap: $pad-small;
+      }
+    }
+
+    .table-container__search-input .input-with-icon {
+      min-width: 305px; // Fit placeholder text
+    }
+
+    .data-table-block {
+      .data-table__table {
+        thead {
+          .Vulnerabilities__header {
+            display: table-cell;
+            max-width: px-to-rem(140);
+          }
+        }
+        tbody {
+          .name__cell {
+            max-width: 250px;
+          }
+
+        }
+      }
+
+      @media (max-width: ($break-sm - 1)) {
+        .data-table__table {
+          th,
+          td {
+            padding-left: $pad-medium;
+            padding-right: $pad-medium;
+          }
+        }
+      }
+    }
+  }
+}

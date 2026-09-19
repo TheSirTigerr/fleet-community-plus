@@ -1,0 +1,199 @@
+import classnames from "classnames";
+import { size } from "lodash";
+import React, { FormEvent, useEffect, useState } from "react";
+
+import Button from "components/buttons/Button";
+import CustomLink from "components/CustomLink";
+// @ts-ignore
+import InputFieldWithIcon from "components/forms/fields/InputFieldWithIcon";
+import validateEmail from "components/forms/validators/valid_email";
+import validatePresence from "components/forms/validators/validate_presence";
+import TooltipWrapper from "components/TooltipWrapper";
+import { ISSOSettings } from "interfaces/ssoSettings";
+import { ILoginUserData } from "interfaces/user";
+import paths from "router/paths";
+
+const baseClass = "login-form";
+
+interface ILoginFormProps {
+  baseError?: string;
+  handleSubmit: (formData: ILoginUserData) => Promise<false | void>;
+  isSubmitting: boolean;
+  pendingEmail: boolean;
+  ssoSettings?: ISSOSettings;
+  handleSSOSignOn?: () => void;
+}
+
+const LoginForm = ({
+  baseError,
+  handleSubmit,
+  isSubmitting,
+  pendingEmail,
+  ssoSettings,
+  handleSSOSignOn,
+}: ILoginFormProps): JSX.Element => {
+  const {
+    idp_name: idpName,
+    idp_image_url: imageURL,
+    sso_enabled: ssoEnabled,
+  } = ssoSettings || {}; // TODO: Consider refactoring ssoSettings undefined
+
+  const loginFormClass = classnames(baseClass);
+
+  const [errors, setErrors] = useState<Record<string, string>>({});
+  const [formData, setFormData] = useState<ILoginUserData>({
+    email: "",
+    password: "",
+  });
+  const [showPendingEmail, setShowPendingEmail] = useState(pendingEmail);
+
+  useEffect(() => {
+    setShowPendingEmail(pendingEmail);
+  }, [pendingEmail]);
+
+  const validate = () => {
+    const { password, email } = formData;
+
+    const validationErrors: { [key: string]: string } = {};
+
+    if (!validatePresence(email)) {
+      validationErrors.email = "Email field must be completed";
+    } else if (!validateEmail(email)) {
+      validationErrors.email = "Email must be a valid email address";
+    }
+
+    if (!validatePresence(password)) {
+      validationErrors.password = "Password field must be completed";
+    }
+
+    setErrors(validationErrors);
+    const valid = !size(validationErrors);
+
+    return valid;
+  };
+
+  const onFormSubmit = (evt: FormEvent): Promise<false | void> | boolean => {
+    evt.preventDefault();
+    const valid = validate();
+
+    if (valid) {
+      return handleSubmit(formData);
+    }
+    return false;
+  };
+
+  const renderSingleSignOnButton = () => {
+    const button = (
+      <Button
+        className={`${baseClass}__sso-btn`}
+        type="button"
+        variant="secondary"
+        onClick={handleSSOSignOn}
+        tabIndex={0}
+      >
+        {imageURL && (
+          <img src={imageURL} alt="" className={`${baseClass}__sso-image`} />
+        )}
+        <span className={`${baseClass}__sso-legend`}>Sign in with SSO</span>
+      </Button>
+    );
+
+    // The label is always the generic "Sign in with SSO"; the configured IdP's
+    // name is surfaced only on hover so a long name can't overflow the button.
+    if (!idpName) {
+      return button;
+    }
+
+    return (
+      <TooltipWrapper
+        className={`${baseClass}__sso-tooltip`}
+        tipContent={`Sign in with ${idpName}`}
+        position="top"
+        showArrow
+        underline={false}
+      >
+        {button}
+      </TooltipWrapper>
+    );
+  };
+
+  const onInputChange = (formField: string): ((value: string) => void) => {
+    return (value: string) => {
+      setErrors({});
+      setFormData({
+        ...formData,
+        [formField]: value,
+      });
+    };
+  };
+
+  if (showPendingEmail) {
+    return (
+      <div className="two-factor-check-email">
+        <>
+          <Button
+            onClick={() => setShowPendingEmail(false)}
+            variant="subdued"
+            className="back-link"
+            icon="chevron-left"
+          >
+            Back to login
+          </Button>
+          <h1>Check your email</h1>
+          <p className={`${baseClass}__text`}>
+            We sent an email to you at <b>{formData.email}</b>. <br />
+            Please click the magic link in the email to sign in.
+          </p>
+        </>
+      </div>
+    );
+  }
+
+  return (
+    <form onSubmit={onFormSubmit} className={loginFormClass} noValidate>
+      {baseError && <div className="form__base-error">{baseError}</div>}
+      <div className={`${baseClass}__form`}>
+        <InputFieldWithIcon
+          error={errors.email}
+          autofocus
+          type="email"
+          label="Email"
+          placeholder="Email"
+          value={formData.email}
+          onChange={onInputChange("email")}
+          ignore1Password={false}
+        />
+        <InputFieldWithIcon
+          error={errors.password}
+          label="Password"
+          placeholder="Password"
+          type="password"
+          value={formData.password}
+          onChange={onInputChange("password")}
+          ignore1Password={false}
+        />
+      </div>
+      {/* Actions displayed using CSS column-reverse to preserve tab order */}
+      <div className={`${baseClass}__actions`}>
+        <div className={`${baseClass}__login-actions`}>
+          <Button
+            className={`${baseClass}__login-btn`}
+            isLoading={isSubmitting}
+            type="submit"
+            tabIndex={0}
+          >
+            Log in
+          </Button>
+          {ssoEnabled && renderSingleSignOnButton()}
+        </div>
+        <CustomLink
+          className={`${baseClass}__forgot-link`}
+          url={paths.FORGOT_PASSWORD}
+          text="Forgot password?"
+        />
+      </div>
+    </form>
+  );
+};
+
+export default LoginForm;

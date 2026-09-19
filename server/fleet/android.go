@@ -1,0 +1,384 @@
+package fleet
+
+import (
+	"bytes"
+	"encoding/json"
+	"errors"
+	"fmt"
+	"reflect"
+	"slices"
+	"strings"
+	"sync"
+	"time"
+
+	"github.com/fleetdm/fleet/v4/server/mdm"
+	"github.com/fleetdm/fleet/v4/server/platform/jsondecode"
+	"github.com/fleetdm/fleet/v4/server/variables"
+	"google.golang.org/api/androidmanagement/v1"
+)
+
+const AndroidWebAppPrefix = "com.google.enterprise.webapp"
+
+// MDMAndroidConfigProfile represents an Android MDM profile in Fleet. This does not map
+// directly to a specific policy in the Android API, rather the policy applied is the
+// result of combining all applicable profiles.
+type MDMAndroidConfigProfile struct {
+	// ProfileUUID is the unique identifier of the configuration profile in
+	// Fleet. For Android profiles, it is the letter "g" followed by a uuid.
+	ProfileUUID      string                      `db:"profile_uuid" json:"profile_uuid"`
+	TeamID           *uint                       `db:"team_id" json:"team_id" renameto:"fleet_id"`
+	Name             string                      `db:"name" json:"name"`
+	RawJSON          []byte                      `db:"raw_json" json:"-"`
+	AutoIncrement    int64                       `db:"auto_increment" json:"auto_increment"`
+	LabelsIncludeAll []ConfigurationProfileLabel `db:"-" json:"labels_include_all,omitempty"`
+	LabelsIncludeAny []ConfigurationProfileLabel `db:"-" json:"labels_include_any,omitempty"`
+	LabelsExcludeAny []ConfigurationProfileLabel `db:"-" json:"labels_exclude_any,omitempty"`
+	CreatedAt        time.Time                   `db:"created_at" json:"created_at"`
+	UploadedAt       time.Time                   `db:"uploaded_at" json:"updated_at"` // Difference in DB field name vs JSON is conscious decision to match other platforms
+}
+
+// AndroidForbiddenJSONKeys are keys that may not be included in user-provided Android configuration profiles and
+// associated error messages when they are included
+var AndroidForbiddenJSONKeys = map[string]string{
+	"statusReportingSettings":       `Android configuration profile can't include "statusReportingSettings" setting. To get host vitals, use Get host endpoint: https://fleetdm.com/docs/rest-api/rest-api#get-host`,
+	"applications":                  `Android configuration profile can't include "applications" setting. Software management is coming soon.`,
+	"appFunctions":                  `Android configuration profile can't include "appFunctions" setting. Software management is coming soon.`,
+	"playStoreMode":                 `Android configuration profile can't include "playStoreMode" setting. Software management is coming soon.`,
+	"installAppsDisabled":           `Android configuration profile can't include "installAppsDisabled" setting. Software management is coming soon.`,
+	"uninstallAppsDisabled":         `Android configuration profile can't include "uninstallAppsDisabled" setting. Software management is coming soon.`,
+	"blockApplicationsEnabled":      `Android configuration profile can't include "blockApplicationsEnabled" setting. Software management is coming soon.`,
+	"appAutoUpdatePolicy":           `Android configuration profile can't include "appAutoUpdatePolicy" setting. Software management is coming soon.`,
+	"kioskCustomLauncherEnabled":    `Android configuration profile can't include "kioskCustomLauncherEnabled" setting. Currently, only personal hosts are supported.`,
+	"kioskCustomization":            `Android configuration profile can't include "kioskCustomization" setting. Currently, only personal hosts are supported.`,
+	"persistentPreferredActivities": `Android configuration profile can't include "persistentPreferredActivities" setting. Currently, only personal hosts are supported.`,
+	"setupActions":                  `Android configuration profile can't include "setupActions" setting. Currently, setup experience customization isn't supported.`,
+	"encryptionPolicy":              `Android configuration profile can't include "encryptionPolicy" setting. Currently, disk encryption isn't supported.`,
+}
+
+// AndroidPremiumOnlyJSONKeys are keys that may not be included in user-provided Android
+// configuration profiles for non-Premium licenses and associated error messages when they are included
+var AndroidPremiumOnlyJSONKeys = map[string]string{
+	"systemUpdate": `Android OS updates ("systemUpdate") is Fleet Premium only.`,
+}
+
+func (m *MDMAndroidConfigProfile) ValidateUserProvided(isPremium bool) error {
+	if len(bytes.TrimSpace(m.RawJSON)) == 0 {
+		return errors.New("The file should include valid JSON.")
+	}
+	fleetNames := mdm.FleetReservedProfileNames()
+	if _, ok := fleetNames[m.Name]; ok {
+		return fmt.Errorf("Profile name %q is not allowed.", m.Name)
+	}
+	type jsonObj map[string]any
+	var profileKeyMap jsonObj
+	err := json.Unmarshal(m.RawJSON, &profileKeyMap)
+	if err != nil {
+		// TODO invalid profile err
+		return err
+	}
+	if len(profileKeyMap) == 0 {
+		return errors.New("JSON profile is empty")
+	}
+	for key := range profileKeyMap {
+		if errMsg, ok := AndroidForbiddenJSONKeys[key]; ok {
+			return errors.New(errMsg)
+		}
+
+		if !isPremium {
+			if errMsg, ok := AndroidPremiumOnlyJSONKeys[key]; ok {
+				return errors.New(errMsg)
+			}
+		}
+
+		if !IsAndroidPolicyFieldValid(key) {
+			return fmt.Errorf("Invalid JSON payload. Unknown key %q", key)
+		}
+	}
+
+	// This only checks that every value has the right type.
+	if err := jsondecode.Unmarshal(m.RawJSON, &androidmanagement.Policy{}); err != nil {
+		return parseAndroidProfileValidationError(err)
+	}
+
+	if err := validateAndroidProfileFleetVariables(m.RawJSON, profileKeyMap); err != nil {
+		return err
+	}
+
+	return nil
+}
+
+func parseAndroidProfileValidationError(err error) error {
+	// Check for type mismatches (e.g., array where object expected)
+	if jsondecode.IsTypeError(err) {
+		fieldPath := jsondecode.FieldPath(err)
+		if fieldPath == "" {
+			fieldPath = "<root>"
+		}
+		return fmt.Errorf("Invalid JSON payload. %q format is wrong.", fieldPath)
+	}
+
+	// Fallback for any other unexpected errors
+	return errors.New("Invalid JSON payload.")
+}
+
+func validateAndroidProfileFleetVariables(rawJSON []byte, decoded map[string]any) error {
+	contents := string(rawJSON)
+
+	// Malformed vital refs (e.g. a typo like $FLEET_HOST_VITAL_asset_tag) are
+	// rejected here rather than left solely to the service-layer existence
+	// check (ds.ValidateReferencedCustomHostVitals), so this function doesn't
+	// depend on callers always pairing it with that check to catch a malformed
+	// reference — mirrors the same rejection in ValidateAndroidAppConfiguration.
+	if malformed := ContainsMalformedCustomHostVitalRefs(contents); len(malformed) > 0 {
+		return errors.New((&InvalidCustomHostVitalRefError{Refs: malformed}).Error())
+	}
+
+	// Custom host vitals ($FLEET_HOST_VITAL_<id>) are validated for existence
+	// at the service layer via ds.ValidateReferencedCustomHostVitals, same as
+	// Apple/Windows profiles. Here we only enforce that the token sits inside a
+	// JSON string value, mirroring the $FLEET_VAR_* check below, since a token
+	// used as a JSON key would corrupt the profile structure once substituted
+	// at delivery time.
+	vitalIDs := FindCustomHostVitalIDs(contents)
+
+	varNames := variables.Find(contents)
+	if len(varNames) == 0 && len(vitalIDs) == 0 {
+		return nil
+	}
+
+	if len(varNames) > 0 {
+		if name := FindUnsupportedAndroidFleetVar(contents); name != "" {
+			return fmt.Errorf("Unsupported Fleet variable $FLEET_VAR_%s.", name)
+		}
+
+		keyVars := make(map[string]struct{})
+		stringVars := make(map[string]struct{})
+		walkJSONForVars(decoded, variables.Find, keyVars, stringVars)
+		for _, name := range varNames {
+			if _, inKey := keyVars[name]; inKey {
+				return fmt.Errorf("Fleet variable $FLEET_VAR_%s must be inside a JSON string value.", name)
+			}
+			if _, inStr := stringVars[name]; !inStr {
+				return fmt.Errorf("Fleet variable $FLEET_VAR_%s must be inside a JSON string value.", name)
+			}
+		}
+	}
+
+	if len(vitalIDs) > 0 {
+		vitalKeyVars := make(map[string]struct{})
+		vitalStringVars := make(map[string]struct{})
+		walkJSONForVars(decoded, findCustomHostVitalTokens, vitalKeyVars, vitalStringVars)
+		for _, id := range vitalIDs {
+			token := fmt.Sprintf("%s%d", CustomHostVitalPrefix, id)
+			if _, inKey := vitalKeyVars[token]; inKey {
+				return fmt.Errorf("Custom host vital $%s must be inside a JSON string value.", token)
+			}
+			if _, inStr := vitalStringVars[token]; !inStr {
+				return fmt.Errorf("Custom host vital $%s must be inside a JSON string value.", token)
+			}
+		}
+	}
+
+	return nil
+}
+
+// findCustomHostVitalTokens returns custom host vital token strings without
+// the leading '$' (e.g. "FLEET_HOST_VITAL_7"). Unlike variables.Find, which
+// strips the entire "$FLEET_VAR_" prefix down to a bare name (e.g.
+// "HOST_UUID"), this keeps the "FLEET_HOST_VITAL_" prefix in each token. It
+// matches the func(string) []string shape walkJSONForVars expects, so it can
+// drive the same walk variables.Find does for $FLEET_VAR_*.
+func findCustomHostVitalTokens(s string) []string {
+	ids := FindCustomHostVitalIDs(s)
+	tokens := make([]string, len(ids))
+	for i, id := range ids {
+		tokens[i] = fmt.Sprintf("%s%d", CustomHostVitalPrefix, id)
+	}
+	return tokens
+}
+
+// walkJSONForVars recursively walks a decoded JSON value and collects
+// variable-like tokens found in string values and in map keys separately.
+// find extracts tokens from a raw string ($FLEET_VAR_* names or
+// $FLEET_HOST_VITAL_<id> tokens).
+func walkJSONForVars(v any, find func(string) []string, keyVars, stringVars map[string]struct{}) {
+	switch t := v.(type) {
+	case string:
+		for _, name := range find(t) {
+			stringVars[name] = struct{}{}
+		}
+	case map[string]any:
+		for k, val := range t {
+			for _, name := range find(k) {
+				keyVars[name] = struct{}{}
+			}
+			walkJSONForVars(val, find, keyVars, stringVars)
+		}
+	case []any:
+		for _, val := range t {
+			walkJSONForVars(val, find, keyVars, stringVars)
+		}
+	}
+}
+
+type MDMAndroidProfilePayload struct {
+	HostUUID                string             `db:"host_uuid"`
+	Status                  *MDMDeliveryStatus `db:"status"`
+	OperationType           MDMOperationType   `db:"operation_type"`
+	Detail                  string             `db:"detail"`
+	ProfileUUID             string             `db:"profile_uuid"`
+	ProfileName             string             `db:"profile_name"`
+	PolicyRequestUUID       *string            `db:"policy_request_uuid"`
+	DeviceRequestUUID       *string            `db:"device_request_uuid"`
+	RequestFailCount        int                `db:"request_fail_count"`
+	IncludedInPolicyVersion *int               `db:"included_in_policy_version"`
+	Checksum                []byte             `db:"checksum"`
+	LastErrorDetails        string             `db:"last_error_details"`
+	CanReverify             bool               `db:"can_reverify"`
+}
+
+// HostMDMAndroidProfile represents the status of an MDM profile for a Android host.
+type HostMDMAndroidProfile struct {
+	HostUUID      string             `db:"host_uuid" json:"host_uuid"`
+	ProfileUUID   string             `db:"profile_uuid" json:"profile_uuid"`
+	Name          string             `db:"name" json:"name"`
+	Status        *MDMDeliveryStatus `db:"status" json:"status"`
+	OperationType MDMOperationType   `db:"operation_type" json:"operation_type"`
+	Detail        string             `db:"detail" json:"detail"`
+}
+
+func (p HostMDMAndroidProfile) ToHostMDMProfile() HostMDMProfile {
+	return HostMDMProfile{
+		HostUUID:      p.HostUUID,
+		ProfileUUID:   p.ProfileUUID,
+		Name:          p.Name,
+		Identifier:    "",
+		Status:        p.Status.StringPtr(),
+		OperationType: p.OperationType,
+		Detail:        p.Detail,
+		Platform:      "android",
+	}
+}
+
+type AndroidPolicyRequestPayload struct {
+	Policy   *androidmanagement.Policy           `json:"policy"`
+	Metadata AndroidPolicyRequestPayloadMetadata `json:"metadata"`
+}
+
+type AndroidPolicyRequestPayloadMetadata struct {
+	SettingsOrigin map[string]string `json:"settings_origin"` // Map of policy setting name, to profile uuid.
+}
+
+var (
+	policyFieldsCache map[string]bool
+	policyFieldsOnce  sync.Once
+)
+
+// Initialize the cache once, lazily, with only JSON tag names.
+// Since we take in the JSON value.
+func initPolicyFieldsCache() {
+	policyFieldsCache = make(map[string]bool)
+	policyType := reflect.TypeOf(androidmanagement.Policy{})
+
+	for i := 0; i < policyType.NumField(); i++ {
+		field := policyType.Field(i)
+
+		// Add JSON tag name if it exists
+		jsonTag := field.Tag.Get("json")
+		if jsonTag != "" {
+			tagName := strings.Split(jsonTag, ",")[0]
+			if tagName != "" && tagName != "-" {
+				policyFieldsCache[tagName] = true
+			}
+		}
+	}
+}
+
+// Fast lookup using cached field names
+func IsAndroidPolicyFieldValid(fieldName string) bool {
+	policyFieldsOnce.Do(initPolicyFieldsCache)
+	return policyFieldsCache[fieldName]
+}
+
+// FindUnsupportedAndroidFleetVar returns the name of the first $FLEET_VAR_*
+// token in content that is not in the Android allow-list, or "" if all are
+// supported.
+func FindUnsupportedAndroidFleetVar(content string) string {
+	for _, name := range variables.Find(content) {
+		if !slices.Contains(FleetVarsSupportedInAndroidAppConfig, FleetVarName(name)) {
+			return name
+		}
+	}
+	return ""
+}
+
+// FleetVarsSupportedInAndroidAppConfig is the allow-list of Fleet variables that
+// can appear in an Android managed app configuration or configuration profile JSON.
+var FleetVarsSupportedInAndroidAppConfig = []FleetVarName{
+	FleetVarHostUUID,
+	FleetVarHostHardwareSerial,
+	FleetVarHostPlatform,
+	FleetVarHostEndUserEmailIDP,
+	FleetVarHostEndUserIDPUsername,
+	FleetVarHostEndUserIDPUsernameLocalPart,
+	FleetVarHostEndUserIDPGroups,
+	FleetVarHostEndUserIDPDepartment,
+	FleetVarHostEndUserIDPFullname,
+}
+
+var validAndroidWorkProfileWidgets = map[string]struct{}{
+	"WORK_PROFILE_WIDGETS_UNSPECIFIED": {},
+	"WORK_PROFILE_WIDGETS_ALLOWED":     {},
+	"WORK_PROFILE_WIDGETS_DISALLOWED":  {},
+}
+
+// ValidateAndroidAppConfiguration validates Android app configuration JSON.
+// Configuration must be valid JSON with only "managedConfiguration" and/or
+// "workProfileWidgets" as top-level keys. Empty configuration is not allowed.
+func ValidateAndroidAppConfiguration(config json.RawMessage) error {
+	if len(config) == 0 {
+		return &BadRequestError{
+			Message: "Couldn't update configuration. Invalid JSON.",
+		}
+	}
+
+	type androidAppConfig struct {
+		ManagedConfiguration json.RawMessage `json:"managedConfiguration"`
+		WorkProfileWidgets   string          `json:"workProfileWidgets"`
+	}
+
+	var cfg androidAppConfig
+	if err := JSONStrictDecode(bytes.NewReader(config), &cfg); err != nil {
+		if strings.Contains(err.Error(), "unknown field") {
+			return &BadRequestError{
+				Message: `Couldn't update configuration. Only "managedConfiguration" and "workProfileWidgets" are supported as top-level keys.`,
+			}
+		}
+
+		return &BadRequestError{
+			Message: "Couldn't update configuration. Invalid JSON.",
+		}
+	}
+
+	if _, validVal := validAndroidWorkProfileWidgets[cfg.WorkProfileWidgets]; cfg.WorkProfileWidgets != "" && !validVal {
+		return &BadRequestError{Message: fmt.Sprintf(`Couldn't update configuration. "%s" is not a supported value for "workProfileWidget".`, cfg.WorkProfileWidgets)}
+	}
+
+	if name := FindUnsupportedAndroidFleetVar(string(config)); name != "" {
+		return &BadRequestError{
+			Message: fmt.Sprintf("Couldn't update configuration. Unsupported variable $FLEET_VAR_%s.", name),
+		}
+	}
+
+	// Malformed custom host vital refs (e.g. a typo like $FLEET_HOST_VITAL_asset_tag)
+	// are rejected here since this validation also runs client-side (fleetctl),
+	// where a database existence check isn't possible. Existence of well-formed
+	// refs is validated server-side via ds.ValidateReferencedCustomHostVitals.
+	if malformed := ContainsMalformedCustomHostVitalRefs(string(config)); len(malformed) > 0 {
+		return &BadRequestError{
+			Message: fmt.Sprintf("Couldn't update configuration. %s", (&InvalidCustomHostVitalRefError{Refs: malformed}).Error()),
+		}
+	}
+
+	return nil
+}

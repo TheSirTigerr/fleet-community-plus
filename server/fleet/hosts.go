@@ -1,0 +1,2300 @@
+package fleet
+
+import (
+	"context"
+	"encoding/json"
+	"errors"
+	"fmt"
+	"net/http"
+	"slices"
+	"strings"
+	"time"
+
+	"github.com/Masterminds/semver/v3"
+	"github.com/fleetdm/fleet/v4/server"
+	"github.com/fleetdm/fleet/v4/server/mdm/android"
+	"github.com/fleetdm/fleet/v4/server/ptr"
+)
+
+type HostStatus string
+
+const (
+	// StatusOnline host is active.
+	StatusOnline = HostStatus("online")
+	// StatusOffline no communication with host for OfflineDuration.
+	StatusOffline = HostStatus("offline")
+	// StatusMIA no communication with host for MIADuration.
+	StatusMIA = HostStatus("mia")
+	// StatusNew means the host has enrolled in the interval defined by
+	// NewDuration. It is independent of offline and online.
+	StatusNew = HostStatus("new")
+	// StatusMissing means the host is missing for 30 days. It is identical
+	// with StatusMIA, but StatusMIA is deprecated.
+	StatusMissing = HostStatus("missing")
+	// StatusEnrolled is a filter-only value (never a host's computed status): every host
+	// except those pending MDM enrollment, which exist in Fleet before they enroll.
+	StatusEnrolled = HostStatus("enrolled")
+
+	// NewDuration if a host has been created within this time period it's
+	// considered new.
+	NewDuration = 24 * time.Hour
+
+	// MIADuration if a host hasn't been in communication for this period it
+	// is considered MIA.
+	MIADuration = 30 * 24 * time.Hour
+
+	// OnlineIntervalBuffer is the additional time in seconds to add to the
+	// online interval to avoid flapping of hosts that check in a bit later
+	// than their expected checkin interval.
+	OnlineIntervalBuffer = 60
+
+	// MobileRefetchInterval is the ListIOSAndIPadOSToRefetch cadence: mobile
+	// hosts are queued for a refetch this often (see fleet.RefetchIOSHostInterval).
+	MobileRefetchInterval = time.Hour
+
+	// MobileCronTickPeriod is the apple_mdm_iphone_ipad_refetcher cron tick.
+	// A refetch queued at t may not be dispatched until the next tick, so the
+	// online window must cover a full tick of dispatch latency on top of the
+	// refetch interval.
+	MobileCronTickPeriod = 10 * time.Minute
+
+	// MobileOnlineWindow bounds the MDM activity signal for mobile hosts to
+	// count as online. Sized to cover the worst-case gap between refetcher
+	// bumps (refetch interval + cron tick + network buffer). Duplicated in the
+	// chart context (mobileOnlineWindowSeconds) which can't import
+	// server/fleet — update both together.
+	MobileOnlineWindow = MobileRefetchInterval + MobileCronTickPeriod + time.Duration(OnlineIntervalBuffer)*time.Second
+
+	// HostIdentiferNotFound is the error message returned when a search for a host by its
+	// identifier (hostname, UUID, or serial number) does not return any results.
+	HostIdentiferNotFound = "Host doesn't exist. Make sure you provide a valid hostname, UUID, or serial number. Learn more about host identifiers: https://fleetdm.com/learn-more-about/host-identifiers"
+)
+
+func (s HostStatus) IsValid() bool {
+	switch s {
+	case StatusOnline, StatusOffline, StatusNew, StatusMissing, StatusMIA, StatusEnrolled:
+		return true
+	default:
+		return false
+	}
+}
+
+// placeholderHardwareSerials is the set of well-known junk SMBIOS serial numbers that OEM/BIOS firmware and VM
+// templates emit in place of a real, unique serial. Keys are already trimmed and lower-cased; compare against a
+// normalized serial. The list is best-effort and will never be exhaustive, so IsPlaceholderHardwareSerial also applies
+// a repeated-character heuristic and callers fall back to a unique identifier when a serial is a placeholder.
+var placeholderHardwareSerials = map[string]struct{}{
+	"to be filled by o.e.m.":   {},
+	"default string":           {},
+	"system serial number":     {},
+	"not specified":            {},
+	"not applicable":           {},
+	"none":                     {},
+	"oem":                      {},
+	"o.e.m.":                   {},
+	"default":                  {},
+	"unknown":                  {},
+	"chassis serial number":    {},
+	"base board serial number": {},
+	"baseboard serial number":  {},
+	"123456789":                {},
+	"0123456789":               {},
+	"1234567890":               {},
+	"1234567":                  {},
+	"n/a":                      {},
+	"na":                       {},
+	"invalid":                  {},
+}
+
+// IsPlaceholderHardwareSerial reports whether serial is empty or a well-known placeholder/junk value that does not
+// uniquely identify a device (common on whitebox/consumer hardware and un-sysprepped VM templates). Callers must not
+// use such a serial to match or link a host, since multiple unrelated devices report the same value; they should fall
+// back to an unambiguous identifier instead.
+//
+// Matching is case-insensitive and trimmed. In addition to the known-value set, a serial made up of a single repeated
+// character (e.g. "0", "00000000", "xxxxxxx", "-------") is treated as a placeholder, since those cannot be enumerated.
+func IsPlaceholderHardwareSerial(serial string) bool {
+	s := strings.TrimSpace(serial)
+	if s == "" {
+		return true
+	}
+	if _, ok := placeholderHardwareSerials[strings.ToLower(s)]; ok {
+		return true
+	}
+	// A serial that is the same character repeated (all zeros, all dots, all dashes, etc.) is never a real identity.
+	for i := 1; i < len(s); i++ {
+		if s[i] != s[0] {
+			return false
+		}
+	}
+	return true
+}
+
+// MDMEnrollStatus defines the possible MDM enrollment statuses.
+type MDMEnrollStatus string
+
+const (
+	MDMEnrollStatusManual     = MDMEnrollStatus("manual")
+	MDMEnrollStatusAutomatic  = MDMEnrollStatus("automatic")
+	MDMEnrollStatusPending    = MDMEnrollStatus("pending")
+	MDMEnrollStatusUnenrolled = MDMEnrollStatus("unenrolled")
+	MDMEnrollStatusEnrolled   = MDMEnrollStatus("enrolled") // combination of "manual", "automatic" and "personal"
+	MDMEnrollStatusPersonal   = MDMEnrollStatus("personal")
+)
+
+// OSSettingsStatus defines the possible statuses of the host's OS settings, which is derived from the
+// status of MDM configuration profiles and non-profile settings applied the host.
+type OSSettingsStatus string
+
+const (
+	OSSettingsVerified  OSSettingsStatus = "verified"
+	OSSettingsVerifying OSSettingsStatus = "verifying"
+	OSSettingsPending   OSSettingsStatus = "pending"
+	OSSettingsFailed    OSSettingsStatus = "failed"
+)
+
+func (s OSSettingsStatus) IsValid() bool {
+	switch s {
+	case OSSettingsFailed, OSSettingsPending, OSSettingsVerifying, OSSettingsVerified:
+		return true
+	default:
+		return false
+	}
+}
+
+// MDMBootstrapPackageStatus defines the possible statuses of the host's MDM bootstrap package,
+// which is derived from the status of the MDM command to install the bootstrap package.
+//
+// See https://developer.apple.com/documentation/devicemanagement/installenterpriseapplicationresponse
+type MDMBootstrapPackageStatus string
+
+const (
+	// MDMBootstrapPackageInstalled means the bootstrap package has been installed on the host. It
+	// corresponds to InstallEnterpriseApplicationResponse.Status "Acknowledged".
+	MDMBootstrapPackageInstalled = MDMBootstrapPackageStatus("installed")
+	// MDMBootstrapPackageFailed means the bootstrap package failed to install on the host. It
+	// corresponds to InstallEnterpriseApplicationResponse.Status "Error".
+	MDMBootstrapPackageFailed = MDMBootstrapPackageStatus("failed")
+	// MDMBootstrapPackagePending means the bootstrap package is pending installation on the host.
+	// It applies if no InstallEnterpriseApplicationResponse has been received or if the response is
+	// anything other than InstallEnterpriseApplicationResponse.Status "Acknowledged" or "Error".
+	MDMBootstrapPackagePending = MDMBootstrapPackageStatus("pending")
+)
+
+func (s MDMBootstrapPackageStatus) IsValid() bool {
+	switch s {
+	case MDMBootstrapPackageInstalled, MDMBootstrapPackagePending, MDMBootstrapPackageFailed:
+		return true
+	default:
+		return false
+	}
+}
+
+// NOTE: any changes to the hosts filters is likely to impact at least the following
+// endpoints, due to how they share the same implementation at the Datastore level:
+//
+// - GET /hosts (list hosts)
+// - GET /hosts/count (count hosts, which calls svc.CountHosts or svc.CountHostsInLabel)
+// - GET /labels/{id}/hosts (list hosts in label)
+// - GET /hosts/report
+// - POST /hosts/delete (calls svc.hostIDsFromFilters)
+// - POST /hosts/transfer/filter (calls svc.hostIDsFromFilters)
+//
+// Make sure the docs are updated accordingly and all endpoints behave as expected.
+type HostListOptions struct {
+	ListOptions
+
+	// DeviceMapping joins device user email mapping for each host if available
+	DeviceMapping bool
+
+	// AdditionalFilters selects which host additional fields should be
+	// populated.
+	AdditionalFilters []string
+	// StatusFilter selects the online status of the hosts.
+	StatusFilter HostStatus
+	// TeamFilter selects the hosts for specified team
+	TeamFilter *uint
+
+	PolicyIDFilter       *uint
+	PolicyResponseFilter *bool
+
+	// Deprecated: SoftwareIDFilter is deprecated as of Fleet 4.42. It is
+	// maintained for backwards compatibility. Use SoftwareVersionIDFilter
+	// instead.
+	SoftwareIDFilter *uint
+	// SoftwareVersionIDFilter filters the hosts by the software version ID that
+	// they use. This identifies a specific version of a "software title".
+	SoftwareVersionIDFilter *uint
+	// SoftwareTitleIDFilter filers the hosts by the software title ID that they
+	// use. This identifies a "software title" independent of the specific
+	// version.
+	SoftwareTitleIDFilter *uint
+	// SoftwareStatusFilter filters the hosts by the status of the software installer, if any,
+	// managed by Fleet. If specified, the SoftwareTitleIDFilter must also be specified.
+	SoftwareStatusFilter *SoftwareInstallerStatus
+
+	OSIDFilter        *uint
+	OSNameFilter      *string
+	OSVersionFilter   *string
+	OSVersionIDFilter *uint
+
+	DisableIssues bool
+
+	// MacOSSettingsFilter filters the hosts by the status of MDM configuration profiles
+	// applied to the hosts.
+	MacOSSettingsFilter OSSettingsStatus
+
+	// MacOSSettingsDiskEncryptionFilter filters the hosts by the status of the disk encryption
+	// MDM profile.
+	MacOSSettingsDiskEncryptionFilter DiskEncryptionStatus
+
+	// OSSettingsFilter filters the hosts by the status of MDM configuration profiles and
+	// non-profile settings applied to the hosts.
+	OSSettingsFilter OSSettingsStatus
+	// OSSettingsDiskEncryptionFilter filters the hosts by the status of the disk encryption
+	// OS setting.
+	OSSettingsDiskEncryptionFilter DiskEncryptionStatus
+
+	// MDMBootstrapPackageFilter filters the hosts by the status of the MDM bootstrap package.
+	MDMBootstrapPackageFilter *MDMBootstrapPackageStatus
+
+	// MDMIDFilter filters the hosts by MDM ID.
+	MDMIDFilter *uint
+	// MDMNameFilter filters the hosts by MDM solution name (e.g. one of the
+	// fleet.WellKnownMDM... constants).
+	MDMNameFilter *string
+	// MDMEnrollmentStatusFilter filters the host by their MDM enrollment status.
+	MDMEnrollmentStatusFilter MDMEnrollStatus
+	// MunkiIssueIDFilter filters the hosts by munki issue ID.
+	MunkiIssueIDFilter *uint
+
+	// LowDiskSpaceFilter filters the hosts by low disk space (defined as a host
+	// with less than N gigs of disk space available). Note that this is a Fleet
+	// Premium feature, Fleet Free ignores the setting (it forces it to nil to
+	// disable it).
+	LowDiskSpaceFilter *int
+
+	// PopulateSoftware adds the `Software` field to all Hosts returned.
+	PopulateSoftware bool
+
+	// PopulateSoftwareVulnerabilityDetails adds description, fix version, etc. fields to software vulnerabilities
+	// (this is a Premium feature that gets forced to false on Fleet Free)
+	PopulateSoftwareVulnerabilityDetails bool
+
+	// PopulatePolicies adds the `Policies` array field to all Hosts returned.
+	PopulatePolicies bool
+
+	// PopulateEndUsers adds the `EndUsers` array field to all Hosts returned
+	PopulateEndUsers bool
+
+	// PopulateUsers adds the `Users` array field to all Hosts returned
+	PopulateUsers bool
+
+	// PopulateLabels adds the `Labels` array field to all host responses returned
+	PopulateLabels bool
+
+	// IncludeDeviceStatus adds the `MDM` field with the `device_status` & `pending_action` sub fields to all hosts returned
+	IncludeDeviceStatus bool
+
+	// VulnerabilityFilter filters the hosts by the presence of a vulnerability (CVE)
+	VulnerabilityFilter *string
+
+	// ConnectedToFleetFilter filters hosts that have an active MDM
+	// connection with this Fleet instance.
+	ConnectedToFleetFilter *bool
+
+	// ProfileUUID is the UUID of the MDM configuration profile and filters hosts by that profile.
+	ProfileUUIDFilter *string
+	// ProfileStatus is the status of the MDM configuration profile and filters hosts by that status.
+	ProfileStatusFilter *OSSettingsStatus
+	// BatchScriptExecutionStatusFilter filters hosts by the status of a batch script execution.
+	BatchScriptExecutionStatusFilter BatchScriptExecutionStatus
+	// BatchScriptExecutionIDFilter filters hosts by the ID of a batch script execution.
+	BatchScriptExecutionIDFilter *string
+
+	DEPProfileErrorFilter *bool
+
+	// DEPAssignProfileResponseFilter filters hosts by their exact DEP profile
+	// assignment response value (SUCCESS, FAILED, THROTTLED, NOT_ACCESSIBLE).
+	DEPAssignProfileResponseFilter *DEPAssignProfileResponseStatus
+}
+
+// TODO(Sarah): Are we missing any filters here? Should all MDM filters be included?
+func (h HostListOptions) Empty() bool {
+	return h.ListOptions.Empty() &&
+		!h.DeviceMapping &&
+		len(h.AdditionalFilters) == 0 &&
+		h.StatusFilter == "" &&
+		h.TeamFilter == nil &&
+		h.PolicyIDFilter == nil &&
+		h.PolicyResponseFilter == nil &&
+		h.SoftwareIDFilter == nil &&
+		h.SoftwareVersionIDFilter == nil &&
+		h.SoftwareTitleIDFilter == nil &&
+		h.SoftwareStatusFilter == nil &&
+		h.OSIDFilter == nil &&
+		h.OSNameFilter == nil &&
+		h.OSVersionFilter == nil &&
+		!h.DisableIssues &&
+		h.MacOSSettingsFilter == "" &&
+		h.MacOSSettingsDiskEncryptionFilter == "" &&
+		h.MDMBootstrapPackageFilter == nil &&
+		h.MDMIDFilter == nil &&
+		h.MDMNameFilter == nil &&
+		h.MDMEnrollmentStatusFilter == "" &&
+		h.MunkiIssueIDFilter == nil &&
+		h.LowDiskSpaceFilter == nil &&
+		h.OSSettingsFilter == "" &&
+		h.OSSettingsDiskEncryptionFilter == "" &&
+		h.ProfileUUIDFilter == nil &&
+		h.ProfileStatusFilter == nil &&
+		h.DEPProfileErrorFilter == nil &&
+		h.DEPAssignProfileResponseFilter == nil
+}
+
+type HostUser struct {
+	Uid       uint   `json:"uid" db:"uid"`
+	Username  string `json:"username" db:"username"`
+	Type      string `json:"type" db:"user_type"`
+	GroupName string `json:"groupname" db:"groupname"`
+	Shell     string `json:"shell" db:"shell"`
+}
+
+type Host struct {
+	UpdateCreateTimestamps
+	HostSoftware
+	ID uint `json:"id" csv:"id"`
+	// OsqueryHostID is the key used in the request context that is
+	// used to retrieve host information.  It is sent from osquery and may currently be
+	// a GUID or a Host Name, but in either case, it MUST be unique
+	OsqueryHostID   *string   `json:"-" db:"osquery_host_id" csv:"-"`
+	DetailUpdatedAt time.Time `json:"detail_updated_at" db:"detail_updated_at" csv:"detail_updated_at"` // Time that the host details were last updated
+	LabelUpdatedAt  time.Time `json:"label_updated_at" db:"label_updated_at" csv:"label_updated_at"`    // Time that the host labels were last updated
+	PolicyUpdatedAt time.Time `json:"policy_updated_at" db:"policy_updated_at" csv:"policy_updated_at"` // Time that the host policies were last updated
+	LastEnrolledAt  time.Time `json:"last_enrolled_at" db:"last_enrolled_at" csv:"last_enrolled_at"`    // Time that the host last enrolled
+	SeenTime        time.Time `json:"seen_time" db:"seen_time" csv:"seen_time"`                         // Time that the host was last "seen"
+	// LastMDMCheckedInAt is nano_seen_times.seen_time for active Apple
+	// enrollments; nil elsewhere. Feeds Host.Status()'s mobile branch. No
+	// omitempty: HostDetail already serialized this as null when absent.
+	LastMDMCheckedInAt *time.Time `json:"last_mdm_checked_in_at" db:"last_mdm_checked_in_at" csv:"-"`
+	RefetchRequested   bool       `json:"refetch_requested" db:"refetch_requested" csv:"refetch_requested"`
+	NodeKey            *string    `json:"-" db:"node_key" csv:"-"`
+	OrbitNodeKey       *string    `json:"-" db:"orbit_node_key" csv:"-"`
+	Hostname           string     `json:"hostname" db:"hostname" csv:"hostname"` // there is a fulltext index on this field
+	UUID               string     `json:"uuid" db:"uuid" csv:"uuid"`             // there is a fulltext index on this field
+	// Platform is the host's platform as defined by osquery's os_version.platform.
+	Platform       string        `json:"platform" csv:"platform"`
+	OsqueryVersion string        `json:"osquery_version" db:"osquery_version" csv:"osquery_version"`
+	OrbitVersion   *string       `json:"orbit_version" db:"orbit_version" csv:"orbit_version"`
+	DesktopVersion *string       `json:"fleet_desktop_version" db:"fleet_desktop_version" csv:"fleet_desktop_version"`
+	ScriptsEnabled *bool         `json:"scripts_enabled" db:"scripts_enabled" csv:"scripts_enabled"`
+	OSVersion      string        `json:"os_version" db:"os_version" csv:"os_version"`
+	Build          string        `json:"build" csv:"build"`
+	PlatformLike   string        `json:"platform_like" db:"platform_like" csv:"platform_like"`
+	CodeName       string        `json:"code_name" db:"code_name" csv:"code_name"`
+	Uptime         time.Duration `json:"uptime" csv:"uptime"`
+	Memory         int64         `json:"memory" sql:"type:bigint" db:"memory" csv:"memory"`
+	// system_info fields
+	CPUType          string `json:"cpu_type" db:"cpu_type" csv:"cpu_type"`
+	CPUSubtype       string `json:"cpu_subtype" db:"cpu_subtype" csv:"cpu_subtype"`
+	CPUBrand         string `json:"cpu_brand" db:"cpu_brand" csv:"cpu_brand"`
+	CPUPhysicalCores int    `json:"cpu_physical_cores" db:"cpu_physical_cores" csv:"cpu_physical_cores"`
+	CPULogicalCores  int    `json:"cpu_logical_cores" db:"cpu_logical_cores" csv:"cpu_logical_cores"`
+	HardwareVendor   string `json:"hardware_vendor" db:"hardware_vendor" csv:"hardware_vendor"`
+	HardwareModel    string `json:"hardware_model" db:"hardware_model" csv:"hardware_model"`
+	HardwareVersion  string `json:"hardware_version" db:"hardware_version" csv:"hardware_version"`
+	HardwareSerial   string `json:"hardware_serial" db:"hardware_serial" csv:"hardware_serial"`
+	ComputerName     string `json:"computer_name" db:"computer_name" csv:"computer_name"`
+	// TimeZone is the host's configured timezone. Currently only ingested for iOS/iPadOS hosts via MDM.
+	// CSV not exported to not break automations.
+	TimeZone *string `json:"timezone" db:"timezone" csv:"-"`
+	// PrimaryNetworkInterfaceID if present indicates to primary network for the host, the details of which
+	// can be found in the NetworkInterfaces element with the same ip_address.
+	PrimaryNetworkInterfaceID *uint               `json:"primary_ip_id,omitempty" db:"primary_ip_id" csv:"primary_ip_id"`
+	NetworkInterfaces         []*NetworkInterface `json:"-" db:"-" csv:"-"`
+	PublicIP                  string              `json:"public_ip" db:"public_ip" csv:"public_ip"`
+	PrimaryIP                 string              `json:"primary_ip" db:"primary_ip" csv:"primary_ip"`
+	PrimaryMac                string              `json:"primary_mac" db:"primary_mac" csv:"primary_mac"`
+	DistributedInterval       uint                `json:"distributed_interval" db:"distributed_interval" csv:"distributed_interval"`
+	ConfigTLSRefresh          uint                `json:"config_tls_refresh" db:"config_tls_refresh" csv:"config_tls_refresh"`
+	LoggerTLSPeriod           uint                `json:"logger_tls_period" db:"logger_tls_period" csv:"logger_tls_period"`
+	TeamID                    *uint               `json:"team_id" renameto:"fleet_id" db:"team_id" csv:"team_id"`
+
+	// Loaded via JOIN in DB
+	PackStats []PackStats `json:"pack_stats" csv:"-"`
+	// TeamName is the name of the team, loaded by JOIN to the teams table.
+	TeamName *string `json:"team_name" renameto:"fleet_name" db:"team_name" csv:"team_name"`
+	// Additional is the additional information from the host
+	// additional_queries. This should be stored in a separate DB table.
+	Additional *json.RawMessage `json:"additional,omitempty" db:"additional" csv:"-"`
+
+	// Users currently in the host
+	Users []HostUser `json:"users,omitempty" csv:"-"`
+
+	// EndUsers is the list of end users associated with the host. Only populated when PopulateEndUsers is set.
+	EndUsers []HostEndUser `json:"end_users,omitempty" csv:"-"`
+
+	GigsDiskSpaceAvailable    float64 `json:"gigs_disk_space_available" db:"gigs_disk_space_available" csv:"gigs_disk_space_available"`
+	PercentDiskSpaceAvailable float64 `json:"percent_disk_space_available" db:"percent_disk_space_available" csv:"percent_disk_space_available"`
+	// GigsTotalDiskSpace and GigsAllDiskSpace as defined by `server > service > osquery_utils >
+	// queries.go > hostDetailQueries.disk_space_unix`
+	GigsTotalDiskSpace float64  `json:"gigs_total_disk_space" db:"gigs_total_disk_space" csv:"gigs_total_disk_space"`
+	GigsAllDiskSpace   *float64 `json:"gigs_all_disk_space" db:"gigs_all_disk_space" csv:"gigs_all_disk_space"`
+
+	// DiskEncryptionEnabled is not exportable as CSV (which is one of the
+	// outputs of the List Hosts endpoint). It is a *bool because for some Linux
+	// we set it to NULL and omit it from the JSON response if the host does not
+	// have disk encryption enabled. It is also omitted if we don't have
+	// encryption information yet.
+	DiskEncryptionEnabled *bool `json:"disk_encryption_enabled,omitempty" db:"disk_encryption_enabled" csv:"-"`
+
+	// BitLockerProtectionStatus and TPMPINSet come from the same host_disks join as DiskEncryptionEnabled and are only
+	// populated by loaders that perform it.
+	// BitLockerProtectionStatus is 0 off, 1 on, nil for unknown or never reported.
+	BitLockerProtectionStatus *int `json:"-" db:"bitlocker_protection_status" csv:"-"`
+	// TPMPINSet is maintained wherever Windows disk encryption is enforced, and only acted on where a PIN is required.
+	TPMPINSet bool `json:"-" db:"tpm_pin_set" csv:"-"`
+	// BitLockerBootProtectorSet reports whether a protector able to release the volume master key at boot is present.
+	BitLockerBootProtectorSet *bool `json:"-" db:"bitlocker_boot_protector_set" csv:"-"`
+
+	// DiskEncryptionKeyEscrowed is set to signal that a FileVault disk encryption key was escrowed.
+	// We need this because the escrow process for macOS is driven by detail queries
+	// (see 'mdm_disk_encryption_key_file_darwin' and 'mdm_disk_encryption_key_file_lines_darwin' queries) and
+	// we want to be able to record an activity whenever a disk encryption key is escrowed (which is handled at the
+	// service layer).
+	DiskEncryptionKeyEscrowed bool `json:"-" db:"-" csv:"-"`
+
+	HostIssues `json:"issues,omitempty" csv:"-"`
+
+	// DeviceMapping is in fact included in the CSV export, but it is not directly
+	// encoded from this column, it is processed before marshaling, hence why the
+	// struct tag here has csv:"-".
+	DeviceMapping *json.RawMessage `json:"device_mapping,omitempty" db:"device_mapping" csv:"-"`
+
+	MDM MDMHostData `json:"mdm" db:"mdm_host_data" csv:"-"`
+
+	// RefetchCriticalQueriesUntil can be set to a timestamp up to which the
+	// "critical" queries will be constantly reported to the host that checks in
+	// to be re-executed until a condition is met (or the timestamp expires). The
+	// notion of "critical query" is voluntarily loosely defined so that future
+	// requirements may use this mechanism. The difference with RefetchRequested
+	// is that the latter is a one-time request, while this one is a persistent
+	// until the timestamp expires. The initial use-case is to check for a host
+	// to be unenrolled from its old MDM solution, in the "migrate to Fleet MDM"
+	// workflow (both Apple and Windows).
+	//
+	// In the future, if we want to use it for more than one use-case, we could
+	// add a "reason" field with well-known labels so we know what condition(s)
+	// are expected to clear the timestamp. For now there's a single use-case
+	// so we don't need this.
+	RefetchCriticalQueriesUntil *time.Time `json:"refetch_critical_queries_until" db:"refetch_critical_queries_until" csv:"-"` //nolint:apiparamcheck
+
+	// When non-nil and in the future, the orbit config response sets
+	// debug_logging=true until that time.
+	OrbitDebugUntil *time.Time `json:"orbit_debug_until,omitempty" db:"orbit_debug_until" csv:"-"`
+
+	// DEPAssignedToFleet is set to true if the host is assigned to Fleet in Apple Business.
+	// It is a *bool becase we want it to be returned from only a subset of endpoints related to
+	// Orbit and Fleet Desktop. Otherwise, it will be set to NULL so it is omitted from JSON
+	// responses.
+	//
+	// The boolean is based on information ingested from the Apple DEP API that is stored in the
+	// host_dep_assignments table.
+	DEPAssignedToFleet *bool `json:"dep_assigned_to_fleet,omitempty" db:"dep_assigned_to_fleet" csv:"-"`
+
+	// GroupTag is the Windows Autopilot group tag for a host synced from a tenant's Autopilot registry.
+	GroupTag *string `json:"group_tag,omitempty" db:"group_tag" csv:"-"`
+
+	// LastRestartedAt is a UNIX timestamp that indicates when the Host was last restarted.
+	LastRestartedAt time.Time `json:"last_restarted_at" db:"last_restarted_at" csv:"last_restarted_at"`
+
+	// Policies is the list of policies and whether it passes for the host
+	Policies *[]*HostPolicy `json:"policies,omitempty" csv:"-"`
+
+	// nil -> field isn't loaded
+	// true -> at least one non-revoked cert exists
+	// false -> we know there is no cert
+	HasHostIdentityCert *bool `json:"-" db:"has_host_identity_cert" csv:"-"`
+
+	// HostMDMAppleDeviceVitals holds additional iOS/iPadOS vitals collected
+	// via the DeviceInformation MDM command and persisted to
+	// host_mdm_apple_device_vitals / host_mdm_apple_service_subscriptions
+	// (see HostMDMAppleDeviceVitals and MDMAppleDeviceVitals, same package).
+	// Embedded anonymously so its fields flatten into the top-level host
+	// JSON response. Only populated for iOS/iPadOS hosts, via a separate
+	// query (loadHostMDMAppleDeviceVitalsDB) — every field is omitted (not
+	// null) for every other platform, or when a given field wasn't returned
+	// by a particular enrollment.
+	HostMDMAppleDeviceVitals
+
+	// HostMDMAndroidDeviceVitals holds additional Android vitals collected
+	// from AMAPI status reports and persisted to
+	// host_mdm_android_device_vitals (see HostMDMAndroidDeviceVitals and
+	// MDMAndroidDeviceVitals, same package). Embedded anonymously so its
+	// fields flatten into the top-level host JSON response. Only populated
+	// for Android hosts, via a separate query
+	// (LoadHostMDMAndroidDeviceVitals) — every field is omitted (not null)
+	// for every other platform, or when a given field wasn't reported by a
+	// particular status report.
+	HostMDMAndroidDeviceVitals
+}
+
+type HostForeignVitalGroup struct {
+	Name  string
+	Query string
+}
+
+type HostVitalType int
+
+const (
+	HostVitalTypeDomestic   HostVitalType = iota // Domestic vitals are those that are stored in the host table
+	HostVitalTypeForeign                         // Foreign vitals are those that are stored in a separate table and joined to the host table
+	HostVitalTypeAdditional                      // Additional vitals are those that are stored in the host_additional table as a JSON blob
+	HostVitalTypeCustom                          // Custom vitals are stored per-host in host_custom_host_vitals, scoped by a custom_host_vital_id
+)
+
+type HostVital struct {
+	Name              string // Display name of the vital
+	VitalType         HostVitalType
+	DataType          string  // Data type of the vital, e.g. "string", "int", "bool"
+	ForeignVitalGroup *string // For foreign vitals, the group they belong to
+	Path              string  // Path to the vital in the SQL query, for use in generating the WHERE clause
+}
+
+var hostForeignVitalGroups = map[string]HostForeignVitalGroup{
+	"idp": {
+		Name: "Identity Provider",
+		// NOTE: This must be an INNER JOIN (not RIGHT JOIN) on host_scim_user. A
+		// RIGHT JOIN keeps all host_scim_user rows even when the host side has been
+		// filtered out -- e.g. for fleet/team-scoped labels, where the hosts table
+		// is pre-filtered to the label's team. An out-of-team scim user that
+		// matches the criteria would then survive the join with hosts.id = NULL,
+		// which both leaks cross-team membership and breaks the INSERT into
+		// label_membership (NULL host_id, which is NOT NULL), rolling back the whole
+		// update so the fleet label gets zero hosts. See #46869.
+		// The scim_user_group join is a recursive derived table (aliased back to
+		// scim_user_group so downstream references are unchanged) that expands each
+		// user's DIRECT group memberships into their EFFECTIVE memberships,
+		// including every ancestor group reachable via nested group edges
+		// (scim_group_group). Entra ID provisions nested groups as group-type
+		// members rather than flattening them, so without this expansion a host
+		// whose user only belongs to a child group would not match a label built on
+		// an ancestor group's display name. The anchor is seeded with only the SCIM
+		// users mapped to hosts: the derived table is materialized once per query
+		// (the outer join predicate isn't pushed into a recursive CTE), and rows for
+		// host-less users would be expanded only to be discarded by that join.
+		Query: `JOIN host_scim_user ON (hosts.id = host_scim_user.host_id)
+				JOIN scim_users ON (host_scim_user.scim_user_id = scim_users.id)
+				LEFT JOIN (
+					WITH RECURSIVE scim_user_group_expanded AS (
+						SELECT scim_user_id, group_id FROM scim_user_group
+						WHERE scim_user_id IN (SELECT scim_user_id FROM host_scim_user)
+						UNION SELECT e.scim_user_id, gg.parent_group_id AS group_id
+						FROM scim_user_group_expanded e
+						JOIN scim_group_group gg ON gg.child_group_id = e.group_id
+					) SELECT scim_user_id, group_id FROM scim_user_group_expanded
+				) scim_user_group ON (host_scim_user.scim_user_id = scim_user_group.scim_user_id)
+				 LEFT JOIN scim_groups ON (scim_user_group.group_id = scim_groups.id)`,
+	},
+}
+
+var hostVitals = map[string]HostVital{
+	"end_user_idp_group": {
+		Name:      "IDP Group",
+		VitalType: HostVitalTypeForeign,
+		// A user can be in multiple groups, but we use a join table to specify them,
+		// so we can represent "group" as a string rather than an array and use AND/OR
+		// criteria to filter hosts by group membership.
+		DataType:          "string",
+		ForeignVitalGroup: ptr.String("idp"),
+		Path:              "scim_groups.display_name",
+	},
+	"end_user_idp_department": {
+		Name:              "IDP Department",
+		VitalType:         HostVitalTypeForeign,
+		DataType:          "string",
+		ForeignVitalGroup: ptr.String("idp"),
+		Path:              "scim_users.department",
+	},
+	// custom_host_vital does not self-identify which vital (unlike the IDP enum
+	// values); the criterion's custom_host_vital_id selects it and scopes the
+	// per-host value join built in parseHostVitalCriteria.
+	"custom_host_vital": {
+		Name:      "Custom host vital",
+		VitalType: HostVitalTypeCustom,
+		DataType:  "string",
+		Path:      "host_custom_host_vitals.value",
+	},
+}
+
+type AndroidHost struct {
+	*Host
+	*android.Device
+}
+
+func (ah *AndroidHost) SetNodeKey(enterpriseSpecificID string) {
+	if ah.Host == nil || ah.Device == nil {
+		return
+	}
+	ah.Device.EnterpriseSpecificID = ptr.String(enterpriseSpecificID)
+	// We use node_key as a unique identifier for the host table row.
+	// Since this key is used by other hosts, we use a prefix to avoid conflicts.
+	hostNodeKey := "android/" + enterpriseSpecificID
+	ah.Host.NodeKey = &hostNodeKey
+}
+
+func (ah *AndroidHost) IsValid() bool {
+	return !(ah == nil || ah.Host == nil || ah.Device == nil ||
+		ah.Host.NodeKey == nil || ah.Device.EnterpriseSpecificID == nil ||
+		*ah.Host.NodeKey != "android/"+*ah.Device.EnterpriseSpecificID)
+}
+
+// HostOrbitInfo maps to the host_orbit_info table in the database, which maps to the orbit_info agent table.
+type HostOrbitInfo struct {
+	Version        string  `json:"version" db:"version"`
+	DesktopVersion *string `json:"desktop_version" db:"desktop_version"`
+	ScriptsEnabled *bool   `json:"scripts_enabled" db:"scripts_enabled"`
+}
+
+// HostHealth contains a subset of Host data that indicates how healthy a Host is. For fields with
+// the same name, see the comments/docs for the Host field above.
+type HostHealth struct {
+	UpdatedAt                    time.Time                      `json:"updated_at,omitempty" db:"updated_at"`
+	OsVersion                    string                         `json:"os_version,omitempty" db:"os_version"`
+	DiskEncryptionEnabled        *bool                          `json:"disk_encryption_enabled,omitempty" db:"disk_encryption_enabled"`
+	FailingPoliciesCount         int                            `json:"failing_policies_count"`
+	FailingCriticalPoliciesCount *int                           `json:"failing_critical_policies_count,omitempty"` // Fleet Premium Only
+	VulnerableSoftware           []HostHealthVulnerableSoftware `json:"vulnerable_software,omitempty"`
+	FailingPolicies              []*HostHealthFailingPolicy     `json:"failing_policies,omitempty"`
+	Platform                     string                         `json:"-" db:"platform"`                                    // Needed to fetch failing policies. Not returned in HTTP responses.
+	TeamID                       *uint                          `json:"team_id,omitempty" renameto:"fleet_id" db:"team_id"` // Needed to verify that user can access this host's health data. Not returned in HTTP responses.
+}
+
+type HostHealthVulnerableSoftware struct {
+	ID      uint   `json:"id"`
+	Name    string `json:"name"`
+	Version string `json:"version"`
+}
+
+type HostHealthFailingPolicy struct {
+	ID         uint    `json:"id"`
+	Name       string  `json:"name"`
+	Critical   *bool   `json:"critical,omitempty"` // Fleet Premium Only
+	Resolution *string `json:"resolution"`
+}
+
+func (hh HostHealth) AuthzType() string {
+	return "host_health"
+}
+
+type MDMHostData struct {
+	// For CSV columns, since the CSV is flattened, we keep the "mdm." prefix
+	// along with the column name.
+
+	// EnrollmentStatus is a string representation of state derived from
+	// booleans stored in the host_mdm table, loaded by JOIN in datastore
+	EnrollmentStatus *string `json:"enrollment_status" db:"-" csv:"mdm.enrollment_status"`
+	// IsPersonalEnrollment reports whether the last MDM enrollment Fleet recorded for the
+	// host was personal (BYOD). Unlike EnrollmentStatus it is not cleared on unenrollment,
+	// so consumers can still tell a BYOD device apart afterwards (BYOD devices never report
+	// a serial number, so the UI has nothing else to identify them by). That only holds for
+	// platforms where MDM state comes from the MDM protocol - Android and Apple mobile. On
+	// macOS and Windows the fleetd detail queries re-ingest MDM state, and
+	// directIngestMDMMac/directIngestMDMWindows pass false once the profile is gone.
+	//
+	// Deliberately not a CSV column: the hosts report is a stable user-facing format and
+	// this field is only needed by the UI.
+	IsPersonalEnrollment bool `json:"is_personal_enrollment" db:"-" csv:"-"`
+	// DEPProfileError is a boolean representing whether Fleet received a "FAILED" response when
+	// attempting to assign a DEP profile for the host.
+	// See https://developer.apple.com/documentation/devicemanagement/assignprofileresponse
+	//
+	// It is not filled in by all host-returning datastore methods.
+	DEPProfileError bool `json:"dep_profile_error" db:"dep_profile_error" csv:"mdm.dep_profile_error"`
+	// ServerURL is the server_url stored in the host_mdm table, loaded by
+	// JOIN in datastore
+	ServerURL *string `json:"server_url" db:"-" csv:"mdm.server_url"`
+	// Name is the name of the MDM solution for the host.
+	Name string `json:"name" db:"name" csv:"-"`
+
+	// EncryptionKeyAvailable indicates if Fleet was able to retrieve and
+	// decode an encryption key for the host.
+	EncryptionKeyAvailable bool `json:"encryption_key_available" db:"-" csv:"-"`
+	// EncryptionKeyArchived indicates if an archived encryption key exists for the host.
+	// It is not filled in by all host-returning methods (currently only populated if
+	// svc.getHostDetails is called).
+	EncryptionKeyArchived *bool `json:"encryption_key_archived,omitempty" db:"encryption_key_archived" csv:"-"`
+
+	// BootstrapTokenEscrowed indicates if Fleet has escrowed a bootstrap token for the
+	// macOS host. The bootstrap token is used by macOS to authorize certain MDM
+	// operations, such as remote wipe and OS updates, without requiring a user with a
+	// secure token to be logged in. It is only applicable to macOS hosts, and it is not
+	// filled in by all host-returning methods (currently only populated if
+	// svc.getHostDetails is called).
+	BootstrapTokenEscrowed *bool `json:"bootstrap_token_escrowed,omitempty" db:"-" csv:"-"`
+
+	// this is set to nil if the key exists but decryptable is NULL in the db, 1
+	// if decryptable, 0 if non-decryptable and -1 if no disk encryption key row
+	// exists for this host. Used internally to determine the disk_encryption
+	// status and action_required fields. See MDMHostData.Scan as for where this
+	// gets filled.
+	rawDecryptable *int
+
+	// OSSettings contains information related to operating systems settings that are managed for
+	// MDM-enrolled hosts and/or Linux hosts with disk encryption enabled, which don't require MDM.
+	//
+	// Note: Additional information for macOS hosts is currently stored in MacOSSettings.
+	OSSettings *HostMDMOSSettings `json:"os_settings,omitempty" db:"-" csv:"-"`
+
+	// Profiles is a list of HostMDMProfiles for the host. Note that as for many
+	// other host fields, it is not filled in by all host-returning datastore methods.
+	//
+	// It is a pointer to a slice so that when set, it gets marhsaled even
+	// if the slice is empty, but when unset, it doesn't get marshaled
+	// (e.g. we don't return that information for the List Hosts endpoint).
+	Profiles *[]HostMDMProfile `json:"profiles,omitempty" db:"profiles" csv:"-"`
+
+	// MacOSSettings indicates macOS-specific MDM settings for the host, such
+	// as disk encryption status and whether any user action is required to
+	// complete the disk encryption process.
+	//
+	// It is not filled in by all host-returning datastore methods.
+	MacOSSettings *MDMHostMacOSSettings `json:"macos_settings,omitempty" renameto:"apple_settings" db:"-" csv:"-"`
+
+	// MacOSSetup indicates macOS-specific MDM setup for the host, such
+	// as the status of the bootstrap package.
+	//
+	// It is not filled in by all host-returning datastore methods.
+	MacOSSetup *HostMDMMacOSSetup `json:"macos_setup,omitempty" renameto:"setup_experience" db:"-" csv:"-"`
+
+	// The DeviceStatus and PendingAction fields are not stored in the database
+	// directly, they are read from the GetHostLockWipeStatus datastore method
+	// and determined from those results. They are not filled by all
+	// host-returning methods.
+	DeviceStatus  *string `json:"device_status,omitempty" db:"-" csv:"-"`
+	PendingAction *string `json:"pending_action,omitempty" db:"-" csv:"-"`
+
+	// ConnectedToFleet indicates if the host has an active MDM connection
+	// with this Fleet instance. This boolean is not filled by all
+	// host-returning methods.
+	ConnectedToFleet *bool `json:"connected_to_fleet" csv:"-" db:"connected_to_fleet"`
+
+	// WipeAllowed, LockAllowed, and ClearPasscodeAllowed indicate whether the
+	// corresponding MDM commands are permitted for this host based on the
+	// AccessRights delivered in the host's enrollment profile. They are nil for
+	// non-Apple-MDM hosts and Apple hosts for which the enrollment permissions
+	// are not yet known (pre-existing manually-enrolled hosts whose stored rights
+	// are defaulted to MDMAccessRightAll on the first SCEP cycle). They are only
+	// populated by getHostDetails, not by list-hosts endpoints.
+	WipeAllowed          *bool `json:"wipe_allowed,omitempty" db:"-" csv:"-"`
+	LockAllowed          *bool `json:"lock_allowed,omitempty" db:"-" csv:"-"`
+	ClearPasscodeAllowed *bool `json:"clear_passcode_allowed,omitempty" db:"-" csv:"-"`
+}
+
+type HostMDMOSSettings struct {
+	DiskEncryption       HostMDMDiskEncryption       `json:"disk_encryption" db:"-" csv:"-"`
+	RecoveryLockPassword HostMDMRecoveryLockPassword `json:"recovery_lock_password" db:"-" csv:"-"`
+	ManagedLocalAccount  HostMDMManagedLocalAccount  `json:"managed_local_account" db:"-" csv:"-"`
+	HostName             *HostMDMHostNameSetting     `json:"host_name,omitempty" db:"-" csv:"-"`
+}
+
+// HostNameSettingStatus is the per-host status of the host-name template
+// enforcement surfaced in the host detail response.
+type HostNameSettingStatus string
+
+const (
+	HostNameSettingPending   HostNameSettingStatus = "pending"
+	HostNameSettingVerifying HostNameSettingStatus = "verifying"
+	HostNameSettingVerified  HostNameSettingStatus = "verified"
+	HostNameSettingFailed    HostNameSettingStatus = "failed"
+)
+
+type HostMDMHostNameSetting struct {
+	Status HostNameSettingStatus `json:"status" db:"-" csv:"-"`
+	Detail string                `json:"detail" db:"-" csv:"-"`
+}
+
+type HostMDMDiskEncryption struct {
+	Status *DiskEncryptionStatus `json:"status" db:"-" csv:"-"`
+	Detail string                `json:"detail" db:"-" csv:"-"`
+	// ActionRequired names what the END USER has to do, and is set only when there is something they can actually do.
+	// macos_settings carries the same value for backwards compatibility
+	ActionRequired *ActionRequiredState `json:"action_required,omitempty" db:"-" csv:"-"`
+	// FleetdCanSetPIN is true when this host's fleetd can apply a BitLocker PIN the end user types, so the page offers
+	// the PIN form rather than the Manage BitLocker instructions.
+	FleetdCanSetPIN *bool `json:"fleetd_can_set_pin,omitempty" db:"-" csv:"-"`
+	// PINRequest is the state of the end user's PIN submission, while one exists. It never carries the PIN.
+	PINRequest *HostBitLockerPINRequest `json:"pin_request,omitempty" db:"-" csv:"-"`
+}
+
+// NeedsBitLockerPIN reports whether the end user is being asked to create a startup PIN.
+func (d *HostMDMDiskEncryption) NeedsBitLockerPIN() bool {
+	return d != nil && d.ActionRequired != nil && *d.ActionRequired == ActionRequiredCreatePIN
+}
+
+type HostMDMRecoveryLockPassword struct {
+	Status            *RecoveryLockStatus `json:"status" db:"-" csv:"-"`
+	Detail            string              `json:"detail" db:"-" csv:"-"`
+	PasswordAvailable bool                `json:"password_available" db:"-" csv:"-"`
+	// rawStatus and operationType are used internally to determine the status translation, not serialized.
+	rawStatus     *MDMDeliveryStatus `json:"-" db:"-" csv:"-"`
+	operationType MDMOperationType   `json:"-" db:"-" csv:"-"`
+}
+
+// RecoveryLockStatus represents the status of recovery lock password enforcement.
+type RecoveryLockStatus string
+
+const (
+	RecoveryLockStatusVerified            RecoveryLockStatus = "verified"
+	RecoveryLockStatusPending             RecoveryLockStatus = "pending"
+	RecoveryLockStatusFailed              RecoveryLockStatus = "failed"
+	RecoveryLockStatusRemovingEnforcement RecoveryLockStatus = "removing_enforcement"
+)
+
+func (s RecoveryLockStatus) addrOf() *RecoveryLockStatus {
+	return &s
+}
+
+// PopulateStatus converts the raw MDMDeliveryStatus based on operation type to RecoveryLockStatus.
+func (r *HostMDMRecoveryLockPassword) PopulateStatus() {
+	if r == nil || r.rawStatus == nil {
+		return
+	}
+	switch r.operationType {
+	case MDMOperationTypeRemove:
+		switch {
+		case *r.rawStatus == MDMDeliveryFailed:
+			r.Status = RecoveryLockStatusFailed.addrOf()
+		default:
+			r.Status = RecoveryLockStatusRemovingEnforcement.addrOf()
+		}
+	default:
+		switch *r.rawStatus {
+		case MDMDeliveryFailed:
+			r.Status = RecoveryLockStatusFailed.addrOf()
+		case MDMDeliveryVerified:
+			r.Status = RecoveryLockStatusVerified.addrOf()
+		case MDMDeliveryVerifying, MDMDeliveryPending:
+			r.Status = RecoveryLockStatusPending.addrOf()
+		}
+	}
+}
+
+// SetRawStatus sets the raw status and operation type for later translation.
+func (r *HostMDMRecoveryLockPassword) SetRawStatus(status *MDMDeliveryStatus, opType MDMOperationType) {
+	r.rawStatus = status
+	r.operationType = opType
+}
+
+// HostDeviceNameEnforcement is the enforcement state of the host-name template
+// for a single Apple host, mirroring a row in host_mdm_apple_device_names. A nil
+// Status means the row is queued for the cron to pick up and enqueue a
+// Settings/DeviceName command.
+type HostDeviceNameEnforcement struct {
+	HostUUID string             `db:"host_uuid"`
+	Status   *MDMDeliveryStatus `db:"status"`
+	// CommandUUID is the UUID of the last Settings/DeviceName command sent for
+	// this host, nil until the cron enqueues one.
+	CommandUUID *string `db:"command_uuid"`
+	// ExpectedDeviceName is the resolved name the cron sent to the device, nil
+	// until the template is resolved and the command is enqueued.
+	ExpectedDeviceName *string   `db:"expected_device_name"`
+	Detail             string    `db:"detail"`
+	CreatedAt          time.Time `db:"created_at"`
+	UpdatedAt          time.Time `db:"updated_at"`
+}
+
+// HostDeviceNamePending carries the host details the cron needs to resolve the
+// host-name template and enqueue a Settings/DeviceName command for a host whose
+// enforcement row is queued (status IS NULL).
+type HostDeviceNamePending struct {
+	HostID         uint   `db:"host_id"`
+	HostUUID       string `db:"host_uuid"`
+	HardwareSerial string `db:"hardware_serial"`
+	Platform       string `db:"platform"`
+	// ComputerName is the host's current name in Fleet; the cron uses it to skip
+	// sending a command when the device already matches the resolved name.
+	ComputerName string `db:"computer_name"`
+	TeamID       *uint  `db:"team_id"`
+}
+
+type DiskEncryptionStatus string
+
+const (
+	DiskEncryptionVerified            DiskEncryptionStatus = "verified"
+	DiskEncryptionVerifying           DiskEncryptionStatus = "verifying"
+	DiskEncryptionActionRequired      DiskEncryptionStatus = "action_required"
+	DiskEncryptionEnforcing           DiskEncryptionStatus = "enforcing"
+	DiskEncryptionFailed              DiskEncryptionStatus = "failed"
+	DiskEncryptionRemovingEnforcement DiskEncryptionStatus = "removing_enforcement"
+)
+
+// BitLocker conversion status values from the Win32_EncryptableVolume WMI class.
+// https://learn.microsoft.com/en-us/windows/win32/secprov/getconversionstatus-win32-encryptablevolume
+//
+// Only FullyEncrypted (1) is used by the server ingestion logic; all other
+// values (0=decrypted, 2=encrypting, 3=decrypting, 4=encryption paused,
+// 5=decryption paused) are treated as "not yet encrypted."
+const (
+	BitLockerConversionStatusFullyDecrypted = 0
+	BitLockerConversionStatusFullyEncrypted = 1
+)
+
+// BitLocker protection status values from the Win32_EncryptableVolume WMI class.
+// https://learn.microsoft.com/en-us/windows/win32/secprov/getprotectionstatus-win32-encryptablevolume
+const (
+	BitLockerProtectionStatusOff     = 0
+	BitLockerProtectionStatusOn      = 1
+	BitLockerProtectionStatusUnknown = 2
+)
+
+func (s DiskEncryptionStatus) addrOf() *DiskEncryptionStatus {
+	return &s
+}
+
+func (s DiskEncryptionStatus) IsValid() bool {
+	switch s {
+	case
+		DiskEncryptionVerifying,
+		DiskEncryptionVerified,
+		DiskEncryptionActionRequired,
+		DiskEncryptionEnforcing,
+		DiskEncryptionFailed,
+		DiskEncryptionRemovingEnforcement:
+		return true
+	default:
+		return false
+	}
+}
+
+type BatchScriptExecutionStatus string
+
+const (
+	BatchScriptExecutionRan          BatchScriptExecutionStatus = "ran"
+	BatchScriptExecutionPending      BatchScriptExecutionStatus = "pending"
+	BatchScriptExecutionErrored      BatchScriptExecutionStatus = "errored"
+	BatchScriptExecutionCanceled     BatchScriptExecutionStatus = "canceled"
+	BatchScriptExecutionIncompatible BatchScriptExecutionStatus = "incompatible"
+)
+
+func (s BatchScriptExecutionStatus) IsValid() bool {
+	switch s {
+	case
+		BatchScriptExecutionRan,
+		BatchScriptExecutionPending,
+		BatchScriptExecutionErrored,
+		BatchScriptExecutionIncompatible,
+		BatchScriptExecutionCanceled:
+		return true
+	default:
+		return false
+	}
+}
+
+type ActionRequiredState string
+
+const (
+	ActionRequiredLogOut    ActionRequiredState = "log_out"
+	ActionRequiredRotateKey ActionRequiredState = "rotate_key"
+	// ActionRequiredTurnOnEncryption is macOS-only: the fleet escrows keys without enforcing FileVault and the disk is
+	// not encrypted, so there is no key to rotate until the end user turns FileVault on.
+	ActionRequiredTurnOnEncryption ActionRequiredState = "turn_on_encryption"
+	// ActionRequiredCreatePIN is Windows-only: BitLocker policy requires a startup PIN and the end user has not set one.
+	ActionRequiredCreatePIN ActionRequiredState = "create_pin"
+	// ActionRequiredRestart is Windows-only: BitLocker protection is off and the agent is waiting for a staged restart
+	// before turning it back on.
+	ActionRequiredRestart ActionRequiredState = "restart"
+)
+
+func (s ActionRequiredState) addrOf() *ActionRequiredState {
+	return &s
+}
+
+type MDMHostMacOSSettings struct {
+	DiskEncryption *DiskEncryptionStatus `json:"disk_encryption" csv:"-"`
+	ActionRequired *ActionRequiredState  `json:"action_required" csv:"-"`
+}
+
+type HostMDMMacOSSetup struct {
+	BootstrapPackageStatus MDMBootstrapPackageStatus `db:"bootstrap_package_status" json:"bootstrap_package_status" csv:"-"`
+	Result                 []byte                    `db:"result" json:"-" csv:"-"`
+	Detail                 string                    `db:"-" json:"detail" csv:"-"`
+	BootstrapPackageName   string                    `db:"bootstrap_package_name" json:"bootstrap_package_name" csv:"-"`
+}
+
+// fileVaultVerification is whether encryption is confirmed once the FileVault
+// profile is delivered: from the escrowed key's decryptability, or from the
+// reported disk state when enforcing without escrow.
+type fileVaultVerification int
+
+const (
+	fileVaultVerificationUnknown fileVaultVerification = iota
+	fileVaultVerificationNotConfirmed
+	fileVaultVerificationConfirmed
+)
+
+func (d *MDMHostData) keyVerification() fileVaultVerification {
+	switch {
+	case d.rawDecryptable == nil:
+		return fileVaultVerificationUnknown
+	case *d.rawDecryptable == 1:
+		return fileVaultVerificationConfirmed
+	default:
+		// no key row (-1) or a key we could not decrypt (0)
+		return fileVaultVerificationNotConfirmed
+	}
+}
+
+func diskVerification(diskEncrypted *bool) fileVaultVerification {
+	switch {
+	case diskEncrypted == nil:
+		return fileVaultVerificationUnknown
+	case *diskEncrypted:
+		return fileVaultVerificationConfirmed
+	default:
+		return fileVaultVerificationNotConfirmed
+	}
+}
+
+// PopulateOSSettingsAndMacOSSettings populates the OSSettings and MacOSSettings
+// on the MDMHostData struct. It derives the disk encryption status from the
+// file-vault profile in its list of profiles and, once delivered, from the
+// escrowed key's decryptability — or from diskEncrypted when cfg enforces
+// FileVault without escrow. The file-vault profile identifier is received as
+// an argument to avoid a circular dependency.
+//
+// NOTE: This overwrites both OSSettings and MacOSSettings on the MDMHostData struct. Any existing
+// data in those fields will be lost.
+func (d *MDMHostData) PopulateOSSettingsAndMacOSSettings(profiles []HostMDMAppleProfile, fileVaultIdentifier string, cfg DiskEncryptionConfig, diskEncrypted *bool) {
+	var settings MDMHostMacOSSettings
+
+	var fvprof *HostMDMAppleProfile
+	for _, p := range profiles {
+		p := p
+		if p.Identifier == fileVaultIdentifier {
+			fvprof = &p
+			break
+		}
+	}
+	if fvprof != nil {
+		switch fvprof.OperationType {
+		case MDMOperationTypeInstall:
+			switch {
+			case fvprof.Status != nil && (*fvprof.Status == MDMDeliveryVerifying || *fvprof.Status == MDMDeliveryVerified):
+				verification := d.keyVerification()
+				// logging out lets the deferred FileVault enablement run; rotating
+				// produces a key Fleet can escrow
+				actionRequired := ActionRequiredRotateKey
+				switch {
+				case cfg.MacOSEnforceOnly():
+					verification = diskVerification(diskEncrypted)
+					actionRequired = ActionRequiredLogOut
+				case cfg.MacOSEscrowEnabled && !cfg.MacOSEnabled && diskVerification(diskEncrypted) == fileVaultVerificationNotConfirmed:
+					// nothing enforces FileVault, so there is no key to rotate
+					// until the end user turns it on
+					actionRequired = ActionRequiredTurnOnEncryption
+				}
+
+				switch verification {
+				case fileVaultVerificationConfirmed:
+					switch *fvprof.Status {
+					case MDMDeliveryVerifying:
+						settings.DiskEncryption = DiskEncryptionVerifying.addrOf()
+					case MDMDeliveryVerified:
+						settings.DiskEncryption = DiskEncryptionVerified.addrOf()
+					}
+				case fileVaultVerificationNotConfirmed:
+					settings.DiskEncryption = DiskEncryptionActionRequired.addrOf()
+					settings.ActionRequired = actionRequired.addrOf()
+				case fileVaultVerificationUnknown:
+					settings.DiskEncryption = DiskEncryptionVerifying.addrOf()
+				}
+
+			case fvprof.Status != nil && *fvprof.Status == MDMDeliveryFailed:
+				// if a FileVault profile failed to be installed [or removed]
+				settings.DiskEncryption = DiskEncryptionFailed.addrOf()
+
+			default:
+				// if a FileVault profile is pending to be installed
+				settings.DiskEncryption = DiskEncryptionEnforcing.addrOf()
+			}
+
+		case MDMOperationTypeRemove:
+			switch {
+			case fvprof.Status != nil && *fvprof.Status == MDMDeliveryVerifying:
+				// successfully removed, same as if	no filevault profile was found
+
+			case fvprof.Status != nil && *fvprof.Status == MDMDeliveryFailed:
+				// if a FileVault profile failed to be [installed or] removed
+				settings.DiskEncryption = DiskEncryptionFailed.addrOf()
+
+			default:
+				// if a FileVault profile is pending to be removed
+				settings.DiskEncryption = DiskEncryptionRemovingEnforcement.addrOf()
+			}
+		}
+	}
+	d.MacOSSettings = &settings
+
+	var hde HostMDMDiskEncryption
+	if settings.DiskEncryption != nil {
+		hde.Status = settings.DiskEncryption
+	}
+	if fvprof != nil {
+		hde.Detail = fvprof.Detail
+	}
+	hde.ActionRequired = settings.ActionRequired
+	d.OSSettings = &HostMDMOSSettings{DiskEncryption: hde}
+}
+
+func (d *MDMHostData) ProfileStatusFromDiskEncryptionState(currStatus *MDMDeliveryStatus) *MDMDeliveryStatus {
+	if d.MacOSSettings == nil || d.MacOSSettings.DiskEncryption == nil {
+		return currStatus
+	}
+	switch *d.MacOSSettings.DiskEncryption {
+	case DiskEncryptionActionRequired, DiskEncryptionEnforcing, DiskEncryptionRemovingEnforcement:
+		return &MDMDeliveryPending
+	case DiskEncryptionFailed:
+		return &MDMDeliveryFailed
+	case DiskEncryptionVerifying:
+		return &MDMDeliveryVerifying
+	case DiskEncryptionVerified:
+		return &MDMDeliveryVerified
+	default:
+		return currStatus
+	}
+}
+
+// Only exposed for Datastore tests, to be able to assert the rawDecryptable
+// unexported field.
+func (d *MDMHostData) TestGetRawDecryptable() *int {
+	return d.rawDecryptable
+}
+
+// Scan implements the Scanner interface for sqlx, to support unmarshaling a
+// JSON object from the database into a MDMHostData struct.
+func (d *MDMHostData) Scan(v interface{}) error {
+	var dst struct {
+		MDMHostData
+		RawDecryptable *int `json:"raw_decryptable"`
+	}
+	switch v := v.(type) {
+	case []byte:
+		if err := json.Unmarshal(v, &dst); err != nil {
+			return err
+		}
+		*d = dst.MDMHostData
+		d.rawDecryptable = dst.RawDecryptable
+		return nil
+
+	default:
+		return fmt.Errorf("unsupported type: %T", v)
+	}
+}
+
+// IsOsqueryEnrolled returns true if the host is enrolled via osquery.
+func (h *Host) IsOsqueryEnrolled() bool {
+	return h.OsqueryHostID != nil && *h.OsqueryHostID != ""
+}
+
+// IsDEPAssignedToFleet returns true if the host was assigned to the Fleet
+// server in ABM.
+func (h *Host) IsDEPAssignedToFleet() bool {
+	return h.DEPAssignedToFleet != nil && *h.DEPAssignedToFleet
+}
+
+// IsLUKSSupported returns true if the host's platform is Linux and running
+// one of the supported OS versions.
+func (h *Host) IsLUKSSupported() bool {
+	return h.Platform == "ubuntu" || h.Platform == "zorin" ||
+		strings.Contains(h.OSVersion, "Fedora") || // fedora h.Platform reports as "rhel"
+		h.Platform == "arch" || h.Platform == "archarm" || h.Platform == "manjaro" || h.Platform == "manjaro-arm" ||
+		h.Platform == "cachyos" || h.Platform == "omarchy"
+}
+
+// IsAppleSilicon returns true if the host is a macOS device with an ARM CPU (Apple Silicon).
+func (h *Host) IsAppleSilicon() bool {
+	return h.Platform == "darwin" && h.CPUType != "" && strings.HasPrefix(strings.ToLower(h.CPUType), "arm")
+}
+
+// IsEligibleForWindowsMDMUnenrollment returns true if the host must be
+// unenrolled from Fleet's Windows MDM (if it MDM was disabled).
+func (h *Host) IsEligibleForWindowsMDMUnenrollment(isConnectedToFleetMDM bool) bool {
+	return h.FleetPlatform() == "windows" &&
+		h.IsOsqueryEnrolled() &&
+		isConnectedToFleetMDM
+}
+
+// HostDisplayName returns ComputerName if it isn't empty. Otherwise, it returns Hostname if it isn't
+// empty. If Hostname is empty and both HardwareSerial and HardwareModel are not empty, it returns a
+// composite string with HardwareModel and HardwareSerial. If all else fails, it returns an empty
+// string.
+func HostDisplayName(computerName string, hostname string, hardwareModel string, hardwareSerial string) string {
+	switch {
+	case computerName != "":
+		return computerName
+	case hostname != "":
+		return hostname
+	case hardwareModel != "" && hardwareSerial != "":
+		return fmt.Sprintf("%s (%s)", hardwareModel, hardwareSerial)
+	default:
+		return ""
+	}
+}
+
+func (h *Host) DisplayName() string {
+	return HostDisplayName(h.ComputerName, h.Hostname, h.HardwareModel, h.HardwareSerial)
+}
+
+// HardwareMarketingName returns the Apple marketing name for the host's hardware
+// model (e.g. "MacBook Pro (16-inch, Nov 2023)"). It returns an empty string
+// when the platform is not an Apple platform or the identifier is not in the
+// mapping, so a missing mapping entry can be told apart from the raw model.
+func (h *Host) HardwareMarketingName() string {
+	if IsApplePlatform(h.Platform) {
+		if name, ok := AppleHardwareModelsToMarketingNames[h.HardwareModel]; ok {
+			return name
+		}
+	}
+	return ""
+}
+
+func (h *HostLite) DisplayName() string {
+	return HostDisplayName(h.ComputerName, h.Hostname, h.HardwareModel, h.HardwareSerial)
+}
+
+type HostIssues struct {
+	FailingPoliciesCount         uint64  `json:"failing_policies_count" db:"failing_policies_count" csv:"-"`
+	CriticalVulnerabilitiesCount *uint64 `json:"critical_vulnerabilities_count,omitempty" db:"critical_vulnerabilities_count" csv:"-"` // We set it to nil if the license is not premium
+	TotalIssuesCount             uint64  `json:"total_issues_count" db:"total_issues_count" csv:"issues"`                              // when exporting in CSV, we want that value as the "issues" column
+}
+
+func (h Host) AuthzType() string {
+	return "host"
+}
+
+// HostDetail provides the full host metadata along with associated labels and
+// packs. It also includes policies, batteries, maintenance window, and MDM profiles, as applicable.
+type HostDetail struct {
+	Host
+	// Labels is the list of labels the host is a member of.
+	Labels []*Label `json:"labels"`
+	// Packs is the list of packs the host is a member of.
+	Packs []*Pack `json:"packs"`
+	// Batteries is the list of batteries for the host. It is a pointer to a
+	// slice so that when set, it gets marhsaled even if the slice is empty,
+	// but when unset, it doesn't get marshaled (e.g. we don't return that
+	// information for the List Hosts endpoint).
+	Batteries *[]*HostBattery `json:"batteries,omitempty"`
+
+	// MaintenanceWindow contains the host user's calendar IANA timezone and the start time of the next scheduled maintenance window.
+	MaintenanceWindow *HostMaintenanceWindow `json:"maintenance_window,omitempty"`
+
+	CustomHostVitals []HostCustomHostVital `json:"custom_host_vitals,omitempty"`
+
+	LastMDMEnrolledAt *time.Time `json:"last_mdm_enrolled_at"`
+	// LastMDMCheckedInAt is defined on the embedded Host so list-hosts loaders can
+	// populate it too. HostDetail's service layer still writes to h.LastMDMCheckedInAt
+	// on the way out.
+	// LastMDMEnrollmentType is the MDM enrollment channel reported by the device,
+	// e.g. "Device" or "User Enrollment (Device)". Manual BYOD and Account-Driven
+	// User Enrollment both report the "On (manual - personal)" status, so this is
+	// what distinguishes them. Nil for hosts with no Apple MDM enrollment.
+	LastMDMEnrollmentType *string `json:"last_mdm_enrollment_type"`
+
+	MDMEnrollmentHardwareAttested bool `json:"mdm_enrollment_hardware_attested"`
+
+	ConditionalAccessBypassed bool `json:"conditional_access_bypassed"`
+
+	OSUpdateMinimumVersion *string `json:"os_update_minimum_version"`
+	OSUpdateDeadline       *string `json:"os_update_deadline"`
+
+	// IDOnly marks a result where the caller was allowed to resolve the host but
+	// not to read it, so only ID is populated. Handlers must render it as an
+	// id-only response rather than a full one with everything zeroed out, which
+	// would advertise fields the caller never had access to.
+	IDOnly bool `json:"-"`
+}
+
+type HostEndUser struct {
+	IdpID            string              `json:"idp_id,omitempty"`
+	IdpUserName      string              `json:"idp_username,omitempty"`
+	IdpFullName      string              `json:"idp_full_name,omitempty"`
+	IdpGroups        []string            `json:"idp_groups,omitempty"`
+	Department       string              `json:"idp_department,omitempty"`
+	IdpInfoUpdatedAt *time.Time          `json:"idp_info_updated_at"`
+	OtherEmails      []HostDeviceMapping `json:"other_emails,omitempty"`
+}
+
+type HostMaintenanceWindow struct {
+	//  StartsAt is the start time of the future maintenance window, retrieved from calendar_events,
+	//  represented as a time.Time in the host's associated google calendar user's timezone, which is represented as a time.Location
+	StartsAt time.Time `json:"starts_at" db:"start_time"`
+	// TimeZone is the IANA timezone of the user's google calendar, retrieved from calendar_events
+	TimeZone *string `json:"timezone" db:"timezone"`
+}
+
+const (
+	HostKind = "host"
+)
+
+// HostSummary is a structure which represents a data summary about the total
+// set of hosts in the database. This structure is returned by the HostService
+// method GetHostSummary
+type HostSummary struct {
+	TeamID              *uint                  `json:"team_id,omitempty" renameto:"fleet_id" db:"-"`
+	TotalsHostsCount    uint                   `json:"totals_hosts_count" db:"total"`
+	OnlineCount         uint                   `json:"online_count" db:"online"`
+	OfflineCount        uint                   `json:"offline_count" db:"offline"`
+	MIACount            uint                   `json:"mia_count" db:"mia"`
+	Missing30DaysCount  uint                   `json:"missing_30_days_count" db:"missing_30_days_count"`
+	NewCount            uint                   `json:"new_count" db:"new"`
+	AllLinuxCount       uint                   `json:"all_linux_count" db:"-"`
+	LowDiskSpaceCount   *uint                  `json:"low_disk_space_count,omitempty" db:"low_disk_space"`
+	BuiltinLabels       []*LabelSummary        `json:"builtin_labels" db:"-"`
+	Platforms           []*HostSummaryPlatform `json:"platforms" db:"-"`
+	DEPAssignErrorCount uint                   `json:"dep_assign_error_count" db:"dep_assign_error_count"`
+}
+
+// HostSummaryPlatform represents the hosts statistics for a given platform,
+// as returned inside the HostSummary struct by the GetHostSummary service.
+type HostSummaryPlatform struct {
+	Platform   string `json:"platform" db:"platform"`
+	HostsCount uint   `json:"hosts_count" db:"total"`
+}
+
+// neverTimestampParsed parses server.NeverTimestamp once so mobileStatus can
+// compare against it as a time.Time. Panics on parse failure so a format
+// drift can't silently degrade to zero-time and false-online every
+// never-checked-in mobile host.
+var neverTimestampParsed = mustParseNeverTimestamp()
+
+func mustParseNeverTimestamp() time.Time {
+	t, err := time.Parse("2006-01-02 15:04:05", server.NeverTimestamp)
+	if err != nil {
+		panic("fleet: neverTimestampParsed: " + err.Error())
+	}
+	return t
+}
+
+// Status calculates the online status of the host. Must stay in sync with
+// filterHostsByStatus, GenerateHostStatusStatistics, and CountHostsInTargets
+// in server/datastore/mysql for both desktop and mobile predicates.
+//
+// The mobile branch reads LastMDMCheckedInAt; minimal-Host{} callers
+// (live_queries, scripts, calendar_cron) don't populate it, but those paths
+// only apply to osquery-capable hosts so the mobile branch never fires there.
+//
+// NOTE: As of Fleet 4.15 StatusMIA is deprecated and will be removed in Fleet 5.0
+func (h *Host) Status(now time.Time) HostStatus {
+	if IsMobilePlatform(h.Platform) {
+		return h.mobileStatus(now)
+	}
+
+	onlineInterval := h.ConfigTLSRefresh
+	if h.DistributedInterval < h.ConfigTLSRefresh {
+		onlineInterval = h.DistributedInterval
+	}
+
+	// Add a small buffer to prevent flapping
+	onlineInterval += OnlineIntervalBuffer
+
+	switch {
+	case h.SeenTime.Add(time.Duration(onlineInterval) * time.Second).Before(now): //nolint:gosec // dismiss G115
+		return StatusOffline
+	default:
+		return StatusOnline
+	}
+}
+
+// mobileStatus is the iOS/iPadOS/Android branch of Status. Takes the freshest
+// of LastMDMCheckedInAt and non-sentinel LabelUpdatedAt against
+// MobileOnlineWindow; no created_at fallback so never-checked-in devices stay
+// offline. SeenTime is skipped: the list loader coalesces hst.seen_time with
+// h.created_at before we see it, which would false-online fresh enrollments.
+// DetailUpdatedAt is skipped for Android because AMAPI stamps it with the
+// device's own status-report time (not when Fleet ingested the Pub/Sub
+// event), so it can lag by delivery latency; LabelUpdatedAt is Fleet-authored
+// on every check-in path (Apple MDM, Android Pub/Sub, osquery labels) and
+// gives a truer "last time we heard from this device" signal.
+//
+// LabelUpdatedAt is NOT gated on enrollment state. The enabled = 1 filter on
+// nesm only screens the MDM signal, so a device that checked out with a fresh
+// label_updated_at still reads online for up to MobileOnlineWindow after.
+// Intentional: the device was genuinely active recently.
+func (h *Host) mobileStatus(now time.Time) HostStatus {
+	var latest time.Time
+	if h.LastMDMCheckedInAt != nil {
+		latest = *h.LastMDMCheckedInAt
+	}
+	if h.LabelUpdatedAt.After(latest) {
+		latest = h.LabelUpdatedAt
+	}
+	if latest.IsZero() {
+		return StatusOffline
+	}
+	if latest.Add(MobileOnlineWindow).After(now) {
+		return StatusOnline
+	}
+	return StatusOffline
+}
+
+func (h *Host) IsNew(now time.Time) bool {
+	withDuration := h.CreatedAt.Add(NewDuration)
+	if withDuration.After(now) ||
+		withDuration.Equal(now) {
+		return true
+	}
+	return false
+}
+
+// FleetPlatform returns the host's generic platform as supported by Fleet.
+func (h *Host) FleetPlatform() string {
+	return PlatformFromHost(h.Platform)
+}
+
+func (h *Host) PlatformSupportsRpmPackages() bool {
+	_, ok := HostRpmPackageOSs[h.Platform]
+	return ok
+}
+
+func (h *Host) PlatformSupportsDebPackages() bool {
+	_, ok := HostDebPackageOSs[h.Platform]
+	return ok
+}
+
+// SupportsOsquery returns whether the device runs osquery.
+func (h *Host) SupportsOsquery() bool {
+	return PlatformSupportsOsquery(h.Platform)
+}
+
+// PlatformSupportsOsquery returns whether osquery is supported on this platform.
+func PlatformSupportsOsquery(platform string) bool {
+	return platform != "ios" && platform != "ipados" && platform != "android"
+}
+
+// HostLinuxOSs are the possible linux values for Host.Platform.
+// IMPORTANT: When updating this, also make sure to update HOST_LINUX_PLATFORMS in frontend code.
+var HostLinuxOSs = []string{
+	"linux",
+	"ubuntu",
+	"zorin",
+	"debian",
+	"rhel",
+	"centos",
+	"sles",
+	"kali",
+	"gentoo",
+	"amzn",
+	"pop",
+	"arch",
+	"linuxmint",
+	"void",
+	"nixos",
+	"endeavouros",
+	"manjaro",
+	"manjaro-arm",
+	"opensuse-leap",
+	"opensuse-tumbleweed",
+	"tuxedo",
+	"neon",
+	"archarm",
+	"flatcar",
+	"coreos",
+	"cachyos",
+	"omarchy",
+	"amd-ryzen-ai-developer-platform",
+}
+
+// HostNeitherDebNorRpmPackageOSs are the list of known Linux platforms that support neither DEB nor RPM packages
+var HostNeitherDebNorRpmPackageOSs = map[string]struct{}{
+	"arch":        {},
+	"archarm":     {},
+	"gentoo":      {},
+	"void":        {},
+	"nixos":       {},
+	"endeavouros": {},
+	"manjaro":     {},
+	"manjaro-arm": {},
+	"flatcar":     {},
+	"coreos":      {},
+	"cachyos":     {},
+	"omarchy":     {},
+}
+
+// HostDebPackageOSs are the list of known Linux platforms that support DEB packages
+var HostDebPackageOSs = map[string]struct{}{
+	"linux":                           {}, // let DEBs through if we're looking at a generic Linux host
+	"ubuntu":                          {},
+	"zorin":                           {},
+	"debian":                          {},
+	"kali":                            {},
+	"pop":                             {},
+	"linuxmint":                       {},
+	"tuxedo":                          {},
+	"neon":                            {},
+	"amd-ryzen-ai-developer-platform": {},
+}
+
+// HostRpmPackageOSs are the list of known Linux platforms that support RPM packages
+var HostRpmPackageOSs = map[string]struct{}{
+	"linux":               {}, // let RPMs through if we're looking at a generic Linux host
+	"rhel":                {},
+	"centos":              {},
+	"sles":                {},
+	"amzn":                {},
+	"opensuse-leap":       {},
+	"opensuse-tumbleweed": {},
+}
+
+func IsLinux(hostPlatform string) bool {
+	return slices.Contains(HostLinuxOSs, hostPlatform)
+}
+
+func IsApplePlatform(hostPlatform string) bool {
+	return hostPlatform == "darwin" || hostPlatform == "ios" || hostPlatform == "ipados"
+}
+
+func IsMacOSPlatform(hostPlatform string) bool {
+	return hostPlatform == "darwin"
+}
+
+// Return true if the platform is either iOS or iPadOS
+func IsAppleMobilePlatform(hostPlatform string) bool {
+	return hostPlatform == "ios" || hostPlatform == "ipados"
+}
+
+func IsAndroidPlatform(hostPlatform string) bool {
+	return hostPlatform == "android"
+}
+
+// IsMobilePlatform reports whether the platform is iOS, iPadOS, or Android.
+// These platforms don't run osquery and have no check-in interval, so status
+// computations must fall back to MDM activity signals instead.
+func IsMobilePlatform(hostPlatform string) bool {
+	return IsAppleMobilePlatform(hostPlatform) || IsAndroidPlatform(hostPlatform)
+}
+
+func IsWindowsPlatform(hostPlatform string) bool {
+	return hostPlatform == "windows"
+}
+
+func IsUnixLike(hostPlatform string) bool {
+	unixLikeOSs := HostLinuxOSs
+	unixLikeOSs = append(unixLikeOSs, "darwin")
+	return slices.Contains(unixLikeOSs, hostPlatform)
+}
+
+// PlatformFromHost converts the given host platform into
+// the generic platforms known by osquery
+// https://osquery.readthedocs.io/en/stable/deployment/configuration/
+// and supported by Fleet.
+//
+// Returns empty string if hostPlatform is unknnown.
+func PlatformFromHost(hostPlatform string) string {
+	switch {
+	case IsLinux(hostPlatform):
+		return "linux"
+	case hostPlatform == "darwin", hostPlatform == "windows",
+		// Some customers have custom agents that support ChromeOS
+		// TODO remove this once that customer migrates to Fleetd for Chrome
+		hostPlatform == "CrOS",
+		// Fleet now supports Chrome via fleetd
+		hostPlatform == "chrome",
+		hostPlatform == "ios",
+		hostPlatform == "ipados",
+		hostPlatform == "android":
+		return hostPlatform
+	default:
+		return ""
+	}
+}
+
+// ExpandPlatform returns the list of platforms corresponding to the (possibly
+// generic) platform provided. For example, "linux" expands to all the platform
+// identifiers considered to be linux, while "debian" returns only "debian",
+// "windows" => "windows", etc.
+func ExpandPlatform(platform string) []string {
+	switch platform {
+	case "linux":
+		// return a copy to make sure the caller cannot modify the slice
+		linuxOSs := make([]string, len(HostLinuxOSs))
+		copy(linuxOSs, HostLinuxOSs)
+		return linuxOSs
+	default:
+		return []string{platform}
+	}
+}
+
+// List of valid sources for HostDeviceMapping (host_emails table in the
+// database).
+const (
+	DeviceMappingGoogleChromeProfiles = "google_chrome_profiles"
+	DeviceMappingMDMIdpAccounts       = "mdm_idp_accounts"
+	DeviceMappingIDP                  = "idp"              // set by user via PUT /hosts/{id}/device_mapping with source=idp
+	DeviceMappingEntraJoin            = "entra_join"       // set by the Windows detail query that reads the Entra join user from the device
+	DeviceMappingCustomInstaller      = "custom_installer" // set by fleetd via device-authenticated API
+	DeviceMappingCustomOverride       = "custom_override"  // set by user via user-authenticated API
+
+	DeviceMappingCustomPrefix      = "custom_" // if host_emails.source starts with this, replace with DeviceMappingCustomReplacement
+	DeviceMappingCustomReplacement = "custom"  // replaces a source that starts with CustomPrefix - in the UI, we want to display those as only "custom"
+)
+
+// HostDeviceMapping represents a mapping of a user email address to a host,
+// as reported by the specified source (e.g. Google Chrome Profiles).
+type HostDeviceMapping struct {
+	ID     uint   `json:"-" db:"id"`
+	HostID uint   `json:"-" db:"host_id"`
+	Email  string `json:"email" db:"email"`
+	Source string `json:"source" db:"source"`
+}
+
+type HostMunkiInfo struct {
+	Version string `json:"version"`
+}
+
+// HostMDM represents a host_mdm row, with information about the MDM solution
+// used by a host. Note that it uses a different JSON representation than its
+// struct - it implements a custom JSON marshaler.
+type HostMDM struct {
+	HostID                 uint    `db:"host_id" json:"-" csv:"-"`
+	Enrolled               bool    `db:"enrolled" json:"-" csv:"-"`
+	ServerURL              string  `db:"server_url" json:"-" csv:"-"`
+	InstalledFromDep       bool    `db:"installed_from_dep" json:"-" csv:"-"`
+	IsServer               bool    `db:"is_server" json:"-" csv:"-"`
+	IsPersonalEnrollment   bool    `db:"is_personal_enrollment" json:"-" csv:"-"`
+	MDMID                  *uint   `db:"mdm_id" json:"-" csv:"-"`
+	Name                   string  `db:"name" json:"-" csv:"-"`
+	DEPProfileAssignStatus *string `db:"dep_profile_assign_status" json:"-" csv:"-"`
+	// ManagedAppleID is set for iOS/iPadOS hosts enrolled via Account-Driven
+	// User Enrollment, sourced from the IdP account email resolved from the
+	// OAuth Bearer token at TokenUpdate time. Apple does not reliably populate
+	// UserLongName on User Enrollment so we don't fall back to it.
+	ManagedAppleID *string `db:"managed_apple_id" json:"-" csv:"-"`
+	// ConnectedToFleet reports whether the host is currently connected to Fleet's MDM.
+	ConnectedToFleet bool `db:"connected_to_fleet" json:"-" csv:"-"`
+}
+
+// HasJSONProfileAssigned returns true if Fleet has assigned an ADE/DEP JSON
+// profile to the host, and it'll be enrolled into Fleet the next time the host
+// performs automatic enrollment.
+func (h *HostMDM) HasJSONProfileAssigned() bool {
+	// TODO: get rid of h != nil with a better solution once we stablish
+	// the pattern for dealing with a nil HostMDM
+	return h != nil &&
+		h.DEPProfileAssignStatus != nil &&
+		*h.DEPProfileAssignStatus == string(DEPAssignProfileResponseSuccess)
+}
+
+// HostMunkiIssue represents a single munki issue for a host.
+type HostMunkiIssue struct {
+	MunkiIssueID       uint      `db:"munki_issue_id" json:"id"`
+	Name               string    `db:"name" json:"name"`
+	IssueType          string    `db:"issue_type" json:"type"`
+	HostIssueCreatedAt time.Time `db:"created_at" json:"created_at"`
+}
+
+// List of well-known MDM solution names. Those correspond to names stored in
+// the mobile_device_management_solutions table.
+const (
+	UnknownMDMName        = ""
+	WellKnownMDMIru       = "Iru"
+	WellKnownMDMJamf      = "Jamf"
+	WellKnownMDMJumpCloud = "JumpCloud"
+	WellKnownMDMVMWare    = "VMware Workspace ONE"
+	WellKnownMDMIntune    = "Intune"
+	WellKnownMDMSimpleMDM = "SimpleMDM"
+	WellKnownMDMFleet     = "Fleet"
+	WellKnownMDMMosyle    = "Mosyle"
+	WellKnownMDMZentral   = "Zentral"
+)
+
+// mdmNameFromServerURLChecks maps URL substrings to well-known MDM solution names.
+// The first matching entry wins, so more-specific substrings must appear before
+// more-generic ones (e.g. "jumpcloud" before "awmdm", since JumpCloud's MDM is
+// hosted on AirWatch/awmdm.com infrastructure and "jumpcloud.awmdm.com" must
+// resolve to JumpCloud rather than VMware Workspace ONE).
+var mdmNameFromServerURLChecks = []struct {
+	substring string
+	name      string
+}{
+	{"kandji", WellKnownMDMIru},
+	{"iru.com", WellKnownMDMIru}, // include top-level domain to disambiguate from other strings that may contain "iru"
+	{"jamf", WellKnownMDMJamf},
+	{"jumpcloud", WellKnownMDMJumpCloud},
+	{"airwatch", WellKnownMDMVMWare},
+	{"awmdm", WellKnownMDMVMWare},
+	{"microsoft", WellKnownMDMIntune},
+	{"simplemdm", WellKnownMDMSimpleMDM},
+	{"fleetdm", WellKnownMDMFleet},
+	{"mosyle", WellKnownMDMMosyle},
+	{"zentral", WellKnownMDMZentral},
+}
+
+// MDMNameFromServerURL returns the MDM solution name corresponding to the
+// given server URL. If no match is found, it returns the unknown MDM name.
+// The check order is deterministic: the first matching substring in
+// mdmNameFromServerURLChecks wins.
+func MDMNameFromServerURL(serverURL string) string {
+	serverURL = strings.ToLower(serverURL)
+
+	for _, check := range mdmNameFromServerURLChecks {
+		if strings.Contains(serverURL, check.substring) {
+			return check.name
+		}
+	}
+	return UnknownMDMName
+}
+
+// MDM enrollment status values returned by HostMDM.EnrollmentStatus and sent back to the UI.
+const (
+	MDMEnrollmentStatusPersonal  = "On (manual - personal)"
+	MDMEnrollmentStatusManual    = "On (manual)"
+	MDMEnrollmentStatusAutomatic = "On (automatic)"
+	MDMEnrollmentStatusPending   = "Pending"
+	MDMEnrollmentStatusOff       = "Off"
+)
+
+func (h *HostMDM) EnrollmentStatus() string {
+	switch {
+	case h.Enrolled && !h.InstalledFromDep && h.IsPersonalEnrollment:
+		return MDMEnrollmentStatusPersonal
+	case h.Enrolled && !h.InstalledFromDep && !h.IsPersonalEnrollment:
+		return MDMEnrollmentStatusManual
+	case h.Enrolled && h.InstalledFromDep:
+		return MDMEnrollmentStatusAutomatic
+	case !h.Enrolled && h.InstalledFromDep:
+		return MDMEnrollmentStatusPending
+	default:
+		return MDMEnrollmentStatusOff
+	}
+}
+
+// ValidateAndroidWipeRequest performs the Android-specific Wipe validations shared by the Fleet Free and Premium WipeHost
+// implementations. Wipe is COBO-only for Android; BYO unenroll already runs an AMAPI WIPE under the hood (see
+// UnenrollAndroidHost) and surfaces as the mdm_unenrolled activity, so routing BYO hosts through the Wipe flow would be redundant
+// and misleading. Validation failures return a typed BadRequestError or InvalidArgumentError; a failure reading the app config
+// returns the underlying datastore error. Callers wrap the result with ctxerr.
+func ValidateAndroidWipeRequest(ctx context.Context, ds Datastore, host *Host) error {
+	if host.MDM.EnrollmentStatus != nil && *host.MDM.EnrollmentStatus == MDMEnrollmentStatusPersonal {
+		return &BadRequestError{
+			Message: "Wipe is not supported for personally-owned Android hosts. Use Unenroll instead.",
+		}
+	}
+
+	appCfg, err := ds.AppConfig(ctx)
+	if err != nil {
+		return err
+	}
+	if !appCfg.MDM.AndroidEnabledAndConfigured {
+		return NewInvalidArgumentError("host_id", AndroidMDMNotConfiguredMessage).WithStatus(http.StatusBadRequest)
+	}
+	return nil
+}
+
+func (h *HostMDM) MarshalJSON() ([]byte, error) {
+	if h == nil {
+		return []byte("null"), nil
+	}
+	if h.IsServer {
+		return []byte("null"), nil
+	}
+	// NOTE: this is the macadmins/host MDM payload, deliberately narrower than
+	// MDMHostData (which the host endpoints return). It intentionally does not carry
+	// is_personal_enrollment; add it here only if a consumer of this endpoint needs it.
+	var jsonMDM struct {
+		EnrollmentStatus string `json:"enrollment_status"`
+		ServerURL        string `json:"server_url"`
+		Name             string `json:"name,omitempty"`
+		ID               *uint  `json:"id,omitempty"`
+	}
+
+	jsonMDM.ServerURL = h.ServerURL
+	jsonMDM.EnrollmentStatus = h.EnrollmentStatus()
+	jsonMDM.Name = h.Name
+	jsonMDM.ID = h.MDMID
+	return json.Marshal(jsonMDM)
+}
+
+func (h *HostMDM) UnmarshalJSON(b []byte) error {
+	// fail attempts to unmarshal in this struct, to prevent using e.g.
+	// getMacadminsDataResponse in tests, as it can't unmarshal in a meaningful
+	// way.
+	return errors.New("JSON unmarshaling is not supported for HostMDM")
+}
+
+// HostBattery represents a host's battery, as reported by the osquery battery
+// table.
+type HostBattery struct {
+	ID           uint   `json:"-" db:"id"`
+	HostID       uint   `json:"-" db:"host_id"`
+	SerialNumber string `json:"-" db:"serial_number"`
+	CycleCount   int    `json:"cycle_count" db:"cycle_count"`
+	Health       string `json:"health" db:"health"`
+}
+
+type MacadminsData struct {
+	Munki       *HostMunkiInfo    `json:"munki"`
+	MDM         *HostMDM          `json:"mobile_device_management"`
+	MunkiIssues []*HostMunkiIssue `json:"munki_issues"`
+}
+
+type AggregatedMunkiVersion struct {
+	HostMunkiInfo
+	HostsCount int `json:"hosts_count" db:"hosts_count"`
+}
+
+// HostMDMApplePermissions records the AccessRights integer that was last delivered
+// to an Apple host's MDM enrollment profile. Apple does not allow profile replacements
+// to widen access rights, so this value is the monotonic ceiling for SCEP/ACME renewal.
+//
+// IsPersonalEnrollment is sourced from host_mdm.is_personal_enrollment (joined into
+// the lookup). It is the authoritative signal for whether the device was enrolled
+// as BYOD, and SCEP/ACME renewal uses it to reconstruct the same ServerURL Apple
+// saw at initial enrollment (Apple rejects ServerURL changes on profile replacement).
+type HostMDMApplePermissions struct {
+	HostUUID             string `db:"host_uuid"`
+	AccessRights         int    `db:"access_rights"`
+	IsPersonalEnrollment bool   `db:"is_personal_enrollment"`
+}
+
+// MunkiIssue represents a single munki issue, as returned by the list hosts
+// endpoint when a muniki issue ID is provided as filter.
+type MunkiIssue struct {
+	ID        uint   `json:"id" db:"id"`
+	Name      string `json:"name" db:"name"`
+	IssueType string `json:"type" db:"issue_type"`
+}
+
+type AggregatedMunkiIssue struct {
+	MunkiIssue
+	HostsCount int `json:"hosts_count" db:"hosts_count"`
+}
+
+type AggregatedMDMStatus struct {
+	EnrolledManualHostsCount    int `json:"enrolled_manual_hosts_count" db:"enrolled_manual_hosts_count"`
+	EnrolledAutomatedHostsCount int `json:"enrolled_automated_hosts_count" db:"enrolled_automated_hosts_count"`
+	EnrolledPersonalHostsCount  int `json:"enrolled_personal_hosts_count" db:"enrolled_personal_hosts_count"`
+	PendingHostsCount           int `json:"pending_hosts_count" db:"pending_hosts_count"`
+	UnenrolledHostsCount        int `json:"unenrolled_hosts_count" db:"unenrolled_hosts_count"`
+	HostsCount                  int `json:"hosts_count" db:"hosts_count"`
+}
+
+// AggregatedMDMData contains aggregated data from mdm installations.
+type AggregatedMDMData struct {
+	CountsUpdatedAt time.Time                `json:"counts_updated_at"`
+	MDMStatus       AggregatedMDMStatus      `json:"mobile_device_management_enrollment_status"`
+	MDMSolutions    []AggregatedMDMSolutions `json:"mobile_device_management_solution"`
+}
+
+// MDMSolution represents a single MDM solution, as returned by the list hosts
+// endpoint when an MDM Solution ID is provided as filter.
+type MDMSolution struct {
+	ID        uint   `json:"id" db:"id"`
+	Name      string `json:"name" db:"name"`
+	ServerURL string `json:"server_url" db:"server_url"`
+}
+
+type AggregatedMDMSolutions struct {
+	MDMSolution
+	HostsCount int `json:"hosts_count" db:"hosts_count"`
+}
+
+type AggregatedMacadminsData struct {
+	CountsUpdatedAt time.Time                `json:"counts_updated_at"`
+	MunkiVersions   []AggregatedMunkiVersion `json:"munki_versions"`
+	MunkiIssues     []AggregatedMunkiIssue   `json:"munki_issues"`
+	MDMStatus       AggregatedMDMStatus      `json:"mobile_device_management_enrollment_status"`
+	MDMSolutions    []AggregatedMDMSolutions `json:"mobile_device_management_solution"`
+}
+
+// HostVulnerabilitySummary type used with webhooks and third-party vulnerability automations.
+// Contains all pertinent host info plus the installed paths of all affected software.
+type HostVulnerabilitySummary struct {
+	// ID Is the ID of the host
+	ID uint `json:"id" db:"id"`
+	// Hostname the host's hostname
+	Hostname string `json:"hostname" db:"hostname"`
+	// DisplayName either the 'computer_name' or the 'host_name' (whatever is not empty)
+	DisplayName string `json:"display_name" db:"display_name"`
+	// SoftwareInstalledPaths paths of vulnerable software installed on the host.
+	SoftwareInstalledPaths []string `json:"software_installed_paths,omitempty" db:"software_installed_paths"`
+}
+
+func (hvs *HostVulnerabilitySummary) AddSoftwareInstalledPath(p string) {
+	if p != "" {
+		hvs.SoftwareInstalledPaths = append(hvs.SoftwareInstalledPaths, p)
+	}
+}
+
+type OSVersions struct {
+	CountsUpdatedAt time.Time   `json:"counts_updated_at"`
+	OSVersions      []OSVersion `json:"os_versions"`
+}
+
+type VulnerableOS struct {
+	OSVersion
+	ResolvedInVersion *string `json:"resolved_in_version"`
+}
+
+// Kernel represents a Linux kernel found on a host.
+type Kernel struct {
+	ID              uint     `json:"id"`
+	Version         string   `json:"version"`
+	Vulnerabilities []string `json:"vulnerabilities"`
+	HostsCount      uint     `json:"hosts_count"`
+}
+
+type OSVersion struct {
+	// ID is the unique id of the operating system.
+	ID uint `json:"id,omitempty"`
+	// OSVersionID is a unique NameOnly/Version combination for the operating system.
+	OSVersionID uint `json:"os_version_id"`
+	// HostsCount is the number of hosts that have reported the operating system.
+	HostsCount int `json:"hosts_count"`
+	// Name is the name and alphanumeric version of the operating system. e.g., "Microsoft Windows 11 Enterprise",
+	// "Ubuntu", or "macOS". NOTE: In Fleet 5.0, this field will no longer include the alphanumeric version.
+	Name string `json:"name"`
+	// NameOnly is the name of the operating system, e.g., "Microsoft Windows 11 Enterprise",
+	// "Ubuntu", or "macOS". NOTE: In Fleet 5.0, this field be removed.
+	NameOnly string `json:"name_only"`
+	// Version is the alphanumeric version of the operating system, e.g., "21H2", "20.4.0", or "12.5".
+	Version string `json:"version"`
+	// Platform is the platform of the operating system, e.g., "windows", "ubuntu", or "darwin".
+	Platform string `json:"platform"`
+	// GeneratedCPE is the Common Platform Enumeration (CPE) name for the operating system.
+	// It is currently only generated for Operating Systems scanned for vulnerabilities
+	// in NVD (macOS only)
+	GeneratedCPEs []string `json:"generated_cpes,omitempty"`
+	// Vulnerabilities are the vulnerabilities associated with the operating system.
+	// For Linux-based operating systems, these are vulnerabilities associated with the Linux kernel.
+	Vulnerabilities Vulnerabilities `json:"vulnerabilities"`
+	// VulnerabilitiesCount is the total count of vulnerabilities for this OS version.
+	// This is useful when vulnerabilities are limited but the total count is needed.
+	VulnerabilitiesCount int `json:"vulnerabilities_count"`
+	// Kernels is a list of Linux kernels found on this operating system.
+	// This list is only populated for Linux-based operating systems.
+	// Vulnerabilities are pulled based on the software entries for the kernels.
+	// Kernels are associated based on enrolled hosts with the selected OS version.
+	// NOTE: The aggregate os_versions endpoint should not return this field.
+	// Uses a pointer to distinguish between nil (omit field) and empty slice (show as []).
+	Kernels *[]*Kernel `json:"kernels,omitempty"`
+}
+
+type HostDetailOptions struct {
+	IncludeCVEScores                    bool
+	IncludeCriticalVulnerabilitiesCount bool
+	IncludePolicies                     bool
+	ExcludeSoftware                     bool
+}
+
+// EnrollHostLimiter defines the methods to support enforcement of enrolled
+// hosts limit, as defined by the user's license.
+type EnrollHostLimiter interface {
+	CanEnrollNewHost(ctx context.Context) (ok bool, err error)
+	SyncEnrolledHostIDs(ctx context.Context) error
+}
+
+type HostMDMCheckinInfo struct {
+	HostID             uint   `json:"-" db:"host_id"`
+	HardwareSerial     string `json:"hardware_serial" db:"hardware_serial"`
+	InstalledFromDEP   bool   `json:"installed_from_dep" db:"installed_from_dep"`
+	DisplayName        string `json:"display_name" db:"display_name"`
+	TeamID             uint   `json:"team_id" renameto:"fleet_id" db:"team_id"`
+	DEPAssignedToFleet bool   `json:"dep_assigned_to_fleet" db:"dep_assigned_to_fleet"`
+	OsqueryEnrolled    bool   `json:"osquery_enrolled" db:"osquery_enrolled"`
+
+	SCEPRenewalInProgress bool   `json:"-" db:"scep_renewal_in_progress"`
+	MigrationInProgress   bool   `json:"-" db:"migration_in_progress"`
+	Platform              string `json:"-" db:"platform"`
+}
+
+// HostEscrowState is where a Linux host's LUKS escrow request stands.
+type HostEscrowState struct {
+	// Pending is true while a request is queued and not yet delivered to the agent.
+	Pending bool
+	// SinceLastActivity is how long ago the agent last showed activity on the request (hand-off or
+	// progress report), on the database clock. Nil when no request is in flight.
+	SinceLastActivity *time.Duration
+}
+
+// InFlightRemaining returns how long the request stays in flight if the agent sends nothing
+// further within window, or zero when it is not in flight.
+func (s *HostEscrowState) InFlightRemaining(window time.Duration) time.Duration {
+	if s == nil || s.SinceLastActivity == nil || *s.SinceLastActivity >= window {
+		return 0
+	}
+	if *s.SinceLastActivity < 0 {
+		return window
+	}
+	return window - *s.SinceLastActivity
+}
+
+type HostDiskEncryptionKey struct {
+	HostID              uint      `json:"-" db:"host_id"`
+	Base64Encrypted     string    `json:"-" db:"base64_encrypted"`
+	Base64EncryptedSalt string    `json:"-" db:"base64_encrypted_salt"`
+	KeySlot             *uint     `json:"-" db:"key_slot"`
+	Decryptable         *bool     `json:"-" db:"decryptable"`
+	UpdatedAt           time.Time `json:"updated_at" db:"updated_at"`
+	DecryptedValue      string    `json:"key" db:"-"`
+	ClientError         string    `json:"-" db:"client_error"`
+}
+
+type HostArchivedDiskEncryptionKey struct {
+	HostID              uint      `json:"-" db:"host_id"`
+	Base64Encrypted     string    `json:"-" db:"base64_encrypted"`
+	Base64EncryptedSalt string    `json:"-" db:"base64_encrypted_salt"`
+	KeySlot             *uint     `json:"-" db:"key_slot"`
+	CreatedAt           time.Time `json:"created_at" db:"created_at"`
+}
+
+// HostSoftwareInstalledPath represents where in the file system a software on a host was installed
+type HostSoftwareInstalledPath struct {
+	// ID row id
+	ID uint `db:"id"`
+	// HostID is the id of the host where the software in question is installed
+	HostID uint `db:"host_id"`
+	// SoftwareID is the id of the software
+	SoftwareID uint `db:"software_id"`
+	// InstalledPath is the file system path where the software is installed
+	InstalledPath string `db:"installed_path"`
+	// TeamIdentifier (not to be confused with Fleet's team IDs) is the Apple's "Team ID" (aka "Developer ID"
+	// or "Signing ID") of signed applications, see https://developer.apple.com/help/account/manage-your-team/locate-your-team-id.
+	TeamIdentifier string `db:"team_identifier"`
+	// CDHashSHA256 is the SHA256 hash of the code directory of the software bundle as reported on macOS by `codesign --display --verbose=3`. See https://developer.apple.com/documentation/endpointsecurity/es_process_t/cdhash
+	CDHashSHA256 *string `db:"cdhash_sha256"`
+	// ExecutableSHA256 is the SHA256 hash of the executable located at ExecutablePath
+	ExecutableSHA256 *string `db:"executable_sha256"`
+	// ExecutablePath is the path to the executable of the software bundle
+	ExecutablePath *string `db:"executable_path"`
+}
+
+// HostMacOSProfile represents a macOS profile installed on a host as reported by the macos_profiles
+// table of the macadmins oquery extension
+type HostMacOSProfile struct {
+	// DisplayName is the display name of the profile.
+	DisplayName string `json:"display_name" db:"display_name"`
+	// Identifier is the identifier of the profile.
+	Identifier string `json:"identifier" db:"identifier"`
+	// InstallDate is the date the profile was installed on the host as reported by the host's clock.
+	InstallDate time.Time `json:"install_date" db:"install_date"`
+}
+
+// HostLite contains a subset of Host fields.
+type HostLite struct {
+	ID                  uint      `db:"id"`
+	TeamID              *uint     `db:"team_id"`
+	ComputerName        string    `db:"computer_name"`
+	Hostname            string    `db:"hostname"`
+	OsqueryHostID       *string   `db:"osquery_host_id"`
+	NodeKey             string    `db:"node_key"`
+	UUID                string    `db:"uuid"`
+	HardwareModel       string    `db:"hardware_model"`
+	HardwareSerial      string    `db:"hardware_serial"`
+	CreatedAt           time.Time `db:"created_at"`
+	SeenTime            time.Time `db:"seen_time"`
+	DistributedInterval uint      `db:"distributed_interval"`
+	ConfigTLSRefresh    uint      `db:"config_tls_refresh"`
+}
+
+// IsEligibleForDEPMigration returns true if the host fulfills all requirements
+// for DEP migration from a third-party provider into Fleet.
+func IsEligibleForDEPMigration(host *Host, mdmInfo *HostMDM, isConnectedToFleetMDM bool) bool {
+	return mdmInfo != nil &&
+		host.IsOsqueryEnrolled() &&
+		host.IsDEPAssignedToFleet() &&
+		mdmInfo.HasJSONProfileAssigned() &&
+		mdmInfo.Enrolled &&
+		// as a special case for migration with user interaction, we
+		// also check the information stored in host_mdm, and assume
+		// the host needs migration if it's not Fleet
+		//
+		// this is because we can't always rely on nano setting
+		// `nano_enrollment.active = 1` since sometimes Fleet won't get
+		// the checkout message from the host.
+		(!isConnectedToFleetMDM || mdmInfo.Name != WellKnownMDMFleet)
+}
+
+var macOSADEMigrationOnlyLastVersion = semver.MustParse("14")
+
+// IsEligibleForManualMigration returns true if the host is manually enrolled into a 3rd party MDM
+// and is able to migrate to Fleet.
+func IsEligibleForManualMigration(host *Host, mdmInfo *HostMDM, isConnectedToFleetMDM bool) (bool, error) {
+	goodVersion, err := IsMacOSMajorVersionOK(host)
+	if err != nil {
+		return false, fmt.Errorf("checking macOS version for manual migration eligibility: %w", err)
+	}
+
+	return goodVersion &&
+		host.IsOsqueryEnrolled() &&
+		!host.IsDEPAssignedToFleet() &&
+		mdmInfo != nil &&
+		!mdmInfo.InstalledFromDep &&
+		!mdmInfo.HasJSONProfileAssigned() &&
+		mdmInfo.Enrolled &&
+		(!isConnectedToFleetMDM || mdmInfo.Name != WellKnownMDMFleet), nil
+}
+
+func IsMacOSMajorVersionOK(host *Host) (bool, error) {
+	if host == nil {
+		return false, nil
+	}
+
+	parts := strings.Split(host.OSVersion, " ")
+
+	if len(parts) < 2 || parts[0] != "macOS" {
+		return false, nil
+	}
+
+	version, err := VersionToSemverVersion(parts[1])
+	if err != nil {
+		return false, fmt.Errorf("parsing macOS version \"%s\": %w", parts[1], err)
+	}
+
+	if version.GreaterThan(macOSADEMigrationOnlyLastVersion) {
+		return true, nil
+	}
+
+	return false, nil
+}
+
+// AddHostsToTeamParams contains the parameters to use when calling AddHostsToTeam.
+type AddHostsToTeamParams struct {
+	TeamID  *uint
+	HostIDs []uint
+	// A large number of hosts could be changing teams at once,
+	// so we need to batch this operation to prevent excessive locks
+	BatchSize uint
+}
+
+// NewAddHostsToTeamParams creates a new AddHostsToTeamParams instance, setting the BatchSize to a
+// sensible default.
+func NewAddHostsToTeamParams(teamID *uint, hostIDs []uint) *AddHostsToTeamParams {
+	return &AddHostsToTeamParams{
+		TeamID:    teamID,
+		HostIDs:   hostIDs,
+		BatchSize: 10_000,
+	}
+}
+
+// WithBatchSize overrides the default BatchSize with the provided value.
+func (params *AddHostsToTeamParams) WithBatchSize(batchSize uint) *AddHostsToTeamParams {
+	params.BatchSize = batchSize
+	return params
+}
+
+func GetEndUserIdpFullName(ctx context.Context, ds Datastore, hostID uint) (string, error) {
+	endUsers, err := GetEndUsers(ctx, ds, hostID)
+	if err != nil {
+		return "", fmt.Errorf("getting host end user idp name: %w", err)
+	}
+
+	// There can be multiple end users, but should only be a single idp user
+	for _, eu := range endUsers {
+		if eu.IdpFullName != "" {
+			return eu.IdpFullName, nil
+		}
+	}
+
+	return "", nil
+}
+
+func GetEndUsers(ctx context.Context, ds Datastore, hostID uint) ([]HostEndUser, error) {
+	scimUser, err := ds.ScimUserByHostID(ctx, hostID)
+	if err != nil && !IsNotFound(err) {
+		return nil, fmt.Errorf("get scim user by host id: %w", err)
+	}
+
+	var endUsers []HostEndUser
+	if scimUser != nil {
+		endUser := HostEndUser{
+			IdpUserName:      scimUser.UserName,
+			IdpFullName:      scimUser.DisplayName(),
+			IdpInfoUpdatedAt: ptr.Time(scimUser.UpdatedAt),
+		}
+
+		if scimUser.ExternalID != nil {
+			endUser.IdpID = *scimUser.ExternalID
+		}
+		for _, group := range scimUser.Groups {
+			endUser.IdpGroups = append(endUser.IdpGroups, group.DisplayName)
+		}
+		if scimUser.Department != nil {
+			endUser.Department = *scimUser.Department
+		}
+		endUsers = append(endUsers, endUser)
+	}
+
+	deviceMapping, err := ds.ListHostDeviceMapping(ctx, hostID)
+	if err != nil {
+		return nil, fmt.Errorf("get host device mapping: %w", err)
+	}
+
+	if len(deviceMapping) > 0 {
+		endUser := HostEndUser{}
+		for _, email := range deviceMapping {
+			switch {
+			case (email.Source == DeviceMappingMDMIdpAccounts || email.Source == DeviceMappingIDP) && len(endUsers) == 0:
+				// If SCIM data is missing, we still populate IdpUserName if present.
+				// For DeviceMappingIDP source, this is the user-provided IDP username.
+				// Note: Username and email is the same thing here until we split them with https://github.com/fleetdm/fleet/issues/27952
+				endUser.IdpUserName = email.Email
+			case email.Source != DeviceMappingMDMIdpAccounts && email.Source != DeviceMappingIDP:
+				// Only add to OtherEmails if it's not an IDP source
+				endUser.OtherEmails = append(endUser.OtherEmails, *email)
+			}
+		}
+		if len(endUsers) > 0 {
+			endUsers[0].OtherEmails = endUser.OtherEmails
+		} else {
+			endUsers = append(endUsers, endUser)
+		}
+	}
+
+	return endUsers, nil
+}
+
+// DeletedHostDetails contains details about a host that has been deleted.
+type DeletedHostDetails struct {
+	ID               uint
+	DisplayName      string
+	Serial           string
+	HostExpiryWindow int
+}
+
+// HostMDMManagedLocalAccount represents the managed local account status for a host.
+type HostMDMManagedLocalAccount struct {
+	Status *string `json:"status" db:"-" csv:"-"` // nil (no record), "pending", "verified", "failed"
+	// Detail carries the device-reported reason the account could not be created, for accounts created by fleetd
+	// (Windows). Empty for macOS accounts, which are configured by an MDM command instead.
+	Detail string `json:"detail" db:"-" csv:"-"`
+	// PasswordAvailable is true whenever the row holds a usable password — i.e.
+	// encrypted_password IS NOT NULL AND status != 'failed'. This decouples
+	// availability from the rotation lifecycle ("pending" is also viewable).
+	PasswordAvailable bool `json:"password_available" db:"-" csv:"-"`
+	// AutoRotateAt is the wall-clock time at which the rotation cron will pick
+	// this row up (set on first view; cleared on rotation).
+	AutoRotateAt *time.Time `json:"auto_rotate_at" db:"-" csv:"-"`
+	// PendingRotation is true when a SetAutoAdminPassword command is in flight
+	// (pending_encrypted_password IS NOT NULL).
+	PendingRotation bool `json:"pending_rotation" db:"-" csv:"-"`
+}
+
+// HostManagedLocalAccountPassword is the API response for the managed local account password.
+type HostManagedLocalAccountPassword struct {
+	Username  string    `json:"username"`
+	Password  string    `json:"password"`
+	UpdatedAt time.Time `json:"updated_at"`
+	// AutoRotateAt is the wall-clock time at which the rotation cron will pick
+	// this row up. Returned in the same response as the password so the modal
+	// can render the auto-rotate banner on first open without waiting on a
+	// separate host-details refetch (the act of fetching the password sets
+	// auto_rotate_at server-side; we read it back here).
+	AutoRotateAt *time.Time `json:"auto_rotate_at,omitempty"`
+	// PendingRotation is true when a SetAutoAdminPassword command is in flight
+	// (pending_encrypted_password IS NOT NULL). Returned alongside the password
+	// so the modal can render the pending-rotation banner without waiting on a
+	// host-details refetch.
+	PendingRotation bool `json:"pending_rotation,omitempty"`
+}

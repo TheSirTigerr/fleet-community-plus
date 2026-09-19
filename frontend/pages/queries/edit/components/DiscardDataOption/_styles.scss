@@ -1,0 +1,13 @@
+.discard-data-option {
+  @include vertical-form-layout;
+
+  .info-banner {
+    margin-bottom: 0; // TODO: Remove when globally info-banner gaps do not rely on margin but flex gap
+  }
+
+  &__edit-anyway {
+    margin-top: -$pad-small; // Prevents help text jump from padded button disappearing when clicked
+    margin-bottom: -$pad-small; // Prevents help text jump from padded button disappearing when clicked
+    margin-left: $pad-small; // Space between text and button, can't use flex as we have a tooltip within text
+  }
+}

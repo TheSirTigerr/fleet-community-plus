@@ -1,0 +1,511 @@
+# Enroll hosts
+
+You can enroll macOS, Windows, Linux, iOS, iPadOS, Android, and ChromeOS hosts to Fleet.
+
+To manually enroll macOS, Windows, and Linux hosts, install Fleet’s agent (fleetd). You can generate fleetd via the [UI](#ui) or [CLI](#cli). 
+
+For iOS, iPadOS, and Android hosts, share the enrollment link from the [Fleet UI](#ui) with your end users. End users with Apple's [Stolen Device Protection](https://support.apple.com/en-us/120340) enabled may have to wait 1 hour before they can enroll, depending on their current location.
+
+You can also automatically enroll macOS, Windows, iOS, and iPadOS hosts. To automatically enroll Apple (macOS, iOS, and iPadOS) hosts, [connect Fleet to Apple Business (AB)](https://fleetdm.com/guides/macos-mdm-setup#apple-business-manager-abm). To automatically enroll Windows hosts, [connect Fleet to Microsoft Entra](https://fleetdm.com/guides/windows-mdm-setup#automatic-enrollment).
+
+To learn how to enroll Chromebooks, see the [Enroll Chromebooks guide](#enroll-chromebooks).
+
+## UI
+
+#### Workstations
+
+To manually enroll macOS, Windows, or Linux hosts, generate Fleet's agent (fleetd) through Fleet UI:
+
+1. Go to the **Hosts** page, select the fleet you want your host(s) to enroll to, and select **Add hosts**.
+
+2. Select the tab for your desired platform (e.g. **macOS**).
+
+3. Copy the command to generate fleetd and run the command with [fleetctl](https://fleetdm.com/docs/using-fleet/fleetctl-cli) installed.
+
+4. Install fleetd on your host(s) to enroll it to Fleet.
+
+#### Mobile devices
+
+To manually enroll iOS, iPadOS, or Android hosts, follow the steps below:
+
+1. Go to the **Hosts** page, select the fleet you want your host(s) to enroll to, and select **Add hosts**.
+
+2. Select the tab for your desired platform (e.g. **iOS**).
+
+3. Copy the enrollment link from the UI and share it with your end users.
+
+4. When your end users visit the link and follow the steps provided on the enrollment page, their host will be enrolled.
+
+To test enrollment yourself, scan the QR code below the enrollment link. It opens the same page you share with your end users.
+
+Company-owned (fully-managed) Android hosts enroll from the setup wizard after a factory reset. That page provides a separate QR code for the wizard to scan.
+
+## CLI
+
+> You must have `fleetctl` installed. [Learn how to install `fleetctl`](https://fleetdm.com/guides/fleetctl#installing-fleetctl).
+
+The `fleetctl package` command is used to generate Fleet's agent (fleetd) install package..
+
+The `--type` flag is used to specify the fleetd installer type.
+
+- macOS: `pkg`
+  - Generating a .pkg on Linux requires [Docker](https://docs.docker.com/get-docker) to be installed and running.
+- Windows: `msi`
+  - Generating a .msi on Windows, Intel Macs, or Linux requires [Docker](https://docs.docker.com/get-docker) to be installed and running. On Windows, you can [use WiX without Docker instead](https://fleetdm.com/guides/enroll-hosts#generating-fleetd-for-windows-using-local-wix-toolset).
+  - Generating a .msi on Apple Silicon Macs requires [Docker](https://docs.docker.com/get-docker) to be installed. If you need to continue using Wine, see [WineHQ wiki](https://gitlab.winehq.org/wine/wine/-/wikis/MacOS).
+- Linux: `deb`, `rpm`, or `pkg.tar.zst`
+  - `deb`: Debian-based linux (e.g. Ubuntu, Debian).
+  - `rpm`: RPM-based linux (e.g. OpenSUSE, Red Hat, Fedora).
+  - `pkg.tar.zst`: Arch Linux based distributions (e.g. Manjaro, Omarchy).
+
+> `fleetctl` on Windows can only generate MSI packages.
+
+A `--fleet-url` (Fleet instance URL) and `--enroll-secret` (Fleet enroll secret) must be specified in order to communicate with Fleet instance.
+
+To generate fleetd for an Arm Linux or Windows host, use the `--arch=arm64` flag.
+
+#### Example
+
+Generate fleetd on macOS (.pkg)
+
+```json
+fleetctl package --type pkg --fleet-url=example.fleetinstance.com --enroll-secret=85O6XRG8'!l~P&zWt_'f&$QK(sM8_D4x
+```
+
+Tip: To see all options for `fleetctl package` command, run `fleetctl package -h` in your Terminal.
+
+### Install fleetd
+
+You can use your tool of choice, like [Munki](https://www.munki.org/munki/) on macOS or a package manager ([APT](https://en.wikipedia.org/wiki/APT_(software)) or [DNF](https://en.wikipedia.org/wiki/DNF_(software))) on Linux, to install fleetd.
+
+### Enroll hosts to a fleet
+`Applies only to Fleet Premium`
+
+With hosts segmented into fleets, you can apply unique queries and give users access to only the hosts in specific fleet. [Learn more about fleet](https://fleetdm.com/docs/using-fleet/segment-hosts).
+
+To enroll to a specific fleet: from the **Hosts** page, select the desired fleet from the menu at the top of the screen, then follow the instructions above for generating Fleet's agent (fleetd). The fleet's enroll secret will be included in the generated command or on the enrollment page for iOS, iPadOS, and Android hosts.
+
+### Fleet Desktop
+
+[Fleet Desktop](https://fleetdm.com/guides/fleet-desktop) is a menu bar icon available on macOS, Windows, and Linux that gives your end users visibility into the security posture of their machine.
+
+You can include Fleet Desktop in Fleet's agent (fleetd) by including `--fleet-desktop` in the `fleetctl package` command.
+
+### Debug TLS certificates and connection to Fleet
+
+You can use `fleetctl debug connection` to troubleshoot issues with server/client TLS certificates, e.g.:
+```sh
+# Test TLS connection using the CA root file that will be embedded on fleetd packages:
+fleetctl debug connection \
+  https://fleet.example.com
+
+# Test TLS connection using a custom CA root file:
+fleetctl debug connection \
+  --fleet-certificate ./your-ca-root.pem \
+  https://fleet.example.com
+```
+
+## Enroll Chromebooks
+
+> The fleetd Chrome extension is for enrolling and managing ChromeOS hosts. To learn how to enroll other platforms, head to the [top of the guide](#enroll).
+
+### Overview
+Google Admin uses organizational units (OUs) to organize devices and users.
+
+One limitation in Google Admin is that extensions can only be configured at the user level, meaning that a user with a MacBook running Chrome, for example, will also get the fleetd Chrome extension.
+
+When deployed on OSs other than ChromeOS, the fleetd Chrome extension will not perform any operation and will not appear in the Chrome toolbar. 
+However, it will appear in the "Manage Extensions" page of Chrome.
+Fleet admins who are comfortable with this situation can skip step 2 below.
+
+To install the fleetd Chrome extension on Google Admin, there are two steps:
+
+1. Create an OU for all users who have Chromebooks and force-install the fleetd Chrome extension for those users
+
+2. Create an OU for all non-Chromebook devices and block the fleetd Chrome extension on this OU
+
+> More complex setups may be necessary, depending on the organization's needs, but the basic principle remains the same.
+
+### Step 1: OU for Chromebook users
+Create an [organizational unit](https://support.google.com/a/answer/182537?hl=en) where the extension should be installed. [Add all the relevant users](https://support.google.com/a/answer/182449?hl=en) to this OU.
+
+In the Google Admin console:
+
+1. In the navigation menu, visit **Devices > Chrome > Apps & Extensions > Users & browsers**.
+
+2. Select the relevant OU where you want the fleetd Chrome extension to be installed.
+
+3. In the bottom right, select the **+** button and select **Add Chrome app or extension by ID**.
+
+4. Go to your Fleet instance and select **Hosts > Add Hosts** and select **ChromeOS** in the popup modal.
+
+5. Enter the **Extension ID**, **Installation URL**, and **Policy for extensions** using the data provided in the modal.
+
+6. Under **Installation Policy**, select **Force install**, and under **Update URL**, select **Installation URL** (see above).
+
+> For the fleetd Chrome extension to have full access to Chrome data, it must be force-installed by enterprise policy as per above
+
+### Step 2: OU to block non-Chromebook devices
+Create an [organizational unit](https://support.google.com/a/answer/182537?hl=en) to house devices where the extension should not be installed. [Add all the relevant devices](https://support.google.com/chrome/a/answer/2978876?hl=en) to this OU.
+
+In the Google Admin console:
+
+1. In the navigation menu, select **Devices > Chrome > Managed Browsers**.
+
+2. Select the relevant OU where you want the fleetd Chrome extension to be blocked.
+
+3. In the bottom right, select the **+** button and select **Add Chrome app or extension by ID**.
+
+4. Go to your Fleet instance and select **Hosts > Add Hosts** and select **ChromeOS** in the popup modal.
+
+5. Enter the **Extension ID** and **Installation URL** using the data provided in the modal.
+
+6. Under **Installation Policy**, select **Block**.
+
+### Unenroll
+
+1. Determine if your host has MDM features turned on by looking at the **MDM status** on the host's **Host details** page. 
+
+2. If MDM is turned on, turn it off:
+  - Windows: Skip to step 3 (Uninstall Fleet's agent).
+  - macOS: On the **Host details** page, select **Actions > Turn off MDM**.
+  - iOS/iPadOS & Android: On the **Host details** page, select **Actions > Unenroll**.
+
+3. For macOS, Windows, and Linux hosts, [uninstall Fleet's agent (fleetd)](https://fleetdm.com/guides/how-to-uninstall-fleetd). 
+
+4. Select **Actions > Delete** to delete the host from Fleet.
+
+> Delete the host from Fleet before re-enrolling to clear labels, prevent pending actions, and avoid showing stale vitals. **Apple Business (AB) hosts are the exception**. Fleet automatically clears stale state on re-enrollment, so deletion isn't needed. See the [Apple MDM setup guide](https://fleetdm.com/guides/macos-mdm-setup#re-enrolling-ab-hosts) for details.
+
+> The unenroll action on Android hosts sends a wipe command via the Android Management API. [Learn more](https://fleedtdm.com/docs/rest-api/rest-api#turn-off-hosts-mdm)
+
+## Delete a host
+
+Deleting a host removes it from Fleet. It does not unenroll the device or change anything in Apple Business (AB). The MDM enrollment and the management profile stay on the device. The device also stays assigned to Fleet in AB.
+
+Because that assignment is still in place, deleting a host assigned to Fleet in AB brings it straight back as a **Pending** host. To remove it for good, release or reassign the device in AB first, then delete the host in Fleet. If Fleet can't reach AB to check the assignment, the delete fails. Retry once AB is reachable.
+
+Deleting a host also cancels its upcoming activities and removes Fleet's record of the MDM commands it has already sent. Delete a host while a wipe or another command is still in flight, and Fleet can no longer report whether that command completed.
+
+To decommission a host:
+
+1. Unenroll or [wipe the host](https://fleetdm.com/guides/lock-wipe-hosts#wipe-a-host) in Fleet, and confirm it finished.
+2. For Apple hosts, release or reassign the device in AB.
+3. Delete the host in Fleet.
+
+## Debugging
+
+If you're running into issues when enrolling hosts, the best practice is to look for errors in the fleetd logs. See our [troubleshooting guide](https://fleetdm.com/guides/fleet-troubleshooting-for-it-admins) for more info.
+
+
+## Advanced
+
+- [Switch a workstation's operating system](#switch-a-workstations-operating-system)
+- [Supported osquery versions](#supported-osquery-versions)
+- [Best practice for dual-boot workstations or VMs with duplicate hardware identifiers](#best-practice-for-dual-boot-workstations-or-vms-with-duplicate-hardware-identifiers)
+- [Fleet agent (fleetd) components](#fleetd-components)
+- [Signing fleetd](#signing-fleetd)
+- [Grant full disk access to osquery on macOS](#grant-full-disk-access-to-osquery-on-macos) 
+- [Using mTLS](#using-mtls)
+- [Using host identity certificates](#using-host-identity-certificates)
+- [Specifying update channels](#specifying-update-channels)
+- [Testing osquery queries locally](#testing-osquery-queries-locally)
+- [Using system keystore for enroll secret](#using-system-keystore-for-enroll-secret)
+- [Generating fleetd for Windows using local WiX toolset](#generating-fleetd-for-windows-using-local-wix-toolset)
+- [Config-less fleetd agent deployment](#config-less-fleetd-agent-deployment)
+- [Experimental features](#experimental-features)
+- [macOS Migration Assistant](#macos-migration-assistant)
+
+### Switch a workstation's operating system
+
+If an end user wants to switch their workstation's operating system (e.g., Windows to Linux), delete the host from Fleet before they switch. Then, re-enroll the host.
+
+### Supported osquery versions
+
+Fleet supports the [latest version of osquery](https://github.com/osquery/osquery/tags). 
+
+### Best practice for dual-boot workstations or VMs with duplicate hardware identifiers
+
+When end users want to have a dual-boot environment (e.g. Windows and Linux on one computer) or have VMs that share hardware identifiers (UUIDs), the best practice is to install fleetd, that uses `--host-identifier=instance`, on both operating systems. This enrolls two hosts, one per operating system, in Fleet.
+
+### fleetd components
+
+```mermaid
+graph LR;
+    tuf["<a href=https://theupdateframework.io/>TUF</a> file server<br>(default: <a href=https://tuf.fleetctl.com>tuf.fleetctl.com</a>)"];
+    fleet_server[Fleet<br>Server];
+    subgraph fleetd
+        orbit[orbit];
+        desktop[Fleet Desktop<br>Tray App];
+        osqueryd[osqueryd];
+        desktop_browser[Fleet Desktop<br> from Browser];
+    end
+    orbit -- "Fleet Orbit API (TLS)" --> fleet_server;
+    desktop -- "Fleet Desktop API (TLS)" --> fleet_server;
+    osqueryd -- "osquery<br>remote API (TLS)" --> fleet_server;
+    desktop_browser -- "My Device API (TLS)" --> fleet_server;
+    orbit -- "Auto Update (TLS)" --> tuf;
+```
+
+### Signing fleetd
+
+  >**Note:** Currently, the `fleetctl package` command does not support signing Windows fleetd. Windows fleetd can be signed after building.
+
+The `fleetctl package` command supports signing and notarizing macOS fleetd via the
+`--sign-identity` and `--notarize` flags.
+
+Check out the example below:
+
+```sh
+  AC_USERNAME=appleid@example.com AC_PASSWORD=app-specific-password fleetctl package --type pkg --sign-identity=[PATH TO SIGN IDENTITY] --notarize --fleet-url=[YOUR FLEET URL] --enroll-secret=[YOUR ENROLL SECRET]
+```
+
+The above command must be run on a macOS device, as the notarizing and signing of macOS fleetd can only be done on macOS devices.
+
+Also, remember to replace both `AC_USERNAME` and `AC_PASSWORD` environment variables with your Apple ID and a valid [app-specific](https://support.apple.com/en-ca/HT204397) password, respectively. Some organizations (notably those with Apple Enterprise Developer Accounts) may also need to specify `AC_TEAM_ID`. This value can be found on the [Apple Developer "Membership" page](https://developer.apple.com/account/#!/membership) under "Team ID."
+
+### Grant full disk access to osquery on macOS
+
+macOS does not allow applications to access all system files by default. 
+
+If you are using an MDM solution or Fleet's MDM features, one of which is required to deploy these profiles, deploy this ["Privacy Preferences Policy Control" configuration profile](https://github.com/fleetdm/fleet/blob/4f8677de3c005e6e971977dc5d86a9dec9e01e48/it-and-security/lib/macos/configuration-profiles/full-disk-access-for-fleetd.mobileconfig). It grants Fleet's agent (fleetd) the required level of access. 
+
+This is required to find files located in protected paths as well as to use event
+tables that require access to the [EndpointSecurity API](https://developer.apple.com/documentation/endpointsecurity#overview), such as *es_process_events*.
+
+Once the computer has received the profile, which you can verify by looking at *Profiles* in *System
+Preferences*, run this report from Fleet:
+
+```sql
+SELECT * FROM file WHERE path LIKE '/Users/%/Downloads/%%';
+```
+
+If this report returns files, the profile was applied, as **Downloads** is a protected location.
+
+If this report does not return data, you can look at operating system logs to confirm whether or not full disk access has been applied.
+
+See the last hour of logs related to TCC permissions with this command:
+
+`log show --predicate 'subsystem == "com.apple.TCC"' --info --last 1h`
+
+You can then look for `orbit` or `osquery` to narrow down results.
+
+### Using mTLS
+
+`Applies only to Fleet Premium`
+
+Fleet's agent (fleetd) and the fleetd Chrome browser extension support mTLS.
+
+#### Fleetd agent
+
+The fleetd agent supports using TLS client certificates for authentication to the Fleet server and [TUF](https://theupdateframework.io/) server.
+
+When generating fleetd, use the following flags:
+```sh
+fleetctl package \
+  [...]
+  --fleet-tls-client-certificate=fleet-client.crt \
+  --fleet-tls-client-key=fleet-client.key \
+  --update-tls-client-certificate=update-client.crt \
+  --update-tls-client-key=update-client.key \
+  [...]
+```
+The certificates must be in PEM format.
+
+The client certificates can also be pushed to existing installations by placing them in the following locations:
+- For macOS and Linux:
+  - `/opt/orbit/fleet_client.crt`
+  - `/opt/orbit/fleet_client.key`
+  - `/opt/orbit/update_client.crt`
+  - `/opt/orbit/update_client.key`
+- For Windows:
+  - `C:\Program Files\Orbit\fleet_client.crt`
+  - `C:\Program Files\Orbit\fleet_client.key`
+  - `C:\Program Files\Orbit\update_client.crt`
+  - `C:\Program Files\Orbit\update_client.key`
+
+#### Alternative browser host
+
+If using Fleet Desktop, you may want to specify an alternative host for Fleet Desktop traffic (such as the "My device" URL in the Fleet tray icon). This is useful when you want to ensure that Fleet Desktop traffic goes through a custom proxy for an extra layer of security.
+
+**Note**: This "alternative host" should not require client certificates on the TLS connection.
+
+There are two ways to do this:
+
+1. Via the `--fleet-desktop-alternative-browser-host` flag when generating fleetd:
+```sh
+fleetctl package
+  [...]
+  --fleet-desktop \
+  --fleet-desktop-alternative-browser-host=fleet-desktop.example.com \
+  [...]
+```
+
+2. Via GitOps or the UI: You can configure the alternative host in the UI by navigating to **Settings > Organization settings > Fleet Desktop**, or via GitOps by adding the following to your `default.yml`:
+```yaml
+...
+fleet_desktop:
+  alternative_browser_host: fleet-desktop.example.com
+...
+```
+
+If the setting is specified via both the flag and UI/GitOps, the value in the UI/GitOps will take precedence. If this setting is not used, you will need to configure client TLS certificates on devices' browsers.
+
+#### fleetd Chrome browser extension
+
+To use mTLS use the [AutoSelectCertificateForUrls policy](https://chromeenterprise.google/policies/?policy=AutoSelectCertificateForUrls) to point Chrome to your client certificates
+
+### Using host identity certificates
+
+`Applies only to Fleet Premium`
+
+Host identity certificates allow Fleet's agent (fleetd) to use hardware-backed client certificates for authentication to the Fleet server. All fleetd requests (except `/api/fleet/orbit/ping` and [Fleet Desktop](https://github.com/fleetdm/fleet/blob/main/docs/Contributing/authentication/tpm-backed-http-signing.md#fleet-desktop-authentication) requests) to the Fleet server will include an HTTP message signature for enhanced security.
+
+This feature uses the host's TPM (Trusted Platform Module) to generate and store cryptographic keys, providing strong hardware-based authentication.
+
+This provides a level of security similar to [mTLS](#using-mtls), but the certificate is hardware-backed and managed by the TPM rather than being stored as a file on disk. The TPM ensures the private key cannot be extracted or copied, providing stronger security guarantees.
+
+The certificate is issued for 365 days. 180 days before expiration, fleetd will automatically try to renew the certificate using a new TPM-based private key. The original enrollment secret is not needed for renewal. The renewal process is based on proof-of-possession of the existing certificate's private key.
+
+Currently, host identity certificates are only supported for Linux hosts (`.deb`, `.rpm`, and `.pkg.tar.zst` fleetd installers) with TPM 2.0 hardware (or vTPM for VMs) and Linux kernel 4.12 or later.
+
+#### Generating fleetd with host identity certificates
+
+To use host identity certificates, generate fleetd with the `--fleet-managed-host-identity-certificate` flag:
+
+```sh
+fleetctl package \
+  --type deb \
+  --fleet-url=https://fleet.example.com \
+  --enroll-secret=your-enroll-secret \
+  --fleet-managed-host-identity-certificate
+```
+
+#### Migration
+
+If you already have Linux hosts enrolled to Fleet, here's how to migrate these hosts to use host identity certificates for authentication to the Fleet server:
+
+1. [Generate fleetd](#generating-fleetd-with-host-identity-certificates) with the `--fleet-managed-host-identity-certificate` flag.
+
+2. Install the new fleetd on your hosts that are already enrolled.
+
+3. Monitor the rollout by adding the following policy to Fleet:
+
+```sql
+SELECT 1
+WHERE (
+    SELECT COUNT(*)
+    FROM file 
+    WHERE path IN (
+        '/opt/orbit/host_identity.crt',
+        '/opt/orbit/host_identity_tpm.pem'
+    )
+) = 2;
+```
+
+This policy passes if a host has a host identity certificate.
+
+4. Last, you can enforce that all hosts need a host identity certificate to communicate with Fleet by enabling the [auth.require_http_message_signature](https://fleetdm.com/docs/configuration/fleet-server-configuration#auth-require-http-message-signature) server configuration option. When this is enforced, hosts that don't have a certificate will stop communicating with Fleet.
+
+#### Important considerations
+
+- Hosts without TPM 2.0 will fail to enroll when this option is enabled. You can run this report to check if hosts have TPM 2.0:
+
+```sql
+SELECT
+  COUNT(*) AS compliant
+FROM
+  file 
+WHERE 
+  path = '/dev/tpmrm0';
+```
+
+- This feature cannot be combined with other client certificate options (`--fleet-tls-client-certificate`)
+- SCEP certificate requests can be throttled by the [osquery_enroll_cooldown](https://fleetdm.com/docs/configuration/fleet-server-configuration#osquery-enroll-cooldown) server option, similar to how fleetd enrollments are throttled
+- When a host requests a host identity certificate, the server will expect all future traffic from that host to be signed with HTTP message signatures. This allows mixed environments where some hosts use managed client certificates and others do not
+- Fleet administrators can enforce HTTP message signature requirements server-wide using the [auth.require_http_message_signature](https://fleetdm.com/docs/configuration/fleet-server-configuration#auth-require-http-message-signature) server configuration option
+- HTTP message signatures use P384 elliptic curve cryptography by default, which requires 50% more CPU resources for the Fleet server. This can impact performance and should be considered when planning your Fleet deployment.
+
+### Specifying update channels
+
+Fleetd uses the concept of "update channels" to determine the version of it's components: Orbit, Fleet Desktop, osquery.
+
+Configure update channels for these components with the `--orbit-channel`, `--desktop-channel` and `--osqueryd-channel` flags when running the `fleetctl package command`.
+
+| Channel | Versions |
+| ------- | -------- |
+| `4`     | 4.x.x    |
+| `4.6`   | 4.6.x    |
+| `4.6.0` | 4.6.0    |
+
+Additionally, `stable` and `edge` are special channel names. The `stable` channel will provide the most recent osquery version that Fleet deems to be stable. 
+
+When a new version of osquery is released, it's added to the `edge` channel for beta testing. Fleet then provides input to the osquery TSC based on testing. After the version is declared stable by the osquery TSC, Fleet will promote the version to `stable` ASAP.
+
+### Testing osquery queries locally
+
+Fleet comes packaged with `osqueryi` which is a tool for testing osquery queries locally.
+
+With fleetd installed on your host, run `orbit osqueryi` or `orbit shell` to open the `osqueryi`.
+
+### Using system keystore for enroll secret
+
+On macOS and Windows, fleetd will add the enroll secret to the system keystore (Keychain on macOS, Credential Manager on Windows) on launch. Subsequent launches will retrieve the enroll secret from the keystore.
+
+System keystore access can be disabled via `--disable-keystore` flag for the `fleetctl package` command. On macOS, subsequent installations of fleetd must be signed by the same organization as the original installation to access the enroll secret in the keychain.
+
+>**Note:** The keychain is not used on macOS when the enroll secret is provided via MDM profile. Keychain support when passing the enroll secret via MDM profile is coming soon.
+
+### Generating fleetd for Windows using local WiX toolset
+
+`Applies only to Fleet Premium`
+
+When generating Fleet's agent (fleetd) for Windows hosts (**.msi**) on a Windows machine, you can tell `fleetctl package` to
+use local installations of the 3 WiX v3 binaries used by this command (`heat.exe`, `candle.exe`, and
+`light.exe`) instead of those in a pre-configured container, which is the default behavior. To do
+so:
+  1. Download the [WiX v3 binaries](https://github.com/wixtoolset/wix3/releases/download/wix3141rtm/wix314-binaries.zip), then unzip the downloaded file.
+  2. Find the absolute filepath of the directory containing your local WiX v3 binaries. This will be wherever you saved the unzipped package contents.
+  3. As Administrator, run `fleetctl package` and pass the absolute path above as the string argument to the `--local-wix-dir` flag. (If the provided path doesn't contain all 3 binaries, the command will fail.) For example:
+
+```powershell
+fleetctl package --type msi --fleet-url=[YOUR FLEET URL] --enroll-secret=[YOUR ENROLL SECRET] --local-wix-dir "\Users\me\AppData\Local\Temp\wix311-binaries"
+```
+
+### Config-less fleetd agent deployment
+
+Config-less deployment allows for Fleet's agent (fleetd) to be installed without embedding configuration settings directly into the package. This approach is ideal for environments requiring flexibility in managing enroll secrets and server URLs. For detailed instructions, visit the [Config-less fleetd agent deployment guide](https://fleetdm.com/guides/config-less-fleetd-agent-deployment).
+
+>**Warning:** If you remove the configuration profile with the settings from macOS, `fleetd` won't work anymore until a similar profile is installed again. If the profile is delivered via MDM, and MDM is turned off, you might face this scenario.
+
+### Experimental features
+
+> Any features listed here are not recommended for use in production environments
+
+**Using `fleetd` without enrolling Orbit**
+
+*Only available in fleetd v1.15.1 on Linux and macOS*
+
+It is possible to generate a fleetd package that does not connect to Fleet by omitting the `--fleet-url` and `--enroll-secret` flags when building a package.
+
+This can be useful in situations where you would like to test using `fleetd` to manage osquery updates while still managing osquery command-line flags and extensions locally 
+but can result in a large volume of error logs. In fleetd v1.15.1, we added an experimental feature to reduce log chatter in this scenario.
+ 
+Applying the environmental variable `"FLEETD_SILENCE_ENROLL_ERROR"=1` on a host will silence fleetd enrollment errors if a `--fleet-url` is not present.
+This variable is read at launch and will require a restart of the Orbit service if it is not set before installing `fleetd` v1.15.1.
+
+### macOS Migration Assistant
+
+When transferring data with [Apple's Migration Assistant](https://support.apple.com/en-us/102613), uncheck the **Other Files & Folders** option.
+
+![Migration settings with Other Files & Folders unchecked](../website/assets/images/articles/migration-assistant-caveat-832x625@2x.png)
+
+Otherwise, the device will continue to communicate with Fleet via the agent and osquery will work, but MDM commands will never be delivered to the new device. To resolve this, devices must be unenrolled and re-enrolled.
+
+
+<meta name="category" value="guides">
+<meta name="authorGitHubUsername" value="noahtalerman">
+<meta name="authorFullName" value="Noah Talerman">
+<meta name="publishedOn" value="2024-08-08">
+<meta name="articleTitle" value="Enroll hosts">
+<meta name="description" value="Learn how to enroll hosts to Fleet.">

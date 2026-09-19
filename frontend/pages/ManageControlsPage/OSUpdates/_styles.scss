@@ -1,0 +1,16 @@
+.os-updates {
+  @include vertical-page-tab-panel-layout;
+  margin-top: $gap-page-component; // Required as these Tabs don't use TabPanel
+
+  &__os-versions-card {
+    margin-bottom: $pad-xxlarge;
+  }
+
+  &__premium-feature-message {
+    margin-top: 80px;
+  }
+
+  &__target-container {
+    @include vertical-page-layout;
+  }
+}

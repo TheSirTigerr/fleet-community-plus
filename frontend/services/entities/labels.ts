@@ -1,0 +1,217 @@
+/* eslint-disable  @typescript-eslint/explicit-module-boundary-types */
+
+import { IHost } from "interfaces/host";
+import {
+  CUSTOM_HOST_VITAL_CRITERION,
+  ILabel,
+  ILabelSummary,
+} from "interfaces/label";
+import { IDynamicLabelFormData } from "pages/labels/components/DynamicLabelForm/DynamicLabelForm";
+import { IManualLabelFormData } from "pages/labels/components/ManualLabelForm/ManualLabelForm";
+import { INewLabelFormData } from "pages/labels/NewLabelPage/NewLabelPage";
+import sendRequest from "services";
+import endpoints from "utilities/endpoints";
+import helpers from "utilities/helpers";
+import { buildQueryStringFromParams } from "utilities/url";
+
+export interface ILabelsResponse {
+  labels: ILabel[];
+}
+
+export interface ILabelsSummaryResponse {
+  labels: ILabelSummary[];
+}
+
+export interface ICreateLabelResponse {
+  label: ILabel;
+}
+export type IUpdateLabelResponse = ICreateLabelResponse;
+export type IGetLabelResponse = ICreateLabelResponse;
+
+export interface IGetHostsInLabelResponse {
+  hosts: IHost[];
+}
+
+const isManualLabelFormData = (
+  formData: IDynamicLabelFormData | IManualLabelFormData
+): formData is IManualLabelFormData => {
+  return "targetedHosts" in formData;
+};
+
+export interface IUpdateLabelOptions {
+  /** Send only the label's host membership, leaving its definition untouched. Used for a manual
+   * label whose definition is managed in git while its membership is managed in Fleet. */
+  membershipOnly?: boolean;
+}
+
+const generateUpdateLabelBody = (
+  formData: IDynamicLabelFormData | IManualLabelFormData,
+  { membershipOnly = false }: IUpdateLabelOptions = {}
+) => {
+  // we need to prepare the post body for only manual labels.
+  if (isManualLabelFormData(formData)) {
+    const hostIds = formData.targetedHosts.map((host) => host.id);
+    if (membershipOnly) {
+      return { host_ids: hostIds };
+    }
+    return {
+      name: formData.name,
+      description: formData.description,
+      host_ids: hostIds,
+    };
+  }
+  return formData;
+};
+
+const generateCreateLabelBody = (formData: INewLabelFormData) => {
+  switch (formData.type) {
+    case "manual":
+      return {
+        name: formData.name,
+        description: formData.description,
+        host_ids: formData.targetedHosts.map((host) => host.id),
+      };
+    case "dynamic":
+      return {
+        name: formData.name,
+        description: formData.description,
+        query: formData.labelQuery,
+        platform: formData.platform,
+      };
+    case "host_vitals":
+      return {
+        name: formData.name,
+        description: formData.description,
+        // `custom_host_vital_id` is only sent for the custom-vital path
+        criteria: {
+          vital: formData.vital,
+          value: formData.vitalValue,
+          ...(formData.vital === CUSTOM_HOST_VITAL_CRITERION &&
+          formData.customHostVitalId != null &&
+          Number.isFinite(formData.customHostVitalId)
+            ? { custom_host_vital_id: formData.customHostVitalId }
+            : {}),
+        },
+      };
+    default:
+      throw new Error(`Unknown label type: ${formData.type}`);
+  }
+};
+
+/** gets the custom label and returns them in case-insensitive alphabetical
+ * ascending order by label name. (e.g. [A, B, C, a, b, c] => [A, a, B, b, C, c])
+ */
+export const getCustomLabels = <T extends { label_type: string; name: string }>(
+  labels: T[]
+) => {
+  if (labels.length === 0) {
+    return [];
+  }
+
+  return labels
+    .filter((label) => label.label_type === "regular")
+    .sort((a, b) => {
+      // Found this technique here
+      // https://developer.mozilla.org/en-US/docs/Web/JavaScript/Reference/Global_Objects/String/localeCompare
+      // This is a case insensitive sort
+      return a.name.localeCompare(b.name, undefined, {
+        sensitivity: "base",
+      });
+    });
+};
+
+export const listNamesFromSelectedLabels = (dict: Record<string, boolean>) => {
+  return Object.entries(dict).reduce((acc, [labelName, isSelected]) => {
+    if (isSelected) {
+      acc.push(labelName);
+    }
+    return acc;
+  }, [] as string[]);
+};
+
+export default {
+  create: (formData: INewLabelFormData): Promise<ICreateLabelResponse> => {
+    const { LABELS } = endpoints;
+    return sendRequest("POST", LABELS, generateCreateLabelBody(formData));
+  },
+
+  destroy: (label: ILabel) => {
+    const { LABELS } = endpoints;
+    const path = `${LABELS}/id/${label.id}`;
+
+    return sendRequest("DELETE", path);
+  },
+  loadAll: async (teamID: number | null = null): Promise<ILabelsResponse> => {
+    const { LABELS } = endpoints;
+
+    const queryStringParams = {
+      include_host_counts: false,
+      fleet_id: null as null | number | string,
+    };
+    if (teamID === 0) {
+      queryStringParams.fleet_id = "global";
+    } else if (teamID !== null && teamID > 0) {
+      // filter out "all teams" -1
+      queryStringParams.fleet_id = teamID;
+    }
+
+    const queryString = buildQueryStringFromParams(queryStringParams);
+    const path = `${LABELS}?${queryString}`;
+
+    try {
+      const response = await sendRequest("GET", path);
+      return Promise.resolve({ labels: helpers.formatLabelResponse(response) });
+    } catch (error) {
+      console.error(error);
+      return Promise.reject(error);
+    }
+  },
+  summary: (
+    teamID: number | null = null,
+    treatAllTeamsAsGlobalOnly = false
+  ): Promise<ILabelsSummaryResponse> => {
+    const { LABELS_SUMMARY } = endpoints;
+
+    const queryStringParams = {
+      fleet_id: null as null | number | string,
+    };
+    if (teamID === 0 || (teamID === -1 && treatAllTeamsAsGlobalOnly)) {
+      queryStringParams.fleet_id = "global";
+    } else if (teamID !== null && teamID > 0) {
+      queryStringParams.fleet_id = teamID;
+    }
+
+    const queryString = buildQueryStringFromParams(queryStringParams);
+
+    return sendRequest(
+      "GET",
+      queryString ? `${LABELS_SUMMARY}?${queryString}` : LABELS_SUMMARY
+    );
+  },
+
+  update: async (
+    labelId: number,
+    formData: IDynamicLabelFormData | IManualLabelFormData,
+    options?: IUpdateLabelOptions
+  ): Promise<IUpdateLabelResponse> => {
+    const { LABEL } = endpoints;
+    const updateAttrs = generateUpdateLabelBody(formData, options);
+    return sendRequest("PATCH", LABEL(labelId), updateAttrs);
+  },
+
+  specByName: (labelName: string) => {
+    const { LABEL_SPEC_BY_NAME } = endpoints;
+    const path = LABEL_SPEC_BY_NAME(labelName);
+    return sendRequest("GET", path);
+  },
+
+  getLabel: (labelId: number): Promise<IGetLabelResponse> => {
+    const { LABEL } = endpoints;
+    return sendRequest("GET", LABEL(labelId));
+  },
+
+  getHostsInLabel: (labelId: number): Promise<IGetHostsInLabelResponse> => {
+    const { LABEL_HOSTS } = endpoints;
+    return sendRequest("GET", LABEL_HOSTS(labelId));
+  },
+};

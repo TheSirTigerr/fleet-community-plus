@@ -1,0 +1,18 @@
+.bootstrap-package-status-filter {
+  display: flex;
+  justify-content: flex-start;
+  align-items: center;
+
+  &__status-filter {
+    width: 170px;
+
+    .Select-menu-outer {
+      width: 170px;
+      max-height: 310px;
+
+      .Select-menu {
+        max-height: none;
+      }
+    }
+  }
+}

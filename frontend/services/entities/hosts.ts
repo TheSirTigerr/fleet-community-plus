@@ -1,0 +1,804 @@
+/* eslint-disable  @typescript-eslint/explicit-module-boundary-types */
+
+import { IHostCertificate } from "interfaces/certificates";
+import { IHost, HostStatus } from "interfaces/host";
+import { IListOptions } from "interfaces/list_options";
+import { IMunkiIssuesAggregate } from "interfaces/macadmins";
+import {
+  DiskEncryptionStatus,
+  BootstrapPackageStatus,
+  IMdmSolution,
+  MdmProfileStatus,
+  MdmEnrollmentStatus,
+} from "interfaces/mdm";
+import {
+  IHostSoftware,
+  ISoftware,
+  SoftwareAggregateStatus,
+  SoftwareSource,
+} from "interfaces/software";
+import sendRequest from "services";
+import { PlatformValueOptions, PolicyResponse } from "utilities/constants";
+import endpoints from "utilities/endpoints";
+import {
+  QueryParams,
+  buildQueryStringFromParams,
+  getLabelParam,
+  reconcileMutuallyExclusiveHostParams,
+  reconcileMutuallyInclusiveHostParams,
+} from "utilities/url";
+
+import { ScriptBatchHostCountV1 } from "./scripts";
+
+export interface ISortOption {
+  key: string;
+  direction: string;
+}
+
+export interface ILoadHostsResponse {
+  hosts: IHost[];
+  software?: ISoftware;
+  software_title?: {
+    name: string;
+    version?: string;
+    source?: SoftwareSource;
+  } | null;
+  munki_issue: IMunkiIssuesAggregate;
+  mobile_device_management_solution: IMdmSolution;
+}
+
+export type DEPDeviceStatus =
+  | "SUCCESS"
+  | "FAILED"
+  | "THROTTLED"
+  | "NOT_ACCESSIBLE";
+
+export interface IDepAssignmentHostResponse {
+  id: number;
+  dep_device: {
+    asset_tag: string;
+    color: string;
+    description: string;
+    device_assigned_by: string;
+    device_assigned_date: string;
+    device_family: string;
+    os: string;
+    profile_status: string;
+    profile_assign_time: string;
+    profile_push_time: string;
+    profile_uuid: string;
+    mdm_migration_deadline: string | null;
+    serial_number: string;
+    response_status: DEPDeviceStatus;
+  } | null;
+  dep_device_error: string | null;
+  host_dep_assignment: {
+    assign_profile_response: DEPDeviceStatus;
+    profile_uuid: string;
+    response_updated_at: string;
+    added_at: string;
+    deleted_at: string | null;
+    abm_token_id: number;
+    mdm_migration_deadline: string;
+    mdm_migration_completed: string;
+  } | null;
+}
+
+export type IUnlockHostResponse =
+  | {
+      host_id: number;
+      unlock_pin: string;
+    }
+  | Record<string, never>;
+
+// the source of truth for the filter option names.
+// there are used on many other pages but we define them here.
+// TODO: add other filter options here.
+export const HOSTS_QUERY_PARAMS = {
+  OS_SETTINGS: "os_settings",
+  DISK_ENCRYPTION: "os_settings_disk_encryption",
+  SOFTWARE_STATUS: "software_status",
+  SCRIPT_BATCH_EXECUTION_STATUS: "script_batch_execution_status",
+  SCRIPT_BATCH_EXECUTION_ID: "script_batch_execution_id",
+} as const;
+
+export interface ILoadHostsQueryKey extends ILoadHostsOptions {
+  scope: "hosts";
+}
+
+export type MacSettingsStatusQueryParam = "latest" | "pending" | "failing";
+
+export interface ILoadHostsOptions {
+  page?: number;
+  perPage?: number;
+  selectedLabels?: string[];
+  globalFilter?: string;
+  sortBy?: ISortOption[];
+  teamId?: number;
+  policyId?: number;
+  policyResponse?: string;
+  macSettingsStatus?: MacSettingsStatusQueryParam;
+  softwareId?: number;
+  softwareTitleId?: number;
+  softwareVersionId?: number;
+  softwareStatus?: SoftwareAggregateStatus;
+  status?: HostStatus;
+  mdmId?: number;
+  mdmEnrollmentStatus?: string;
+  lowDiskSpaceHosts?: number;
+  osVersionId?: number;
+  osName?: string;
+  osVersion?: string;
+  vulnerability?: string;
+  munkiIssueId?: number;
+  device_mapping?: boolean;
+  columns?: string;
+  visibleColumns?: string;
+  osSettings?: MdmProfileStatus;
+  diskEncryptionStatus?: DiskEncryptionStatus;
+  bootstrapPackageStatus?: BootstrapPackageStatus;
+  configProfileStatus?: string;
+  configProfileUUID?: string;
+  scriptBatchExecutionStatus?: ScriptBatchHostCountV1;
+  scriptBatchExecutionId?: string;
+  depProfileError?: boolean;
+  depAssignProfileResponse?: DEPDeviceStatus;
+}
+
+export interface IExportHostsOptions {
+  sortBy: ISortOption[];
+  page?: number;
+  perPage?: number;
+  selectedLabels?: string[];
+  globalFilter?: string;
+  teamId?: number;
+  policyId?: number;
+  policyResponse?: string;
+  macSettingsStatus?: MacSettingsStatusQueryParam;
+  softwareId?: number;
+  softwareTitleId?: number;
+  softwareVersionId?: number;
+  softwareStatus?: SoftwareAggregateStatus;
+  status?: HostStatus;
+  mdmId?: number;
+  munkiIssueId?: number;
+  mdmEnrollmentStatus?: string;
+  lowDiskSpaceHosts?: number;
+  osId?: number;
+  osName?: string;
+  osVersionId?: number;
+  osVersion?: string;
+  vulnerability?: string;
+  device_mapping?: boolean;
+  columns?: string;
+  visibleColumns?: string;
+  bootstrapPackageStatus?: BootstrapPackageStatus;
+  osSettings?: MdmProfileStatus;
+  diskEncryptionStatus?: DiskEncryptionStatus;
+  configProfileUUID?: string;
+  configProfileStatus?: string;
+  scriptBatchExecutionStatus?: ScriptBatchHostCountV1;
+  scriptBatchExecutionId?: string;
+  depProfileError?: boolean;
+  depAssignProfileResponse?: DEPDeviceStatus;
+}
+
+export interface IActionByFilter {
+  teamId?: number | null;
+  query: string;
+  status: string;
+  labelId?: number;
+  currentTeam?: number | null;
+  policyId?: number | null;
+  policyResponse?: PolicyResponse;
+  softwareId?: number | null;
+  softwareTitleId?: number | null;
+  softwareVersionId?: number | null;
+  softwareStatus?: SoftwareAggregateStatus;
+  osName?: string;
+  osVersion?: string;
+  osVersionId?: number | null;
+  macSettingsStatus?: MacSettingsStatusQueryParam;
+  bootstrapPackageStatus?: BootstrapPackageStatus;
+  mdmId?: number | null;
+  mdmEnrollmentStatus?: MdmEnrollmentStatus;
+  munkiIssueId?: number | null;
+  lowDiskSpaceHosts?: number | null;
+  osSettings?: MdmProfileStatus;
+  diskEncryptionStatus?: DiskEncryptionStatus;
+  vulnerability?: string;
+  scriptBatchExecutionStatus?: ScriptBatchHostCountV1;
+  scriptBatchExecutionId?: string;
+  depProfileError?: boolean;
+  depAssignProfileResponse?: DEPDeviceStatus;
+}
+
+export interface IGetHostSoftwareResponse {
+  software: IHostSoftware[];
+  count: number;
+  meta: {
+    has_next_results: boolean;
+    has_previous_results: boolean;
+  };
+}
+
+export interface IHostSoftwareApiParams extends QueryParams {
+  page?: number;
+  perPage?: number;
+  query?: string;
+  orderKey?: string;
+  orderDirection?: "asc" | "desc";
+  availableForInstall?: boolean;
+  vulnerable?: boolean;
+  maxCvssScore?: string;
+  minCvssScore?: string;
+  exploit?: boolean;
+}
+
+export interface IHostSoftwareQueryParams extends QueryParams {
+  page: number;
+  per_page: number;
+  query: string;
+  order_key: string;
+  order_direction: "asc" | "desc";
+  available_for_install?: boolean;
+  include_available_for_install?: boolean;
+  vulnerable?: boolean;
+  min_cvss_score?: number;
+  max_cvss_score?: number;
+  exploit?: boolean;
+  macos_applications?: boolean;
+}
+
+export interface IHostSoftwareQueryKey extends IHostSoftwareQueryParams {
+  scope: "host_software";
+  id: number;
+  softwareUpdatedAt?: string;
+}
+
+export interface IGetHostCertsApiParams extends IListOptions {
+  host_id: number;
+}
+
+export interface IGetHostDeviceURLResponse {
+  host_id: number;
+  device_url: string;
+}
+
+export interface IGetHostCertificatesResponse {
+  certificates: IHostCertificate[];
+  meta: {
+    has_next_results: boolean;
+    has_previous_results: boolean;
+  };
+  count: number;
+}
+
+export type ILoadHostDetailsExtension = "macadmins";
+
+const LABEL_PREFIX = "labels/";
+
+const getLabel = (selectedLabels?: string[]) => {
+  if (selectedLabels === undefined) return undefined;
+  return selectedLabels.find((filter) => filter.includes(LABEL_PREFIX));
+};
+
+const getHostEndpoint = (selectedLabels?: string[]) => {
+  const { HOSTS, LABEL_HOSTS } = endpoints;
+  if (selectedLabels === undefined) return HOSTS;
+
+  const label = getLabel(selectedLabels);
+  if (label) {
+    const labelId = label.substr(LABEL_PREFIX.length);
+    return LABEL_HOSTS(parseInt(labelId, 10));
+  }
+
+  return HOSTS;
+};
+
+const getSortParams = (sortOptions?: ISortOption[]) => {
+  if (sortOptions === undefined || sortOptions.length === 0) {
+    return {};
+  }
+
+  const sortItem = sortOptions[0];
+  return {
+    order_key: sortItem.key,
+    order_direction: sortItem.direction,
+  };
+};
+
+const createMdmParams = (platform?: PlatformValueOptions, teamId?: number) => {
+  if (platform === "all") {
+    return buildQueryStringFromParams({ fleet_id: teamId });
+  }
+
+  return buildQueryStringFromParams({ platform, fleet_id: teamId });
+};
+
+export default {
+  destroy: (host: IHost) => {
+    const { HOSTS } = endpoints;
+    const path = `${HOSTS}/${host.id}`;
+
+    return sendRequest("DELETE", path);
+  },
+  destroyBulk: (hostIds: number[]) => {
+    const { HOSTS_DELETE } = endpoints;
+
+    return sendRequest("POST", HOSTS_DELETE, { ids: hostIds });
+  },
+  destroyByFilter: ({
+    teamId,
+    query,
+    status,
+    labelId,
+    policyId,
+    policyResponse,
+    softwareId,
+    softwareTitleId,
+    softwareVersionId,
+    softwareStatus,
+    osName,
+    osVersion,
+    osVersionId,
+    macSettingsStatus,
+    bootstrapPackageStatus,
+    mdmId,
+    mdmEnrollmentStatus,
+    munkiIssueId,
+    lowDiskSpaceHosts,
+    osSettings,
+    diskEncryptionStatus,
+    vulnerability,
+  }: IActionByFilter) => {
+    const { HOSTS_DELETE } = endpoints;
+    return sendRequest("POST", HOSTS_DELETE, {
+      filters: {
+        query: query || undefined, // Prevents empty string passed to API which as of 4.47 will return an error
+        status,
+        label_id: labelId,
+        fleet_id: teamId,
+        policy_id: policyId,
+        policy_response: policyResponse,
+        software_id: softwareId,
+        software_title_id: softwareTitleId,
+        software_version_id: softwareVersionId,
+        [HOSTS_QUERY_PARAMS.SOFTWARE_STATUS]: softwareStatus,
+        os_name: osName,
+        os_version: osVersion,
+        os_version_id: osVersionId,
+        apple_settings: macSettingsStatus,
+        macos_bootstrap_package: bootstrapPackageStatus,
+        mdm_id: mdmId,
+        mdm_enrollment_status: mdmEnrollmentStatus,
+        munki_issue_id: munkiIssueId,
+        low_disk_space: lowDiskSpaceHosts,
+        os_settings: osSettings,
+        os_settings_disk_encryption: diskEncryptionStatus,
+        vulnerability,
+      },
+    });
+  },
+  exportHosts: (options: IExportHostsOptions) => {
+    const sortBy = options.sortBy;
+    const selectedLabels = options?.selectedLabels || [];
+    const globalFilter = options?.globalFilter || "";
+    const teamId = options?.teamId;
+    const policyId = options?.policyId;
+    const policyResponse = options?.policyResponse || "passing";
+    const softwareId = options?.softwareId;
+    const softwareTitleId = options?.softwareTitleId;
+    const softwareVersionId = options?.softwareVersionId;
+    const softwareStatus = options?.softwareStatus;
+    const macSettingsStatus = options?.macSettingsStatus;
+    const osName = options?.osName;
+    const osVersionId = options?.osVersionId;
+    const osVersion = options?.osVersion;
+    const status = options?.status;
+    const mdmId = options?.mdmId;
+    const mdmEnrollmentStatus = options?.mdmEnrollmentStatus;
+    const lowDiskSpaceHosts = options?.lowDiskSpaceHosts;
+    const bootstrapPackageStatus = options?.bootstrapPackageStatus;
+    const visibleColumns = options?.visibleColumns;
+    const label = getLabelParam(selectedLabels);
+    const munkiIssueId = options?.munkiIssueId;
+    const osSettings = options?.osSettings;
+    const diskEncryptionStatus = options?.diskEncryptionStatus;
+    const vulnerability = options?.vulnerability;
+    const configProfileUUID = options?.configProfileUUID;
+    const configProfileStatus = options?.configProfileStatus;
+    const scriptBatchExecutionStatus = options?.scriptBatchExecutionStatus;
+    const scriptBatchExecutionId = options?.scriptBatchExecutionId;
+    const depProfileError = options?.depProfileError;
+    const depAssignProfileResponse = options?.depAssignProfileResponse;
+
+    if (!sortBy.length) {
+      throw Error("sortBy is a required field.");
+    }
+    const queryParams = {
+      order_key: sortBy[0].key,
+      order_direction: sortBy[0].direction,
+      query: globalFilter,
+      ...reconcileMutuallyInclusiveHostParams({
+        label,
+        teamId,
+        macSettingsStatus,
+        osSettings,
+      }),
+      ...reconcileMutuallyExclusiveHostParams({
+        teamId,
+        label,
+        policyId,
+        policyResponse,
+        mdmId,
+        mdmEnrollmentStatus,
+        munkiIssueId,
+        softwareId,
+        softwareTitleId,
+        softwareVersionId,
+        softwareStatus,
+        osName,
+        osVersionId,
+        osVersion,
+        lowDiskSpaceHosts,
+        osSettings,
+        bootstrapPackageStatus,
+        diskEncryptionStatus,
+        vulnerability,
+        configProfileUUID,
+        configProfileStatus,
+        scriptBatchExecutionStatus,
+        scriptBatchExecutionId,
+        depProfileError,
+        depAssignProfileResponse,
+      }),
+      status,
+      label_id: label,
+      columns: visibleColumns,
+      format: "csv",
+    };
+
+    const queryString = buildQueryStringFromParams(queryParams);
+    const endpoint = endpoints.HOSTS_REPORT;
+    const path = `${endpoint}?${queryString}`;
+
+    return sendRequest("GET", path);
+  },
+
+  loadHosts: ({
+    page = 0,
+    perPage = 100,
+    globalFilter,
+    teamId,
+    policyId,
+    policyResponse = "passing",
+    macSettingsStatus,
+    softwareId,
+    softwareTitleId,
+    softwareVersionId,
+    softwareStatus,
+    status,
+    mdmId,
+    mdmEnrollmentStatus,
+    munkiIssueId,
+    lowDiskSpaceHosts,
+    osVersionId,
+    osName,
+    osVersion,
+    vulnerability,
+    device_mapping,
+    selectedLabels,
+    sortBy,
+    osSettings,
+    diskEncryptionStatus,
+    bootstrapPackageStatus,
+    configProfileStatus,
+    configProfileUUID,
+    scriptBatchExecutionStatus,
+    scriptBatchExecutionId,
+    depProfileError,
+    depAssignProfileResponse,
+  }: ILoadHostsOptions): Promise<ILoadHostsResponse> => {
+    const label = getLabel(selectedLabels);
+    const sortParams = getSortParams(sortBy);
+
+    const queryParams = {
+      page,
+      per_page: perPage,
+      query: globalFilter,
+      device_mapping,
+      order_key: sortParams.order_key,
+      order_direction: sortParams.order_direction,
+      status,
+      ...reconcileMutuallyInclusiveHostParams({
+        label,
+        teamId,
+        macSettingsStatus,
+        osSettings,
+      }),
+      ...reconcileMutuallyExclusiveHostParams({
+        teamId,
+        label,
+        policyId,
+        policyResponse,
+        mdmId,
+        mdmEnrollmentStatus,
+        munkiIssueId,
+        softwareId,
+        softwareTitleId,
+        softwareVersionId,
+        softwareStatus,
+        lowDiskSpaceHosts,
+        osVersionId,
+        osName,
+        osVersion,
+        vulnerability,
+        diskEncryptionStatus,
+        osSettings,
+        bootstrapPackageStatus,
+        configProfileStatus,
+        configProfileUUID,
+        scriptBatchExecutionStatus,
+        scriptBatchExecutionId,
+        depProfileError,
+        depAssignProfileResponse,
+      }),
+    };
+
+    const queryString = buildQueryStringFromParams(queryParams);
+
+    const endpoint = getHostEndpoint(selectedLabels);
+    const path = `${endpoint}?${queryString}`;
+    return sendRequest("GET", path);
+  },
+  loadHostDetails: (hostID: number) => {
+    const { HOSTS } = endpoints;
+    const path = `${HOSTS}/${hostID}?exclude_software=true`;
+
+    return sendRequest("GET", path);
+  },
+  loadHostDetailsExtension: (
+    hostID: number,
+    extension: ILoadHostDetailsExtension
+  ) => {
+    const { HOSTS } = endpoints;
+    const path = `${HOSTS}/${hostID}/${extension}`;
+
+    return sendRequest("GET", path);
+  },
+  refetch: (host: IHost) => {
+    const { HOSTS } = endpoints;
+    const path = `${HOSTS}/${host.id}/refetch`;
+
+    return sendRequest("POST", path);
+  },
+  apnsPing: (hostID: number) => {
+    const { HOST_APNS_PING } = endpoints;
+    const path = `${HOST_APNS_PING(hostID)}`;
+
+    return sendRequest("POST", path);
+  },
+  search: (searchText: string) => {
+    const { HOSTS } = endpoints;
+    const path = `${HOSTS}?query=${searchText}`;
+
+    return sendRequest("GET", path);
+  },
+  transferToTeam: (teamId: number | null, hostIds: number[]) => {
+    const { HOSTS_TRANSFER } = endpoints;
+
+    return sendRequest("POST", HOSTS_TRANSFER, {
+      fleet_id: teamId,
+      hosts: hostIds,
+    });
+  },
+
+  // TODO confirm interplay with policies
+  transferToTeamByFilter: ({
+    teamId,
+    query,
+    status,
+    labelId,
+    currentTeam,
+    policyId,
+    policyResponse,
+    softwareId,
+    softwareTitleId,
+    softwareVersionId,
+    softwareStatus,
+    osName,
+    osVersion,
+    osVersionId,
+    macSettingsStatus,
+    bootstrapPackageStatus,
+    mdmId,
+    mdmEnrollmentStatus,
+    munkiIssueId,
+    lowDiskSpaceHosts,
+    osSettings,
+    diskEncryptionStatus,
+    vulnerability,
+    depProfileError,
+    depAssignProfileResponse,
+  }: IActionByFilter) => {
+    const { HOSTS_TRANSFER_BY_FILTER } = endpoints;
+    return sendRequest("POST", HOSTS_TRANSFER_BY_FILTER, {
+      fleet_id: teamId,
+      filters: {
+        query: query || undefined, // Prevents empty string passed to API which as of 4.47 will return an error
+        status,
+        label_id: labelId,
+        fleet_id: currentTeam,
+        policy_id: policyId,
+        policy_response: policyResponse,
+        software_id: softwareId,
+        software_title_id: softwareTitleId,
+        software_version_id: softwareVersionId,
+        [HOSTS_QUERY_PARAMS.SOFTWARE_STATUS]: softwareStatus,
+        os_name: osName,
+        os_version: osVersion,
+        os_version_id: osVersionId,
+        apple_settings: macSettingsStatus,
+        macos_bootstrap_package: bootstrapPackageStatus,
+        mdm_id: mdmId,
+        mdm_enrollment_status: mdmEnrollmentStatus,
+        munki_issue_id: munkiIssueId,
+        low_disk_space: lowDiskSpaceHosts,
+        os_settings: osSettings,
+        os_settings_disk_encryption: diskEncryptionStatus,
+        vulnerability,
+        dep_profile_error: depProfileError,
+        dep_assing_profile_response: depAssignProfileResponse,
+      },
+    });
+  },
+
+  getMdm: (id: number) => {
+    const { HOST_MDM } = endpoints;
+    return sendRequest("GET", HOST_MDM(id));
+  },
+
+  getMdmSummary: (platform?: PlatformValueOptions, teamId?: number) => {
+    const { MDM_SUMMARY } = endpoints;
+
+    if (!platform || platform === "linux") {
+      throw new Error("mdm not supported for this platform");
+    }
+
+    const params = createMdmParams(platform, teamId);
+    const fullPath = params !== "" ? `${MDM_SUMMARY}?${params}` : MDM_SUMMARY;
+    return sendRequest("GET", fullPath);
+  },
+
+  getEncryptionKey: (id: number) => {
+    const { HOST_ENCRYPTION_KEY } = endpoints;
+    return sendRequest("GET", HOST_ENCRYPTION_KEY(id));
+  },
+
+  getRecoveryLockPassword: (id: number) => {
+    const { HOST_RECOVERY_LOCK_PASSWORD } = endpoints;
+    return sendRequest("GET", HOST_RECOVERY_LOCK_PASSWORD(id));
+  },
+
+  rotateRecoveryLockPassword: (id: number): Promise<void> => {
+    const { HOST_RECOVERY_LOCK_PASSWORD_ROTATE } = endpoints;
+    return sendRequest("POST", HOST_RECOVERY_LOCK_PASSWORD_ROTATE(id));
+  },
+
+  getDeviceURL: (id: number): Promise<IGetHostDeviceURLResponse> => {
+    const { HOST_DEVICE_URL } = endpoints;
+    return sendRequest("GET", HOST_DEVICE_URL(id));
+  },
+
+  getManagedAccountPassword: (id: number) => {
+    const { HOST_MANAGED_ACCOUNT_PASSWORD } = endpoints;
+    return sendRequest("GET", HOST_MANAGED_ACCOUNT_PASSWORD(id));
+  },
+
+  rotateManagedLocalAccountPassword: (id: number): Promise<void> => {
+    const { HOST_MANAGED_LOCAL_ACCOUNT_ROTATE } = endpoints;
+    return sendRequest("POST", HOST_MANAGED_LOCAL_ACCOUNT_ROTATE(id));
+  },
+
+  lockHost: (id: number) => {
+    const { HOST_LOCK } = endpoints;
+    return sendRequest("POST", HOST_LOCK(id));
+  },
+
+  unlockHost: (id: number): Promise<IUnlockHostResponse> => {
+    const { HOST_UNLOCK } = endpoints;
+    return sendRequest("POST", HOST_UNLOCK(id));
+  },
+
+  wipeHost: (id: number) => {
+    const { HOST_WIPE } = endpoints;
+    return sendRequest("POST", HOST_WIPE(id));
+  },
+
+  clearPasscode: (id: number) => {
+    const { HOST_CLEAR_PASSCODE } = endpoints;
+    return sendRequest("POST", HOST_CLEAR_PASSCODE(id));
+  },
+
+  resendProfile: (hostId: number, profileUUID: string): Promise<void> => {
+    const { HOST_RESEND_PROFILE } = endpoints;
+
+    return sendRequest("POST", HOST_RESEND_PROFILE(hostId, profileUUID));
+  },
+
+  resendCertificate: (
+    hostId: number,
+    certificateTemplateId: number
+  ): Promise<void> => {
+    const { HOST_RESEND_CERTIFICATE } = endpoints;
+
+    return sendRequest(
+      "POST",
+      HOST_RESEND_CERTIFICATE(hostId, certificateTemplateId)
+    );
+  },
+
+  resendNameTemplate: (hostId: number): Promise<void> => {
+    const { HOST_RESEND_NAME_TEMPLATE } = endpoints;
+
+    return sendRequest("POST", HOST_RESEND_NAME_TEMPLATE(hostId));
+  },
+
+  getHostSoftware: (
+    params: IHostSoftwareQueryKey
+  ): Promise<IGetHostSoftwareResponse> => {
+    const { HOST_SOFTWARE } = endpoints;
+    // eslint-disable-next-line @typescript-eslint/no-unused-vars
+    const { id, scope, ...rest } = params;
+    const queryString = buildQueryStringFromParams(rest);
+
+    return sendRequest("GET", `${HOST_SOFTWARE(id)}?${queryString}`);
+  },
+
+  installHostSoftwarePackage: (hostId: number, softwareId: number) => {
+    const { HOST_SOFTWARE_PACKAGE_INSTALL } = endpoints;
+    return sendRequest(
+      "POST",
+      HOST_SOFTWARE_PACKAGE_INSTALL(hostId, softwareId)
+    );
+  },
+
+  uninstallHostSoftwarePackage: (hostId: number, softwareId: number) => {
+    const { HOST_SOFTWARE_PACKAGE_UNINSTALL } = endpoints;
+    return sendRequest(
+      "POST",
+      HOST_SOFTWARE_PACKAGE_UNINSTALL(hostId, softwareId)
+    );
+  },
+
+  getHostCertificates: ({
+    host_id,
+    page,
+    per_page,
+    order_key,
+    order_direction,
+  }: IGetHostCertsApiParams): Promise<IGetHostCertificatesResponse> => {
+    const { HOST_CERTIFICATES } = endpoints;
+    const path = `${HOST_CERTIFICATES(host_id)}?${buildQueryStringFromParams({
+      page,
+      per_page,
+      order_key,
+      order_direction,
+    })}`;
+
+    return sendRequest("GET", path);
+  },
+  updateHostIdp(hostId: number, idpUsername: string) {
+    const path = endpoints.HOST_DEVICE_MAPPING(hostId);
+    return sendRequest("PUT", path, { source: "idp", email: idpUsername });
+  },
+  deleteHostIdp(hostId: number) {
+    const path = endpoints.HOST_DEVICE_MAPPING_IDP(hostId);
+    return sendRequest("DELETE", path);
+  },
+  getDepAssignment: (id: number) => {
+    const { HOST_DEP_ASSIGNMENT } = endpoints;
+    return sendRequest("GET", HOST_DEP_ASSIGNMENT(id));
+  },
+};

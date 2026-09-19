@@ -1,0 +1,254 @@
+import React, { useCallback, useContext, useEffect, useMemo } from "react";
+import { InjectedRouter } from "react-router";
+import { Tab, Tabs, TabList } from "react-tabs";
+
+import FleetsDropdown from "components/FleetsDropdown";
+import MainContent from "components/MainContent";
+import TabNav from "components/TabNav";
+import TabText from "components/TabText";
+import { AppContext } from "context/app";
+import useTeamIdParam from "hooks/useTeamIdParam";
+import { API_NO_TEAM_ID } from "interfaces/team";
+import PATHS from "router/paths";
+
+import { parseOSUpdatesCurrentVersionsQueryParams } from "./OSUpdates/components/CurrentVersionSection/CurrentVersionSection";
+
+interface IControlsSubNavItem {
+  name: string;
+  pathname: string;
+}
+
+const controlsSubNav: IControlsSubNavItem[] = [
+  {
+    name: "OS updates",
+    pathname: PATHS.CONTROLS_OS_UPDATES,
+  },
+  {
+    name: "OS settings",
+    pathname: PATHS.CONTROLS_OS_SETTINGS,
+  },
+  {
+    name: "Setup experience",
+    pathname: PATHS.CONTROLS_SETUP_EXPERIENCE,
+  },
+  {
+    name: "Scripts",
+    pathname: PATHS.CONTROLS_SCRIPTS,
+  },
+  {
+    name: "Variables",
+    pathname: PATHS.CONTROLS_VARIABLES,
+  },
+];
+
+// params to strip when navigating between tabs
+const subNavQueryParams = [
+  "page",
+  "order_key",
+  "order_direction",
+  "status",
+] as const;
+
+interface IManageControlsPageProps {
+  children: JSX.Element;
+  location: {
+    pathname: string;
+    search: string;
+    hash?: string;
+    query: {
+      fleet_id?: string;
+      page?: string;
+      order_key?: string;
+      order_direction?: "asc" | "desc";
+    };
+  };
+  router: InjectedRouter; // v3
+}
+
+const getTabIndex = (
+  permittedControlsSubNav: IControlsSubNavItem[],
+  path: string
+): number => {
+  return permittedControlsSubNav.findIndex((navItem) => {
+    // tab stays highlighted for paths that start with same pathname
+    return path.startsWith(navItem.pathname);
+  });
+};
+
+const baseClass = "manage-controls-page";
+
+const ManageControlsPage = ({
+  // TODO(sarah): decide on pattern to pass team id to subcomponents.
+  // using children makes it difficult to centralize page-level control
+  // over team id param
+  children,
+  location,
+  router,
+}: IManageControlsPageProps): JSX.Element => {
+  const page = parseInt(location?.query?.page || "", 10) || 0;
+
+  const {
+    config,
+    isOnGlobalTeam,
+    isPremiumTier,
+    isGlobalAdmin,
+    isTeamAdmin,
+    isTeamTechnician,
+    isGlobalTechnician,
+  } = useContext(AppContext);
+
+  const {
+    currentTeamId,
+    userTeams,
+    teamIdForApi,
+    handleTeamChange,
+  } = useTeamIdParam({
+    location,
+    router,
+    includeAllTeams: false,
+    includeNoTeam: true,
+    permittedAccessByTeamRole: {
+      admin: true,
+      maintainer: true,
+      observer: false,
+      observer_plus: false,
+      technician: true,
+    },
+  });
+
+  // Controls pages don't support "All teams". On free tier the page runs as
+  // "All teams", so teamIdForApi is undefined and the sub-pages (which gate
+  // their render on it being defined) would spin forever. Free tier has only
+  // "No team", so coerce to it — but only once we've confirmed the tier is Free
+  // (isPremiumTier === false). While the tier is still unknown (undefined during
+  // config load) or premium, pass teamIdForApi through untouched so the
+  // sub-pages keep waiting instead of firing "No team" queries before the tier
+  // is known (which would flash wrong-team data for premium users on boot).
+  const teamIdForApiToUse =
+    isPremiumTier === false ? API_NO_TEAM_ID : teamIdForApi;
+
+  const permittedControlsSubNav = useMemo(() => {
+    let renderedSubNav = controlsSubNav;
+    if (isTeamTechnician || isGlobalTechnician) {
+      renderedSubNav = controlsSubNav.filter((navItem) => {
+        return navItem.name === "OS settings" || navItem.name === "Scripts";
+      });
+    } else if (!isGlobalAdmin && !isTeamAdmin) {
+      renderedSubNav = controlsSubNav.filter((navItem) => {
+        return navItem.name !== "OS updates";
+      });
+    }
+    return renderedSubNav;
+  }, [isGlobalAdmin, isTeamAdmin, isTeamTechnician, isGlobalTechnician]);
+
+  // Redirect to the first permitted tab if the current path doesn't match any
+  const currentTabIndex = getTabIndex(
+    permittedControlsSubNav,
+    location?.pathname || ""
+  );
+  useEffect(() => {
+    if (currentTabIndex === -1 && permittedControlsSubNav.length > 0) {
+      const newParams = new URLSearchParams(location?.search);
+      subNavQueryParams.forEach((p) => newParams.delete(p));
+      const newQuery = newParams.toString();
+      router.replace(
+        permittedControlsSubNav[0].pathname.concat(
+          newQuery ? `?${newQuery}` : ""
+        )
+      );
+    }
+  }, [currentTabIndex, permittedControlsSubNav, location?.search, router]);
+
+  const navigateToNav = useCallback(
+    (i: number): void => {
+      const navPath = permittedControlsSubNav[i].pathname;
+      // remove query params related to the prior tab
+      const newParams = new URLSearchParams(location?.search);
+      subNavQueryParams.forEach((p) => newParams.delete(p));
+      const newQuery = newParams.toString();
+
+      router.replace(
+        navPath
+          .concat(newQuery ? `?${newQuery}` : "")
+          .concat(location?.hash || "")
+      );
+    },
+    [location, router, permittedControlsSubNav]
+  );
+
+  const renderBody = () => {
+    return (
+      <div>
+        <TabNav>
+          <Tabs
+            selectedIndex={getTabIndex(
+              permittedControlsSubNav,
+              location?.pathname || ""
+            )}
+            onSelect={navigateToNav}
+          >
+            <TabList>
+              {permittedControlsSubNav.map((navItem) => {
+                return (
+                  <Tab key={navItem.name} data-text={navItem.name}>
+                    <TabText>{navItem.name}</TabText>
+                  </Tab>
+                );
+              })}
+            </TabList>
+          </Tabs>
+        </TabNav>
+        <div className="tab-nav-routed-content">
+          <div key={currentTabIndex} className="tab-nav-routed-content__fade">
+            {React.cloneElement(children, {
+              teamIdForApi: teamIdForApiToUse,
+              currentPage: page,
+              queryParams: parseOSUpdatesCurrentVersionsQueryParams(
+                location.query
+              ),
+            })}
+          </div>
+        </div>
+      </div>
+    );
+  };
+
+  const renderHeaderContent = () => {
+    if (isPremiumTier && !config?.partnerships?.enable_primo && userTeams) {
+      if (userTeams.length > 1 || isOnGlobalTeam) {
+        return (
+          <FleetsDropdown
+            currentUserFleets={userTeams}
+            selectedFleetId={currentTeamId}
+            onChange={handleTeamChange}
+            includeAllFleets={false}
+            includeUnassigned
+          />
+        );
+      }
+      if (!isOnGlobalTeam && userTeams.length === 1) {
+        return <h1>{userTeams[0].name}</h1>;
+      }
+    }
+    return <h1>Controls</h1>;
+  };
+
+  const renderHeader = () => (
+    <div className={`${baseClass}__header`}>
+      <div className={`${baseClass}__text`}>
+        <div className={`${baseClass}__title`}>{renderHeaderContent()}</div>
+      </div>
+    </div>
+  );
+
+  return (
+    <MainContent className={baseClass}>
+      <div className={`${baseClass}__header-wrap`}>
+        <div className={`${baseClass}__header-wrap`}>{renderHeader()}</div>
+      </div>
+      {renderBody()}
+    </MainContent>
+  );
+};
+
+export default ManageControlsPage;

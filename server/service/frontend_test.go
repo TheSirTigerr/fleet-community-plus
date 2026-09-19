@@ -1,0 +1,360 @@
+package service
+
+import (
+	"bytes"
+	"context"
+	"fmt"
+	"github.com/WatchBeam/clock"
+	mockredis "github.com/fleetdm/fleet/v4/server/mock/redis"
+	"io"
+	"log/slog"
+	"net/http"
+	"net/http/httptest"
+	"os"
+	"sync"
+	"testing"
+	"time"
+
+	"github.com/fleetdm/fleet/v4/pkg/fleethttp"
+	shared_mdm "github.com/fleetdm/fleet/v4/pkg/mdm"
+	"github.com/fleetdm/fleet/v4/server/fleet"
+	"github.com/fleetdm/fleet/v4/server/mock"
+	"github.com/stretchr/testify/assert"
+	"github.com/stretchr/testify/require"
+)
+
+func TestServeFrontend(t *testing.T) {
+	if !hasBuildTag("full") {
+		t.Skip("This test requires running with -tags full")
+	}
+	logger := slog.New(slog.NewTextHandler(os.Stdout, nil))
+	h := ServeFrontend("", false, logger, false)
+	ts := httptest.NewServer(h)
+	t.Cleanup(func() {
+		ts.Close()
+	})
+
+	// Simulate a misconfigured osquery sending log requests to the root endpoint.
+	requestBody := []byte(`
+	{"data":[{"snapshot":[{"build_distro":"10.14","build_platform":"darwin","config_hash":"d8d220440ebea888f8704c4a0a5c1ced4ab601b5",
+	"config_valid":"1","extensions":"active","instance_id":"522e6020-37de-460b-bb01-b76c77298f75","pid":"57456","platform_mask":"21",
+	"start_time":"1707768989","uuid":"408F3B27-434F-4776-8538-DA394A3D545F","version":"5.11.0","watcher":"57455"}],"action":"snapshot",
+	"name":"packFOOBARGlobalFOOBARQuery_50","hostIdentifier":"589966AE-074A-503B-B17B-54B05684A120","calendarTime":"Mon Feb 12 20:16:40 2024 UTC",
+	"unixTime":1707769000,"epoch":0,"counter":0,"numerics":false,"decorations":{"host_uuid":"589966AE-074A-503B-B17B-54B05684A120",
+	"hostname":"foobar.local"}},{"snapshot":[{"build_distro":"10.14","build_platform":"darwin",
+	"config_hash":"d8d220440ebea888f8704c4a0a5c1ced4ab601b5","config_valid":"1","extensions":"active",
+	"instance_id":"522e6020-37de-460b-bb01-b76c77298f75","pid":"57456","platform_mask":"21","start_time":"1707768989",
+	"uuid":"408F3B27-434F-4776-8538-DA394A3D545F","version":"5.11.0","watcher":"57455"}],"action":"snapshot",
+	"name":"packFOOBARGlobalFOOBARQuery_28","hostIdentifier": "589966AE-074A-503B-B17B-54B05684A120","calendarTime":"Mon Feb 12 20:16:41 2024 UTC",
+	"unixTime":1707769001,"epoch":0,"counter":0,"numerics":false,"decorations":{"host_uuid":"408F3B27-434F-4776-8538-DA394A3D545F",
+	"hostname":"foobar.local"}}],"log_type":"result","node_key":"J9pA1CmjydHGi0bqS1XkkR9pOJQJzoPA"}`)
+	response, err := http.DefaultClient.Post(ts.URL, "", bytes.NewReader(requestBody))
+	require.NoError(t, err)
+	require.Equal(t, http.StatusMethodNotAllowed, response.StatusCode)
+}
+
+func TestAssetCacheControl(t *testing.T) {
+	for _, tc := range []struct {
+		path   string
+		status int
+		want   string
+	}{
+		// Content-hashed build output (JS/CSS, fonts, images) is safe to cache
+		// forever — webpack emits everything as [name]@[hash][ext].
+		{"/bundle-3ccf015bc0fac64b4ce8.js", http.StatusOK, "public, max-age=31536000, immutable"},
+		{"/bundle-1e51316ac7963e1112c1.css", http.StatusOK, "public, max-age=31536000, immutable"},
+		{"/Inter-Bold@1a2b3c4d5e6f7890.woff2", http.StatusOK, "public, max-age=31536000, immutable"},
+		{"/404-dark@1a2b3c4d5e6f7890.svg", http.StatusOK, "public, max-age=31536000, immutable"},
+		{"/jira-preview-400x419@2x@1a2b3c4d5e6f7890.png", http.StatusOK, "public, max-age=31536000, immutable"},
+		// A 304 keeps the immutable header (the cached copy is still valid).
+		{"/bundle-3ccf015bc0fac64b4ce8.js", http.StatusNotModified, "public, max-age=31536000, immutable"},
+		// A missing/errored hashed asset (deploy race) must NOT be cached for a
+		// year, or a transient failure would pin a broken asset at the CDN/browser.
+		{"/bundle-deadbeefdeadbeef.js", http.StatusNotFound, "no-cache"},
+		{"/Inter-Bold@deadbeef12345678.woff2", http.StatusInternalServerError, "no-cache"},
+		// Unhashed (dev builds, favicon, static scripts) must keep revalidating.
+		{"/bundle.js", http.StatusOK, "no-cache"},
+		{"/bundle.css", http.StatusOK, "no-cache"},
+		{"/favicon.ico", http.StatusOK, "no-cache"},
+		// status 0 = handler writes a body without calling WriteHeader, exercising
+		// the implicit-200 path in cacheControlResponseWriter.Write.
+		{"/bundle-3ccf015bc0fac64b4ce8.js", 0, "public, max-age=31536000, immutable"},
+	} {
+		t.Run(fmt.Sprintf("%s_%d", tc.path, tc.status), func(t *testing.T) {
+			handler := assetCacheControl(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+				if tc.status == 0 {
+					_, _ = w.Write([]byte("body"))
+					return
+				}
+				w.WriteHeader(tc.status)
+			}))
+			rec := httptest.NewRecorder()
+			handler.ServeHTTP(rec, httptest.NewRequest(http.MethodGet, tc.path, nil))
+			require.Equal(t, tc.want, rec.Header().Get("Cache-Control"))
+		})
+	}
+}
+
+func TestServeEndUserEnrollOTA(t *testing.T) {
+	if !hasBuildTag("full") {
+		t.Skip("This test requires running with -tags full")
+	}
+
+	ds := new(mock.DataStore)
+	ds.HasUsersFunc = func(ctx context.Context) (bool, error) {
+		return true, nil
+	}
+	appCfg := &fleet.AppConfig{
+		MDM: fleet.MDM{
+			EnabledAndConfigured:        false,
+			AndroidEnabledAndConfigured: false,
+		},
+	}
+	ds.AppConfigFunc = func(ctx context.Context) (*fleet.AppConfig, error) {
+		return appCfg, nil
+	}
+	ds.VerifyEnrollSecretFunc = func(ctx context.Context, secret string) (*fleet.EnrollSecret, error) {
+		return nil, &notFoundError{}
+	}
+	ds.TeamIDsWithSetupExperienceIdPEnabledFunc = func(ctx context.Context) ([]uint, error) {
+		return nil, nil
+	}
+
+	svc, _ := newTestService(t, ds, nil, nil)
+
+	for _, enabled := range []bool{true, false} {
+		t.Run(fmt.Sprintf("MDM enabled: %t", enabled), func(t *testing.T) {
+			appCfg.MDM.EnabledAndConfigured = enabled
+			appCfg.MDM.AndroidEnabledAndConfigured = enabled
+
+			logger := slog.New(slog.NewTextHandler(os.Stdout, nil))
+			h := ServeEndUserEnrollOTA(svc, "", ds, newMemKeyValueStore(), clock.C, logger, false)
+			ts := httptest.NewServer(h)
+			t.Cleanup(func() {
+				ts.Close()
+			})
+
+			// assert html is returned
+			response, err := http.DefaultClient.Get(ts.URL + "?enroll_secret=foo")
+			require.NoError(t, err)
+			require.Equal(t, http.StatusOK, response.StatusCode)
+			require.Equal(t, response.Header.Get("Content-Type"), "text/html; charset=utf-8")
+			assert.True(t, ds.AppConfigFuncInvoked)
+
+			// assert it contains the content we expect
+			defer response.Body.Close()
+			bodyBytes, err := io.ReadAll(response.Body)
+			require.NoError(t, err)
+			bodyString := string(bodyBytes)
+			require.Contains(t, bodyString, "api/v1/fleet/enrollment_profiles/ota?enroll_secret=foo")
+			require.Contains(t, bodyString, "/api/v1/fleet/android_enterprise/enrollment_token")
+			require.Contains(t, bodyString, fmt.Sprintf(`const ANDROID_MDM_ENABLED = "%t" === "true";`, enabled))
+			require.Contains(t, bodyString, fmt.Sprintf(`const MAC_MDM_ENABLED = "%t" == "true";`, enabled))
+		})
+	}
+}
+
+// ssoURLCaptureService captures the customOriginalURL passed to InitiateMDMSSO so
+// tests can assert which query parameters survive into the SAML round-trip.
+type ssoURLCaptureService struct {
+	fleet.Service
+	capturedOriginalURL string
+}
+
+func (s *ssoURLCaptureService) InitiateMDMSSO(_ context.Context, _, customOriginalURL, _ string) (string, int, string, error) {
+	s.capturedOriginalURL = customOriginalURL
+	return "session-id", 300, "https://idp.example.com/sso", nil
+}
+
+// The original URL is where the user lands after completing SAML auth, so any
+// enrollment query parameter (fully_managed, byod) must be threaded through it or
+// it is lost across the round-trip.
+func TestInitiateOTAEnrollSSOPersistsQueryParams(t *testing.T) {
+	for _, tc := range []struct {
+		name         string
+		query        string
+		wantContains []string
+		wantExcludes []string
+	}{
+		{
+			name:         "byod true is persisted",
+			query:        "byod=true",
+			wantContains: []string{"&byod=true"},
+		},
+		{
+			name:         "byod absent is not added",
+			query:        "",
+			wantExcludes: []string{"byod"},
+		},
+		{
+			name:         "byod false is not persisted",
+			query:        "byod=false",
+			wantExcludes: []string{"byod"},
+		},
+		{
+			name:         "byod and fully_managed both persisted",
+			query:        "byod=true&fully_managed=true",
+			wantContains: []string{"&byod=true", "&fully_managed=true"},
+		},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			svc := &ssoURLCaptureService{}
+			target := "/enroll?enroll_secret=foo"
+			if tc.query != "" {
+				target += "&" + tc.query
+			}
+			req := httptest.NewRequest(http.MethodGet, target, nil)
+			rec := httptest.NewRecorder()
+
+			err := initiateOTAEnrollSSO(svc, rec, req, "foo")
+			require.NoError(t, err)
+
+			require.Contains(t, svc.capturedOriginalURL, "enroll_secret=foo")
+			for _, want := range tc.wantContains {
+				require.Contains(t, svc.capturedOriginalURL, want)
+			}
+			for _, exclude := range tc.wantExcludes {
+				require.NotContains(t, svc.capturedOriginalURL, exclude)
+			}
+
+			// The handler should redirect the browser to the IdP.
+			require.Equal(t, http.StatusSeeOther, rec.Code)
+			require.Equal(t, "https://idp.example.com/sso", rec.Header().Get("Location"))
+		})
+	}
+}
+
+func TestServeEndUserEnrollOTAKeepsSessionForFullyManaged(t *testing.T) {
+	if !hasBuildTag("full") {
+		t.Skip("This test requires running with -tags full")
+	}
+
+	ds := new(mock.DataStore)
+	ds.HasUsersFunc = func(ctx context.Context) (bool, error) {
+		return true, nil
+	}
+	teamID := uint(1)
+	ds.VerifyEnrollSecretFunc = func(ctx context.Context, secret string) (*fleet.EnrollSecret, error) {
+		return &fleet.EnrollSecret{Secret: secret, TeamID: &teamID}, nil
+	}
+	ds.TeamLiteFunc = func(ctx context.Context, id uint) (*fleet.TeamLite, error) {
+		return &fleet.TeamLite{
+			ID: id,
+			Config: fleet.TeamConfigLite{
+				MDM: fleet.TeamMDM{
+					MacOSSetup: fleet.MacOSSetup{
+						EnableEndUserAuthentication: true,
+					},
+				},
+			},
+		}, nil
+	}
+	appCfg := &fleet.AppConfig{
+		MDM: fleet.MDM{
+			EnabledAndConfigured:        true,
+			AndroidEnabledAndConfigured: true,
+		},
+	}
+	ds.AppConfigFunc = func(ctx context.Context) (*fleet.AppConfig, error) {
+		return appCfg, nil
+	}
+
+	kv := newMemKeyValueStore()
+	svc, ctx := newTestService(t, ds, nil, nil, &TestServerOpts{KeyValueStore: kv})
+	logger := slog.New(slog.NewTextHandler(os.Stdout, nil))
+	h := ServeEndUserEnrollOTA(svc, "", ds, kv, clock.C, logger, false)
+	ts := httptest.NewServer(h)
+	t.Cleanup(func() {
+		ts.Close()
+	})
+
+	idpUUID := "test-idp-uuid-1234"
+	sessionID, err := shared_mdm.CreateBYODIdPSession(ctx, kv, clock.C, idpUUID)
+	require.NoError(t, err)
+
+	// The session must outlive the page: the token endpoint resolves it and
+	// only then ends it.
+	for _, query := range []string{"?enroll_secret=foo&fully_managed=true", "?enroll_secret=foo"} {
+		req, err := http.NewRequest("GET", ts.URL+query, nil)
+		require.NoError(t, err)
+		req.AddCookie(&http.Cookie{Name: shared_mdm.BYODIdpCookieName, Value: sessionID, Secure: true, HttpOnly: true, SameSite: http.SameSiteLaxMode})
+
+		response, err := fleethttp.NewClient(fleethttp.WithFollowRedir(false)).Do(req)
+		require.NoError(t, err)
+		defer response.Body.Close()
+		require.Equal(t, http.StatusOK, response.StatusCode)
+
+		for _, sc := range response.Header.Values("Set-Cookie") {
+			require.False(t,
+				bytes.Contains([]byte(sc), []byte(shared_mdm.BYODIdpCookieName)) &&
+					bytes.Contains([]byte(sc), []byte("Max-Age=0")),
+				"%s should not clear %s, got: %v", query, shared_mdm.BYODIdpCookieName, sc,
+			)
+		}
+		body, err := io.ReadAll(response.Body)
+		require.NoError(t, err)
+		require.NotContains(t, string(body), idpUUID)
+		require.NotContains(t, string(body), "IDP_UUID")
+	}
+}
+
+func TestServeEndUserEnrollOTARejectsUnknownSession(t *testing.T) {
+	ds := new(mock.Store)
+	ds.HasUsersFunc = func(ctx context.Context) (bool, error) { return true, nil }
+	ds.VerifyEnrollSecretFunc = func(ctx context.Context, secret string) (*fleet.EnrollSecret, error) {
+		return &fleet.EnrollSecret{Secret: secret}, nil
+	}
+	ds.AppConfigFunc = func(ctx context.Context) (*fleet.AppConfig, error) {
+		return &fleet.AppConfig{MDM: fleet.MDM{MacOSSetup: fleet.MacOSSetup{EnableEndUserAuthentication: true}}}, nil
+	}
+	kv := newMemKeyValueStore()
+	svc := &enrollPageService{}
+	h := ServeEndUserEnrollOTA(svc, "", ds, kv, clock.C, slog.New(slog.NewTextHandler(os.Stdout, nil)), false)
+	ts := httptest.NewServer(h)
+	t.Cleanup(ts.Close)
+
+	unknown := "not-a-session"
+	req, err := http.NewRequest("GET", ts.URL+"?enroll_secret=foo&fully_managed=true&enrollment_reference="+unknown, nil)
+	require.NoError(t, err)
+	req.AddCookie(&http.Cookie{Name: shared_mdm.BYODIdpCookieName, Value: unknown, Secure: true, HttpOnly: true, SameSite: http.SameSiteLaxMode})
+
+	resp, err := fleethttp.NewClient(fleethttp.WithFollowRedir(false)).Do(req)
+	require.NoError(t, err)
+	defer resp.Body.Close()
+	body, err := io.ReadAll(resp.Body)
+	require.NoError(t, err)
+
+	require.Equal(t, http.StatusSeeOther, resp.StatusCode)
+	require.NotEmpty(t, resp.Header.Get("Location"))
+	require.NotContains(t, string(body), unknown)
+}
+
+func newMemKeyValueStore() *mockredis.KeyValueStore {
+	var mu sync.Mutex
+	vals := map[string]string{}
+	return &mockredis.KeyValueStore{
+		SetFunc: func(_ context.Context, key, value string, _ time.Duration) error {
+			mu.Lock()
+			defer mu.Unlock()
+			vals[key] = value
+			return nil
+		},
+		GetFunc: func(_ context.Context, key string) (*string, error) {
+			mu.Lock()
+			defer mu.Unlock()
+			v, ok := vals[key]
+			if !ok {
+				return nil, nil
+			}
+			return &v, nil
+		},
+	}
+}
+
+// enrollPageService is the ssoURLCaptureService plus what /enroll asks of the
+// service before it decides to start SSO.
+type enrollPageService struct {
+	ssoURLCaptureService
+}
+
+func (s *enrollPageService) SetupRequired(context.Context) (bool, error) { return false, nil }

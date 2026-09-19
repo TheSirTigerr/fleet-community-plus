@@ -1,0 +1,60 @@
+.info-banner {
+  display: flex;
+  justify-content: space-between;
+  padding: $pad-medium;
+  gap: $pad-large; // Between text and CTA
+  font-size: $x-small;
+  font-weight: $regular;
+  color: $core-fleet-black;
+  line-height: $line-height;
+
+  &__page-banner {
+    padding: $pad-large $pad-xlarge;
+    width: auto;
+    gap: $pad-small;
+  }
+
+  // When a leading icon is rendered, group it with the copy on the left
+  // instead of pushing them to opposite edges with `space-between`.
+  &__icon {
+    justify-content: flex-start;
+    align-items: flex-start;
+    gap: $pad-small;
+  }
+
+  &__leading-icon {
+    flex-shrink: 0;
+    // Override .icon's `align-self: center` so a wrapping message keeps the
+    // icon lined up with the first line of text. The one-line-tall band +
+    // `align-items: center` centers the 16px svg on the first line of copy.
+    align-self: flex-start;
+    align-items: center;
+    height: calc(#{$x-small} * #{$line-height});
+  }
+
+  &__info {
+    // Do not use display flex as it will have adverse effects on spacing around HTML tags
+    align-content: center;
+    p {
+      margin: $pad-small 0 0 0; // TOFIX: this causes weird top margin noticed in #28110
+    }
+  }
+
+  &__cta {
+    display: flex;
+    align-items: center;
+    color: $core-fleet-black;
+    text-align: right;
+    gap: $pad-small;
+    min-width: max-content;
+    margin-left: $pad-small;
+
+    button {
+      margin-left: $pad-small;
+    }
+  }
+
+  &__close {
+    margin: -$pad-medium; // Offset clickable padding from making banner taller
+  }
+}

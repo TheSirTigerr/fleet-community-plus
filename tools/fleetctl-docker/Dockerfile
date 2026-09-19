@@ -1,0 +1,39 @@
+FROM rust:latest@sha256:563b33de55d0add224b2e301182660b59bf3cf7219e9dc0fda68f8500e5fe14a AS builder
+
+ARG transporter_url=https://itunesconnect.apple.com/WebObjects/iTunesConnect.woa/ra/resources/download/public/Transporter__Linux/bin
+
+RUN cargo install --locked --version 0.28.0 apple-codesign \
+  && curl -sSf $transporter_url -o transporter_install.sh \
+  && sh transporter_install.sh --target transporter --accept --noexec
+
+FROM debian:trixie-slim@sha256:f6e2cfac5cf956ea044b4bd75e6397b4372ad88fe00908045e9a0d21712ae3ba
+
+LABEL maintainer="Fleet Developers"
+LABEL org.opencontainers.image.vendor="Fleet Device Management Inc."
+LABEL org.opencontainers.image.title="fleetctl"
+LABEL org.opencontainers.image.source="https://github.com/fleetdm/fleet"
+LABEL org.opencontainers.image.url="https://fleetdm.com"
+LABEL org.opencontainers.image.documentation="https://fleetdm.com/docs"
+
+ARG binpath=build/binary-bundle/linux/fleetctl
+
+RUN apt-get update \
+  && dpkg --add-architecture i386 \
+  && apt update \
+  && apt upgrade -y \
+  && apt install -y --no-install-recommends ca-certificates cpio libxml2 wine wine32 libgtk-3-0 \
+  && rm -rf /var/lib/apt/lists/* 
+
+# copy macOS dependencies
+COPY --from=builder /transporter/itms /usr/local/
+COPY --from=builder /usr/local/cargo/bin/rcodesign /usr/local/bin
+
+# copy Windows dependencies
+COPY --from=fleetdm/wix:latest /home/wine /home/wine
+
+# copy fleetctl
+COPY ${binpath} /usr/bin/fleetctl
+
+ENV FLEETCTL_NATIVE_TOOLING=1 WINEPREFIX=/home/wine/.wine WINEARCH=win32 PATH="/home/wine/bin:$PATH" WINEDEBUG=-all
+
+ENTRYPOINT ["fleetctl"]

@@ -1,0 +1,253 @@
+import React, { useState, useContext } from "react";
+import { InjectedRouter } from "react-router";
+
+import Button from "components/buttons/Button";
+import CustomLink from "components/CustomLink";
+// @ts-ignore
+import ChangeEmailForm from "components/forms/ChangeEmailForm";
+// @ts-ignore
+import ChangePasswordForm from "components/forms/ChangePasswordForm";
+import InputFieldHiddenContent from "components/forms/fields/InputFieldHiddenContent";
+// @ts-ignore
+import UserSettingsForm from "components/forms/UserSettingsForm";
+import InfoBanner from "components/InfoBanner";
+import MainContent from "components/MainContent";
+// @ts-ignore
+import Modal from "components/Modal";
+import SidePanelContent from "components/SidePanelContent";
+import SidePanelPage from "components/SidePanelPage";
+import { notify } from "components/ToastNotification";
+import { AppContext } from "context/app";
+import { IUser } from "interfaces/user";
+import usersAPI from "services/entities/users";
+import authToken from "utilities/auth_token";
+import deepDifference from "utilities/deep_difference";
+import formatErrorResponse from "utilities/format_error_response";
+
+import AccountSidePanel from "./AccountSidePanel";
+import { getErrorMessage } from "./helpers";
+
+const baseClass = "account-page";
+
+interface IAccountPageProps {
+  router: InjectedRouter;
+}
+
+const AccountPage = ({ router }: IAccountPageProps): JSX.Element | null => {
+  const { config, currentUser } = useContext(AppContext);
+
+  const [pendingEmail, setPendingEmail] = useState("");
+  const [showEmailModal, setShowEmailModal] = useState(false);
+  const [showPasswordModal, setShowPasswordModal] = useState(false);
+  const [updatedUser, setUpdatedUser] = useState<Partial<IUser>>({});
+  const [showApiTokenModal, setShowApiTokenModal] = useState(false);
+  const [errors, setErrors] = useState<{ [key: string]: string }>({});
+
+  const onCancel = (evt: React.MouseEvent<HTMLButtonElement>) => {
+    evt.preventDefault();
+    return router.goBack();
+  };
+
+  const onShowPasswordModal = () => {
+    setShowPasswordModal(true);
+    return false;
+  };
+
+  const onShowApiTokenModal = () => {
+    setShowApiTokenModal(true);
+    return false;
+  };
+
+  const onToggleEmailModal = (updated = {}) => {
+    setShowEmailModal(!showEmailModal);
+    setUpdatedUser(updated);
+    return false;
+  };
+
+  const onTogglePasswordModal = () => {
+    setShowPasswordModal(!showPasswordModal);
+    return false;
+  };
+
+  const onToggleApiTokenModal = () => {
+    setShowApiTokenModal(!showApiTokenModal);
+    return false;
+  };
+
+  const handleSubmit = async (formData: Partial<IUser>) => {
+    if (!currentUser) {
+      return false;
+    }
+
+    const updated = deepDifference(formData, currentUser);
+
+    if (updated.email && !updated.password) {
+      return onToggleEmailModal(updated);
+    }
+
+    try {
+      await usersAPI.update(currentUser.id, updated);
+      let accountUpdatedFlashMessage = "Account updated";
+      if (updated.email) {
+        // always present, this for typing
+        const senderAddressMessage = config?.smtp_settings?.sender_address
+          ? ` from ${config?.smtp_settings?.sender_address}`
+          : "";
+        accountUpdatedFlashMessage += `: A confirmation email was sent${senderAddressMessage} to ${updated.email}`;
+        setPendingEmail(updated.email);
+      }
+
+      notify.success(accountUpdatedFlashMessage);
+      return true;
+    } catch (response) {
+      const errorObject = formatErrorResponse(response);
+      setErrors(errorObject);
+      notify.error(
+        errorObject.base.includes("already exists")
+          ? "A user with this email address already exists."
+          : "Could not edit user. Please try again.",
+        { response }
+      );
+
+      setShowEmailModal(false);
+      return false;
+    }
+  };
+
+  const handleSubmitPasswordForm = async (formData: {
+    old_password: string;
+    new_password: string;
+  }) => {
+    try {
+      await usersAPI.changePassword(formData);
+      notify.success("Password changed successfully");
+      setShowPasswordModal(false);
+    } catch (e) {
+      notify.error(getErrorMessage(e), { response: e });
+    }
+  };
+
+  const renderEmailModal = () => {
+    const emailSubmit = (formData: Partial<IUser>) => {
+      handleSubmit(formData).then((r?: boolean) => {
+        return r ? onToggleEmailModal() : false;
+      });
+    };
+
+    if (!showEmailModal) {
+      return false;
+    }
+
+    return (
+      <Modal title="Confirm email update" onExit={onToggleEmailModal}>
+        <ChangeEmailForm
+          formData={updatedUser}
+          handleSubmit={emailSubmit}
+          onCancel={onToggleEmailModal}
+          serverErrors={errors}
+        />
+      </Modal>
+    );
+  };
+
+  const renderPasswordModal = () => {
+    if (!showPasswordModal) {
+      return false;
+    }
+
+    return (
+      <Modal title="Change password" onExit={onTogglePasswordModal}>
+        <ChangePasswordForm
+          handleSubmit={handleSubmitPasswordForm}
+          onCancel={onTogglePasswordModal}
+        />
+      </Modal>
+    );
+  };
+
+  const renderApiTokenModal = () => {
+    if (!showApiTokenModal) {
+      return false;
+    }
+
+    // TODO - move to its own component
+    return (
+      <Modal
+        title="Get API token"
+        onExit={onToggleApiTokenModal}
+        onEnter={onToggleApiTokenModal}
+      >
+        <InfoBanner>
+          <p>
+            <strong>This token expires.</strong> If you want an API key for a
+            permanent integration, create an&nbsp;
+            <CustomLink
+              url="https://fleetdm.com/docs/using-fleet/fleetctl-cli?utm_medium=fleetui&utm_campaign=get-api-token#using-fleetctl-with-an-api-only-user"
+              text="API-only user"
+              newTab
+              variant="banner-link"
+            />
+            &nbsp;instead.
+          </p>
+        </InfoBanner>
+        <InputFieldHiddenContent
+          value={authToken.get() || ""}
+          helpText={
+            <>
+              This token is intended for SSO users to authenticate in the
+              fleetctl CLI. It expires based on the{" "}
+              <CustomLink
+                url="https://fleetdm.com/docs/deploying/configuration?utm_medium=fleetui&utm_campaign=get-api-token#session-duration"
+                text="session duration configuration"
+                newTab
+              />
+            </>
+          }
+        />
+        <div className="modal-cta-wrap">
+          <Button onClick={onToggleApiTokenModal} type="button">
+            Close
+          </Button>
+        </div>
+      </Modal>
+    );
+  };
+
+  if (!currentUser) {
+    return null;
+  }
+
+  return (
+    <SidePanelPage>
+      <>
+        <MainContent className={baseClass}>
+          <>
+            <div className={`${baseClass}__manage`}>
+              <h1>My account</h1>
+              <UserSettingsForm
+                formData={currentUser}
+                handleSubmit={handleSubmit}
+                onCancel={onCancel}
+                pendingEmail={pendingEmail}
+                serverErrors={errors}
+                smtpConfigured={config?.smtp_settings?.configured || false}
+              />
+            </div>
+            {renderEmailModal()}
+            {renderPasswordModal()}
+            {renderApiTokenModal()}
+          </>
+        </MainContent>
+        <SidePanelContent>
+          <AccountSidePanel
+            currentUser={currentUser}
+            onChangePassword={onShowPasswordModal}
+            onGetApiToken={onShowApiTokenModal}
+          />
+        </SidePanelContent>
+      </>
+    </SidePanelPage>
+  );
+};
+
+export default AccountPage;

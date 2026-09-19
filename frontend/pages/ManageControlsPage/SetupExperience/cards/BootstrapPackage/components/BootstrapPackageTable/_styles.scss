@@ -1,0 +1,24 @@
+.bootstrap-package-table {
+  // keep a minimum height to prevent UI jumping when the table data is done
+  // loading.
+  min-height: 191px;
+
+  // some data table overrides to display the table correctly
+  .data-table-block .data-table {
+    tbody td .w250 {
+      min-width: auto;
+    }
+
+    &__wrapper {
+      margin-top: 0;
+    }
+  }
+
+  @media (max-width: $break-lg) {
+    .view-hosts-link {
+      span {
+        display: none;
+      }
+    }
+  }
+}

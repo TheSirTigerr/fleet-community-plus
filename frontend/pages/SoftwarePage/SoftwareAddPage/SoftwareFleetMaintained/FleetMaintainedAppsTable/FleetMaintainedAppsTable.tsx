@@ -1,0 +1,299 @@
+import React, { useCallback, useMemo } from "react";
+import { InjectedRouter } from "react-router";
+
+import CustomLink from "components/CustomLink";
+import EmptyState from "components/EmptyState";
+import TableContainer from "components/TableContainer";
+import { ITableQueryData } from "components/TableContainer/TableContainer";
+import TableCount from "components/TableContainer/TableCount";
+import {
+  FleetMaintainedAppPlatform,
+  ICombinedFMA,
+  IFleetMaintainedApp,
+} from "interfaces/software";
+import PATHS from "router/paths";
+import { ISoftwareFleetMaintainedAppsResponse } from "services/entities/software";
+import { getNextLocationPath } from "utilities/helpers";
+
+import { generateTableConfig } from "./FleetMaintainedAppsTableConfig";
+import {
+  FmaStatusFilter,
+  FmaPlatformFilter,
+  FmaPlatformValue,
+  FmaStatusValue,
+} from "./FmaFilters/FmaFilters";
+
+const baseClass = "fleet-maintained-apps-table";
+
+const EmptyFleetAppsTable = () => (
+  <EmptyState
+    header="No items match the current search criteria"
+    info={
+      <>
+        Can&apos;t find app?{" "}
+        <CustomLink
+          newTab
+          url="https://fleetdm.com/feature-request"
+          text="File an issue on GitHub"
+        />
+      </>
+    }
+  />
+);
+
+/** Converts the FleetMaintainedApp API response, which has separate macOS and
+ * Windows entries, into a table-friendly format that combines an app's entries
+ * for different platforms into one row. Apps are keyed by their slug token (the
+ * prefix before "/"), not by name, so two distinct apps that share a display
+ * name stay as separate rows. */
+export const combineAppsByPlatform = (
+  fmaList: IFleetMaintainedApp[]
+): ICombinedFMA[] => {
+  const combinedApps: { [appToken: string]: ICombinedFMA } = {};
+
+  fmaList.forEach((app: IFleetMaintainedApp) => {
+    const { name, platform, ...rest } = app;
+    const appToken = app.slug.split("/")[0];
+
+    if (!combinedApps[appToken]) {
+      combinedApps[appToken] = { name, macos: null, windows: null };
+    }
+
+    if (platform === "darwin") {
+      combinedApps[appToken].macos = {
+        platform: platform as FleetMaintainedAppPlatform,
+        ...rest,
+      };
+    } else if (platform === "windows") {
+      combinedApps[appToken].windows = {
+        platform: platform as FleetMaintainedAppPlatform,
+        ...rest,
+      };
+    }
+  });
+
+  return Object.values(combinedApps);
+};
+
+interface IFleetMaintainedAppsTableProps {
+  teamId: number;
+  isLoading: boolean;
+  query: string;
+  perPage: number;
+  orderDirection: "asc" | "desc";
+  orderKey: string;
+  platformParam?: FmaPlatformValue;
+  statusParam?: FmaStatusValue;
+  currentPage: number;
+  router: InjectedRouter;
+  data?: ISoftwareFleetMaintainedAppsResponse;
+}
+
+interface IRowProps {
+  original: IFleetMaintainedApp;
+}
+
+const FleetMaintainedAppsTable = ({
+  teamId,
+  isLoading,
+  data,
+  router,
+  query,
+  perPage,
+  orderDirection,
+  platformParam,
+  statusParam,
+  orderKey,
+  currentPage,
+}: IFleetMaintainedAppsTableProps) => {
+  // Filter values are driven by the URL, which is also the source of truth for
+  // the server-side query. Derive them from props rather than local state so
+  // the controls stay in sync on back/forward navigation.
+  const status: FmaStatusValue = statusParam || "all";
+  const platform: FmaPlatformValue = platformParam || "all";
+
+  const determineQueryParamChange = useCallback(
+    (newTableQuery: ITableQueryData) => {
+      const changedEntry = Object.entries(newTableQuery).find(([key, val]) => {
+        switch (key) {
+          case "searchQuery":
+            return val !== query;
+          case "sortDirection":
+            return val !== orderDirection;
+          case "sortHeader":
+            return val !== orderKey;
+          case "pageIndex":
+            return val !== currentPage;
+          case "platform":
+            return val !== platformParam;
+          case "status":
+            return val !== statusParam;
+          default:
+            return false;
+        }
+      });
+      return changedEntry?.[0] ?? "";
+    },
+    [currentPage, orderDirection, orderKey, query, platformParam, statusParam]
+  );
+
+  const generateNewQueryParams = useCallback(
+    (
+      newTableQuery: ITableQueryData,
+      changedParam: string,
+      nextPlatform: FmaPlatformValue,
+      nextStatus: FmaStatusValue
+    ) => {
+      const newQueryParam: Record<string, string | number | undefined> = {
+        query: newTableQuery.searchQuery,
+        fleet_id: teamId,
+        order_direction: newTableQuery.sortDirection,
+        order_key: newTableQuery.sortHeader,
+        page: changedParam === "pageIndex" ? newTableQuery.pageIndex : 0,
+        platform: nextPlatform === "all" ? undefined : nextPlatform,
+        status: nextStatus === "all" ? undefined : nextStatus,
+      };
+
+      return newQueryParam;
+    },
+    [teamId]
+  );
+
+  // NOTE: this is called once on initial render and every time the query changes
+  const onQueryChange = useCallback(
+    (newTableQuery: ITableQueryData) => {
+      // we want to determine which query param has changed in order to
+      // reset the page index to 0 if any other param has changed.
+      const changedParam = determineQueryParamChange(newTableQuery);
+
+      // if nothing has changed, don't update the route. this can happen when
+      // this handler is called on the inital render. Can also happen when
+      // the filter dropdown is changed. That is handled on the onChange handler
+      // for the dropdown.
+      if (changedParam === "") return;
+
+      const newRoute = getNextLocationPath({
+        pathPrefix: PATHS.SOFTWARE_ADD_FLEET_MAINTAINED,
+        routeTemplate: "",
+        queryParams: generateNewQueryParams(
+          newTableQuery,
+          changedParam,
+          platform,
+          status
+        ),
+      });
+
+      router.replace(newRoute);
+    },
+    [
+      determineQueryParamChange,
+      generateNewQueryParams,
+      router,
+      platform,
+      status,
+    ]
+  );
+
+  const tableHeadersConfig = useMemo(() => {
+    if (!data) return [];
+    return generateTableConfig(router, teamId);
+  }, [data, router, teamId]);
+
+  // Pagination, platform/"hide added apps" filtering, sort, and counts are all
+  // handled server-side. The API returns every platform row for the apps on the
+  // current page, so combining macOS and Windows entries here always yields
+  // complete rows (an app is never split across a page boundary).
+  const combinedAppsByPlatform =
+    (data && combineAppsByPlatform(data.fleet_maintained_apps ?? [])) ?? [];
+
+  const renderCount = () => {
+    if (!data) return null;
+
+    return <TableCount name="items" count={data.count} />;
+  };
+
+  const handleFmaStatusDropdownChange = (newStatus: FmaStatusValue) => {
+    const newRoute = getNextLocationPath({
+      pathPrefix: PATHS.SOFTWARE_ADD_FLEET_MAINTAINED,
+      routeTemplate: "",
+      queryParams: generateNewQueryParams(
+        {
+          searchQuery: query,
+          sortDirection: orderDirection,
+          sortHeader: orderKey,
+          pageIndex: currentPage,
+          pageSize: perPage,
+        },
+        "status",
+        platform,
+        newStatus
+      ),
+    });
+
+    router.replace(newRoute);
+  };
+
+  const handleFmaPlatformDropdownChange = (newPlatform: FmaPlatformValue) => {
+    const newRoute = getNextLocationPath({
+      pathPrefix: PATHS.SOFTWARE_ADD_FLEET_MAINTAINED,
+      routeTemplate: "",
+      queryParams: generateNewQueryParams(
+        {
+          searchQuery: query,
+          sortDirection: orderDirection,
+          sortHeader: orderKey,
+          pageIndex: currentPage,
+          pageSize: perPage,
+        },
+        "platform",
+        newPlatform,
+        status
+      ),
+    });
+
+    router.replace(newRoute);
+  };
+
+  const renderCustomControls = () => (
+    <div className={`${baseClass}__filters`}>
+      <FmaStatusFilter
+        value={status}
+        onChange={handleFmaStatusDropdownChange}
+        className={`${baseClass}__status-filter`}
+      />
+      <FmaPlatformFilter
+        value={platform}
+        onChange={handleFmaPlatformDropdownChange}
+        className={`${baseClass}__platform-filter`}
+      />
+    </div>
+  );
+
+  return (
+    <TableContainer<IRowProps>
+      className={baseClass}
+      columnConfigs={tableHeadersConfig}
+      data={combinedAppsByPlatform}
+      isLoading={isLoading}
+      resultsTitle="items"
+      emptyComponent={EmptyFleetAppsTable}
+      defaultSortHeader={orderKey}
+      defaultSortDirection={orderDirection}
+      pageIndex={currentPage}
+      defaultSearchQuery={query}
+      manualSortBy
+      pageSize={perPage}
+      showMarkAllPages={false}
+      isAllPagesSelected={false}
+      disableNextPage={!data?.meta.has_next_results}
+      searchable
+      inputPlaceHolder="Search by name"
+      onQueryChange={onQueryChange}
+      renderCount={renderCount}
+      customControl={renderCustomControls}
+      stackControls
+    />
+  );
+};
+
+export default FleetMaintainedAppsTable;

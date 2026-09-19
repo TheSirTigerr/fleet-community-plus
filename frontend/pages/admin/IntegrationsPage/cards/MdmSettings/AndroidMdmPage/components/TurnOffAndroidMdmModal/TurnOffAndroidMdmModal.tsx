@@ -1,0 +1,89 @@
+import React, { useCallback, useContext, useState } from "react";
+import { useQueryClient } from "react-query";
+import { InjectedRouter } from "react-router";
+
+import Button from "components/buttons/Button";
+import GitOpsModeTooltipWrapper from "components/GitOpsModeTooltipWrapper";
+import Modal from "components/Modal";
+import { notify } from "components/ToastNotification";
+import { AppContext } from "context/app";
+import { IConfig } from "interfaces/config";
+import PATHS from "router/paths";
+import mdmAndroidAPI from "services/entities/mdm_android";
+
+const baseClass = "turn-off-android-mdm-modal";
+
+interface ITurnOffAndroidMdmModalProps {
+  onExit: () => void;
+  router: InjectedRouter;
+}
+
+const TurnOffAndroidMdmModal = ({
+  onExit,
+  router,
+}: ITurnOffAndroidMdmModalProps) => {
+  const { setConfig } = useContext(AppContext);
+  const queryClient = useQueryClient();
+
+  const [isDeleting, setIsDeleting] = useState(false);
+
+  const onClickConfirm = useCallback(async () => {
+    setIsDeleting(true);
+    try {
+      await mdmAndroidAPI.turnOffAndroidMdm();
+    } catch (e) {
+      onExit();
+      notify.error("Couldn't turn off Android MDM. Please try again.", {
+        response: e,
+      });
+      return;
+    }
+    // DELETE success means the backend has already cleared
+    // android_enabled_and_configured. Patch the in-memory config so the
+    // parent MDM page's card flips immediately on redirect.
+    const prevConfig = queryClient.getQueryData<IConfig>(["config"]);
+    if (prevConfig) {
+      const patched: IConfig = {
+        ...prevConfig,
+        mdm: { ...prevConfig.mdm, android_enabled_and_configured: false },
+      };
+      setConfig(patched);
+      queryClient.setQueryData(["config"], patched);
+    }
+    notify.success("Android MDM turned off successfully.");
+    router.push(PATHS.ADMIN_INTEGRATIONS_MDM);
+  }, [onExit, queryClient, router, setConfig]);
+
+  return (
+    <Modal title="Turn off Android MDM" className={baseClass} onExit={onExit}>
+      <p>
+        If you want to use MDM features again, you&apos;ll have to reconnect
+        Android Enterprise.
+      </p>
+      <p>
+        End users will lose access to organization resources and all data in
+        their Android work partition.
+      </p>
+      <div className="modal-cta-wrap">
+        <GitOpsModeTooltipWrapper
+          tipOffset={8}
+          renderChildren={(disableChildren) => (
+            <Button
+              variant="alert"
+              isLoading={isDeleting}
+              disabled={isDeleting || disableChildren}
+              onClick={onClickConfirm}
+            >
+              Turn off
+            </Button>
+          )}
+        />
+        <Button variant="secondary" disabled={isDeleting} onClick={onExit}>
+          Cancel
+        </Button>
+      </div>
+    </Modal>
+  );
+};
+
+export default TurnOffAndroidMdmModal;

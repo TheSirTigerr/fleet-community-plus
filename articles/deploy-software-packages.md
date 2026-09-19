@@ -1,0 +1,188 @@
+# Deploy software
+
+![Deploy software](../website/assets/images/articles/deploy-security-agents-1600x900@2x.png)
+
+_Available in Fleet Premium_
+
+In Fleet you can deploy [Fleet-maintained apps](https://fleetdm.com/guides/fleet-maintained-apps), [App Store (VPP) apps](https://fleetdm.com/guides/install-app-store-apps), and custom packages to your hosts.
+
+This guide will walk you through steps to manually install custom packages on your hosts.
+
+Learn more about automatically installing software [the Automatically install software guide](https://fleetdm.com/guides/automatic-software-install-in-fleet).
+
+## Prerequisites
+
+* `fleetd` deployed with the `--enable-scripts` flag. If you're using MDM features, scripts are enabled by default.
+
+* If you're self-hosting Fleet, you need an S3 bucket [configured](https://fleetdm.com/docs/configuration/fleet-server-configuration#s-3-software-installers-bucket) to store the packages. Increase any load balancer timeouts to at least 5 minutes for the [Add package](https://fleetdm.com/docs/rest-api/rest-api#add-package) and [Modify package](https://fleetdm.com/docs/rest-api/rest-api#modify-package) API endpoints.
+
+## Add a custom package
+
+* Navigate to the **Software** page.
+* Select a fleet
+> Software cannot be added to "All fleets"
+* Click the **Add software** button in the top right corner.
+* Select the **Custom package** tab.
+* Choose a file to upload. `.pkg`, `.msi`, `.exe`, `.rpm`, `.deb`, `.ipa`, `.tar.gz`, `.sh`, `.py`, and `.ps1` files are supported.
+* To customize installer behavior, click on **Advanced options**.
+
+> After the initial package upload, all options can be modified by editing the software. This includes self-service, targets, advanced options (pre-install query, scripts), and the software package file. However, if the installer package needs to be replaced, the new package must be of the same file type (such as .pkg, .msi, .exe, .deb, .rpm, or .ipa) and for the same software as the original. Files in .dmg or .zip formats cannot be edited or uploaded for replacement. To enable automatic installs, follow the steps in our [automatic software install guide](https://fleetdm.com/guides/automatic-software-install-in-fleet).
+
+### Package metadata extraction
+
+The following metadata is used in uninstall scripts and policies that trigger automatic installation to check whether the software is already installed:
+- bundle identifier (`.pkg`)
+- product code (`.msi`)
+- name (`.deb`, `.rpm`)
+
+Software installer uploads will fail if Fleet can't extract this metadata and version number. For more details check the extractor code for each package type.
+- [.pkg extractor code](https://github.com/fleetdm/fleet/blob/main/pkg/file/xar.go#:~:text=func%20ExtractXARMetadata)
+- [.msi extractor code](https://github.com/fleetdm/fleet/blob/main/pkg/file/msi.go#:~:text=func%20ExtractMSIMetadata)
+- [.exe extractor code](https://github.com/fleetdm/fleet/blob/main/pkg/file/pe.go#:~:text=func%20ExtractPEMetadata)
+- [.deb extractor code](https://github.com/fleetdm/fleet/blob/main/pkg/file/deb.go#:~:text=func%20ExtractDebMetadata)
+- [.rpm extractor code](https://github.com/fleetdm/fleet/blob/main/pkg/file/rpm.go#:~:text=func%20ExtractRPMMetadata)
+- [.ipa extractor code](https://github.com/fleetdm/fleet/blob/main/pkg/file/ipa.go#:~:text=func%20ExtractIPAMetadata)
+
+.tar.gz archives are uploaded as-is without attempting to pull metadata, and will be added successfully as long as they are valid archives, and as long as install and uninstall scripts are supplied.
+
+> Fleet regularly enhances its metadata extraction logic, which can change how packages are matched to software inventory. When this happens, you may see this error: "The selected package is for different software." To fix it, delete and re-add the package.
+
+### Script-only packages
+
+Script-only packages (`.sh`, `.py`, and `.ps1` files) are packages that only contain a script that runs directly on hosts without installing traditional software. The script file's contents become the install script.  The `.sh` and `.py` files are supported for macOS and Linux hosts, and `.ps1` files for Windows hosts.
+
+Script-only packages are useful for:
+- Self-service scripts (e.g., connecting to a VPN, configuring printers)
+- Running maintenance tasks on demand
+- Deploying configuration changes that don't require a traditional installer
+
+
+Script packages do not support `install_script` (the file contents are the install script) or automatic install. They do support `uninstall_script`, `post_install_script`, and `pre_install_query`.
+
+If an `install_script` is provided when uploading a script package, it will be ignored.
+
+
+### Pre-install query
+
+A pre-install query is a valid osquery SQL statement that will be evaluated on the host before installing the software. If provided, the installation will proceed only if the query returns any value.
+
+### Install script
+
+After selecting a file, a default install script will be pre-filled for most installer types. If the software package requires a custom installation process (for example, for .tar.gz archives and [EXE-based Windows installers](https://fleetdm.com/learn-more-about/exe-install-scripts)), this script can be edited. When the script is run, the `$INSTALLER_PATH` environment variable will be set by `fleetd` to where the installer is being run. `$INSTALLER_PATH` will be inside a temporary directory created by the operating system (e.g. `/tmp/[random string]` on Linux hosts).
+
+> For .tar.gz archives, fleetd 1.42.0 or later will extract the archive into `$INSTALLER_PATH` before handing control over to your install script, and will clean this directory up after the install script concludes. Symlinks inside .tar.gz archives are skipped during extraction. If your archive contains symlinks, reference the symlink's target path directly in your install script instead.
+> 
+> For example, with Postman's [Linux installer](https://dl.pstmn.io/download/latest/linux64), the downloaded tarball contents look like this:
+> 
+> ```bash
+> $ tar -tvf postman-linux-x64.tar.gz
+> drwxrwxr-x  0 circleci circleci    0 Aug 14 18:32 Postman/
+> lrwxrwxrwx  0 circleci circleci    0 Aug 14 18:32 Postman/Postman -> app/Postman
+> drwxrwxr-x  0 circleci circleci    0 Aug 14 18:32 Postman/app/
+> ...
+> ```
+> 
+> In this case, don't reference the symlink at `Postman/Postman`, but the original file at `Postman/app/Postman`.
+
+### Post-install script
+
+A post-install script will run after the installation, allowing you to, for example, configure the security agent right after installation. If this script returns a non-zero exit code, the installation will fail, and `fleetd` will attempt to uninstall the software.
+
+### Uninstall script
+
+An uninstall script will run when an admin chooses to uninstall the software from the host on the host details page, or if the post-install script (if supplied) fails. Like the install script, a default uninstall script will be pre-filled after selecting a file for most installer formats, other than EXE-based installers and .tar.gz archives. This script can be edited if the software package requires a custom uninstallation process.
+
+You can use `$PACKAGE_ID` in uninstall scripts as a placeholder for the package IDs (for .pkg files), package name (for Linux installers), product code (for MSIs), or software name (for EXE installers). The Fleet server will substitute `$PACKAGE_ID` on upload.
+
+Fleet also provides an `$UPGRADE_CODE` placeholder for MSIs. This placeholder is replaced with the `UpgradeCode` extracted from the MSI on upload. If Fleet cannot extract an upgrade code from an MSI when using the default uninstall script, Fleet will use a product code-based uninstall script instead. If Fleet cannot extract an upgrade code from an MSI when a user-provided uninstall script uses the placeholder, the software upload will fail.
+
+> Currently, the default MSI uninstaller script only uninstalls that exact installer, rather than earlier/later versions of the same application.
+
+> Uninstall scripts do _not_ download the installer package to a host before running; if a .tar.gz archive includes an uninstall script, the contents of that script and any dependencies should be copied into the uninstall script text field rather than referred to by filename.
+
+## Add multiple packages to the same fleet
+
+You can add up to 10 custom packages of the same software to a fleet. This lets you support multiple architectures (for example, Arm and Intel builds) or run a staged rollout (a stable build for all hosts plus a newer build scoped to a test group) without creating separate fleets.
+
+To add another package to a software:
+
+* Navigate to the **Software** page, select a fleet, and select the **Library** tab.
+* Select the software.
+* In the **Library** section of the **Software details** page, select **Add package**.
+* Choose a file to upload, set the **Target**, and configure any advanced options.
+
+Each package has its own [target labels](https://fleetdm.com/guides/managing-labels-in-fleet), [self-service](https://fleetdm.com/guides/software-self-service) availability, categories, and advanced options. Scope each package to a distinct set of labels so that each host matches only one package.
+
+> If multiple packages target the same host, Fleet installs the one that was added first.
+
+During [setup experience](https://fleetdm.com/guides/setup-experience), Fleet installs the package that was added first. Labels don't apply during setup experience.
+
+Fleet identifies packages by their contents, so you can add different builds of the same version. Uploading the exact same file again is rejected.
+
+
+Script-only packages (`.sh` and `.ps1`) can also be added multiple times to the same software item. Fleet uses the filename as a unique identifier to group multiple script-only packages into the same software.
+
+## Install the package
+
+After a software package is added to a fleet, it can be installed on hosts via the UI.
+
+* Navigate to the **Hosts** page.
+* Select the host where you want to install the software package.
+* Select **Software > Library** on the host details page.
+* Use the dropdown to select software **Available for install** or use the search bar to search for your software by name.
+* Select **Install** action in the rightmost column of the table. Install will happen automatically or when the host comes online.
+* Check install status in the **Host > Software > Library > Status column** or the **Host > Details > Activity**.
+
+Once the package is installed, Fleet will automatically refetch the host's vitals and update the software inventory.
+
+> .ipa apps on iOS/iPadOS will be uninstalled when the host is unenrolled from MDM.
+
+> Software installs are automatically attempted up to 3 times (1 initial attempt + 2 retries) to handle intermittent network issues or temporary failures. IT admins can see error messages for all attempts in the **Host details > Activity** card.
+
+## Edit the package
+
+* Navigate to the **Software** page, choose a fleet, and select the **Library** tab.
+* Select the software you want to edit.
+* On the **Software details** page, select **Edit** next to a package in the **Library** section to edit that package's [self-service](https://fleetdm.com/guides/software-self-service) status, change its target to different sets of hosts, or edit advanced options like pre-install query, install script, post-install script, and uninstall script. Each package is edited separately.
+* Select **Actions > Edit appearance** to edit the software's icon and display name. The icon and display name can be edited for software that is available for install. The new icon and display name will appear on the software list and details pages for the fleet where the package is uploaded, as well as on **My device > Self-service**. If the display name is not set, then the default name (ingested by osquery) will be used.
+
+> Editing the advanced options cancels all pending installations and uninstallations for that package. Installs and uninstalls currently running on a host will complete, but results won't appear in Fleet. The software's host counts will be reset.
+
+## Uninstall the package
+
+After a software package is installed on a host, it can be uninstalled on the host via the UI.
+
+* Navigate to the **Hosts** page.
+* Select the host from which you want to uninstall the software package.
+* Select **Software > Library** on the host details page.
+* Use the dropdown to select software **Available for install** or use the search bar to search for your software by name.
+* Select the **Install** action in the rightmost column of the table. Uninstall will happen automatically or when the host comes online.
+* Check the uninstall status in the **Host > Software > Library > Status column** or the **Host > Details > Activity**.
+
+## Delete the package
+
+* Navigate to the **Software** page, choose a fleet, and select the **Library** tab.
+* Select the software you want to delete.
+* On the **Software details** page, select the **Delete** icon next to a package in the **Library** section to delete that package. If a title has more than one package, the remaining packages stay intact.
+
+> Deleting a software package from a fleet will cancel pending installs for hosts that are not in the middle of installing the software, but will not uninstall the software from hosts where it is already installed.
+
+## Manage packages with Fleet's REST API
+
+Fleet also provides a REST API for managing software programmatically. The API allows you to add, update, retrieve, list, and delete software. Detailed documentation on Fleet's [REST API is available](https://fleetdm.com/docs/rest-api/rest-api#software), including endpoints for installing and uninstalling packages.
+
+## Manage packages with GitOps
+
+Software packages can be managed via `fleetctl` using [GitOps](https://fleetdm.com/docs/using-fleet/gitops).
+
+Please refer to the documentation for [managing software with GitOps](https://fleetdm.com/docs/using-fleet/gitops#software), for a real-world example, [see how we manage software at Fleet](https://github.com/fleetdm/fleet/tree/main/it-and-security/fleets).
+
+> When managing software packages via GitOps, the Fleet server receiving GitOps requests (**not** the machine running fleetctl as part of the GitOps workflow) will download installers from the specified URLs directly.
+
+<meta name="articleTitle" value="Deploy software">
+<meta name="authorFullName" value="Roberto Dip">
+<meta name="authorGitHubUsername" value="roperzh">
+<meta name="category" value="guides">
+<meta name="publishedOn" value="2026-03-26">
+<meta name="articleImageUrl" value="../website/assets/images/articles/deploy-security-agents-1600x900@2x.png">
+<meta name="description" value="This guide will walk you through adding and editing software packages in Fleet.">

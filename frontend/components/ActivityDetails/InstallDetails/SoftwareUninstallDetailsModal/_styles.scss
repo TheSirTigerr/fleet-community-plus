@@ -1,0 +1,11 @@
+.software-uninstall-details-modal {
+  &__modal-content {
+    display: flex;
+    flex-direction: column;
+    gap: 1rem;
+  }
+
+  .reveal-button {
+    width: min-content;
+  }
+}

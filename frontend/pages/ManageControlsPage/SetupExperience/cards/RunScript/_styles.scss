@@ -1,0 +1,8 @@
+.run-script {
+  @include vertical-card-layout;
+
+  &__run-message {
+    margin: 0 0 $pad-small;
+    font-weight: $bold;
+  }
+}

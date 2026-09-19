@@ -1,0 +1,140 @@
+import { AxiosError } from "axios";
+import React from "react";
+import { useQuery } from "react-query";
+import { InjectedRouter } from "react-router";
+
+import DataError from "components/DataError";
+import LastUpdatedText from "components/LastUpdatedText";
+import SectionHeader from "components/SectionHeader";
+import Spinner from "components/Spinner";
+import { IOperatingSystemVersion } from "interfaces/operating_system";
+import {
+  getOSVersions,
+  IOSVersionsResponse,
+} from "services/entities/operating_systems";
+
+import { OSUpdatesSupportedPlatform } from "../../OSUpdates";
+import OSVersionsEmptyState from "../OSVersionsEmptyState";
+import OSVersionTable from "../OSVersionTable";
+
+/** This overrides the `platform` attribute on IOperatingSystemVersion so that only our filtered platforms (currently
+ * "darwin" and "windows") values are included */
+export type IFilteredOperatingSystemVersion = Omit<
+  IOperatingSystemVersion,
+  "platform"
+> & {
+  platform: OSUpdatesSupportedPlatform;
+};
+
+const baseClass = "os-updates-current-version-section";
+
+interface ICurrentVersionSectionProps {
+  router: InjectedRouter;
+  currentTeamId: number;
+  queryParams: ReturnType<typeof parseOSUpdatesCurrentVersionsQueryParams>;
+}
+
+const DEFAULT_SORT_DIRECTION = "desc";
+const DEFAULT_SORT_HEADER = "hosts_count";
+const DEFAULT_PAGE = 0;
+const DEFAULT_PAGE_SIZE = 8;
+
+export const parseOSUpdatesCurrentVersionsQueryParams = (queryParams: {
+  page?: string;
+  order_key?: string;
+  order_direction?: "asc" | "desc";
+}) => {
+  const sortHeader = queryParams?.order_key ?? DEFAULT_SORT_HEADER;
+  const sortDirection = queryParams?.order_direction ?? DEFAULT_SORT_DIRECTION;
+  const page = queryParams?.page
+    ? parseInt(queryParams.page, 10)
+    : DEFAULT_PAGE;
+  const pageSize = DEFAULT_PAGE_SIZE;
+
+  return {
+    page,
+    order_key: sortHeader,
+    order_direction: sortDirection,
+    per_page: pageSize,
+  };
+};
+
+const CurrentVersionSection = ({
+  router,
+  currentTeamId,
+  queryParams,
+}: ICurrentVersionSectionProps) => {
+  const { data, isError, isLoading: isLoadingOsVersions } = useQuery<
+    IOSVersionsResponse,
+    AxiosError
+  >(
+    ["os_versions", currentTeamId, queryParams],
+    () =>
+      getOSVersions({
+        teamId: currentTeamId,
+        ...queryParams,
+        query: "windows,darwin,ios,ipados", // We only want to show windows mac, ios, ipados versions atm.
+      }),
+    {
+      retry: false,
+      refetchOnWindowFocus: false,
+    }
+  );
+
+  const generateSubTitleText = () => {
+    return (
+      <LastUpdatedText
+        lastUpdatedAt={data?.counts_updated_at}
+        customTooltipText="Fleet periodically queries all hosts to retrieve operating systems. Click to view hosts for the most up-to-date lists."
+      />
+    );
+  };
+
+  const renderTable = () => {
+    if (isLoadingOsVersions) {
+      return <Spinner />;
+    }
+
+    if (isError) {
+      return (
+        <DataError
+          verticalPaddingSize="pad-xxxlarge"
+          description="Refresh the page to try again."
+          excludeIssueLink
+        />
+      );
+    }
+
+    if (!data) {
+      return null;
+    }
+
+    if (!data.os_versions) {
+      return <OSVersionsEmptyState />;
+    }
+
+    return (
+      <OSVersionTable
+        router={router}
+        osVersionData={data.os_versions as IFilteredOperatingSystemVersion[]}
+        currentTeamId={currentTeamId}
+        isLoading={isLoadingOsVersions}
+        queryParams={queryParams}
+        hasNextPage={data.meta.has_next_results}
+      />
+    );
+  };
+
+  return (
+    <div className={baseClass}>
+      <SectionHeader
+        title="Current versions"
+        subTitle={isLoadingOsVersions ? null : generateSubTitleText()}
+        wrapperCustomClass={`${baseClass}__header`}
+      />
+      {renderTable()}
+    </div>
+  );
+};
+
+export default CurrentVersionSection;

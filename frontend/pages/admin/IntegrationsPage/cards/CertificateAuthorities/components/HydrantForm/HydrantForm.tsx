@@ -1,0 +1,136 @@
+import React, { useMemo, useState } from "react";
+
+import Button from "components/buttons/Button";
+import InputField from "components/forms/fields/InputField";
+import TooltipWrapper from "components/TooltipWrapper";
+import { ICertificateAuthorityPartial } from "interfaces/certificates";
+import { MAX_ENTITY_CHAR_LENGTH } from "utilities/constants";
+
+import {
+  validateFormData,
+  IHydrantFormValidation,
+  generateFormValidations,
+} from "./helpers";
+
+const baseClass = "hydrant-form";
+
+export interface IHydrantFormData {
+  name: string;
+  url: string;
+  clientId: string;
+  clientSecret: string;
+}
+
+interface IHydrantFormProps {
+  certAuthorities?: ICertificateAuthorityPartial[];
+  formData: IHydrantFormData;
+  submitBtnText: string;
+  isSubmitting: boolean;
+  isEditing?: boolean;
+  isDirty?: boolean;
+  onChange: (update: { name: string; value: string }) => void;
+  onSubmit: () => void;
+  onCancel: () => void;
+}
+
+const HydrantForm = ({
+  certAuthorities,
+  formData,
+  submitBtnText,
+  isSubmitting,
+  isEditing = false,
+  isDirty = true,
+  onChange,
+  onSubmit,
+  onCancel,
+}: IHydrantFormProps) => {
+  const validations = useMemo(
+    () => generateFormValidations(certAuthorities ?? [], isEditing),
+    [certAuthorities, isEditing]
+  );
+
+  const [formValidation, setFormValidation] = useState<IHydrantFormValidation>(
+    () => validateFormData(formData, validations)
+  );
+
+  const { name, url, clientId, clientSecret } = formData;
+
+  const onSubmitForm = (evt: React.FormEvent<HTMLFormElement>) => {
+    evt.preventDefault();
+    onSubmit();
+  };
+
+  const onInputChange = (update: { name: string; value: string }) => {
+    setFormValidation(
+      validateFormData(
+        { ...formData, [update.name]: update.value },
+        validations
+      )
+    );
+    onChange(update);
+  };
+
+  return (
+    <form className={baseClass} onSubmit={onSubmitForm}>
+      <InputField
+        name="name"
+        label="Name"
+        value={name}
+        onChange={onInputChange}
+        error={formValidation.name?.message}
+        helpText="Letters, numbers, and underscores only. Fleet will create configuration profile variables with the name as suffix (e.g. $FLEET_VAR_HYDRANT_DATA_WIFI_CERTIFICATE)."
+        parseTarget
+        placeholder="WIFI_CERTIFICATE"
+        inputOptions={{ maxLength: MAX_ENTITY_CHAR_LENGTH }}
+      />
+      <InputField
+        name="url"
+        label="URL"
+        value={url}
+        onChange={onInputChange}
+        error={formValidation.url?.message}
+        parseTarget
+        helpText="EST endpoint provided by Hydrant."
+        placeholder="https://example.hydrantid.com/.well-known/est/abc123"
+      />
+      <InputField
+        name="clientId"
+        label="Client ID"
+        value={clientId}
+        onChange={onInputChange}
+        parseTarget
+        helpText="Client ID provided by Hydrant."
+      />
+      <InputField
+        name="clientSecret"
+        label="Client secret"
+        value={clientSecret}
+        onChange={onInputChange}
+        parseTarget
+        helpText="Client secret provided by Hydrant."
+      />
+      <div className="modal-cta-wrap">
+        <TooltipWrapper
+          tipContent="Complete all required fields to save."
+          underline={false}
+          position="top"
+          disableTooltip={formValidation.isValid}
+          showArrow
+        >
+          <Button
+            isLoading={isSubmitting}
+            disabled={!formValidation.isValid || isSubmitting || !isDirty}
+            type="submit"
+          >
+            {submitBtnText}
+          </Button>
+        </TooltipWrapper>
+        <Button variant="secondary" onClick={onCancel}>
+          Cancel
+        </Button>
+      </div>
+    </form>
+  );
+};
+
+export default HydrantForm;

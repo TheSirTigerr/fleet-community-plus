@@ -1,0 +1,38 @@
+.upcoming-activity-feed {
+  display: flex;
+  flex-direction: column;
+  position: relative;
+
+  &__load-activities-button {
+    color: $core-vibrant-blue;
+    vertical-align: bottom;
+    padding: 6px;
+
+    .fleeticon-chevronleft,
+    .fleeticon-chevronright {
+      &:before {
+        font-size: 0.5rem;
+        font-weight: $bold;
+        position: relative;
+        top: -2px;
+      }
+    }
+
+    .fleeticon-chevronleft {
+      margin-right: $pad-small;
+    }
+
+    .fleeticon-chevronright {
+      margin-left: $pad-small;
+    }
+
+    &:first-of-type {
+      margin-right: $pad-large;
+    }
+
+    &:hover:not(.button--disabled),
+    &:focus {
+      background-color: $ui-fleet-black-10;
+    }
+  }
+}

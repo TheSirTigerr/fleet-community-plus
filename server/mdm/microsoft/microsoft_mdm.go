@@ -1,0 +1,145 @@
+package microsoft_mdm
+
+import (
+	"crypto/x509"
+	"encoding/base64"
+	"regexp"
+	"strings"
+
+	"github.com/fleetdm/fleet/v4/server/fleet"
+	"github.com/fleetdm/fleet/v4/server/mdm/internal/commonmdm"
+	"github.com/smallstep/pkcs7"
+)
+
+const (
+	// MDMPath is Fleet's HTTP path for the core Windows MDM service.
+	MDMPath = "/api/mdm/microsoft"
+
+	// DiscoveryPath is the HTTP endpoint path that serves the IDiscoveryService functionality.
+	// This is the endpoint that process the Discover and DiscoverResponse messages
+	// See the section 3.1 on the MS-MDE2 specification for more details:
+	// https://learn.microsoft.com/en-us/openspecs/windows_protocols/ms-mde2/2681fd76-1997-4557-8963-cf656ab8d887
+	MDE2DiscoveryPath = MDMPath + "/discovery"
+
+	// MDE2PolicyPath is the HTTP endpoint path that delivers the X.509 Certificate Enrollment Policy (MS-XCEP) functionality.
+	// This is the endpoint that process the GetPolicies and GetPoliciesResponse messages
+	// See the section 3.3 on the MS-MDE2 specification for more details on this endpoint requirements:
+	// https://learn.microsoft.com/en-us/openspecs/windows_protocols/ms-mde2/8a5efdf8-64a9-44fd-ab63-071a26c9f2dc
+	// The MS-XCEP specification is available here:
+	// https://learn.microsoft.com/en-us/openspecs/windows_protocols/ms-xcep/08ec4475-32c2-457d-8c27-5a176660a210
+	MDE2PolicyPath = MDMPath + "/policy"
+
+	// MDE2EnrollPath is the HTTP endpoint path that delivers WS-Trust X.509v3 Token Enrollment (MS-WSTEP) functionality.
+	// This is the endpoint that process the RequestSecurityToken and RequestSecurityTokenResponseCollection messages
+	// See the section 3.4 on the MS-MDE2 specification for more details on this endpoint requirements:
+	// https://learn.microsoft.com/en-us/openspecs/windows_protocols/ms-mde2/5b02c625-ced2-4a01-a8e1-da0ae84f5bb7
+	// The MS-WSTEP specification is available here:
+	// https://learn.microsoft.com/en-us/openspecs/windows_protocols/ms-wstep/4766a85d-0d18-4fa1-a51f-e5cb98b752ea
+	MDE2EnrollPath = MDMPath + "/enroll"
+
+	// MDE2ManagementPath is the HTTP endpoint path that delivers WS-Trust X.509v3 Token Enrollment (MS-WSTEP) functionality.
+	// This is the endpoint that process the RequestSecurityToken and RequestSecurityTokenResponseCollection messages
+	// See the section 3.4 on the MS-MDE2 specification for more details:
+	// https://learn.microsoft.com/en-us/openspecs/windows_protocols/ms-mde2/5b02c625-ced2-4a01-a8e1-da0ae84f5bb7
+	MDE2ManagementPath = MDMPath + "/management"
+
+	// MDE2TOSPath is the HTTP endpoint path that delivers Terms of Service Content
+	MDE2TOSPath = MDMPath + "/tos"
+
+	// These are the entry points for the Microsoft Device Enrollment (MS-MDE) and Microsoft Device Enrollment v2 (MS-MDE2) protocols.
+	// These are required to be implemented by the MDM server to support user-driven enrollments
+	MSEnrollEntryPoint = "/EnrollmentServer/Discovery.svc"
+	MSManageEntryPoint = "/ManagementServer/MDM.svc"
+)
+
+// Device Enrolled States
+
+const (
+	// Device is not yet MDM enrolled
+	MDMDeviceStateNotEnrolled = "MDMDeviceEnrolledNotEnrolled"
+
+	// Device is MDM enrolled
+	MDMDeviceStateEnrolled = "MDMDeviceEnrolledEnrolled"
+
+	// Device is MDM enrolled and managed
+	/* #nosec G101 -- this constant doesn't contain any credentials */
+	MDMDeviceStateManaged = "MDMDeviceEnrolledManaged"
+)
+
+func ResolveWindowsMDMDiscovery(serverURL string) (string, error) {
+	return commonmdm.ResolveURL(serverURL, MDE2DiscoveryPath, false)
+}
+
+func ResolveWindowsMDMPolicy(serverURL string) (string, error) {
+	return commonmdm.ResolveURL(serverURL, MDE2PolicyPath, false)
+}
+
+func ResolveWindowsMDMEnroll(serverURL string) (string, error) {
+	return commonmdm.ResolveURL(serverURL, MDE2EnrollPath, false)
+}
+
+func ResolveWindowsMDMManagement(serverURL string) (string, error) {
+	return commonmdm.ResolveURL(serverURL, MDE2ManagementPath, false)
+}
+
+// Encrypt uses pkcs7 to encrypt a raw value using the provided certificate.
+// The returned encrypted value is base64-encoded.
+func Encrypt(rawValue string, cert *x509.Certificate) (string, error) {
+	encrypted, err := pkcs7.Encrypt([]byte(rawValue), []*x509.Certificate{cert})
+	if err != nil {
+		return "", err
+	}
+	b64Enc := base64.StdEncoding.EncodeToString(encrypted)
+	return b64Enc, nil
+}
+
+// regex to validate UPN
+// https://learn.microsoft.com/en-us/windows/win32/ad/naming-properties#upn-format
+// The local part also accepts ' ! # ^ ~, which Entra allows in user principal names.
+var upnRegex = regexp.MustCompile(`^[a-zA-Z0-9._%+'!#^~-]+@[a-zA-Z0-9.-]+\.[a-zA-Z]{2,}$`)
+
+// IsValidUPN checks if the provided user ID is a valid UPN
+func IsValidUPN(userID string) bool {
+	return upnRegex.MatchString(userID)
+}
+
+// IsValidEntraUPN additionally applies Entra ID's own limits on a user principal
+// name: at most 64 characters before the '@' and 48 after, no '+' or '%' in the
+// local part, and a local part that does not end with a period.
+// https://learn.microsoft.com/en-us/microsoft-365/enterprise/prepare-for-directory-synchronization
+func IsValidEntraUPN(userID string) bool {
+	if !IsValidUPN(userID) {
+		return false
+	}
+	at := strings.LastIndex(userID, "@")
+	local, domain := userID[:at], userID[at+1:]
+	return len(local) <= 64 && len(domain) <= 48 &&
+		!strings.ContainsAny(local, "+%") && !strings.HasSuffix(local, ".")
+}
+
+// WindowsUserContextStateFromDevice reports what Fleet knows about the enrollment's MDM user context, which decides whether its
+// user-scoped profiles are held or delivered.
+func WindowsUserContextStateFromDevice(device *fleet.MDMWindowsEnrolledDevice) fleet.WindowsUserContextState {
+	if device == nil {
+		return fleet.WindowsUserContextUnknown
+	}
+	return WindowsUserContextStateFor(device.MDMEnrollUserID, device.LastLoginStatus)
+}
+
+// WindowsUserContextStateFor is WindowsUserContextStateFromDevice over the two fields it actually needs.
+func WindowsUserContextStateFor(enrollUserID string, lastLoginStatus *fleet.WindowsMDMLoginStatus) fleet.WindowsUserContextState {
+	if lastLoginStatus != nil && *lastLoginStatus == fleet.WindowsMDMLoginStatusUser {
+		// The device reported a usable user context.
+		return fleet.WindowsUserContextPresent
+	}
+	if IsValidUPN(enrollUserID) {
+		// A user-bound enrollment holds until its enrolled user signs in: "others", "none", and never-observed alike.
+		return fleet.WindowsUserContextCanArrive
+	}
+	if lastLoginStatus != nil {
+		// A device-bound enrollment that positively reported no usable user context.
+		return fleet.WindowsUserContextCanArrive
+	}
+	// A device-bound enrollment that has never reported a login status.
+	return fleet.WindowsUserContextUnknown
+}

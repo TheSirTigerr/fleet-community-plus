@@ -1,0 +1,1026 @@
+package service
+
+import (
+	"context"
+	"errors"
+	"fmt"
+	"maps"
+	"reflect"
+	"slices"
+	"strconv"
+
+	"github.com/fleetdm/fleet/v4/server/authz"
+	"github.com/fleetdm/fleet/v4/server/contexts/ctxerr"
+	"github.com/fleetdm/fleet/v4/server/contexts/license"
+	"github.com/fleetdm/fleet/v4/server/contexts/logging"
+	"github.com/fleetdm/fleet/v4/server/contexts/viewer"
+	"github.com/fleetdm/fleet/v4/server/fleet"
+	"github.com/fleetdm/fleet/v4/server/ptr"
+)
+
+/////////////////////////////////////////////////////////////////////////////////
+// Add
+/////////////////////////////////////////////////////////////////////////////////
+
+func teamPolicyEndpoint(ctx context.Context, request interface{}, svc fleet.Service) (fleet.Errorer, error) {
+	req := request.(*fleet.TeamPolicyRequest)
+	resp, err := svc.NewTeamPolicy(ctx, req.TeamID, fleet.NewTeamPolicyPayload{
+		QueryID:                      req.QueryID,
+		Name:                         req.Name,
+		Query:                        req.Query,
+		Description:                  req.Description,
+		Resolution:                   req.Resolution,
+		Platform:                     req.Platform,
+		Critical:                     req.Critical,
+		CalendarEventsEnabled:        req.CalendarEventsEnabled,
+		SoftwareTitleID:              req.SoftwareTitleID,
+		SoftwareInstallerID:          req.SoftwareInstallerID,
+		ScriptID:                     req.ScriptID,
+		LabelsIncludeAny:             req.LabelsIncludeAny,
+		LabelsIncludeAll:             req.LabelsIncludeAll,
+		LabelsExcludeAny:             req.LabelsExcludeAny,
+		LabelsExcludeAll:             req.LabelsExcludeAll,
+		ConditionalAccessEnabled:     req.ConditionalAccessEnabled,
+		ContinuousAutomationsEnabled: req.ContinuousAutomationsEnabled,
+		Type:                         req.Type,
+		PatchSoftwareTitleID:         req.PatchSoftwareTitleID,
+		PatchWhenClosed:              req.PatchWhenClosed,
+		ProfileUUID:                  req.ProfileUUID,
+	})
+	if err != nil {
+		return fleet.TeamPolicyResponse{Err: err}, nil
+	}
+	return fleet.TeamPolicyResponse{Policy: resp}, nil
+}
+
+func (svc Service) NewTeamPolicy(ctx context.Context, teamID uint, tp fleet.NewTeamPolicyPayload) (*fleet.Policy, error) {
+	if err := svc.authz.Authorize(ctx, &fleet.Policy{
+		PolicyData: fleet.PolicyData{
+			TeamID: ptr.Uint(teamID),
+		},
+	}, fleet.ActionWrite); err != nil {
+		return nil, err
+	}
+
+	vc, ok := viewer.FromContext(ctx)
+	if !ok {
+		return nil, errors.New("user must be authenticated to create team policies")
+	}
+
+	p, err := svc.newTeamPolicyPayloadToPolicyPayload(ctx, teamID, tp)
+	if err != nil {
+		return nil, err
+	}
+
+	if err := p.Verify(); err != nil {
+		return nil, ctxerr.Wrap(ctx, &fleet.BadRequestError{
+			Message: fmt.Sprintf("policy payload verification: %s", err),
+		})
+	}
+
+	if p.QueryID != nil {
+		query, err := svc.ds.Query(ctx, *p.QueryID)
+		if err != nil {
+			return nil, ctxerr.Wrap(ctx, err, "get query for policy")
+		}
+		if err := svc.authz.Authorize(ctx, query, fleet.ActionRead); err != nil {
+			return nil, err
+		}
+	}
+
+	if (len(tp.LabelsIncludeAll) > 0 || len(tp.LabelsExcludeAll) > 0 || len(tp.LabelsIncludeAny) > 0 || len(tp.LabelsExcludeAny) > 0) && !license.IsPremium(ctx) {
+		return nil, fleet.ErrMissingLicense
+	}
+
+	if tp.ProfileUUID != nil && !license.IsPremium(ctx) {
+		return nil, fleet.ErrMissingLicense
+	}
+
+	if err := verifyLabelsToAssociate(ctx, svc.ds, &teamID, slices.Concat(tp.LabelsIncludeAny, tp.LabelsIncludeAll, tp.LabelsExcludeAny, tp.LabelsExcludeAll), vc.User); err != nil {
+		return nil, ctxerr.Wrap(ctx, err, "verify labels to associate")
+	}
+
+	policy, err := svc.ds.NewTeamPolicy(ctx, teamID, ptr.Uint(vc.UserID()), p)
+	if err != nil {
+		return nil, ctxerr.Wrap(ctx, err, "creating policy")
+	}
+
+	if err := svc.populateAutomationsForTeamPolicy(ctx, policy); err != nil {
+		return nil, ctxerr.Wrap(ctx, err, "populate automations")
+	}
+
+	//nolint:nilaway // ds.NewTeamPolicy returns an error whenever policy is nil
+	if policy.Type == fleet.PolicyTypePatch && policy.PatchWhenClosed && policy.PatchSoftwareTitleID != nil {
+		if err := svc.ds.ClearPreInstallQueryForTitle(ctx, teamID, *policy.PatchSoftwareTitleID); err != nil {
+			return nil, ctxerr.Wrap(ctx, err, "clear pre-install query for title")
+		}
+	}
+
+	if teamID == 0 {
+		noTeamID := int64(0)
+		if err := svc.NewActivity(
+			ctx,
+			authz.UserFromContext(ctx),
+			fleet.ActivityTypeCreatedPolicy{
+				ID:       policy.ID,
+				Name:     policy.Name,
+				TeamID:   &noTeamID,
+				TeamName: nil,
+			},
+		); err != nil {
+			return nil, ctxerr.Wrap(ctx, err, "create activity for no-team policy creation")
+		}
+		return policy, nil
+	}
+
+	// Note: Issue #4191 proposes that we move to SQL transactions for actions so that we can
+	// rollback an action in the event of an error writing the associated activity
+
+	var teamName *string
+	if teamID != 0 {
+		if svc.EnterpriseOverrides != nil && svc.EnterpriseOverrides.TeamByIDOrName != nil {
+			team, err := svc.EnterpriseOverrides.TeamByIDOrName(ctx, &teamID, nil)
+			if err != nil {
+				return nil, ctxerr.Wrap(ctx, err, "fetching team details")
+			}
+			teamName = &team.Name
+		}
+	}
+
+	teamIDPtr := int64(teamID)
+	if err := svc.NewActivity(
+		ctx,
+		authz.UserFromContext(ctx),
+		fleet.ActivityTypeCreatedPolicy{
+			ID:       policy.ID,
+			Name:     policy.Name,
+			TeamID:   &teamIDPtr,
+			TeamName: teamName,
+		},
+	); err != nil {
+		return nil, ctxerr.Wrap(ctx, err, "create activity for team policy creation")
+	}
+	return policy, nil
+}
+
+func (svc *Service) populateAutomationsForTeamPolicy(ctx context.Context, policy *fleet.Policy) error {
+	if policy == nil {
+		return nil
+	}
+	if policy.TeamID == nil {
+		return nil
+	}
+	if err := svc.populatePolicyInstallSoftware(ctx, policy); err != nil {
+		return ctxerr.Wrap(ctx, err, "populate install_software")
+	}
+	if err := svc.populatePolicyRunScript(ctx, policy); err != nil {
+		return ctxerr.Wrap(ctx, err, "populate run_script")
+	}
+	if err := svc.populatePolicyResendConfigProfile(ctx, policy); err != nil {
+		return ctxerr.Wrap(ctx, err, "populate resend_config_profile")
+	}
+	if err := svc.populatePolicyPatchSoftware(ctx, policy); err != nil {
+		return ctxerr.Wrap(ctx, err, "populate patch_software")
+	}
+	return nil
+}
+
+func (svc *Service) populatePolicyInstallSoftware(ctx context.Context, p *fleet.Policy) error {
+	if p.SoftwareInstallerID != nil {
+		installerMetadata, err := svc.ds.GetSoftwareInstallerMetadataByID(ctx, *p.SoftwareInstallerID)
+		if err != nil {
+			return ctxerr.Wrap(ctx, err, "get software installer metadata by id")
+		}
+		p.InstallSoftware = &fleet.PolicySoftwareTitle{
+			SoftwareTitleID:     *installerMetadata.TitleID,
+			SoftwareInstallerID: new(installerMetadata.InstallerID),
+			Name:                installerMetadata.SoftwareTitle,
+			DisplayName:         installerMetadata.DisplayName,
+		}
+		return nil
+	} else if p.VPPAppsTeamsID != nil {
+		titleInfo, err := svc.ds.GetTitleInfoFromVPPAppsTeamsID(ctx, *p.VPPAppsTeamsID)
+		if err != nil {
+			return ctxerr.Wrap(ctx, err, "get VPP title metadata by adam_id")
+		}
+		p.InstallSoftware = titleInfo
+	}
+
+	return nil
+}
+
+func (svc *Service) populatePolicyRunScript(ctx context.Context, p *fleet.Policy) error {
+	if p.ScriptID == nil {
+		return nil
+	}
+	scriptMetadata, err := svc.ds.Script(ctx, *p.ScriptID)
+	if err != nil {
+		return ctxerr.Wrap(ctx, err, "get script metadata by id")
+	}
+	p.RunScript = &fleet.PolicyScript{ID: *p.ScriptID, Name: scriptMetadata.Name}
+	return nil
+}
+
+func (svc *Service) populatePolicyResendConfigProfile(ctx context.Context, p *fleet.Policy) error {
+	if p.ResendAppleProfileUUID == nil && p.ResendWindowsProfileUUID == nil {
+		return nil
+	}
+
+	if p.ResendAppleProfileUUID != nil {
+		prof, err := svc.ds.GetMDMAppleConfigProfile(ctx, *p.ResendAppleProfileUUID)
+		if err != nil {
+			return ctxerr.Wrap(ctx, err, "get apple config profile by uuid")
+		}
+		p.ResendConfigurationProfile = &fleet.PolicyProfile{
+			UUID: prof.ProfileUUID,
+			Name: prof.Name,
+		}
+		return nil
+	}
+
+	prof, err := svc.ds.GetMDMWindowsConfigProfile(ctx, *p.ResendWindowsProfileUUID)
+	if err != nil {
+		return ctxerr.Wrap(ctx, err, "get windows config profile by uuid")
+	}
+	p.ResendConfigurationProfile = &fleet.PolicyProfile{
+		UUID: prof.ProfileUUID,
+		Name: prof.Name,
+	}
+
+	return nil
+}
+
+func (svc *Service) populatePolicyPatchSoftware(ctx context.Context, p *fleet.Policy) error {
+	if p.PatchSoftwareTitleID != nil {
+		installerMetadata, err := svc.ds.GetSoftwareInstallerMetadataByTeamAndTitleID(ctx, p.TeamID, *p.PatchSoftwareTitleID, false)
+		if err != nil {
+			return ctxerr.Wrap(ctx, err, "get software installer metadata by title id")
+		}
+		// SoftwareInstallerID intentionally omitted — patch policies target FMA
+		// titles (single installer per title) so per-package pinning doesn't apply.
+		p.PatchSoftware = &fleet.PolicySoftwareTitle{
+			SoftwareTitleID: *installerMetadata.TitleID,
+			Name:            installerMetadata.SoftwareTitle,
+			DisplayName:     installerMetadata.DisplayName,
+		}
+		return nil
+	}
+	return nil
+}
+
+func getPolicySoftwareTitleIconURL(teamID, titleID uint) string {
+	icon := fleet.SoftwareTitleIcon{TeamID: teamID, SoftwareTitleID: titleID}
+	return icon.IconUrl()
+}
+
+// populateSoftwareIconURLs sets the IconURL on each policy's software automation
+// when the software title has an icon to serve: a custom icon uploaded for the
+// title, or a VPP app (whose icon endpoint redirects to the App Store icon).
+// Otherwise the IconURL is left nil.
+func (svc *Service) populateSoftwareIconURLs(ctx context.Context, policies []*fleet.Policy) error {
+	titleIDsByTeam := make(map[uint]map[uint]struct{})
+	for _, p := range policies {
+		// Merged team-policy lists can include inherited/global policies (nil TeamID).
+		// They should not have software automation, so skip them.
+		if p.TeamID == nil {
+			continue
+		}
+		teamID := *p.TeamID
+		for _, t := range []*fleet.PolicySoftwareTitle{p.InstallSoftware, p.PatchSoftware} {
+			if t == nil {
+				continue
+			}
+			if titleIDsByTeam[teamID] == nil {
+				titleIDsByTeam[teamID] = make(map[uint]struct{})
+			}
+			titleIDsByTeam[teamID][t.SoftwareTitleID] = struct{}{}
+		}
+	}
+	if len(titleIDsByTeam) == 0 {
+		return nil
+	}
+
+	iconsByTeam := make(map[uint]map[uint]fleet.SoftwareTitleIcon, len(titleIDsByTeam))
+	for teamID, set := range titleIDsByTeam {
+		titleIDs := slices.Collect(maps.Keys(set))
+		icons, err := svc.ds.GetSoftwareIconsByTeamAndTitleIds(ctx, teamID, titleIDs)
+		if err != nil {
+			return ctxerr.Wrap(ctx, err, "get software icons for policies")
+		}
+		iconsByTeam[teamID] = icons
+	}
+
+	for _, p := range policies {
+		if p.TeamID == nil {
+			continue
+		}
+		teamID := *p.TeamID
+		icons := iconsByTeam[teamID]
+
+		if t := p.InstallSoftware; t != nil {
+			_, hasCustomIcon := icons[t.SoftwareTitleID]
+			// VPP apps always have an App Store icon the icon endpoint redirects
+			// to (see getPolicySoftwareTitleIconURL), so it's safe to point at it
+			// without risking a 404.
+			if hasCustomIcon || p.VPPAppsTeamsID != nil {
+				t.IconURL = new(getPolicySoftwareTitleIconURL(teamID, t.SoftwareTitleID))
+			}
+		}
+
+		if t := p.PatchSoftware; t != nil {
+			// Patch software is always a package installer (never a VPP app), so
+			// it only gets an icon URL when a custom icon was uploaded.
+			if _, ok := icons[t.SoftwareTitleID]; ok {
+				t.IconURL = new(getPolicySoftwareTitleIconURL(teamID, t.SoftwareTitleID))
+			}
+		}
+	}
+	return nil
+}
+
+func (svc *Service) newTeamPolicyPayloadToPolicyPayload(ctx context.Context, teamID uint, p fleet.NewTeamPolicyPayload) (fleet.PolicyPayload, error) {
+	policyType := fleet.PolicyTypeDynamic
+
+	if p.Type != nil && *p.Type == fleet.PolicyTypePatch {
+		policyType = fleet.PolicyTypePatch
+	}
+
+	softwareInstallerID, vppAppsTeamsID, err := svc.getInstallerOrVPPAppForTitle(ctx, &teamID, p.SoftwareTitleID, p.SoftwareInstallerID)
+	if err != nil {
+		return fleet.PolicyPayload{}, err
+	}
+
+	// Continuous automations must be enabled so the patch policy keeps retrying until the app is closed.
+	if p.PatchWhenClosed && !p.ContinuousAutomationsEnabled {
+		return fleet.PolicyPayload{}, &fleet.BadRequestError{Message: errPatchWhenClosedRequiresContinuousAutomations}
+	}
+
+	return fleet.PolicyPayload{
+		QueryID:                      p.QueryID,
+		Name:                         p.Name,
+		Query:                        p.Query,
+		Critical:                     p.Critical,
+		Description:                  p.Description,
+		Resolution:                   p.Resolution,
+		Platform:                     p.Platform,
+		CalendarEventsEnabled:        p.CalendarEventsEnabled,
+		SoftwareInstallerID:          softwareInstallerID,
+		VPPAppsTeamsID:               vppAppsTeamsID,
+		ScriptID:                     p.ScriptID,
+		LabelsIncludeAny:             p.LabelsIncludeAny,
+		LabelsIncludeAll:             p.LabelsIncludeAll,
+		LabelsExcludeAny:             p.LabelsExcludeAny,
+		LabelsExcludeAll:             p.LabelsExcludeAll,
+		ConditionalAccessEnabled:     p.ConditionalAccessEnabled,
+		ContinuousAutomationsEnabled: p.ContinuousAutomationsEnabled,
+		PatchWhenClosed:              p.PatchWhenClosed,
+		Type:                         policyType,
+		PatchSoftwareTitleID:         p.PatchSoftwareTitleID,
+		ProfileUUID:                  p.ProfileUUID,
+	}, nil
+}
+
+/////////////////////////////////////////////////////////////////////////////////
+// List
+/////////////////////////////////////////////////////////////////////////////////
+
+func listTeamPoliciesEndpoint(ctx context.Context, request interface{}, svc fleet.Service) (fleet.Errorer, error) {
+	req := request.(*fleet.ListTeamPoliciesRequest)
+
+	inheritedListOptions := fleet.ListOptions{
+		Page:           req.InheritedPage,
+		PerPage:        req.InheritedPerPage,
+		OrderDirection: req.InheritedOrderDirection,
+		OrderKey:       req.InheritedOrderKey,
+	}
+
+	tmPols, inheritedPols, err := svc.ListTeamPolicies(ctx, req.TeamID, req.Opts, inheritedListOptions, req.MergeInherited, req.AutomationType, req.Platform)
+	if err != nil {
+		return fleet.ListTeamPoliciesResponse{Err: err}, nil
+	}
+	return fleet.ListTeamPoliciesResponse{Policies: tmPols, InheritedPolicies: inheritedPols}, nil
+}
+
+func (svc *Service) ListTeamPolicies(ctx context.Context, teamID uint, opts fleet.ListOptions, iopts fleet.ListOptions, mergeInherited bool, automationType fleet.PolicyAutomationType, platform string) (teamPolicies, inheritedPolicies []*fleet.Policy, err error) {
+	if err := svc.authz.Authorize(ctx, &fleet.Policy{
+		PolicyData: fleet.PolicyData{
+			TeamID: ptr.Uint(teamID),
+		},
+	}, fleet.ActionRead); err != nil {
+		return nil, nil, err
+	}
+
+	if err := fleet.ValidatePolicyPlatformFilter(platform); err != nil {
+		return nil, nil, ctxerr.Wrap(ctx, err)
+	}
+
+	if teamID > 0 {
+		if _, err := svc.ds.TeamLite(ctx, teamID); err != nil { // TODO see if we can use TeamExists here instead
+			return nil, nil, ctxerr.Wrapf(ctx, err, "loading team %d", teamID)
+		}
+	}
+
+	if mergeInherited {
+		policies, err := svc.ds.ListMergedTeamPolicies(ctx, teamID, opts, automationType, platform)
+		if err != nil {
+			return nil, nil, err
+		}
+		for i := range policies {
+			if err := svc.populateAutomationsForTeamPolicy(ctx, policies[i]); err != nil {
+				return nil, nil, ctxerr.Wrapf(ctx, err, "populate automations for policy_id: %d", policies[i].ID)
+			}
+		}
+		if err := svc.populateSoftwareIconURLs(ctx, policies); err != nil {
+			return nil, nil, ctxerr.Wrap(ctx, err, "populate software icon urls")
+		}
+		return policies, nil, nil
+	}
+
+	teamPolicies, inheritedPolicies, err = svc.ds.ListTeamPolicies(ctx, teamID, opts, iopts, automationType, platform)
+	if err != nil {
+		return nil, nil, err
+	}
+
+	for i := range teamPolicies {
+		if err := svc.populateAutomationsForTeamPolicy(ctx, teamPolicies[i]); err != nil {
+			return nil, nil, ctxerr.Wrapf(ctx, err, "populate automations for policy_id: %d", teamPolicies[i].ID)
+		}
+	}
+	if err := svc.populateSoftwareIconURLs(ctx, teamPolicies); err != nil {
+		return nil, nil, ctxerr.Wrap(ctx, err, "populate software icon urls")
+	}
+
+	return teamPolicies, inheritedPolicies, nil
+}
+
+/////////////////////////////////////////////////////////////////////////////////
+// Count
+/////////////////////////////////////////////////////////////////////////////////
+
+func countTeamPoliciesEndpoint(ctx context.Context, request interface{}, svc fleet.Service) (fleet.Errorer, error) {
+	req := request.(*fleet.CountTeamPoliciesRequest)
+	count, inheritedCount, err := svc.CountTeamPolicies(ctx, req.TeamID, req.ListOptions.MatchQuery, req.MergeInherited, req.AutomationType, req.Platform)
+	if err != nil {
+		return fleet.CountTeamPoliciesResponse{Err: err}, nil
+	}
+	return fleet.CountTeamPoliciesResponse{Count: count, InheritedPolicyCount: inheritedCount}, nil
+}
+
+func (svc *Service) CountTeamPolicies(ctx context.Context, teamID uint, matchQuery string, mergeInherited bool, automationType fleet.PolicyAutomationType, platform string) (int, int, error) {
+	if err := svc.authz.Authorize(ctx, &fleet.Policy{
+		PolicyData: fleet.PolicyData{
+			TeamID: ptr.Uint(teamID),
+		},
+	}, fleet.ActionRead); err != nil {
+		return 0, 0, err
+	}
+
+	if err := fleet.ValidatePolicyPlatformFilter(platform); err != nil {
+		return 0, 0, ctxerr.Wrap(ctx, err)
+	}
+
+	if teamID > 0 {
+		if _, err := svc.ds.TeamLite(ctx, teamID); err != nil { // TODO see if we can use TeamExists here instead
+			return 0, 0, ctxerr.Wrapf(ctx, err, "loading team %d", teamID)
+		}
+	}
+
+	if mergeInherited {
+		count, err := svc.ds.CountMergedTeamPolicies(ctx, teamID, matchQuery, automationType, platform)
+		if err != nil {
+			return 0, 0, err
+		}
+		// CountPolicies ignores automationType when teamID is nil, so the
+		// inherited count would be wrong (too high) when an automation filter
+		// is active. Short-circuit to 0 in that case.
+		if automationType != "" {
+			return count, 0, nil
+		}
+		inheritedCount, err := svc.ds.CountPolicies(ctx, nil, matchQuery, automationType, platform)
+		if err != nil {
+			return 0, 0, err
+		}
+		return count, inheritedCount, nil
+	}
+
+	count, err := svc.ds.CountPolicies(ctx, &teamID, matchQuery, automationType, platform)
+	if err != nil {
+		return 0, 0, err
+	}
+	return count, 0, nil
+}
+
+/////////////////////////////////////////////////////////////////////////////////
+// Get by id
+/////////////////////////////////////////////////////////////////////////////////
+
+func getTeamPolicyByIDEndpoint(ctx context.Context, request interface{}, svc fleet.Service) (fleet.Errorer, error) {
+	req := request.(*fleet.GetTeamPolicyByIDRequest)
+	teamPolicy, err := svc.GetTeamPolicyByID(ctx, req.TeamID, req.PolicyID)
+	if err != nil {
+		return fleet.GetTeamPolicyByIDResponse{Err: err}, nil
+	}
+	return fleet.GetTeamPolicyByIDResponse{Policy: teamPolicy}, nil
+}
+
+func (svc Service) GetTeamPolicyByID(ctx context.Context, teamID uint, policyID uint) (*fleet.Policy, error) {
+	if err := svc.authz.Authorize(ctx, &fleet.Policy{
+		PolicyData: fleet.PolicyData{
+			TeamID: ptr.Uint(teamID),
+		},
+	}, fleet.ActionRead); err != nil {
+		return nil, err
+	}
+
+	teamPolicy, err := svc.ds.TeamPolicy(ctx, teamID, policyID)
+	if err != nil {
+		return nil, err
+	}
+
+	if err := svc.populateAutomationsForTeamPolicy(ctx, teamPolicy); err != nil {
+		return nil, ctxerr.Wrap(ctx, err, "populate automations")
+	}
+	if err := svc.populateSoftwareIconURLs(ctx, []*fleet.Policy{teamPolicy}); err != nil {
+		return nil, ctxerr.Wrap(ctx, err, "populate software icon urls")
+	}
+
+	return teamPolicy, nil
+}
+
+/////////////////////////////////////////////////////////////////////////////////
+// Delete
+/////////////////////////////////////////////////////////////////////////////////
+
+func deleteTeamPoliciesEndpoint(ctx context.Context, request interface{}, svc fleet.Service) (fleet.Errorer, error) {
+	req := request.(*fleet.DeleteTeamPoliciesRequest)
+	resp, err := svc.DeleteTeamPolicies(ctx, req.TeamID, req.IDs)
+	if err != nil {
+		return fleet.DeleteTeamPoliciesResponse{Err: err}, nil
+	}
+	return fleet.DeleteTeamPoliciesResponse{Deleted: resp}, nil
+}
+
+func (svc Service) DeleteTeamPolicies(ctx context.Context, teamID uint, ids []uint) ([]uint, error) {
+	if err := svc.authz.Authorize(ctx, &fleet.Policy{
+		PolicyData: fleet.PolicyData{
+			TeamID: ptr.Uint(teamID),
+		},
+	}, fleet.ActionWrite); err != nil {
+		return nil, err
+	}
+
+	if teamID > 0 {
+		if _, err := svc.ds.TeamLite(ctx, teamID); err != nil { // TODO see if we can use TeamExists here instead
+			return nil, ctxerr.Wrapf(ctx, err, "loading team %d", teamID)
+		}
+	}
+
+	if len(ids) == 0 {
+		return nil, nil
+	}
+	policiesByID, err := svc.ds.PoliciesByID(ctx, ids)
+	if err != nil {
+		return nil, ctxerr.Wrap(ctx, err, "getting policies by ID")
+	}
+
+	for _, policy := range policiesByID {
+		if t := policy.PolicyData.TeamID; t == nil || *t != teamID {
+			return nil, authz.ForbiddenWithInternal(
+				fmt.Sprintf("attempting to delete policy that does not belong to team %s", strconv.Itoa(int(teamID))),
+				authz.UserFromContext(ctx),
+				policy,
+				fleet.ActionWrite,
+			)
+		}
+	}
+
+	deletedIDs, err := svc.ds.DeleteTeamPolicies(ctx, teamID, ids)
+	if err != nil {
+		return nil, err
+	}
+
+	if teamID == 0 {
+		noTeamID := int64(0)
+		for _, id := range deletedIDs {
+			if err := svc.NewActivity(
+				ctx,
+				authz.UserFromContext(ctx),
+				fleet.ActivityTypeDeletedPolicy{
+					ID:       id,
+					Name:     policiesByID[id].Name,
+					TeamID:   &noTeamID,
+					TeamName: nil,
+				},
+			); err != nil {
+				return nil, ctxerr.Wrap(ctx, err, "create activity for no-team policy deletion")
+			}
+		}
+		return ids, nil
+	}
+
+	// Note: Issue #4191 proposes that we move to SQL transactions for actions so that we can
+	// rollback an action in the event of an error writing the associated activity
+
+	var teamName *string
+	if teamID != 0 {
+		if svc.EnterpriseOverrides != nil && svc.EnterpriseOverrides.TeamByIDOrName != nil {
+			team, err := svc.EnterpriseOverrides.TeamByIDOrName(ctx, &teamID, nil)
+			if err != nil {
+				return nil, ctxerr.Wrap(ctx, err, "fetching team details")
+			}
+			teamName = &team.Name
+		}
+	}
+
+	for _, id := range deletedIDs {
+		teamIDPtr := int64(teamID)
+		if err := svc.NewActivity(
+			ctx,
+			authz.UserFromContext(ctx),
+			fleet.ActivityTypeDeletedPolicy{
+				ID:       id,
+				Name:     policiesByID[id].Name,
+				TeamID:   &teamIDPtr,
+				TeamName: teamName,
+			},
+		); err != nil {
+			return nil, ctxerr.Wrap(ctx, err, "create activity for policy deletion")
+		}
+	}
+
+	return ids, nil
+}
+
+/////////////////////////////////////////////////////////////////////////////////
+// Modify
+/////////////////////////////////////////////////////////////////////////////////
+
+func modifyTeamPolicyEndpoint(ctx context.Context, request interface{}, svc fleet.Service) (fleet.Errorer, error) {
+	req := request.(*fleet.ModifyTeamPolicyRequest)
+	resp, err := svc.ModifyTeamPolicy(ctx, req.TeamID, req.PolicyID, req.ModifyPolicyPayload)
+	if err != nil {
+		return fleet.ModifyTeamPolicyResponse{Err: err}, nil
+	}
+	return fleet.ModifyTeamPolicyResponse{Policy: resp}, nil
+}
+
+func (svc *Service) ModifyTeamPolicy(ctx context.Context, teamID uint, id uint, p fleet.ModifyPolicyPayload) (*fleet.Policy, error) {
+	return svc.modifyPolicy(ctx, &teamID, id, p)
+}
+
+func checkTeamID(teamID *uint, policy *fleet.Policy) bool {
+	return policy != nil && reflect.DeepEqual(teamID, policy.TeamID)
+}
+
+func (svc *Service) modifyPolicy(ctx context.Context, teamID *uint, id uint, p fleet.ModifyPolicyPayload) (*fleet.Policy, error) {
+	if err := svc.authz.Authorize(ctx, &fleet.Policy{
+		PolicyData: fleet.PolicyData{
+			TeamID: teamID,
+		},
+	}, fleet.ActionWrite); err != nil {
+		return nil, err
+	}
+
+	policy, err := svc.ds.Policy(ctx, id)
+	if err != nil {
+		return nil, err
+	}
+
+	if ok := checkTeamID(teamID, policy); !ok {
+		return nil, ctxerr.Wrap(ctx, &fleet.BadRequestError{
+			Message:     "policy does not belong to team/global",
+			InternalErr: fmt.Errorf("teamID: %+v, policy: %+v", teamID, policy),
+		})
+	}
+
+	if p.ConditionalAccessEnabled != nil && *p.ConditionalAccessEnabled && teamID == nil {
+		return nil, ctxerr.Wrap(ctx, &fleet.BadRequestError{
+			Message: fmt.Sprintf(`policy payload verification: %s`, errPolicyAllFleetsForConditionalAccess),
+		})
+	}
+
+	if p.ContinuousAutomationsEnabled != nil && *p.ContinuousAutomationsEnabled && teamID == nil {
+		return nil, ctxerr.Wrap(ctx, &fleet.BadRequestError{
+			Message: fmt.Sprintf(`policy payload verification: %s`, errPolicyAllFleetsForContinuousAutomations),
+		})
+	}
+
+	// Only reject an actual profile assignment. An explicit null/empty value means
+	// "unset the profile", which is a no-op on a global policy (clients such as the
+	// UI send the full payload, including profile_uuid: null).
+	if p.ProfileUUID.Set && p.ProfileUUID.Valid && p.ProfileUUID.Value != "" && teamID == nil {
+		return nil, ctxerr.Wrap(ctx, &fleet.BadRequestError{
+			Message: fmt.Sprintf("policy payload verification: %s", errPolicyAllFleetsForProfiles),
+		})
+	}
+
+	p.Type = policy.Type
+	if err := p.Verify(); err != nil {
+		return nil, ctxerr.Wrap(ctx, &fleet.BadRequestError{
+			Message: fmt.Sprintf("policy payload verification: %s", err),
+		})
+	}
+
+	if (len(p.LabelsIncludeAll) > 0 || len(p.LabelsExcludeAll) > 0 || len(p.LabelsIncludeAny) > 0 || len(p.LabelsExcludeAny) > 0) && !license.IsPremium(ctx) {
+		return nil, fleet.ErrMissingLicense
+	}
+
+	if p.ProfileUUID.Valid && p.ProfileUUID.Value != "" && !license.IsPremium(ctx) {
+		return nil, fleet.ErrMissingLicense
+	}
+
+	if err := verifyLabelsToAssociate(ctx, svc.ds, teamID, slices.Concat(p.LabelsIncludeAny, p.LabelsIncludeAll, p.LabelsExcludeAny, p.LabelsExcludeAll), authz.UserFromContext(ctx)); err != nil {
+		return nil, ctxerr.Wrap(ctx, err, "verify labels to associate")
+	}
+
+	var removeAllMemberships bool
+	var removeStats bool
+	if p.Name != nil {
+		policy.Name = *p.Name
+	}
+	if p.Description != nil {
+		policy.Description = *p.Description
+	}
+	if p.Query != nil {
+		if policy.Query != *p.Query {
+			removeAllMemberships = true
+			removeStats = true
+		}
+		policy.Query = *p.Query
+	}
+	if p.Resolution != nil {
+		policy.Resolution = p.Resolution
+	}
+	if p.Platform != nil {
+		if policy.Platform != *p.Platform {
+			removeStats = true
+		}
+		policy.Platform = *p.Platform
+	}
+	if p.Critical != nil {
+		policy.Critical = *p.Critical
+	}
+	if p.CalendarEventsEnabled != nil {
+		policy.CalendarEventsEnabled = *p.CalendarEventsEnabled
+	}
+	if p.ConditionalAccessEnabled != nil {
+		policy.ConditionalAccessEnabled = *p.ConditionalAccessEnabled
+	}
+	if p.ContinuousAutomationsEnabled != nil {
+		policy.ContinuousAutomationsEnabled = *p.ContinuousAutomationsEnabled
+	}
+	patchWhenClosed := policy.PatchWhenClosed
+	if p.PatchWhenClosed != nil {
+		patchWhenClosed = *p.PatchWhenClosed
+	}
+	// patch_when_closed needs continuous automations: reject an explicit false, otherwise force it on.
+	if patchWhenClosed && p.ContinuousAutomationsEnabled != nil && !*p.ContinuousAutomationsEnabled {
+		return nil, ctxerr.Wrap(ctx, &fleet.BadRequestError{Message: errPatchWhenClosedRequiresContinuousAutomations})
+	}
+	if patchWhenClosed {
+		policy.ContinuousAutomationsEnabled = true
+	}
+	policy.PatchWhenClosed = patchWhenClosed
+	if removeStats {
+		policy.FailingHostCount = 0
+		policy.PassingHostCount = 0
+	}
+	// A chosen package without a title has nothing to resolve against (the software block below
+	// only runs when the title is set), so reject it rather than silently ignore the choice.
+	if !p.SoftwareTitleID.Set && p.SoftwareInstallerID.Set && p.SoftwareInstallerID.Value != 0 {
+		return nil, ctxerr.Wrap(ctx, &fleet.BadRequestError{
+			Message: "software_package_id can only be set together with software_title_id",
+		})
+	}
+	if p.SoftwareTitleID.Set {
+		var chosenInstallerID *uint
+		if p.SoftwareInstallerID.Set && p.SoftwareInstallerID.Value != 0 {
+			chosenInstallerID = &p.SoftwareInstallerID.Value
+		}
+		softwareInstallerID, vppAppsTeamsID, err := svc.getInstallerOrVPPAppForTitle(ctx, teamID, &p.SoftwareTitleID.Value, chosenInstallerID)
+		if err != nil {
+			return nil, err
+		}
+		// If the associated installer/app is changed (or it's set and the policy didn't have an associated installer/app)
+		// then we clear the results of the policy so that automation can be triggered upon failure
+		// (automation is currently triggered on the first failure or when it goes from passing to failure).
+		if (softwareInstallerID != nil && (policy.SoftwareInstallerID == nil || *policy.SoftwareInstallerID != *softwareInstallerID)) ||
+			(vppAppsTeamsID != nil && (policy.VPPAppsTeamsID == nil || *policy.VPPAppsTeamsID != *vppAppsTeamsID)) {
+			removeAllMemberships = true
+			removeStats = true
+		}
+		policy.SoftwareInstallerID = softwareInstallerID
+		policy.VPPAppsTeamsID = vppAppsTeamsID
+	}
+	if p.ScriptID.Set { // indicates that script ID is changing, but might be to 0 to remove
+		// If the associated script is changed (or it's set and the policy didn't have an associated script)
+		// then we clear the results of the policy so that automation can be triggered upon failure
+		// (automation is currently triggered on the first failure or when it goes from passing to failure).
+		if p.ScriptID.Value != 0 && (policy.ScriptID == nil || *policy.ScriptID != p.ScriptID.Value) {
+			removeAllMemberships = true
+			removeStats = true
+		}
+
+		if p.ScriptID.Value == 0 {
+			policy.ScriptID = nil
+		} else {
+			policy.ScriptID = &p.ScriptID.Value
+		}
+	}
+	if p.ProfileUUID.Set {
+		// If the associated profile is changed (or it's set and the policy didn't have an
+		// associated profile) then we clear the results of the policy so that automation can
+		// be triggered upon failure.
+		if p.ProfileUUID.Value != "" &&
+			!ptr.Equal(policy.ResendAppleProfileUUID, &p.ProfileUUID.Value) &&
+			!ptr.Equal(policy.ResendWindowsProfileUUID, &p.ProfileUUID.Value) {
+			removeAllMemberships = true
+			removeStats = true
+		}
+
+		if err := policy.SetResendProfileUUID(p.ProfileUUID.Value); err != nil {
+			return nil, ctxerr.Wrap(ctx, err, "set resend configuration profile")
+		}
+	}
+	// If the client sent any of the label scope fields, treat all of them as authoritative
+	// for the policy's label state. Verify() enforces that at most one include scope and one
+	// exclude scope carry values (empty slices are allowed and just clear that scope), so the
+	// provided fields switch scope and clear the others. Sending none of them (all nil) leaves
+	// labels untouched.
+	if p.LabelsIncludeAny != nil || p.LabelsIncludeAll != nil || p.LabelsExcludeAny != nil || p.LabelsExcludeAll != nil {
+		policy.LabelsIncludeAny = fleet.LabelNamesToIdents(p.LabelsIncludeAny)
+		policy.LabelsIncludeAll = fleet.LabelNamesToIdents(p.LabelsIncludeAll)
+		policy.LabelsExcludeAny = fleet.LabelNamesToIdents(p.LabelsExcludeAny)
+		policy.LabelsExcludeAll = fleet.LabelNamesToIdents(p.LabelsExcludeAll)
+	}
+
+	if err := fleet.PolicyVerifyConditionalAccess(policy.ConditionalAccessEnabled, policy.Platform); err != nil {
+		return nil, ctxerr.Wrap(ctx, &fleet.BadRequestError{
+			Message: fmt.Sprintf("policy payload verification: %s", err),
+		})
+	}
+	// Checked against the merged policy, not the payload: either the profile or the platform can
+	// be the field being changed, and both have to end up consistent.
+	if err := fleet.PolicyVerifyResendProfile(policy.ResendProfileUUID(), policy.Platform); err != nil {
+		return nil, ctxerr.Wrap(ctx, &fleet.BadRequestError{
+			Message: fmt.Sprintf("policy payload verification: %s", err),
+		})
+	}
+
+	logging.WithExtras(ctx, "name", policy.Name, "sql", policy.Query)
+
+	err = svc.ds.SavePolicy(ctx, policy, removeAllMemberships, removeStats)
+	if err != nil {
+		return nil, ctxerr.Wrap(ctx, err, "saving policy")
+	}
+
+	if err := svc.populateAutomationsForTeamPolicy(ctx, policy); err != nil {
+		return nil, ctxerr.Wrap(ctx, err, "populate automations")
+	}
+
+	if policy.Type == fleet.PolicyTypePatch && policy.PatchWhenClosed && policy.PatchSoftwareTitleID != nil {
+		if err := svc.ds.ClearPreInstallQueryForTitle(ctx, ptr.ValOrZero(teamID), *policy.PatchSoftwareTitleID); err != nil {
+			return nil, ctxerr.Wrap(ctx, err, "clear pre-install query for title")
+		}
+	}
+
+	if teamID == nil {
+		globalTeamID := int64(-1)
+		if err := svc.NewActivity(
+			ctx,
+			authz.UserFromContext(ctx),
+			fleet.ActivityTypeEditedPolicy{
+				ID:       policy.ID,
+				Name:     policy.Name,
+				TeamID:   &globalTeamID,
+				TeamName: nil,
+			},
+		); err != nil {
+			return nil, ctxerr.Wrap(ctx, err, "create activity for global policy modification")
+		}
+		return policy, nil
+	}
+
+	// Add a special case for handling "No Team" (teamID = 0) in ModifyTeamPolicy
+	if *teamID == 0 {
+		noTeamID := int64(0)
+		if err := svc.NewActivity(
+			ctx,
+			authz.UserFromContext(ctx),
+			fleet.ActivityTypeEditedPolicy{
+				ID:       policy.ID,
+				Name:     policy.Name,
+				TeamID:   &noTeamID,
+				TeamName: nil,
+			},
+		); err != nil {
+			return nil, ctxerr.Wrap(ctx, err, "create activity for no-team policy modification")
+		}
+		return policy, nil
+	}
+
+	// Note: Issue #4191 proposes that we move to SQL transactions for actions so that we can
+	// rollback an action in the event of an error writing the associated activity
+
+	var teamName *string
+	if *teamID != 0 {
+		if svc.EnterpriseOverrides != nil && svc.EnterpriseOverrides.TeamByIDOrName != nil {
+			team, err := svc.EnterpriseOverrides.TeamByIDOrName(ctx, teamID, nil)
+			if err != nil {
+				return nil, ctxerr.Wrap(ctx, err, "fetching team details")
+			}
+			teamName = &team.Name
+		}
+	}
+
+	// Convert *uint to *int64 for the activity
+	var activityTeamID *int64
+	teamIDInt64 := int64(*teamID)
+	activityTeamID = &teamIDInt64
+
+	if err := svc.NewActivity(
+		ctx,
+		authz.UserFromContext(ctx),
+		fleet.ActivityTypeEditedPolicy{
+			ID:       policy.ID,
+			Name:     policy.Name,
+			TeamID:   activityTeamID,
+			TeamName: teamName,
+		},
+	); err != nil {
+		return nil, ctxerr.Wrap(ctx, err, "create activity for policy modification")
+	}
+
+	return policy, nil
+}
+
+func (svc *Service) getInstallerOrVPPAppForTitle(ctx context.Context, teamID *uint, softwareTitleID *uint, chosenInstallerID *uint) (installerID *uint, vppAppsTeamsID *uint, err error) {
+	installerChosen := chosenInstallerID != nil && *chosenInstallerID != 0
+
+	// SoftwareTitleID value 0 (or nil) unsets the current installer from the policy. A chosen
+	// installer without a title has nothing to resolve against, so reject it rather than silently drop it.
+	if softwareTitleID == nil || *softwareTitleID == 0 {
+		if installerChosen {
+			return nil, nil, ctxerr.Wrap(ctx, &fleet.BadRequestError{
+				Message: "software_package_id can only be set together with software_title_id",
+			})
+		}
+		return nil, nil, nil
+	}
+
+	if teamID == nil {
+		return nil, nil, ctxerr.Wrap(ctx, &fleet.BadRequestError{
+			Message: "Software title ID cannot be set on global policies",
+		})
+	}
+
+	// When the caller selects a specific package, honor it. A chosen installer is always a custom
+	// package (VPP apps have no per-package selection). Validate it against the title's active
+	// packages so it belongs to this title/team and isn't an inactive row.
+	if installerChosen {
+		pkgs, err := svc.ds.GetSoftwarePackagesByTeamAndTitleID(ctx, teamID, *softwareTitleID)
+		if err != nil {
+			return nil, nil, ctxerr.Wrap(ctx, err, "list packages for chosen policy installer")
+		}
+		for _, p := range pkgs {
+			if p.InstallerID == *chosenInstallerID {
+				return new(*chosenInstallerID), nil, nil
+			}
+		}
+		return nil, nil, ctxerr.Wrap(ctx, &fleet.BadRequestError{
+			Message: fmt.Sprintf("Software installer with ID %d does not belong to software title ID %d on team ID %d", *chosenInstallerID, *softwareTitleID, *teamID),
+		})
+	}
+
+	softwareTitle, err := svc.SoftwareTitleByID(ctx, *softwareTitleID, teamID)
+	if err != nil {
+		if fleet.IsNotFound(err) {
+			return nil, nil, ctxerr.Wrap(ctx, &fleet.BadRequestError{
+				Message: fmt.Sprintf("Software title with ID %d does not belong to team ID %d", *softwareTitleID, *teamID),
+			})
+		}
+		return nil, nil, ctxerr.Wrap(ctx, err, "software title by id")
+	}
+	if softwareTitle.AppStoreApp != nil {
+		if softwareTitle.AppStoreApp.Platform != fleet.MacOSPlatform {
+			return nil, nil, ctxerr.Wrap(ctx, &fleet.BadRequestError{
+				Message: fmt.Sprintf(
+					"Software title with ID %d on team ID %d is associated to an iOS or iPadOS VPP app, only software installers or macOS VPP apps are supported",
+					*softwareTitleID,
+					*teamID,
+				),
+			})
+		}
+
+		return nil, &softwareTitle.AppStoreApp.VPPAppsTeamsID, nil
+	}
+	if softwareTitle.SoftwarePackage == nil {
+		return nil, nil, ctxerr.Wrap(ctx, &fleet.BadRequestError{
+			Message: fmt.Sprintf("Software title with ID %d on team ID %d does not have an associated package", *softwareTitleID, *teamID),
+		})
+	}
+
+	// At this point we assume *softwareTitle.SoftwarePackage.TeamID == *teamID,
+	// because SoftwareTitleByID above receives the teamID.
+	return ptr.Uint(softwareTitle.SoftwarePackage.InstallerID), nil, nil
+}

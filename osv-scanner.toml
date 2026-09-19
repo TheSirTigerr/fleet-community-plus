@@ -1,0 +1,6 @@
+# Configure OSV-Scanner
+# https://google.github.io/osv-scanner/configuration/
+
+[[IgnoredVulns]]
+id = "GO-2023-1788"
+reason = "2024/04/02 - When packaging linux files, we do not use global permissions. Manually verified that packed fleet-osquery files do not have group/global write permissions. Reference: https://osv.dev/vulnerability/GO-2023-1788"

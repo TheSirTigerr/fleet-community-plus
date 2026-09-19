@@ -1,0 +1,48 @@
+import React from "react";
+
+import CardHeader from "components/CardHeader";
+import EmptyState from "components/EmptyState";
+import TableContainer from "components/TableContainer";
+import { IMunkiIssue } from "interfaces/host";
+
+import { munkiIssuesTableHeaders } from "./MunkiIssuesTableConfig";
+
+const baseClass = "munki-issues-section";
+
+interface IMunkiIssuesTableProps {
+  isLoading: boolean;
+  munkiIssues?: IMunkiIssue[];
+  deviceType?: string;
+}
+
+const MunkiIssuesTable = ({
+  isLoading,
+  munkiIssues,
+  deviceType,
+}: IMunkiIssuesTableProps): JSX.Element => {
+  return (
+    <div className={baseClass}>
+      <CardHeader header="Munki issues" />
+      <div className={deviceType || ""}>
+        <TableContainer
+          columnConfigs={munkiIssuesTableHeaders}
+          data={munkiIssues || []}
+          isLoading={isLoading}
+          defaultSortHeader="name"
+          defaultSortDirection="asc"
+          resultsTitle="issue"
+          emptyComponent={() => (
+            <EmptyState
+              header="No Munki issues detected"
+              info="The last time Munki ran on this host, no issues were reported."
+            />
+          )}
+          showMarkAllPages={false}
+          isAllPagesSelected={false}
+          isClientSidePagination
+        />
+      </div>
+    </div>
+  );
+};
+export default MunkiIssuesTable;

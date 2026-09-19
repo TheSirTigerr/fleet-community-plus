@@ -1,0 +1,714 @@
+#pricing {
+
+  h1, p {
+    color: #192147;
+  }
+  h2 {
+    font-weight: 800;
+    font-size: 32px;
+    line-height: 38px;
+  }
+  h4 {
+    color: #515774;
+    font-weight: 500;
+    font-size: 18px;
+    line-height: 24px;
+  }
+  p {
+    color: #515774;
+    font-weight: 400;
+    font-size: 16px;
+    line-height: 24px;
+  }
+  a {
+    color: #515774;
+  }
+  .btn {
+    color: #fff;
+  }
+  [purpose='page-content'] {
+    padding-left: 40px;
+    padding-right: 40px;
+    color: #192147;
+    max-width: 1120px;
+  }
+  [purpose='pricing-tiers'] {
+    margin-bottom: 24px;
+  }
+  [purpose='pricing-card-body'] {
+    padding: 24px 32px;
+    flex-grow: 1;
+    display: flex;
+    flex-direction: column;
+    justify-content: space-between;
+  }
+  [purpose='pricing-card'] {
+    width: 33%;
+    [purpose='pricing-tier-image'] {
+      height: 149px;
+      width: 100%;
+      border-radius: 12px 12px 0px 0px;
+      background-size: auto 100%;
+      background-position: bottom;
+      background-repeat: no-repeat;
+    }
+
+  }
+  [purpose='free-tier-card'] {
+    text-align: left;
+    padding: 0px;
+    border-radius: 16px;
+    border: 1px solid #E2E4EA;
+    width: 100%;
+    box-shadow: none;
+    background: #fff;
+
+    [purpose='pricing-tier-image'] {
+      background-image: url('/images/pricing-page-card-free-543x233@2x.png');
+    }
+  }
+  [purpose='premium-tier-card'] {
+    padding: 0px;
+    border-radius: 16px;
+    border: 1px solid #E2E4EA;
+    text-align: left;
+    box-shadow: none;
+    margin-left: 16px;
+    background: #fff;
+    [purpose='pricing-tier-image'] {
+      background-image: url('/images/pricing-page-card-premium-543x233@2x.png');
+    }
+  }
+  [purpose='custom-tier-card'] {
+    padding: 0px;
+    border-radius: 16px;
+    border: 1px solid #E2E4EA;
+    text-align: left;
+    box-shadow: none;
+    margin-left: 16px;
+    background: #fff;
+    [purpose='pricing-tier-image'] {
+      background-image: url('/images/pricing-page-card-custom-543x233@2x.png');
+    }
+    [purpose='pricing-tier-title'] {
+      h2 {
+        margin-bottom: 17px;
+      }
+      h3 {
+        margin-bottom: 17px;
+      }
+
+    }
+  }
+  [purpose='button-container'] {
+    height: 52px;
+  }
+  [purpose='pricing-tier-title'] {
+    text-align: left;
+    [purpose='tier-price'] {
+      margin-bottom: 12px;
+    }
+    h1 {// Price e.g., $0
+      font-size: 32px;
+      font-weight: 800;
+      line-height: 120%;
+      margin-bottom: 0px;
+      color: #192147;
+    }
+    h2 {// Tier name
+      font-size: 24px;
+      font-weight: 800;
+      line-height: 120%;
+      color: #192147;
+      margin-bottom: 4px;
+    }
+    h3 {// for "Unlimited hosts"
+      font-weight: 400;
+      font-size: 14px;
+      line-height: 150%;
+      color: #515774;
+      margin-bottom: 12px;
+    }
+    strong { // "/host/month"
+      padding-left: 8px;
+      font-size: 14px;
+      line-height: 150%;
+      color: @core-fleet-black-75;
+      font-weight: 400;
+    }
+    p {
+      color: #ff5c83;
+      margin-bottom: 8px;
+    }
+  }
+  [purpose='contact-sales-link'] {
+    text-align: center;
+    margin-top: 8px;
+    margin-bottom: 0px;
+    font-weight: 400;
+    font-size: 14px;
+    line-height: 20px;
+    a {
+      text-decoration: underline;
+      color: #ff5c83;
+      cursor: pointer;
+    }
+
+  }
+  [purpose='logos-container'] {
+    margin-top: 40px;
+    margin-bottom: 32px;
+    max-width: 100%;
+    [parasails-component='logo-carousel'] {
+      margin-bottom: 32px;
+    }
+  }
+  [purpose='features-list'] {
+
+    p {
+      font-size: 14px;
+      margin-bottom: 12px;
+      text-indent: -24px;
+      padding-left: 24px;
+      color: #515774;
+    }
+    p::before {
+      content: '';
+      display: inline-block;
+      background: url('/images/icon-checkmark-green-16x16@2x.png');
+      background-size: cover;
+      margin-right: 8px;
+      height: 14px;
+      width: 14px;
+    }
+  }
+
+  [purpose='card-button'] {
+    .cta-button();
+    font-size: 16px;
+    padding: 15px;
+    margin-top: 8px;
+    margin-bottom: 0px;
+  }
+
+  [purpose='chat-button'], [purpose='card-button'] {
+    position: relative;
+  }
+
+  [purpose='features-table'].hide {
+    display: none !important; //lesshint-disable-line importantRule
+  }
+  [purpose='mobile-feature-table-section'] {
+    margin-bottom: 16px;
+    h4 {
+      font-weight: 700;
+      font-size: 20px;
+      line-height: 28px;
+      color: #192147;
+      margin-bottom: 20px;
+    }
+  }
+  [purpose='mobile-features-table'] {
+    border-radius: 8px;
+    border: 1px solid #E2E4EA;
+    margin-bottom: 24px;
+    img {
+      vertical-align: middle;
+    }
+    div {
+      padding: 8px 16px;
+    }
+    div:first-of-type {
+      border-top-left-radius: 8px;
+      border-top-right-radius: 8px;
+      border-top: none;
+    }
+    div:last-of-type {
+      border-bottom-left-radius: 8px;
+      border-bottom-right-radius: 8px;
+    }
+    div {
+      border-top: 1px solid #E2E4EA;
+    }
+    [purpose='striped-row'] {
+      background-color: #F9FAFC;
+    }
+    strong {
+      color: @core-fleet-black-75;
+    }
+  }
+  [purpose='premium-price-linebreak'] {
+    display: none;
+  }
+  [purpose='checkmark'] {
+    height: 16px;
+    width: 16px;
+  }
+
+  .tooltip-inner {
+    p {
+      font-size: 12px;
+      line-height: 150%;
+      color: #FFF;
+      margin-bottom: 8px;
+    }
+    a {
+      text-decoration: underline;
+      color: #FFF;
+    }
+  }
+  [purpose='mobile-tooltip'] {
+    [purpose='modal-content'] {
+      padding: 64px 24px;
+      background-color: @core-fleet-black-75;
+      border-radius: 16px;
+      border: none;
+      [purpose='modal-close-button'] {
+        color: #FFF;
+      }
+    }
+    p {
+      font-size: 14px;
+      line-height: 150%;
+      color: #FFF;
+      margin-bottom: 0px;
+    }
+    a {
+      font-size: 14px;
+      margin-top: 16px;
+      display: inline-block;
+      text-decoration: underline;
+      color: #FFF;
+    }
+  }
+  [purpose='tooltip-icon'] {
+    margin-left: 6px;
+    height: 14px;
+    cursor: pointer;
+    margin-bottom: 2px;
+  }
+
+  [purpose='table-checkmark'] {
+    width: 175px;
+  }
+  [purpose='pricing-categories-table'] {
+    margin-bottom: 40px;
+    thead {
+      td {
+        vertical-align: bottom;
+        border: none;
+      }
+      h4 {
+        color: #192147;
+        font-weight: 700;
+        font-size: 24px;
+        line-height: 24px;
+      }
+    }
+    tbody {
+      color: #515774;
+      border-radius: 8px;
+      outline: 1px solid #E2E4EA;
+      outline-offset: -1px;
+      td {
+        padding: 12px 24px;
+        vertical-align: middle;
+      }
+      tr:first-child {
+        td {
+          border: none;
+        }
+      }
+      tr:last-child {
+        td:first-child {
+          border-bottom-left-radius: 8px;
+        }
+        td:last-child {
+          border-bottom-right-radius: 8px;
+        }
+      }
+      tr:nth-of-type(even) {
+        background-color: #F9FAFC;
+      }
+    }
+  }
+
+
+  [purpose='features-table'] {
+    .truncated {
+      max-height: 649px;
+      overflow-y: hidden;
+      justify-content: flex-start;
+      position: relative;
+      [purpose='truncated-features-fade'] {
+        position: absolute;
+        bottom: 0px;
+        background: linear-gradient(180deg, rgba(255, 255, 255, 0.00) -2.2%, #FFF 87.37%);
+        width: 100%;
+        height: 101px;
+      }
+    }
+    [purpose='show-all-features-button'] {
+      cursor: pointer;
+      color: #515774;
+      font-size: 14px;
+      font-weight: 700;
+      line-height: 150%;
+      border-radius: 16px;
+      background: #FFF;
+      padding: 8px 16px;
+      margin-bottom: 64px;
+      span {
+        height: 12px;
+        width: 12px;
+        display: inline-block;
+        background: url('/images/icon-chevron-fleet-black-75-12x12@2x.png');
+        background-size: 12px 12px;
+        background-repeat: no-repeat;
+        margin-left: 8px;
+      }
+      &:hover {
+        color: #515774;
+        background-color: #F9FAFC;
+      }
+      &.expanded {
+        span {
+          transform: rotate(180deg);
+        }
+      }
+    }
+  }
+  [purpose='faq'] {
+    padding-top: 80px;
+    border-top: 1px solid #E2E4EA;
+    margin-bottom: 80px;
+    [purpose='faq-header'] {
+      width: 392px;
+      margin-right: 16px;
+    }
+    [purpose='accordion'] {
+      width: 640px;
+      flex-grow: 1;
+      [purpose='accordion-body'] {
+        [purpose='accordion-header'] {
+          color: #192147;
+          display: flex;
+          flex-direction: row;
+          justify-content: space-between;
+          align-items: center;
+          font-weight: 700;
+          font-size: 16px;
+          line-height: 150%;
+          p {
+            margin-bottom: 0px;
+          }
+          span {
+            margin-left: 40px;
+            color: #8B8FA2;
+            font-weight: 900;
+            transform: rotate(0deg);
+            font-size: 19px;
+          }
+          &[aria-expanded] {
+            span {
+              transform: rotate(180deg);
+            }
+          }
+          &.collapsed {
+            span {
+              transform: rotate(0deg);
+            }
+          }
+        }
+        [purpose='accordion-item'] {
+          border-bottom: 1px solid #E2E4EA;
+          margin-top: 24px;
+          padding-bottom: 12px;
+        }
+        [purpose='faq-answer'] {
+          margin-right: 40px;
+          margin-bottom: 16px;
+          a {
+            text-decoration-line: underline;
+          }
+        }
+      }
+    }
+  }
+
+  [purpose='contact-note'] {
+    margin-top: 24px;
+    font-size: 16px;
+    font-style: normal;
+    font-weight: 400;
+    line-height: 24px;
+    a {
+      text-decoration-line: underline;
+    }
+  }
+  [purpose='bottom-cta'] {
+    padding-top: 80px;
+    padding-bottom: 120px;
+    h2 {
+      font-weight: 800;
+      font-size: 24px;
+      line-height: 32px;
+      color: #192147;
+      margin-bottom: 24px;
+    }
+    p {
+      margin-bottom: 24px;
+    }
+    a:not(.btn) {
+      font-size: 16px;
+      line-height: 24px;
+      color: @core-fleet-black-75;
+      text-decoration: underline;
+    }
+  }
+
+  [purpose='faq-list'] {
+    padding-left: 20px;
+    li {
+      margin-bottom: 16px;
+      padding-left: 8px;
+    }
+  }
+  [purpose='chat-button'] {
+    height: 54px;
+    line-height: 16px;
+    font-size: 16px;
+  }
+  [purpose='cta-button'] {
+    margin: 0;
+    color: #192147;
+    max-width: 250px;
+    line-height: 16px;
+    font-size: 16px;
+    .btn-animated-arrow-red();
+    &::before {
+      left: 80%;
+      top: 10px;
+    }
+    &:hover::before {
+      left: 83%;
+    }
+  }
+  [purpose='pricing-table-category']:not(:first-of-type) {
+    margin-top: 48px;
+  }
+
+
+  @media (min-width: 1400px) {
+    // > 1400px width: the page has no left or right padding
+    [purpose='page-content'] {
+      max-width: 1160px;
+      padding-left: 0px;
+      padding-right: 0px;
+    }
+    [purpose='pricing-card'] {
+      width: 33%;
+      [purpose='pricing-tier-image'] {
+        height: 149px;
+        width: 100%;
+        border-radius: 12px 12px 0px 0px;
+        background-size: 100% auto;
+        background-position: center 0px;
+      }
+    }
+  }
+  @media (max-width: 991px) {
+    // >992 width:
+    //   - The pages padding is reduced to 24px
+    //   - Tier cards shift to a column view and have 100% width;
+    [purpose='page-content'] {
+      padding-left: 24px;
+      padding-right: 24px;
+    }
+    [purpose='pricing-card'] {
+      width: 100%;
+      [purpose='pricing-tier-image'] {
+        height: 240px;
+        min-height: 100%;
+        max-width: 337px;
+        width: 100%;
+        border-radius: 12px 0px 0px 12px;
+        background-position: center;
+        background-repeat: no-repeat;
+      }
+    }
+    [purpose='pricing-card-body'] {
+      padding: 24px 64px;
+    }
+    [purpose='free-tier-card'] {
+      margin-bottom: 16px;
+    }
+    [purpose='premium-tier-card'] {
+      margin-left: 0px;
+      margin-bottom: 16px;
+      [purpose='card-button'] {
+          width: 100%;
+      }
+    }
+    [purpose='custom-tier-card'] {
+      margin-left: 0px;
+    }
+  }
+
+  @media (max-width: 767px) {
+
+    [purpose='pricing-card'] {
+      width: 100%;
+      [purpose='pricing-tier-image'] {
+        height: auto;
+        min-height: 100%;
+        width: 100%;
+        max-width: 257px;
+        border-radius: 12px 0px 0px 12px;
+        background-position: center;
+        background-repeat: no-repeat;
+      }
+    }
+    [purpose='pricing-card-body'] {
+      padding: 24px 32px;
+    }
+    [purpose='features-table'] {
+      .truncated {
+        max-height: 1480px;
+        overflow-y: hidden;
+        justify-content: flex-start;
+        position: relative;
+        [purpose='truncated-features-fade'] {
+          position: absolute;
+          bottom: 0px;
+          background: linear-gradient(180deg, rgba(255, 255, 255, 0.00) -2.2%, #FFF 87.37%);
+          width: 100%;
+          height: 101px;
+        }
+      }
+    }
+    [purpose='faq'] {
+      padding-top: 80px;
+      border-top: 1px solid #E2E4EA;
+      margin-bottom: 80px;
+      [purpose='faq-header'] {
+        width: unset;
+        margin-right: 0px;
+        margin-bottom: 16px;
+      }
+      [purpose='accordion'] {
+        width: 100%;
+        [purpose='accordion-body'] {
+          [purpose='accordion-header'] {
+            color: #192147;
+            display: flex;
+            flex-direction: row;
+            justify-content: space-between;
+            align-items: center;
+            font-weight: 700;
+            font-size: 16px;
+            line-height: 150%;
+            p {
+              margin-bottom: 0px;
+            }
+            span {
+              margin-left: 40px;
+              color: #8B8FA2;
+              font-weight: 900;
+              transform: rotate(0deg);
+              font-size: 19px;
+            }
+            &[aria-expanded] {
+              span {
+                transform: rotate(180deg);
+              }
+            }
+            &.collapsed {
+              span {
+                transform: rotate(0deg);
+              }
+            }
+          }
+          [purpose='accordion-item'] {
+            border-bottom: 1px solid #E2E4EA;
+            margin-top: 16px;
+            margin-bottom: 16px;
+          }
+        }
+      }
+    }
+  }
+  @media (max-width: 575px) {
+    // >575px:
+    //   - The Premium Cloud card switches to a column layout
+    //   - The picing tier cards have their padding reduced to 24px
+    [purpose='hero-text'] {
+      padding-right: -5px;
+      padding-left: -5px;
+    }
+    [purpose='page-content'] {
+      padding-left: 24px;
+      padding-right: 24px;
+    }
+    [purpose='pricing-card'] {
+      width: 100%;
+      [purpose='pricing-tier-image'] {
+        height: 233px;
+        min-height: 100%;
+        width: 100%;
+        max-width: unset;
+        border-radius: 12px 12px 0px 0px;
+        background-position: center;
+        background-repeat: no-repeat;
+      }
+    }
+    [purpose='free-tier-card'] {
+      justify-content: center;
+    }
+    [purpose='premium-tier-card'] {
+      justify-content: center;
+    }
+    [purpose='custom-tier-card'] {
+      justify-content: center;
+    }
+    [purpose='pricing-categories-table'] {
+      margin-bottom: 40px;
+      thead {
+        h4 {
+          color: #192147;
+          font-weight: 700;
+          font-size: 14px;
+          line-height: 21px;
+          margin-bottom: 0px;
+        }
+        tr {
+          td {
+            padding: 4px 4px;
+            vertical-align: middle;
+            strong {
+              font-size: 12px;
+            }
+
+          }
+        }
+      }
+      tbody {
+        td {
+          font-size: 14px;
+          padding: 8px 8px;
+          vertical-align: middle;
+        }
+      }
+    }
+    [purpose='chat-button'] {
+      margin-bottom: 16px;
+    }
+    .modal-dialog {
+      margin: 0.5rem auto;
+      padding-left: 24px;
+      padding-right: 24px;
+    }
+  }
+
+
+}

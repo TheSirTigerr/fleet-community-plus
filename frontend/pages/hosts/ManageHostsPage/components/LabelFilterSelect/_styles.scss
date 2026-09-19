@@ -1,0 +1,200 @@
+.label-filter-select {
+  width: 305px;
+
+  svg {
+    transition: transform 0.25s ease;
+  }
+
+  &:hover {
+    // no access to hover state from react-select in JS so this is done here.
+    .custom-dropdown-indicator {
+      & path {
+        stroke: $ui-fleet-black-75;
+      }
+    }
+
+    .filter-icon {
+      & path {
+        fill: $ui-fleet-black-75;
+      }
+    }
+  }
+
+  .label-filter-select__control {
+    border: 1px solid $ui-fleet-black-10;
+    background-color: $core-fleet-white;
+    border-radius: $border-radius;
+    height: 36px;
+    // react-select-5 bakes in a 38px minHeight via its own emotion styles,
+    // which otherwise wins over the height above
+    min-height: 36px !important;
+
+    body.dark-mode & {
+      background-color: $ui-fleet-black-5;
+    }
+
+    &:hover {
+      cursor: pointer;
+      border: 1px solid $ui-fleet-black-50;
+    }
+
+    &--is-disabled {
+      pointer-events: none;
+      opacity: 0.5;
+    }
+
+    &--is-focused,
+    &--menu-is-open {
+      box-shadow: none;
+      border: 1px solid $core-fleet-black;
+    }
+
+    &--menu-is-open {
+      .custom-dropdown-indicator {
+        svg {
+          transform: rotate(180deg);
+          transition: transform 0.25s ease;
+        }
+      }
+      .filter-icon {
+        & path {
+          fill: $ui-fleet-black-75;
+        }
+      }
+    }
+  }
+
+  .label-filter-select__value-container {
+    display: flex;
+    gap: $pad-small;
+    margin-left: $pad-xsmall;
+  }
+
+  .label-filter-select__single-value,
+  .label-filter-select__placeholder {
+    color: $core-fleet-black;
+    font-size: $x-small;
+  }
+
+  .label-filter-select__single-value {
+    max-width: 84%; // Must override default styling of .css-qc6sy-singleValue
+  }
+
+  .label-filter-select__placeholder {
+    width: 215px; // Any larger runs into indicator
+    overflow: hidden;
+    text-overflow: ellipsis;
+    white-space: nowrap;
+
+    @media (max-width: $table-controls-break) {
+      width: auto;
+    }
+  }
+
+  .label-filter-select__indicator-separator {
+    display: none;
+  }
+
+  .label-filter-select__indicator {
+    color: $core-fleet-black;
+    // override react-select default styles to increase flexibility of dropdown styling
+    padding: 0;
+    padding-right: $pad-small;
+  }
+
+  .label-filter-select__menu {
+    width: 300px;
+    margin-top: 0;
+    z-index: 2;
+    animation: fade-in 150ms ease-out;
+    background-color: $core-fleet-white;
+
+    body.dark-mode & {
+      background-color: $ui-fleet-black-5;
+    }
+  }
+
+  .label-filter-select__menu-list {
+    max-height: 590px;
+    padding: $pad-medium;
+  }
+
+  .label-filter-select__option {
+    padding: 10px 1rem;
+    border-radius: $border-radius;
+
+    &:hover {
+      cursor: pointer;
+    }
+
+    &--is-selected {
+      background-color: transparent;
+
+      .option-label__text {
+        font-weight: $bold;
+      }
+    }
+
+    &--is-focused {
+      background-color: $ui-fleet-black-5;
+
+      &:active {
+        background-color: $ui-fleet-black-10;
+      }
+    }
+
+    &--is-disabled {
+      &:active {
+        background-color: transparent;
+      }
+    }
+  }
+
+  .label-filter-select__group-heading {
+    display: flex;
+    flex-direction: column;
+    gap: $pad-small;
+    padding: 0;
+  }
+
+  .option-label {
+    display: flex;
+    align-items: center;
+    min-width: 0;
+
+    .option-icon {
+      flex-shrink: 0;
+      margin-right: $pad-small;
+    }
+  }
+
+  .option-label__text {
+    min-width: 0;
+    font-size: $x-small;
+    font-weight: $regular;
+    color: $core-fleet-black;
+
+    // TooltipWrapper has `cursor: default` on its element, which sits
+    // below the pointer the option row and the closed control set on hover.
+    // Inherit so the text defers to whichever surface it is rendered in.
+    .component__tooltip-wrapper__element {
+      cursor: inherit;
+    }
+  }
+
+  &__custom-dropdown-indicator {
+    &:hover {
+      cursor: pointer;
+    }
+  }
+}
+
+@media (min-width: $table-controls-break) {
+  .label-filter-select {
+    min-width: 305px;
+
+    &__single-value {
+      max-width: 210px !important; // Must override default styling of .css-qc6sy-singleValue
+    }
+  }
+}

@@ -1,0 +1,1198 @@
+import { AxiosError } from "axios";
+import classNames from "classnames";
+import { omit, pick } from "lodash";
+import React, { useState, useCallback, useEffect, useMemo } from "react";
+import { useQuery } from "react-query";
+import { InjectedRouter, Params } from "react-router/lib/Router";
+import { Tab, Tabs, TabList, TabPanel } from "react-tabs";
+
+import CustomLink from "components/CustomLink";
+import DeviceUserError from "components/DeviceUserError";
+// @ts-ignore
+import OrgLogoIcon from "components/icons/OrgLogoIcon";
+import Spinner from "components/Spinner";
+import TabNav from "components/TabNav";
+import TabText from "components/TabText";
+import { notify } from "components/ToastNotification";
+import useIsMobileWidth from "hooks/useIsMobileWidth";
+import {
+  IHostCertificate,
+  CERTIFICATES_DEFAULT_SORT,
+} from "interfaces/certificates";
+import { IDeviceGlobalConfig } from "interfaces/config";
+import { hasStatusKey } from "interfaces/errors";
+import { IMacadminsResponse, IDUPDetails, IHostDevice } from "interfaces/host";
+import { IListSort } from "interfaces/list_options";
+import { canTriggerAPNSPing } from "interfaces/mdm";
+import {
+  isMacOS,
+  isAppleDevice,
+  isLinuxLike,
+  isWindows,
+} from "interfaces/platform";
+import { IHostPolicy } from "interfaces/policy";
+import { ISetupStep } from "interfaces/setup";
+import { IHostSoftware } from "interfaces/software";
+import UnsupportedScreenSize from "layouts/UnsupportedScreenSize";
+import shouldShowUnsupportedScreen from "layouts/UnsupportedScreenSize/helpers";
+import PATHS from "router/paths";
+import deviceUserAPI, {
+  IGetDeviceCertsApiParams,
+  IGetDeviceCertificatesResponse,
+  IGetSetupExperienceStatusesResponse,
+} from "services/entities/device_user";
+import diskEncryptionAPI from "services/entities/disk_encryption";
+import {
+  DEFAULT_USE_QUERY_OPTIONS,
+  DOCUMENT_TITLE_SUFFIX,
+  HOST_VITALS_DATA,
+  HOST_SUMMARY_DATA,
+} from "utilities/constants";
+import { normalizeEmptyValues } from "utilities/helpers";
+import { isDarkMode } from "utilities/theme";
+import { getPathWithQueryParams } from "utilities/url";
+
+import CertificatesCard from "../cards/Certificates";
+import ControlsCard from "../cards/Controls";
+import { shouldShowControlsTab } from "../cards/Controls/helpers";
+import {
+  countFailedControls,
+  generateTableData,
+} from "../cards/Controls/OSSettingsTableConfig";
+import HostHeader from "../cards/HostHeader/HostHeader";
+import HostSummaryCard from "../cards/HostSummary";
+import PoliciesCard from "../cards/Policies";
+import PolicyDetailsModal from "../cards/Policies/HostPoliciesTable/PolicyDetailsModal";
+import SoftwareCard from "../cards/Software";
+import { parseHostSoftwareQueryParams } from "../cards/Software/HostSoftware";
+import SelfService from "../cards/Software/SelfService";
+import { parseSelfServiceQueryParams } from "../cards/Software/SelfService/SelfService";
+import UserCard from "../cards/User";
+import VitalsCard from "../cards/Vitals";
+import { REFETCH_HOST_DETAILS_POLLING_INTERVAL } from "../HostDetailsPage/HostDetailsPage";
+import BootstrapPackageModal from "../HostDetailsPage/modals/BootstrapPackageModal";
+import CertificateDetailsModal from "../modals/CertificateDetailsModal";
+import InventoryVersionsModal from "../modals/InventoryVersionsModal";
+
+import AutoEnrollMdmModal from "./AutoEnrollMdmModal";
+import BitLockerPinInstructionsModal from "./BitLockerPinInstructionsModal";
+import BitLockerPinModal from "./BitLockerPinModal";
+import BypassModal from "./BypassModal";
+import DeviceUserBanners from "./components/DeviceUserBanners";
+import InfoButton from "./components/InfoButton";
+import SettingUpYourDevice from "./components/SettingUpYourDevice";
+import CreateLinuxKeyModal from "./CreateLinuxKeyModal";
+import {
+  getErrorMessage,
+  hasRemainingSetupSteps,
+  isSoftwareScriptSetup,
+  isIPhone,
+  isIPad,
+  isRecentlyEnrolled,
+  isMismatchedSSOUserError,
+} from "./helpers";
+import InfoModal from "./InfoModal";
+import useDeviceSSO from "./useDeviceSSO";
+
+const baseClass = "device-user";
+
+const getRetryAfterSeconds = (e: unknown): number | undefined => {
+  if (typeof e !== "object" || e === null || !("headers" in e)) {
+    return undefined;
+  }
+  const headers = (e as { headers?: Record<string, unknown> }).headers;
+  const seconds = Number(headers?.["retry-after"]);
+  return Number.isFinite(seconds) && seconds > 0 ? seconds : undefined;
+};
+
+const fullWidthCardClass = `${baseClass}__card--full-width`;
+
+const PREMIUM_TAB_PATHS = [
+  PATHS.DEVICE_USER_DETAILS_SELF_SERVICE,
+  PATHS.DEVICE_USER_DETAILS,
+  PATHS.DEVICE_USER_DETAILS_CONTROLS,
+  PATHS.DEVICE_USER_DETAILS_SOFTWARE,
+  PATHS.DEVICE_USER_DETAILS_POLICIES,
+] as const;
+
+const FREE_TAB_PATHS = [
+  PATHS.DEVICE_USER_DETAILS,
+  PATHS.DEVICE_USER_DETAILS_CONTROLS,
+  PATHS.DEVICE_USER_DETAILS_SOFTWARE,
+] as const;
+
+const DEFAULT_CERTIFICATES_PAGE_SIZE = 10;
+const DEFAULT_CERTIFICATES_PAGE = 0;
+
+const BITLOCKER_PIN_POLL_INTERVAL = 5000;
+
+/** Whether a submitted BitLocker PIN is still in the agent's hands, so its outcome is still coming. */
+const hasPINRequestInFlight = (data?: IDUPDetails) => {
+  const status =
+    data?.host.mdm.os_settings?.disk_encryption.pin_request?.status;
+  return status === "pending" || status === "delivered";
+};
+
+interface IDeviceUserPageProps {
+  location: {
+    pathname: string;
+    query: {
+      vulnerable?: string;
+      exploit?: string;
+      min_cvss_score?: string;
+      max_cvss_score?: string;
+      page?: string;
+      query?: string;
+      order_key?: string;
+      order_direction?: "asc" | "desc";
+      setup_only?: string;
+      sso_error?: string;
+      create_pin?: string;
+    };
+    search?: string;
+  };
+  router: InjectedRouter;
+  params: Params;
+}
+
+const DeviceUserPage = ({
+  location,
+  router,
+  params: { device_auth_token },
+}: IDeviceUserPageProps): JSX.Element => {
+  const deviceAuthToken = device_auth_token;
+  const isMobileView = useIsMobileWidth();
+  const isMobileDevice = isIPhone(navigator) || isIPad(navigator);
+
+  const [showBypassModal, setShowBypassModal] = useState(false);
+  const [showBitLockerPINModal, setShowBitLockerPINModal] = useState(false);
+  const [showInfoModal, setShowInfoModal] = useState(false);
+  const [showEnrollMdmModal, setShowEnrollMdmModal] = useState(false);
+  const [enrollUrlError, setEnrollUrlError] = useState<string | null>(null);
+  const [selectedPolicy, setSelectedPolicy] = useState<IHostPolicy | null>(
+    null
+  );
+  const [showPolicyDetailsModal, setShowPolicyDetailsModal] = useState(false);
+  const [showBootstrapPackageModal, setShowBootstrapPackageModal] = useState(
+    false
+  );
+  const [showCreateLinuxKeyModal, setShowCreateLinuxKeyModal] = useState(false);
+  const [isTriggeringCreateLinuxKey, setIsTriggeringCreateLinuxKey] = useState(
+    false
+  );
+  const [isEscrowInFlight, setIsEscrowInFlight] = useState(false);
+  const [escrowRetryAfterSeconds, setEscrowRetryAfterSeconds] = useState<
+    number | undefined
+  >();
+  const [
+    hostSWForInventoryVersions,
+    setHostSWForInventoryVersions,
+  ] = useState<IHostSoftware | null>(null);
+
+  // certificates states
+  const [
+    selectedCertificate,
+    setSelectedCertificate,
+  ] = useState<IHostCertificate | null>(null);
+  const [certificatePage, setCertificatePage] = useState(
+    DEFAULT_CERTIFICATES_PAGE
+  );
+  const [sortCerts, setSortCerts] = useState<IListSort>({
+    ...CERTIFICATES_DEFAULT_SORT,
+  });
+  const [queuedSelfServiceRefetch, setQueuedSelfServiceRefetch] = useState(
+    false
+  );
+  const [refetchStartTime, setRefetchStartTime] = useState<number | null>(null);
+  const [showRefetchSpinner, setShowRefetchSpinner] = useState(false);
+
+  const [darkMode, setDarkMode] = useState(() => isDarkMode());
+
+  useEffect(() => {
+    const onThemeChange = (e: Event) => {
+      setDarkMode((e as CustomEvent).detail.dark);
+    };
+    window.addEventListener("fleet-theme-change", onThemeChange);
+    return () =>
+      window.removeEventListener("fleet-theme-change", onThemeChange);
+  }, []);
+
+  const { data: deviceMacAdminsData } = useQuery(
+    ["macadmins", deviceAuthToken],
+    () => deviceUserAPI.loadHostDetailsExtension(deviceAuthToken, "macadmins"),
+    {
+      enabled: !!deviceAuthToken,
+      refetchOnMount: false,
+      refetchOnReconnect: false,
+      refetchOnWindowFocus: false,
+      retry: false,
+      select: (data: IMacadminsResponse) => data.macadmins,
+    }
+  );
+
+  const {
+    data: deviceCertificates,
+    isLoading: isLoadingDeviceCertificates,
+    isError: isErrorDeviceCertificates,
+    error: deviceCertificatesError,
+    refetch: refetchDeviceCertificates,
+  } = useQuery<
+    IGetDeviceCertificatesResponse,
+    Error,
+    IGetDeviceCertificatesResponse,
+    Array<IGetDeviceCertsApiParams & { scope: "device-certificates" }>
+  >(
+    [
+      {
+        scope: "device-certificates",
+        token: deviceAuthToken,
+        page: certificatePage,
+        per_page: DEFAULT_CERTIFICATES_PAGE_SIZE,
+        order_key: sortCerts.order_key,
+        order_direction: sortCerts.order_direction,
+      },
+    ],
+    ({ queryKey }) => deviceUserAPI.getDeviceCertificates(queryKey[0]),
+    {
+      ...DEFAULT_USE_QUERY_OPTIONS,
+      // FIXME: is it worth disabling for unsupported platforms? we'd have to workaround the a
+      // catch-22 where we need to know the platform to know if it's supported but we also need to
+      // be able to include the cert refetch in the hosts query hook.
+      enabled: !!deviceUserAPI,
+      keepPreviousData: true,
+      staleTime: 15000,
+    }
+  );
+
+  const refetchExtensions = useCallback(() => {
+    deviceCertificates && refetchDeviceCertificates();
+  }, [deviceCertificates, refetchDeviceCertificates]);
+
+  /**
+   * Hides refetch spinner and resets refetch timer,
+   * ensuring no stale timeout triggers on new requests.
+   */
+  const resetHostRefetchStates = () => {
+    setShowRefetchSpinner(false);
+    setRefetchStartTime(null);
+  };
+
+  const isRefetching = ({
+    refetch_requested,
+    refetch_critical_queries_until,
+  }: IHostDevice) => {
+    if (!refetch_critical_queries_until) {
+      return refetch_requested;
+    }
+
+    const now = new Date();
+    const refetchUntil = new Date(refetch_critical_queries_until);
+    const isRefetchingCriticalQueries =
+      !isNaN(refetchUntil.getTime()) && refetchUntil > now;
+    return refetch_requested || isRefetchingCriticalQueries;
+  };
+
+  const {
+    data: dupDetails,
+    isLoading: isLoadingDupDetails,
+    error: dupDetailsError,
+    refetch: refetchDupDetails,
+  } = useQuery<IDUPDetails, AxiosError>(
+    ["host", deviceAuthToken],
+    () =>
+      deviceUserAPI.loadHostDetails({
+        token: deviceAuthToken,
+        exclude_software: true,
+      }),
+    {
+      enabled: !!deviceAuthToken,
+      refetchOnMount: false,
+      refetchOnReconnect: false,
+      refetchOnWindowFocus: false,
+      retry: false,
+      // A PIN the agent has not reported on yet resolves without the end user doing anything, so the banner clears itself.
+      refetchInterval: (data) =>
+        !showBitLockerPINModal && hasPINRequestInFlight(data)
+          ? BITLOCKER_PIN_POLL_INTERVAL
+          : false,
+      onSuccess: ({ host: responseHost }) => {
+        // If we're just showing the setup screen,
+        // we don't need to refetch or alert on offline hosts.
+        if (location.query.setup_only) {
+          return;
+        }
+        // Handle spinner and timer for refetch
+        if (isRefetching(responseHost)) {
+          setShowRefetchSpinner(true);
+
+          // Only set timer if not already running
+          if (!refetchStartTime) {
+            // Here and below: iOS/iPadOS refetches use MDM commands which can be slower/less predictable
+            // than osquery. Don't show an error, just reset and let the user try again.
+            // Recently enrolled hosts are also exempted: orbit endpoints don't update host_seen_times,
+            // so a fresh host can read as offline until its first osquery distributed-read.
+            const isIOSOrIPadOS =
+              responseHost.platform === "ios" ||
+              responseHost.platform === "ipados";
+            if (
+              responseHost.status === "online" ||
+              isIOSOrIPadOS ||
+              isRecentlyEnrolled(responseHost.last_enrolled_at)
+            ) {
+              setRefetchStartTime(Date.now());
+              setTimeout(() => {
+                refetchDupDetails();
+                refetchExtensions();
+              }, REFETCH_HOST_DETAILS_POLLING_INTERVAL);
+            } else {
+              resetHostRefetchStates();
+              notify.error(
+                `This host is offline. Please try refetching host vitals later.`
+              );
+            }
+          } else {
+            const totalElapsedTime = Date.now() - refetchStartTime;
+            if (totalElapsedTime < 180000) {
+              const isIOSOrIPadOS =
+                responseHost.platform === "ios" ||
+                responseHost.platform === "ipados";
+              if (
+                responseHost.status === "online" ||
+                isIOSOrIPadOS ||
+                isRecentlyEnrolled(responseHost.last_enrolled_at)
+              ) {
+                setTimeout(() => {
+                  refetchDupDetails();
+                  refetchExtensions();
+                }, REFETCH_HOST_DETAILS_POLLING_INTERVAL);
+              } else {
+                resetHostRefetchStates();
+                notify.error(
+                  `This host is offline. Please try refetching host vitals later.`
+                );
+              }
+            } else {
+              // Timeout reached (3 minutes)
+              resetHostRefetchStates();
+              const isIOSOrIPadOS =
+                responseHost.platform === "ios" ||
+                responseHost.platform === "ipados";
+              if (!isIOSOrIPadOS) {
+                notify.error(
+                  "Refetch sent but vitals are taking longer than expected to load. You’ll see an update when the host responds."
+                );
+              }
+            }
+          }
+        } else {
+          // Not refetching: reset spinner and timer
+          resetHostRefetchStates();
+        }
+      },
+    }
+  );
+
+  const isAuthenticationError =
+    dupDetailsError && dupDetailsError.status === 401;
+
+  const {
+    host,
+    license,
+    org_logo_url: orgLogoUrl = "",
+    org_logo_url_light_background: orgLogoUrlLightBackground = "",
+    org_logo_url_dark_mode: orgLogoUrlDarkMode = "",
+    org_logo_url_light_mode: orgLogoUrlLightMode = "",
+    org_contact_url: orgContactURL = "",
+    global_config: globalConfig = null as IDeviceGlobalConfig | null,
+    self_service: hasSelfService = false,
+  } = dupDetails || {};
+  const darkLogoURL = orgLogoUrlDarkMode || orgLogoUrl;
+  const lightLogoURL = orgLogoUrlLightMode || orgLogoUrlLightBackground;
+  const orgLogoURL = darkMode ? darkLogoURL : lightLogoURL;
+  const isPremiumTier = license?.tier === "premium";
+  const diskEncryptionSetting = host?.mdm.os_settings?.disk_encryption;
+  const needsBitLockerPIN =
+    diskEncryptionSetting?.action_required === "create_pin";
+
+  // The Fleet Desktop toast links here with ?create_pin=1. The parameter is dropped once the page has acted on it.
+  useEffect(() => {
+    if (!location.query.create_pin || !host) {
+      return;
+    }
+    if (needsBitLockerPIN) {
+      setShowBitLockerPINModal(true);
+    }
+    router.replace(
+      getPathWithQueryParams(
+        location.pathname,
+        omit(location.query, "create_pin")
+      )
+    );
+  }, [host, needsBitLockerPIN, location, router]);
+
+  const pollHostDetails = useCallback(async () => {
+    // A failed refetch resolves rather than rejects, and leaves the last good data in place.
+    const { data, error } = await refetchDupDetails();
+    if (error) {
+      throw error;
+    }
+    return data;
+  }, [refetchDupDetails]);
+  const isAppleHost = isAppleDevice(host?.platform);
+  const isIOSIPadOS = host?.platform === "ios" || host?.platform === "ipados";
+  const isSetupExperienceSoftwareEnabledPlatform =
+    isLinuxLike(host?.platform || "") ||
+    host?.platform === "windows" ||
+    isMacOS(host?.platform || "");
+
+  const isManualAppleEnrollmentBlocked =
+    globalConfig?.mdm.only_allow_apple_business_enrollment ?? false;
+
+  const isFleetMdmManualUnenrolledMac =
+    !!globalConfig?.mdm.enabled_and_configured &&
+    !!host &&
+    !host.dep_assigned_to_fleet &&
+    host.platform === "darwin" &&
+    (host.mdm.enrollment_status === "Off" ||
+      host.mdm.enrollment_status === null);
+
+  const checkForSetupExperienceSoftware =
+    isSetupExperienceSoftwareEnabledPlatform && isPremiumTier;
+
+  // Memoized so the table keeps a stable `data` reference across renders.
+  const controls = useMemo(
+    () => (host ? generateTableData(host.mdm, host.platform) ?? [] : []),
+    [host]
+  );
+
+  const summaryData = normalizeEmptyValues(pick(host, HOST_SUMMARY_DATA));
+
+  const vitalsData = normalizeEmptyValues(pick(host, HOST_VITALS_DATA));
+
+  const {
+    data: setupStepStatuses,
+    isLoading: isLoadingSetupSteps,
+    isError: isErrorSetupSteps,
+    error: setupStepsError,
+  } = useQuery<
+    IGetSetupExperienceStatusesResponse,
+    AxiosError,
+    ISetupStep[] | null | undefined
+  >(
+    ["software-setup-statuses", deviceAuthToken],
+    () => deviceUserAPI.getSetupExperienceStatuses({ token: deviceAuthToken }),
+    {
+      ...DEFAULT_USE_QUERY_OPTIONS,
+      enabled: checkForSetupExperienceSoftware, // this can only become true once the above `dupResponse` is defined by its associated API call response, ensuring this call only fires once the frontend knows if this is a Fleet Premium instance
+      refetchInterval: (data) => (hasRemainingSetupSteps(data) ? 5000 : false), // refetch every 5s until finished
+      refetchIntervalInBackground: true,
+      select: (response) => {
+        // Marshal the response to include a `type` property so we can differentiate
+        // between software, script-only software, and script setup steps in the UI.
+        return [
+          ...(response.setup_experience_results.software ?? []).map((s) => ({
+            ...s,
+            type: isSoftwareScriptSetup(s)
+              ? "software_script_run" // used for script-only software
+              : "software_install",
+          })),
+          ...(response.setup_experience_results.scripts ?? []).map((s) => ({
+            ...s,
+            type: "script_run" as const,
+          })),
+        ];
+      },
+    }
+  );
+
+  const {
+    data: mdmManualEnrollUrl,
+    // isLoading, // not used; see related comment in onClickTurnOnMdm below
+    error: mdmManualEnrollUrlError,
+  } = useQuery<{ enroll_url: string }, Error, string>(
+    ["mdm_mandual_enroll_url", deviceAuthToken],
+    () => deviceUserAPI.getMdmManualEnrollUrl(deviceAuthToken),
+    {
+      enabled:
+        !!deviceAuthToken &&
+        isFleetMdmManualUnenrolledMac &&
+        !isManualAppleEnrollmentBlocked,
+      refetchOnMount: false,
+      refetchOnReconnect: false,
+      refetchOnWindowFocus: false,
+      retry: false,
+      select: (data) => data.enroll_url,
+    }
+  );
+
+  const {
+    isSSORequired,
+    isRedirecting: isRedirectingToSSO,
+    retry: retryDeviceSSO,
+  } = useDeviceSSO({
+    deviceAuthToken,
+    errors: [
+      dupDetailsError,
+      deviceCertificatesError,
+      setupStepsError,
+      mdmManualEnrollUrlError,
+    ],
+    ssoErrorParam: location.query.sso_error,
+    isSetupOnly: !!location.query.setup_only,
+    hasSession: !!dupDetails,
+  });
+
+  const { bypassConditionalAccess } = deviceUserAPI;
+
+  const [isLoadingBypass, setIsLoadingBypass] = useState(false);
+
+  const toggleShowBypassModal = useCallback(() => {
+    setShowBypassModal(!showBypassModal);
+  }, [showBypassModal, setShowBypassModal]);
+
+  const toggleInfoModal = useCallback(() => {
+    setShowInfoModal(!showInfoModal);
+  }, [showInfoModal, setShowInfoModal]);
+
+  const toggleEnrollMdmModal = useCallback(() => {
+    setShowEnrollMdmModal(!showEnrollMdmModal);
+  }, [showEnrollMdmModal, setShowEnrollMdmModal]);
+
+  const onClickTurnOnMdm = useCallback(async () => {
+    if (host?.dep_assigned_to_fleet) {
+      // display the modal with auto-enroll instructions
+      setShowEnrollMdmModal(true);
+      return;
+    }
+    // if we have an enroll URL, DeviceUserBanners will display a CustomLink in place of the Button;
+    // in some unexpected cases, may not have an enroll URL at this point (e.g., there was an error
+    // fetching the URL from the API or the user clicked the link extremely quickly after page load
+    // before the URL was fetched), we fallback to showing the Button and we'll display an error if
+    // the user tries to click when we don't have an enroll URL.
+    setEnrollUrlError(
+      `Failed to get enrollment URL. ${mdmManualEnrollUrlError}`
+    );
+  }, [host?.dep_assigned_to_fleet, mdmManualEnrollUrlError]);
+
+  const togglePolicyDetailsModal = useCallback(
+    (policy: IHostPolicy) => {
+      setShowPolicyDetailsModal(!showPolicyDetailsModal);
+      setSelectedPolicy(policy);
+    },
+    [showPolicyDetailsModal, setShowPolicyDetailsModal, setSelectedPolicy]
+  );
+
+  const bootstrapPackageData = {
+    status: host?.mdm.setup_experience?.bootstrap_package_status,
+    details: host?.mdm.setup_experience?.details,
+    name: host?.mdm.setup_experience?.bootstrap_package_name,
+  };
+
+  const onCancelPolicyDetailsModal = useCallback(() => {
+    setShowPolicyDetailsModal(false);
+    setSelectedPolicy(null);
+  }, [setShowPolicyDetailsModal, setSelectedPolicy]);
+
+  // User-initiated refetch always starts a new timer!
+  const onRefetchHost = useCallback(async () => {
+    if (!host) return;
+    setShowRefetchSpinner(true);
+
+    // Trigger APNS ping independently of the main refetch
+    if (canTriggerAPNSPing(host)) {
+      deviceUserAPI.apnsPing(deviceAuthToken).catch((error) => {
+        notify.error("Failed to send APNS ping", { response: error });
+      });
+    }
+
+    try {
+      await deviceUserAPI.refetch(deviceAuthToken);
+      setRefetchStartTime(Date.now());
+      setTimeout(() => {
+        refetchDupDetails();
+        refetchExtensions();
+      }, REFETCH_HOST_DETAILS_POLLING_INTERVAL);
+    } catch (error) {
+      notify.error(getErrorMessage(error, host.display_name), {
+        response: error,
+      });
+      resetHostRefetchStates();
+    }
+  }, [host, deviceAuthToken, refetchDupDetails, refetchExtensions]);
+
+  // Handles the queue: If there's a queued refetch and not actively refetching, run refetch
+  useEffect(() => {
+    if (queuedSelfServiceRefetch && !showRefetchSpinner) {
+      setQueuedSelfServiceRefetch(false);
+      onRefetchHost();
+    }
+  }, [queuedSelfServiceRefetch, showRefetchSpinner, onRefetchHost]);
+
+  // Triggered when a software update finishes
+  const requestRefetch = () => {
+    // If a refetch is already happening, queue this refetch
+    if (showRefetchSpinner) {
+      setQueuedSelfServiceRefetch(true);
+    } else {
+      // Otherwise, run it now
+      onRefetchHost();
+    }
+  };
+
+  const pageHeader = "My device";
+
+  // Updates title that shows up on browser tabs
+  useEffect(() => {
+    document.title = `${pageHeader} | ${DOCUMENT_TITLE_SUFFIX}`;
+  }, [location.pathname, host, pageHeader]);
+
+  const renderActionButtons = () => {
+    return (
+      <div className={`${baseClass}__action-button-container`}>
+        <InfoButton onClick={toggleInfoModal} />
+      </div>
+    );
+  };
+
+  const onTriggerEscrowLinuxKey = async () => {
+    setIsTriggeringCreateLinuxKey(true);
+    // reset before the request so a previous in-flight answer never flashes while loading
+    setIsEscrowInFlight(false);
+    // modal opens in loading state
+    setShowCreateLinuxKeyModal(true);
+    try {
+      await diskEncryptionAPI.triggerLinuxDiskEncryptionKeyEscrow(
+        deviceAuthToken
+      );
+    } catch (e) {
+      // 409: fleetd is already handling an earlier request, so no new pop-up is coming
+      if (hasStatusKey(e) && e.status === 409) {
+        setIsEscrowInFlight(true);
+        setEscrowRetryAfterSeconds(getRetryAfterSeconds(e));
+      } else {
+        notify.error("Failed to trigger key creation.", { response: e });
+        setShowCreateLinuxKeyModal(false);
+      }
+    } finally {
+      setIsTriggeringCreateLinuxKey(false);
+    }
+  };
+
+  const onSelectCertificate = (certificate: IHostCertificate) => {
+    setSelectedCertificate(certificate);
+  };
+
+  const resendProfile = useCallback(
+    (profileUUID: string): Promise<void> => {
+      return deviceUserAPI.resendProfile(deviceAuthToken, profileUUID);
+    },
+    [deviceAuthToken]
+  );
+
+  const renderDeviceUserPage = () => {
+    const failingPoliciesCount = host?.issues?.failing_policies_count || 0;
+
+    const failedControlsCount = countFailedControls(controls);
+
+    const showControlsTab =
+      !!host &&
+      shouldShowControlsTab({
+        platform: host.platform,
+        osVersion: host.os_version,
+        enrollmentStatus: host.mdm?.enrollment_status ?? null,
+        hasControls: controls.length > 0,
+      });
+
+    // TODO: We should probably have a standard way to handle this on all pages. Do we want to show
+    // a premium-only message in the case that a user tries direct navigation to a premium-only page
+    // or silently redirect as below?
+    let tabPaths = (isPremiumTier
+      ? PREMIUM_TAB_PATHS
+      : FREE_TAB_PATHS
+    ).map((t) => t(deviceAuthToken));
+    if (!hasSelfService) {
+      tabPaths = tabPaths.filter((path) => !path.includes("self-service"));
+    }
+    if (!showControlsTab) {
+      tabPaths = tabPaths.filter((path) => !path.endsWith("/controls"));
+    }
+
+    const findSelectedTab = (pathname: string) => {
+      const cleanPath = pathname.split("?")[0];
+      // Filter tabPaths that are prefix of cleanPath
+      const matchingIndices = tabPaths
+        .map((tabPath, idx) => ({ tabPath, idx }))
+        .filter(({ tabPath }) => cleanPath.startsWith(tabPath));
+
+      if (matchingIndices.length === 0) {
+        return -1;
+      }
+
+      // Return the index of the longest matching prefix
+      return matchingIndices.reduce((best, current) =>
+        current.tabPath.length > best.tabPath.length ? current : best
+      ).idx;
+    };
+
+    if (
+      !isLoadingDupDetails &&
+      host &&
+      findSelectedTab(location.pathname) === -1
+    ) {
+      router.push(tabPaths[0]);
+    }
+
+    // Note: API response global_config is misnamed because the backend actually returns the global
+    // or team config (as applicable)
+    const isSoftwareEnabled = !!globalConfig?.features
+      ?.enable_software_inventory;
+
+    if (
+      !host ||
+      isLoadingDupDetails ||
+      isLoadingDeviceCertificates ||
+      isLoadingSetupSteps
+    ) {
+      return <Spinner {...(isMobileView && { variant: "mobile" })} />;
+    }
+    if (isErrorSetupSteps) {
+      return (
+        <div className={`${baseClass} main-content`}>
+          <DeviceUserError
+            isMobileView={isMobileView}
+            isMobileDevice={isMobileDevice}
+            isErrorSetupSteps={isErrorSetupSteps}
+          />
+        </div>
+      );
+    }
+    if (
+      checkForSetupExperienceSoftware &&
+      (hasRemainingSetupSteps(setupStepStatuses) || location.query.setup_only)
+    ) {
+      // at this point, softwareSetupStatuses will be non-empty
+      return (
+        <SettingUpYourDevice
+          setupSteps={setupStepStatuses || []}
+          requireAllSoftware={
+            (isAppleHost && globalConfig?.mdm?.require_all_software_macos) ??
+            false
+          }
+          toggleInfoModal={toggleInfoModal}
+          platform={host.platform}
+        />
+      );
+    }
+
+    // iOS/iPadOS devices or narrow screens should show mobile UI
+    const shouldShowMobileUI = isIOSIPadOS || isMobileView;
+
+    if (shouldShowMobileUI) {
+      // Force redirect to self-service route for iOS/iPadOS devices
+      if (
+        isIOSIPadOS &&
+        !location.pathname.includes("/self-service") &&
+        hasSelfService
+      ) {
+        router.replace(PATHS.DEVICE_USER_DETAILS_SELF_SERVICE(deviceAuthToken));
+        return <Spinner />;
+      }
+
+      // Render the simplified mobile version
+      // For iOS/iPadOS and narrow screen devices
+      return (
+        <div className={`${baseClass} main-content`}>
+          <div className="device-user-mobile">
+            <SelfService
+              contactUrl={orgContactURL}
+              deviceToken={deviceAuthToken}
+              isSoftwareEnabled
+              pathname={location.pathname}
+              queryParams={parseSelfServiceQueryParams(location.query)}
+              router={router}
+              refetchHostDetails={requestRefetch}
+              isHostDetailsPolling={showRefetchSpinner}
+              hostSoftwareUpdatedAt={host.software_updated_at}
+              hostDisplayName={host?.hostname || ""}
+              isMobileView={shouldShowMobileUI}
+              mdmEnrollmentStatus={host.mdm.enrollment_status || "Off"}
+            />
+          </div>
+        </div>
+      );
+    }
+
+    const hasAnyCriticalFailingCAPolicy = host?.policies?.some(
+      (p) => p.response === "fail" && p.conditional_access_enabled && p.critical
+    );
+
+    return (
+      <>
+        <div className={`${baseClass} main-content`}>
+          <DeviceUserBanners
+            hostPlatform={host.platform}
+            hostOsVersion={host.os_version}
+            mdmEnrollmentStatus={host.mdm.enrollment_status}
+            mdmEnabledAndConfigured={!!globalConfig?.mdm.enabled_and_configured}
+            connectedToFleetMdm={!!host.mdm.connected_to_fleet}
+            macDiskEncryptionStatus={
+              host.mdm.apple_settings?.disk_encryption ?? null
+            }
+            diskEncryptionActionRequired={
+              host.mdm.apple_settings?.action_required ?? null
+            }
+            onClickCreatePIN={() => setShowBitLockerPINModal(true)}
+            onClickTurnOnMdm={onClickTurnOnMdm}
+            onTriggerEscrowLinuxKey={onTriggerEscrowLinuxKey}
+            diskEncryptionOSSetting={host.mdm.os_settings?.disk_encryption}
+            diskIsEncrypted={host.disk_encryption_enabled}
+            diskEncryptionKeyAvailable={host.mdm.encryption_key_available}
+            mdmManualEnrolmentUrl={mdmManualEnrollUrl}
+            lastMdmEnrolledAt={host.last_mdm_enrolled_at}
+            detailUpdatedAt={host.detail_updated_at}
+            depAssignedToFleet={host.dep_assigned_to_fleet || false}
+            onlyAllowAppleBusinessEnrollment={
+              !!globalConfig?.mdm.only_allow_apple_business_enrollment
+            }
+          />
+          <HostHeader
+            summaryData={summaryData}
+            showRefetchSpinner={showRefetchSpinner}
+            onRefetchHost={onRefetchHost}
+            renderActionsDropdown={renderActionButtons}
+            deviceUser
+            deviceUserHeader={pageHeader}
+            hostMdmEnrollmentStatus={null}
+          />
+          <TabNav className={`${baseClass}__tab-nav`}>
+            <Tabs
+              selectedIndex={findSelectedTab(location.pathname)}
+              onSelect={(i) => router.push(tabPaths[i])}
+            >
+              <TabList>
+                {isPremiumTier && isSoftwareEnabled && hasSelfService && (
+                  <Tab>
+                    <TabText>Self service</TabText>
+                  </Tab>
+                )}
+                <Tab>
+                  <TabText>Details</TabText>
+                </Tab>
+                {showControlsTab && (
+                  <Tab>
+                    <TabText count={failedControlsCount} countVariant="alert">
+                      Controls
+                    </TabText>
+                  </Tab>
+                )}
+                {isSoftwareEnabled && (
+                  <Tab>
+                    <TabText>Software</TabText>
+                  </Tab>
+                )}
+                {isPremiumTier && (
+                  <Tab>
+                    <TabText count={failingPoliciesCount} countVariant="alert">
+                      Policies
+                    </TabText>
+                  </Tab>
+                )}
+              </TabList>
+              {isPremiumTier && isSoftwareEnabled && hasSelfService && (
+                <TabPanel>
+                  <SelfService
+                    contactUrl={orgContactURL}
+                    deviceToken={deviceAuthToken}
+                    isSoftwareEnabled
+                    pathname={location.pathname}
+                    queryParams={parseSelfServiceQueryParams(location.query)}
+                    router={router}
+                    refetchHostDetails={requestRefetch}
+                    isHostDetailsPolling={showRefetchSpinner}
+                    hostSoftwareUpdatedAt={host.software_updated_at}
+                    hostDisplayName={host?.hostname || ""}
+                    mdmEnrollmentStatus={host.mdm.enrollment_status || "Off"}
+                  />
+                </TabPanel>
+              )}
+              <TabPanel className={`${baseClass}__details-panel`}>
+                <HostSummaryCard
+                  className={fullWidthCardClass}
+                  summaryData={summaryData}
+                  bootstrapPackageData={bootstrapPackageData}
+                  isPremiumTier={isPremiumTier}
+                />
+                <VitalsCard
+                  className={fullWidthCardClass}
+                  vitalsData={vitalsData}
+                  munki={deviceMacAdminsData?.munki}
+                />
+                <UserCard
+                  className={fullWidthCardClass}
+                  canWriteEndUser={false}
+                  endUsers={host.end_users ?? []}
+                />
+                {isAppleHost && !!deviceCertificates?.certificates.length && (
+                  <CertificatesCard
+                    className={fullWidthCardClass}
+                    isMyDevicePage
+                    data={deviceCertificates}
+                    isError={isErrorDeviceCertificates}
+                    page={certificatePage}
+                    pageSize={DEFAULT_CERTIFICATES_PAGE_SIZE}
+                    sortHeader={sortCerts.order_key}
+                    sortDirection={sortCerts.order_direction}
+                    hostPlatform={host.platform}
+                    onSelectCertificate={onSelectCertificate}
+                    onNextPage={() => setCertificatePage(certificatePage + 1)}
+                    onPreviousPage={() =>
+                      setCertificatePage(certificatePage - 1)
+                    }
+                    onSortChange={setSortCerts}
+                  />
+                )}
+              </TabPanel>
+              {showControlsTab && (
+                <TabPanel>
+                  <ControlsCard
+                    controls={controls}
+                    hostDisplayName={host.display_name}
+                    isDeviceUser
+                    isConnectedToFleetMdm={!!host.mdm.connected_to_fleet}
+                    canResendProfiles={isAppleHost || isWindows(host.platform)}
+                    resendRequest={resendProfile}
+                    onProfileResent={refetchDupDetails}
+                    router={router}
+                  />
+                </TabPanel>
+              )}
+              {isSoftwareEnabled && (
+                <TabPanel>
+                  <SoftwareCard
+                    id={deviceAuthToken}
+                    softwareUpdatedAt={host.software_updated_at}
+                    router={router}
+                    pathname={location.pathname}
+                    queryParams={parseHostSoftwareQueryParams(location.query)}
+                    isMyDevicePage
+                    isPremiumTier={isPremiumTier}
+                    platform={host.platform}
+                    hostTeamId={host.team_id || 0}
+                    isSoftwareEnabled={isSoftwareEnabled}
+                    onShowInventoryVersions={setHostSWForInventoryVersions}
+                  />
+                </TabPanel>
+              )}
+              {isPremiumTier && (
+                <TabPanel>
+                  <PoliciesCard
+                    policies={host?.policies || []}
+                    isLoading={isLoadingDupDetails}
+                    deviceUser
+                    togglePolicyDetailsModal={togglePolicyDetailsModal}
+                    closePolicyDetailsModal={onCancelPolicyDetailsModal}
+                    hostPlatform={host?.platform || ""}
+                    conditionalAccessEnabled={
+                      globalConfig?.features?.enable_conditional_access
+                    }
+                    conditionalAccessBypassed={
+                      host?.conditional_access_bypassed
+                    }
+                  />
+                </TabPanel>
+              )}
+            </Tabs>
+          </TabNav>
+          {showEnrollMdmModal && host.dep_assigned_to_fleet ? (
+            <AutoEnrollMdmModal host={host} onCancel={toggleEnrollMdmModal} />
+          ) : null}
+          {showBitLockerPINModal &&
+            (diskEncryptionSetting?.fleetd_can_set_pin ? (
+              <BitLockerPinModal
+                deviceAuthToken={deviceAuthToken}
+                onPollHost={pollHostDetails}
+                onExit={() => setShowBitLockerPINModal(false)}
+              />
+            ) : (
+              <BitLockerPinInstructionsModal
+                onExit={() => setShowBitLockerPINModal(false)}
+              />
+            ))}
+        </div>
+        {!!host && showPolicyDetailsModal && (
+          <PolicyDetailsModal
+            onCancel={onCancelPolicyDetailsModal}
+            policy={selectedPolicy}
+            isDeviceUser
+            onResolveLater={
+              globalConfig?.features?.enable_conditional_access &&
+              globalConfig.features?.enable_conditional_access_bypass &&
+              !hasAnyCriticalFailingCAPolicy
+                ? () => {
+                    onCancelPolicyDetailsModal();
+                    setShowBypassModal(true);
+                  }
+                : undefined
+            }
+          />
+        )}
+        {showBootstrapPackageModal &&
+          bootstrapPackageData.details &&
+          bootstrapPackageData.name && (
+            <BootstrapPackageModal
+              packageName={bootstrapPackageData.name}
+              details={bootstrapPackageData.details}
+              onClose={() => setShowBootstrapPackageModal(false)}
+            />
+          )}
+        {showCreateLinuxKeyModal && !!host && (
+          <CreateLinuxKeyModal
+            isTriggeringCreateLinuxKey={isTriggeringCreateLinuxKey}
+            isEscrowInFlight={isEscrowInFlight}
+            retryAfterSeconds={escrowRetryAfterSeconds}
+            onExit={() => {
+              setShowCreateLinuxKeyModal(false);
+            }}
+          />
+        )}
+        {hostSWForInventoryVersions && !!host && (
+          <InventoryVersionsModal
+            hostSoftware={hostSWForInventoryVersions}
+            onExit={() => setHostSWForInventoryVersions(null)}
+          />
+        )}
+        {selectedCertificate && (
+          <CertificateDetailsModal
+            certificate={selectedCertificate}
+            onExit={() => setSelectedCertificate(null)}
+          />
+        )}
+      </>
+    );
+  };
+
+  const renderDeviceSSOState = () => {
+    if (isRedirectingToSSO) {
+      return (
+        <div className={`${baseClass}__sso-redirect`} role="status">
+          <Spinner {...(isMobileView && { variant: "mobile" })} />
+          <span>Redirecting to your organization’s sign-in page…</span>
+        </div>
+      );
+    }
+
+    return (
+      <DeviceUserError
+        isMobileView={isMobileView}
+        isMobileDevice={isMobileDevice}
+        ssoError="sign_in_failed"
+        onRetry={retryDeviceSSO}
+      />
+    );
+  };
+
+  const coreWrapperClassnames = classNames("core-wrapper", {
+    "low-width-supported": !shouldShowUnsupportedScreen(location.pathname),
+  });
+
+  const siteNavContainerClassnames = classNames("site-nav-container", {
+    "low-width-supported": !shouldShowUnsupportedScreen(location.pathname),
+  });
+
+  // The SSO branch has to come first: a refused device call is an error to
+  // every query on the page, but one the end user can act on by signing in.
+  const renderDeviceUserBody = () => {
+    if (isSSORequired) {
+      return renderDeviceSSOState();
+    }
+    // Only a failure that leaves nothing to show takes over the page. An expired token still takes over, because
+    // nothing here will work again without signing in.
+    if (
+      (dupDetailsError && !dupDetails) ||
+      isAuthenticationError ||
+      enrollUrlError
+    ) {
+      return (
+        <DeviceUserError
+          isMobileView={isMobileView}
+          isMobileDevice={isMobileDevice}
+          isAuthenticationError={!!isAuthenticationError}
+          ssoError={
+            isMismatchedSSOUserError(dupDetailsError)
+              ? "mismatched_sso_user"
+              : undefined
+          }
+        />
+      );
+    }
+    return (
+      <div className={coreWrapperClassnames}>{renderDeviceUserPage()}</div>
+    );
+  };
+
+  return (
+    <div className="app-wrap">
+      {shouldShowUnsupportedScreen(location.pathname) && (
+        <UnsupportedScreenSize />
+      )}
+      <nav className={siteNavContainerClassnames}>
+        <div className="site-nav-content">
+          <ul className="site-nav-left">
+            <li className="site-nav-item dup-org-logo" key="dup-org-logo">
+              <div className="site-nav-item__logo-wrapper">
+                <div className="site-nav-item__logo">
+                  {isLoadingDupDetails ? (
+                    <Spinner centered={false} />
+                  ) : (
+                    <OrgLogoIcon className="logo" src={orgLogoURL} />
+                  )}
+                </div>
+              </div>
+            </li>
+          </ul>
+          {isMobileView && (
+            <div className="site-nav-better-link">
+              <CustomLink
+                url={PATHS.DEVICE_TRANSPARENCY(deviceAuthToken)}
+                text="About Fleet"
+                newTab
+              />
+            </div>
+          )}
+        </div>
+      </nav>
+      {renderDeviceUserBody()}
+      {showInfoModal && (
+        <InfoModal
+          onCancel={toggleInfoModal}
+          transparencyURL={PATHS.DEVICE_TRANSPARENCY(deviceAuthToken)}
+        />
+      )}
+      {showBypassModal && (
+        <BypassModal
+          onCancel={toggleShowBypassModal}
+          onResolveLater={async () => {
+            setIsLoadingBypass(true);
+            try {
+              await bypassConditionalAccess(deviceAuthToken);
+              notify.success(
+                "Access has been temporarily restored. You may now attempt to sign in again."
+              );
+              refetchDupDetails();
+            } catch {
+              notify.error(
+                `Couldn't restore access. Please click "Refetch" and try again.`
+              );
+            } finally {
+              setIsLoadingBypass(false);
+              setShowBypassModal(false);
+            }
+          }}
+          isLoading={isLoadingBypass}
+        />
+      )}
+    </div>
+  );
+};
+
+export default DeviceUserPage;

@@ -1,0 +1,25 @@
+.enroll-secrets {
+  &__secret {
+    display: flex;
+    align-items: center;
+    gap: $pad-small;
+
+    .form-field {
+      margin-bottom: 0;
+    }
+
+    .form-field__label {
+      position: relative;
+      font-size: $x-small;
+      font-weight: $bold;
+      margin-bottom: 0;
+      height: 0;
+      min-height: 0;
+    }
+  }
+
+  &__edit-delete-btns {
+    display: flex;
+    gap: $pad-small;
+  }
+}

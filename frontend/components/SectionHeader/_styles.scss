@@ -1,0 +1,34 @@
+.section-header {
+  display: flex;
+  justify-content: space-between;
+  align-items: baseline;
+
+  &__left-header {
+    display: flex;
+    align-items: baseline;
+    gap: $pad-small;
+
+    &--vertical {
+      flex-direction: column;
+      gap: $pad-xsmall;
+    }
+  }
+
+  &__sub-title {
+    font-size: $x-small;
+    font-weight: $regular;
+    &--grey {
+      @include grey-text;
+    }
+  }
+
+  h2 {
+    font-size: $small;
+    width: 100%;
+  }
+
+  // GOAL: rely on gap instead of these bottom margins
+  &__no-margin {
+    margin: 0;
+  }
+}

@@ -1,0 +1,125 @@
+# Automatically install/patch software
+
+In Fleet, you can automatically and remotely install and patch software on hosts:
+
+1. Add software. Learn how in the [deploy software](https://fleetdm.com/guides/deploy-software-packages) guide.
+
+> Currently, script-only  packages (`.sh` and `.ps1` files) can't be automatically installed. Instead, add a script and [automatically run it](https://fleetdm.com/guides/policy-automation-run-script).
+
+2. In Fleet, add a [policy](https://fleetdm.com/securing/what-are-fleet-policies). When a host fails the policy check, Fleet automatically triggers the software install.
+
+For example, a policy with this query will fail on hosts that have an outdated version of Adobe Acrobat Reader:
+
+```sql
+SELECT 1 FROM apps WHERE bundle_identifier = 'com.adobe.Reader' AND version_compare(bundle_short_version, '23.001.20687') >= 0;
+```
+
+> The bundle ID for a macOS app can be found in the `bundle_identifier` field when [viewing the associated software title via the API](https://fleetdm.com/docs/rest-api/rest-api#get-software).
+
+3. In the **Policies** tab, select the **Manage automations** button on the top-right, then select **Install software** from the context menu that pops up.
+
+![Manage policies](../website/assets/images/articles/automatic-software-install-policies-manage-692x199@2x.png)
+
+4. Select the checkbox next to your newly created policy's name. To the right of it select from the
+   drop-down list the software you would like to be installed upon failure of this policy.
+
+![Install software modal](../website/assets/images/articles/automatic-software-install-install-software-398x259@2x.png)
+
+> If a software title has more than one [custom package](https://fleetdm.com/guides/deploy-software-packages#add-multiple-packages-to-a-software-title), you can select which package to install. Fleet selects the package that was added first by default. Fleet installs the package on hosts within that package's label scope.
+
+Once the software is installed, Fleet will automatically refetch the host's vitals and update the software inventory.
+
+Policy automation software installs are automatically attempted up to 3 total times. Each time the policy runs and fails, Fleet triggers the software install again, up to a total of 3 attempts. If the host passes the policy, the retry count resets.
+
+If the software install still fails after all attempts, you can reset a software automation and trigger the install on all targeted hosts again. To do this, deselect the policy in the **Policies > Manage automations** modal, select **Save**, and then reselect the policy. This will reset the policy's host passing and failing host counts and retrigger the software automations.
+
+If software has a custom target (labels), it will only be installed on hosts within that scope. Similarly, if a policy has a custom target, it will only run on hosts within that scope. When the scopes differ, each behaves independently. For example, if the policy has a broader scope than the software: the policy runs on all hosts in its scope and reports pass/fail for each, but the automatic installation only triggers on hosts that fall within the software's (narrower) scope.
+
+## How does it work?
+
+* After configuring Fleet to auto-install a specific software the rest will be done automatically.
+* The policy check mechanism runs on a typical one-hour cadence on all online hosts.
+* Fleet will send install requests to the hosts on the first policy failure (first "No" result for the host) or if a policy goes from "Yes" to "No". By default, Fleet will not send an install request if a policy is already failing and continues to fail ("No" -> "No"). See the following flowchart for details.
+* To send an install request on _every_ failing result, including consecutive failures ("No" -> "No"), set `continuous_automations_enabled` to `true` on the policy (_Available in Fleet Premium_). Because this can retry an install that doesn't resolve the policy, it may cause a retry loop.
+
+![Flowchart](../website/assets/images/articles/automatic-software-install-workflow-674x189@2x.png)
+*Detailed flowchart*
+
+App Store (VPP) apps won't be installed if a host has MDM turned off or if you run out of licenses (purchased in Apple Business). Currently, these errors aren't surfaced in Fleet. After turning MDM on for a host or purchasing more licenses, you can retry [installing the app on the host's **Host details** page](https://fleetdm.com/guides/deploy-software-packages#install-the-package). To retry on multiple hosts at once, head to **Policies > Manage Automations** in Fleet and turn the app's policy automation off and back on.
+
+Uninstalling VPP apps is [coming soon](https://github.com/fleetdm/fleet/issues/25497).
+
+## Templates for policy queries
+
+Use the following policy templates to see if the software is already installed at at least the desired version.
+
+### macOS (pkg and VPP)
+
+```sql
+SELECT 1 FROM apps WHERE bundle_identifier = '<YOUR_APP_BUNDLE_ID>' AND version_compare(bundle_short_version, '<SOFTWARE_PACKAGE_VERSION>') >= 0;
+```
+
+> You can also use the `name` column for matching (e.g. "Google Chrome.app"), but using `bundle_identifier` is more reliable for macOS apps that have bundle identifiers.
+
+### Windows (msi and exe)
+
+```sql
+SELECT 1 FROM programs WHERE name = '<SOFTWARE_TITLE_NAME>' AND version_compare(version, '<VERSION>') >= 0;
+```
+
+> Currently, automatic install policies generated by Fleet for MSIs use `identifying_number` in the `programs` table, which corresponds to an application's ProductCode. ProductCode only refers to a specific version of a specific application, so the policy will fail (triggering an install) if any other version, newer or older, of the application is installed instead. The UpgradeCode attribute ties together multiple versions of the same application, and will be used for MSI auto-install policies [in a future release of Fleet](https://github.com/fleetdm/fleet/issues/27447) [once supported in osquery](https://github.com/fleetdm/fleet/issues/27759).
+
+### Debian-based (deb)
+
+```sql
+SELECT 1 FROM deb_packages WHERE name = '<SOFTWARE_TITLE_NAME>' AND version_compare(version, '<SOFTWARE_PACKAGE_VERSION>') >= 0;
+```
+
+If your fleet has both Ubuntu and RHEL-based hosts then you should use the following template for the policy queries:
+```sql
+SELECT 1 WHERE EXISTS (
+   -- This will mark the policies as successful on non-Debian-based hosts.
+   SELECT 1 WHERE (SELECT COUNT(*) FROM deb_packages) = 0
+) OR EXISTS (
+   SELECT 1 FROM deb_packages WHERE name = '<SOFTWARE_TITLE_NAME>' AND version_compare(version, '<SOFTWARE_PACKAGE_VERSION>') >= 0
+);
+```
+
+### RPM-based (rpm)
+
+```sql
+SELECT 1 FROM rpm_packages WHERE name = '<SOFTWARE_TITLE_NAME>' AND version_compare(version, '<SOFTWARE_PACKAGE_VERSION>') >= 0;
+```
+
+If your fleet has both Ubuntu and RHEL-based hosts then you should use the following template for the policy queries:
+```sql
+SELECT 1 WHERE EXISTS (
+   -- This will mark the policies as successful on non-RPM-based hosts.
+   SELECT 1 WHERE (SELECT COUNT(*) FROM rpm_packages) = 0
+) OR EXISTS (
+   SELECT 1 FROM rpm_packages WHERE name = '<SOFTWARE_TITLE_NAME>' AND version_compare(version, 'SOFTWARE_PACKAGE_VERSION') >= 0
+);
+```
+
+## Via the API
+
+Fleet provides a REST API for managing policies, including software install automations. Learn more about Fleet's [REST API](https://fleetdm.com/docs/rest-api/rest-api#add-team-policy).
+
+## Via GitOps
+
+To manage software automations using Fleet's best practice GitOps, check out the `install_software` key in the [policies section of the GitOps reference documentation](https://fleetdm.com/docs/configuration/yaml-files#policies).
+
+## Conclusion
+
+Software deployment can be time-consuming and risky. This guide presents Fleet's ability to mass deploy software to your fleet in a simple and safe way. Starting with uploading a trusted installer and ending with deploying it to the proper set of machines answering the exact policy defined by you.
+
+Leveraging Fleet’s ability to install and upgrade software on your hosts, you can streamline the process of controlling your hosts, replacing old versions of software and having the up-to-date info on what's installed on your fleet.
+
+By automating software deployment, you can gain greater control over what's installed on your machines and have better oversight of version upgrades, ensuring old software with known issues is replaced.
+
+<meta name="articleTitle" value="Automatically install software">
+<meta name="authorFullName" value="Sharon Katz">
+<meta name="authorGitHubUsername" value="sharon-fdm">
+<meta name="category" value="guides">
+<meta name="publishedOn" value="2025-02-28">
+<meta name="description" value="A guide to workflows using automatic software installation in Fleet.">

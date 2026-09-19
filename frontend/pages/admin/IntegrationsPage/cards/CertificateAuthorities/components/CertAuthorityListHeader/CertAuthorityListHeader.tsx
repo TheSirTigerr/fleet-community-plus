@@ -1,0 +1,38 @@
+import React from "react";
+
+import Button from "components/buttons/Button";
+import GitOpsModeTooltipWrapper from "components/GitOpsModeTooltipWrapper";
+
+const baseClass = "cert-authority-list-header";
+
+interface ICertAuthorityListHeaderProps {
+  onClickAddCertAuthority: () => void;
+}
+
+const CertAuthorityListHeader = ({
+  onClickAddCertAuthority,
+}: ICertAuthorityListHeaderProps) => {
+  return (
+    <div className={baseClass}>
+      <span className={`${baseClass}__name`}>Certificate authority (CA)</span>
+      <span className={`${baseClass}__actions`}>
+        <GitOpsModeTooltipWrapper
+          position="left"
+          renderChildren={(disableChildren) => (
+            <Button
+              disabled={disableChildren}
+              variant="secondary"
+              className={`${baseClass}__add-button`}
+              onClick={onClickAddCertAuthority}
+              icon="plus"
+            >
+              Add CA
+            </Button>
+          )}
+        />
+      </span>
+    </div>
+  );
+};
+
+export default CertAuthorityListHeader;

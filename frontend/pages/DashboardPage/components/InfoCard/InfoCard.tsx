@@ -1,0 +1,162 @@
+import classnames from "classnames";
+import React, { useState, useEffect } from "react";
+import { browserHistory } from "react-router";
+
+import AutomationsButton from "components/buttons/AutomationsButton";
+import Button from "components/buttons/Button";
+import Card from "components/Card";
+
+interface IInfoCardProps {
+  title: string;
+  titleDetail?: JSX.Element | string | null;
+  description?: JSX.Element | string;
+  actionUrl?: string;
+  children: React.ReactNode;
+  action?:
+    | {
+        type: "link";
+        to?: string;
+        text: string;
+      }
+    | {
+        type: "button";
+        text: string;
+        onClick?: () => void;
+      }
+    | {
+        type: "automations";
+        onClick?: () => void;
+      };
+  total_host_count?: number;
+  showTitle?: boolean;
+  className?: string;
+}
+
+const baseClass = "dashboard-info-card";
+
+const useInfoCard = ({
+  title,
+  titleDetail: defaultTitleDetail,
+  description: defaultDescription,
+  actionUrl: defaultActionUrl,
+  children,
+  action,
+  total_host_count,
+  showTitle = true,
+  className,
+}: IInfoCardProps): JSX.Element => {
+  const [actionLink, setActionURL] = useState<string | null>(
+    defaultActionUrl || null
+  );
+  const [titleDetail, setTitleDetail] = useState<JSX.Element | string | null>(
+    defaultTitleDetail || null
+  );
+  const [description, setDescription] = useState<JSX.Element | string | null>(
+    defaultDescription || null
+  );
+
+  useEffect(() => {
+    if (defaultTitleDetail) {
+      setTitleDetail(defaultTitleDetail);
+    }
+  }, [defaultTitleDetail]);
+
+  const renderAction = () => {
+    if (action) {
+      if (action.type === "automations") {
+        return (
+          <AutomationsButton
+            className={`${baseClass}__action-button`}
+            size="small"
+            onClick={action.onClick}
+          />
+        );
+      }
+
+      if (action.type === "button") {
+        return (
+          <Button
+            className={`${baseClass}__action-button`}
+            variant="secondary"
+            size="small"
+            onClick={action.onClick}
+          >
+            <>
+              <span className={`${baseClass}__action-button-text`}>
+                {action.text}
+              </span>
+            </>
+          </Button>
+        );
+      }
+
+      const linkTo = actionLink || action.to;
+      if (linkTo) {
+        const onClick = (): void => {
+          browserHistory.push(linkTo);
+        };
+
+        return (
+          <Button
+            variant="secondary"
+            onClick={onClick}
+            className={`${baseClass}__action-button`}
+            size="small"
+          >
+            <span className={`${baseClass}__action-button-text`}>
+              {action.text}
+            </span>
+          </Button>
+        );
+      }
+    }
+
+    return null;
+  };
+
+  const clonedChildren = React.Children.toArray(children).map((child) => {
+    if (React.isValidElement(child)) {
+      child = React.cloneElement(child, {
+        setTitleDetail,
+        setTitleDescription: setDescription,
+        setActionURL,
+      });
+    }
+    return child;
+  });
+
+  const classNames = classnames(baseClass, className);
+
+  return (
+    <Card className={classNames} paddingSize="xlarge" borderRadiusSize="large">
+      {showTitle && (
+        <div>
+          <div className={`${baseClass}__section-title-cta`}>
+            <div className={`${baseClass}__section-title-group`}>
+              <div className={`${baseClass}__section-title`}>
+                <h2>{title}</h2>
+                {total_host_count !== undefined && (
+                  <span>{total_host_count}</span>
+                )}
+              </div>
+              {titleDetail && (
+                <div className={`${baseClass}__section-title-detail`}>
+                  {titleDetail}
+                </div>
+              )}
+            </div>
+            {renderAction()}
+          </div>
+          {description && (
+            <div className={`${baseClass}__section-description`}>
+              {description}
+            </div>
+          )}
+        </div>
+      )}
+      {clonedChildren}
+    </Card>
+  );
+};
+
+export default useInfoCard;

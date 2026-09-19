@@ -1,0 +1,352 @@
+package nvd
+
+import (
+	"errors"
+	"testing"
+
+	"github.com/fleetdm/fleet/v4/server/vulnerabilities/nvd/tools/wfn"
+	"github.com/stretchr/testify/require"
+)
+
+func TestCPEProcessingRule(t *testing.T) {
+	buildRule := func() CPEMatchingRule {
+		return CPEMatchingRule{
+			CPESpecs: []CPEMatchingRuleSpec{
+				{
+					Vendor:           "microsoft",
+					Product:          "word",
+					TargetSW:         "windows",
+					SemVerConstraint: "1.2.3",
+				},
+			},
+
+			CVEs: map[string]struct{}{"CVE-123": {}},
+		}
+	}
+
+	buildCPEMeta := func() *wfn.Attributes {
+		cpeMeta, err := wfn.Parse("cpe:2.3:a:microsoft:word:1.2.3:*:*:*:*:windows:*:*")
+		require.NoError(t, err)
+		return cpeMeta
+	}
+
+	t.Run("getCPEAttrs", func(t *testing.T) {
+		rule := buildRule()
+		result := rule.CPESpecs[0].getCPEMeta()
+		require.NotNil(t, result)
+
+		expected := wfn.Attributes{
+			Vendor:   rule.CPESpecs[0].Vendor,
+			Product:  rule.CPESpecs[0].Product,
+			TargetSW: rule.CPESpecs[0].TargetSW,
+		}
+		require.True(t, expected.MatchWithoutVersion(result))
+	})
+
+	t.Run("Matches", func(t *testing.T) {
+		t.Run("is a match", func(t *testing.T) {
+			rule := buildRule()
+			cpeMeta := buildCPEMeta()
+			require.True(t, rule.CPEMatches(cpeMeta))
+		})
+
+		t.Run("CPEMeta info is null", func(t *testing.T) {
+			rule := buildRule()
+			require.False(t, rule.CPEMatches(nil))
+		})
+
+		t.Run("CPEs don't match", func(t *testing.T) {
+			rule := buildRule()
+			rule.CPESpecs[0].Vendor = "AMD"
+			cpeMeta := buildCPEMeta()
+			require.False(t, rule.CPEMatches(cpeMeta))
+		})
+
+		t.Run("SemVer is a range constraint", func(t *testing.T) {
+			rule := buildRule()
+			rule.CPESpecs[0].SemVerConstraint = "1.0.0 - 2.0.0"
+			cpeMeta := buildCPEMeta()
+			require.True(t, rule.CPEMatches(cpeMeta))
+		})
+	})
+
+	t.Run("Validate", func(t *testing.T) {
+		testCases := []struct {
+			rule CPEMatchingRule
+			err  error
+		}{
+			{
+				rule: CPEMatchingRule{
+					CPESpecs: []CPEMatchingRuleSpec{
+						{
+							Vendor:           "",
+							Product:          "word",
+							TargetSW:         "windows",
+							SemVerConstraint: "1.2.3",
+						},
+					},
+
+					CVEs: map[string]struct{}{"CVE-123": {}},
+				}, err: errors.New("Vendor can't be empty"),
+			},
+			{
+				rule: CPEMatchingRule{
+					CPESpecs: []CPEMatchingRuleSpec{
+						{
+							Vendor:           "*",
+							Product:          "word",
+							TargetSW:         "windows",
+							SemVerConstraint: "1.2.3",
+						},
+					},
+
+					CVEs: map[string]struct{}{"CVE-123": {}},
+				}, err: errors.New("Vendor can't be 'ANY'"),
+			},
+			{
+				rule: CPEMatchingRule{
+					CPESpecs: []CPEMatchingRuleSpec{
+						{
+							Vendor:           "-",
+							Product:          "word",
+							TargetSW:         "windows",
+							SemVerConstraint: "1.2.3",
+						},
+					},
+					CVEs: map[string]struct{}{"CVE-123": {}},
+				}, err: errors.New("Vendor can't be 'NA'"),
+			},
+			{
+				rule: CPEMatchingRule{
+					CPESpecs: []CPEMatchingRuleSpec{
+						{
+							Vendor:           "microsoft",
+							Product:          "",
+							TargetSW:         "windows",
+							SemVerConstraint: "1.2.3",
+						},
+					},
+
+					CVEs: map[string]struct{}{"CVE-123": {}},
+				}, err: errors.New("Product can't be empty"),
+			},
+			{
+				rule: CPEMatchingRule{
+					CPESpecs: []CPEMatchingRuleSpec{
+						{
+							Vendor:           "microsoft",
+							Product:          "*",
+							TargetSW:         "windows",
+							SemVerConstraint: "1.2.3",
+						},
+					},
+
+					CVEs: map[string]struct{}{"CVE-123": {}},
+				}, err: errors.New("Product can't be 'ANY'"),
+			},
+			{
+				rule: CPEMatchingRule{
+					CPESpecs: []CPEMatchingRuleSpec{
+						{
+							Vendor:           "microsoft",
+							Product:          "-",
+							TargetSW:         "windows",
+							SemVerConstraint: "1.2.3",
+						},
+					},
+					CVEs: map[string]struct{}{"CVE-123": {}},
+				}, err: errors.New("Product can't be 'NA'"),
+			},
+			{
+				rule: CPEMatchingRule{
+					CPESpecs: []CPEMatchingRuleSpec{
+						{
+							Vendor:           "microsoft",
+							Product:          "word",
+							TargetSW:         "",
+							SemVerConstraint: "1.2.3",
+						},
+					},
+					CVEs: map[string]struct{}{"CVE-123": {}},
+				}, err: errors.New("TargetSW can't be empty"),
+			},
+			{
+				rule: CPEMatchingRule{
+					CPESpecs: []CPEMatchingRuleSpec{
+						{
+							Vendor:           "microsoft",
+							Product:          "word",
+							TargetSW:         "*",
+							SemVerConstraint: "1.2.3",
+						},
+					},
+					CVEs: map[string]struct{}{"CVE-123": {}},
+				}, err: errors.New("TargetSW can't be 'ANY'"),
+			},
+			{
+				rule: CPEMatchingRule{
+					CPESpecs: []CPEMatchingRuleSpec{
+						{
+							Vendor:           "microsoft",
+							Product:          "word",
+							TargetSW:         "-",
+							SemVerConstraint: "1.2.3",
+						},
+					},
+					CVEs: map[string]struct{}{"CVE-123": {}},
+				}, err: errors.New("TargetSW can't be 'NA'"),
+			},
+			{
+				rule: CPEMatchingRule{
+					CPESpecs: []CPEMatchingRuleSpec{
+						{
+							Vendor:           "microsoft",
+							Product:          "word",
+							TargetSW:         "windows",
+							SemVerConstraint: ".as.-as",
+						},
+					},
+					CVEs: map[string]struct{}{"CVE-123": {}},
+				}, err: errors.New(`improper constraint: ".as.-as"`),
+			},
+			{
+				rule: CPEMatchingRule{
+					CPESpecs: []CPEMatchingRuleSpec{
+						{
+							Vendor:           "microsoft",
+							Product:          "word",
+							TargetSW:         "windows",
+							SemVerConstraint: "1.2.3",
+						},
+					},
+				}, err: errors.New("At least one CVE is required"),
+			},
+			{
+				rule: CPEMatchingRule{
+					CPESpecs: []CPEMatchingRuleSpec{
+						{
+							Vendor:           "microsoft",
+							Product:          "word",
+							TargetSW:         "windows",
+							SemVerConstraint: "1.2.3",
+						},
+					},
+					CVEs: map[string]struct{}{"": {}, "  ": {}, "CVE-123": {}},
+				}, err: errors.New("CVE can't be empty"),
+			},
+		}
+
+		for _, tc := range testCases {
+			result := tc.rule.Validate()
+			require.Equal(t, tc.err, result)
+		}
+	})
+}
+
+func TestGetKnownNVDBugRules(t *testing.T) {
+	cpeMatchingRules, err := GetKnownNVDBugRules()
+	require.NoError(t, err)
+
+	cpeMeta, err := wfn.Parse("cpe:2.3:a:microsoft:teams:*:*:*:*:*:*:*:*")
+	require.NoError(t, err)
+
+	// Test that CVE-2020-10146 never matches (i.e. is ignored).
+	rule, ok := cpeMatchingRules.FindMatch("CVE-2020-10146")
+	require.True(t, ok)
+	ok = rule.CPEMatches(cpeMeta)
+	require.False(t, ok)
+
+	// Test that CVE-2013-0340 never matches (i.e. is ignored).
+	rule, ok = cpeMatchingRules.FindMatch("CVE-2013-0340")
+	require.True(t, ok)
+	ok = rule.CPEMatches(cpeMeta)
+	require.False(t, ok)
+
+	// Test that CVE-2017-17522 (disputed Python webbrowser CVE) never matches. See #35148.
+	pythonCPEMeta, err := wfn.Parse("cpe:2.3:a:python:python:3.9.6:*:*:*:*:*:*:*")
+	require.NoError(t, err)
+	rule, ok = cpeMatchingRules.FindMatch("CVE-2017-17522")
+	require.True(t, ok)
+	require.False(t, rule.CPEMatches(pythonCPEMeta), "CVE-2017-17522 should be ignored for all Python versions")
+
+	// Test that CVE-2023-36632 (disputed Python email.utils.parseaddr CVE) never matches. See #35148.
+	rule, ok = cpeMatchingRules.FindMatch("CVE-2023-36632")
+	require.True(t, ok)
+	require.False(t, rule.CPEMatches(pythonCPEMeta), "CVE-2023-36632 should be ignored for all Python versions")
+
+	// Test that CVE-2024-3219 (Python socket.socketpair) only matches on Windows. See #35148.
+	rule, ok = cpeMatchingRules.FindMatch("CVE-2024-3219")
+	require.True(t, ok)
+
+	pythonWindows, err := wfn.Parse("cpe:2.3:a:python:python:3.11.0:*:*:*:*:windows:*:*")
+	require.NoError(t, err)
+	require.True(t, rule.CPEMatches(pythonWindows), "CVE-2024-3219 should match Python on Windows")
+
+	pythonMacOS, err := wfn.Parse("cpe:2.3:a:python:python:3.11.0:*:*:*:*:macos:*:*")
+	require.NoError(t, err)
+	require.False(t, rule.CPEMatches(pythonMacOS), "CVE-2024-3219 should not match Python on macOS")
+
+	pythonLinux, err := wfn.Parse("cpe:2.3:a:python:python:3.11.0:*:*:*:*:linux:*:*")
+	require.NoError(t, err)
+	require.False(t, rule.CPEMatches(pythonLinux), "CVE-2024-3219 should not match Python on Linux")
+
+	pythonAnyTargetSW, err := wfn.Parse("cpe:2.3:a:python:python:3.11.0:*:*:*:*:*:*:*")
+	require.NoError(t, err)
+	require.False(t, rule.CPEMatches(pythonAnyTargetSW), "CVE-2024-3219 should not match Python with target_sw=*")
+
+	// Test that gitk CVEs don't match the base git package
+	gitCPEMeta, err := wfn.Parse("cpe:2.3:a:git:git:2.47.1:*:*:*:*:*:*:*")
+	require.NoError(t, err)
+
+	rule, ok = cpeMatchingRules.FindMatch("CVE-2025-27613")
+	require.True(t, ok)
+	ok = rule.CPEMatches(gitCPEMeta)
+	require.False(t, ok, "CVE-2025-27613 should not match git:git")
+
+	rule, ok = cpeMatchingRules.FindMatch("CVE-2025-27614")
+	require.True(t, ok)
+	ok = rule.CPEMatches(gitCPEMeta)
+	require.False(t, ok, "CVE-2025-27614 should not match git:git")
+
+	rule, ok = cpeMatchingRules.FindMatch("CVE-2025-46835")
+	require.True(t, ok)
+	ok = rule.CPEMatches(gitCPEMeta)
+	require.False(t, ok, "CVE-2025-46835 should not match git:git")
+
+	// Test that Admin By Request CVEs only match on Windows (not macOS/Linux). See #41586.
+	for _, cve := range []string{"CVE-2019-17201", "CVE-2019-17202"} {
+		rule, ok = cpeMatchingRules.FindMatch(cve)
+		require.True(t, ok)
+
+		abrMacOS, err := wfn.Parse("cpe:2.3:a:fasttracksoftware:admin_by_request:5.2:*:*:*:*:macos:*:*")
+		require.NoError(t, err)
+		require.False(t, rule.CPEMatches(abrMacOS), "%s should not match on macOS", cve)
+
+		abrLinux, err := wfn.Parse("cpe:2.3:a:fasttracksoftware:admin_by_request:4.0:*:*:*:*:linux:*:*")
+		require.NoError(t, err)
+		require.False(t, rule.CPEMatches(abrLinux), "%s should not match on Linux", cve)
+
+		abrWindows, err := wfn.Parse("cpe:2.3:a:fasttracksoftware:admin_by_request:5.0:*:*:*:*:windows:*:*")
+		require.NoError(t, err)
+		require.True(t, rule.CPEMatches(abrWindows), "%s should match on Windows", cve)
+	}
+
+	// Test that CVE-2024-7006 (libtiff) only matches on Linux.
+	rule, ok = cpeMatchingRules.FindMatch("CVE-2024-7006")
+	require.True(t, ok)
+
+	// Should not match on Windows
+	cpeMetaWindows, err := wfn.Parse("cpe:2.3:a:libtiff:libtiff:4.0.0:*:*:*:*:windows:*:*")
+	require.NoError(t, err)
+	require.False(t, rule.CPEMatches(cpeMetaWindows))
+
+	// Should not match on macOS
+	cpeMetaMacOS, err := wfn.Parse("cpe:2.3:a:libtiff:libtiff:4.0.0:*:*:*:*:macos:*:*")
+	require.NoError(t, err)
+	require.False(t, rule.CPEMatches(cpeMetaMacOS))
+
+	// Should match on Linux
+	cpeMetaLinux, err := wfn.Parse("cpe:2.3:a:libtiff:libtiff:4.0.0:*:*:*:*:linux:*:*")
+	require.NoError(t, err)
+	require.True(t, rule.CPEMatches(cpeMetaLinux))
+}

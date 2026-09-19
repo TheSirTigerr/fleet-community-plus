@@ -1,0 +1,35 @@
+.activity-type-dropdown {
+  &__search-field {
+    position: sticky;
+    top: 0;
+    padding-top: $pad-small;
+    background-color: $core-fleet-white;
+
+    .icon {
+      position: absolute;
+      left: 12px;
+      top: 19px;
+    }
+  }
+
+  &__search-input {
+    @include menu-search-input;
+
+    &--disabled {
+      color: $ui-fleet-black-50;
+    }
+
+    &--error {
+      color: $core-vibrant-red;
+      border: 1px solid $core-vibrant-red;
+      box-sizing: border-box;
+      border-radius: $border-radius;
+
+      &:focus {
+        border-color: $ui-error;
+        background-color: $core-fleet-white;
+        color: $core-fleet-black;
+      }
+    }
+  }
+}

@@ -1,0 +1,124 @@
+import React from "react";
+import { PlacesType } from "react-tooltip-5";
+
+import NotSupported from "components/NotSupported";
+import ProgressBar from "components/ProgressBar";
+import TooltipWrapper from "components/TooltipWrapper";
+import { isLinuxLike } from "interfaces/platform";
+import { COLORS } from "styles/var/colors";
+
+const baseClass = "disk-space-indicator";
+interface IDiskSpaceIndicatorProps {
+  gigsDiskSpaceAvailable: number | "---";
+  percentDiskSpaceAvailable: number;
+  gigsTotalDiskSpace?: number;
+  gigsAllDiskSpace?: number;
+  platform: string;
+  tooltipPosition?: PlacesType;
+}
+
+const DiskSpaceIndicator = ({
+  gigsDiskSpaceAvailable,
+  percentDiskSpaceAvailable,
+  gigsTotalDiskSpace,
+  gigsAllDiskSpace,
+  platform,
+  tooltipPosition = "top",
+}: IDiskSpaceIndicatorProps): JSX.Element => {
+  // Check if storage measurement is not supported (sentinel value -1)
+  if (
+    typeof gigsDiskSpaceAvailable === "number" &&
+    gigsDiskSpaceAvailable < 0
+  ) {
+    return NotSupported;
+  }
+
+  if (gigsDiskSpaceAvailable === 0 || gigsDiskSpaceAvailable === "---") {
+    return <span className={`${baseClass}__empty`}>No data available</span>;
+  }
+
+  const getDiskSpaceIndicatorColor = (): string => {
+    // return space-dependent indicator colors for mac and windows hosts, green for linux
+    if (platform === "darwin" || platform === "windows") {
+      if (gigsDiskSpaceAvailable < 16) {
+        return COLORS["ui-error"];
+      } else if (gigsDiskSpaceAvailable < 32) {
+        return COLORS["ui-warning"];
+      }
+    }
+    return COLORS["status-success"];
+  };
+
+  const diskSpaceTooltipText = ((): string | undefined => {
+    if (platform === "darwin" || platform === "windows") {
+      if (gigsDiskSpaceAvailable < 16) {
+        return "Not enough disk space available to install most small operating systems updates.";
+      } else if (gigsDiskSpaceAvailable < 32) {
+        return "Not enough disk space available to install most large operating systems updates.";
+      }
+      return "Enough disk space available to install most operating systems updates.";
+    }
+    return undefined;
+  })();
+
+  const renderBar = () => (
+    <ProgressBar
+      sections={[
+        {
+          color: getDiskSpaceIndicatorColor(),
+          portion: percentDiskSpaceAvailable / 100,
+        },
+      ]}
+      width="small"
+    />
+  );
+
+  // get disk space tooltip content for Linux hosts
+  const totalDiskSpaceContent = gigsTotalDiskSpace ? (
+    <>System disk space: {gigsTotalDiskSpace} GB</>
+  ) : null;
+  const allPartitionsContent = gigsAllDiskSpace ? (
+    <>All partitions: {gigsAllDiskSpace} GB</>
+  ) : null;
+
+  const copyTootltipContent =
+    totalDiskSpaceContent || allPartitionsContent ? (
+      <>
+        {totalDiskSpaceContent}
+        {totalDiskSpaceContent && allPartitionsContent && <br />}
+        {allPartitionsContent}
+      </>
+    ) : null;
+
+  const copyText = `${gigsDiskSpaceAvailable} GB`;
+
+  return (
+    <span className={baseClass}>
+      {diskSpaceTooltipText ? (
+        <TooltipWrapper
+          position={tooltipPosition}
+          tipOffset={10}
+          showArrow
+          underline={false}
+          tipContent={diskSpaceTooltipText}
+        >
+          {renderBar()}
+        </TooltipWrapper>
+      ) : (
+        renderBar()
+      )}
+      {copyTootltipContent && isLinuxLike(platform) ? (
+        <TooltipWrapper
+          tooltipClass="copy-tooltip-content"
+          tipContent={copyTootltipContent}
+        >
+          {copyText}
+        </TooltipWrapper>
+      ) : (
+        copyText
+      )}
+    </span>
+  );
+};
+
+export default DiskSpaceIndicator;

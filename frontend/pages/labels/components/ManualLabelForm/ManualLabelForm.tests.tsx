@@ -1,0 +1,93 @@
+import { screen } from "@testing-library/react";
+import { noop } from "lodash";
+import React from "react";
+
+import createMockHost from "__mocks__/hostMock";
+import { createCustomRenderer } from "test/test-utils";
+
+import ManualLabelForm, {
+  LABEL_TARGET_HOSTS_INPUT_LABEL,
+} from "./ManualLabelForm";
+
+describe("ManualLabelForm", () => {
+  it("should render a Select Hosts input", () => {
+    const render = createCustomRenderer({ withBackendMock: true });
+
+    render(<ManualLabelForm onSave={noop} onCancel={noop} teamName={null} />);
+
+    expect(
+      screen.getByText(LABEL_TARGET_HOSTS_INPUT_LABEL)
+    ).toBeInTheDocument();
+  });
+
+  it("should pass up the form data when the form is submitted and valid", async () => {
+    const render = createCustomRenderer({ withBackendMock: true });
+    const onSave = jest.fn();
+
+    const name = "Test Name";
+    const description = "Test Description";
+    const targetedHosts = [createMockHost()];
+
+    const { user } = render(
+      <ManualLabelForm
+        onSave={onSave}
+        onCancel={noop}
+        defaultTargetedHosts={targetedHosts}
+        teamName={null}
+      />
+    );
+
+    await user.type(screen.getByLabelText("Name"), name);
+    await user.type(screen.getByLabelText("Description"), description);
+    await user.click(screen.getByRole("button", { name: "Save" }));
+
+    expect(onSave).toHaveBeenCalledWith({
+      name,
+      description,
+      targetedHosts,
+    });
+  });
+
+  describe("GitOps mode", () => {
+    const gitOpsContext = {
+      app: {
+        config: {
+          gitops: {
+            gitops_mode_enabled: true,
+            repository_url: "https://github.com/example/fleet-gitops",
+          },
+        },
+      },
+    };
+
+    it("should submit host membership when editing a label managed in GitOps", async () => {
+      const render = createCustomRenderer({
+        withBackendMock: true,
+        context: gitOpsContext,
+      });
+      const onSave = jest.fn();
+
+      const name = "Remediation exclusion";
+      const description = "Hosts temporarily excluded";
+      const targetedHosts = [
+        createMockHost({ id: 1 }),
+        createMockHost({ id: 2 }),
+      ];
+
+      const { user } = render(
+        <ManualLabelForm
+          onSave={onSave}
+          onCancel={noop}
+          defaultName={name}
+          defaultDescription={description}
+          defaultTargetedHosts={targetedHosts}
+          teamName={null}
+        />
+      );
+
+      await user.click(screen.getByRole("button", { name: "Save" }));
+
+      expect(onSave).toHaveBeenCalledWith({ name, description, targetedHosts });
+    });
+  });
+});

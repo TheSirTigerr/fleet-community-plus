@@ -1,0 +1,112 @@
+package service
+
+import (
+	"context"
+	"crypto/rsa"
+	"errors"
+	"log/slog"
+
+	"github.com/fleetdm/fleet/v4/server/contexts/ctxerr"
+	"github.com/fleetdm/fleet/v4/server/fleet"
+	"github.com/fleetdm/fleet/v4/server/mdm/assets"
+	"github.com/fleetdm/fleet/v4/server/mdm/nanomdm/cryptoutil"
+	"github.com/fleetdm/fleet/v4/server/mdm/scep/kitlogadapter"
+	scepserver "github.com/fleetdm/fleet/v4/server/mdm/scep/server"
+	"github.com/smallstep/scep"
+)
+
+var _ scepserver.Service = (*service)(nil)
+
+type service struct {
+	// The (chainable) CSR signing function. Intended to handle all
+	// SCEP request functionality such as CSR & challenge checking, CA
+	// issuance, RA proxying, etc.
+	signer scepserver.CSRSignerContext
+
+	/// info logging is implemented in the service middleware layer.
+	debugLogger *slog.Logger
+
+	ds fleet.MDMAssetRetriever
+}
+
+func (svc *service) GetCACaps(ctx context.Context) ([]byte, error) {
+	defaultCaps := []byte("Renewal\nSHA-1\nSHA-256\nAES\nDES3\nSCEPStandard\nPOSTPKIOperation")
+	return defaultCaps, nil
+}
+
+func (svc *service) GetCACert(ctx context.Context, _ string) ([]byte, int, error) {
+	cert, err := assets.CAKeyPair(ctx, svc.ds)
+	if err != nil {
+		return nil, 0, ctxerr.Wrap(ctx, err, "parsing SCEP certificate")
+	}
+	return cert.Leaf.Raw, 1, nil
+}
+
+func (svc *service) PKIOperation(ctx context.Context, data []byte) ([]byte, error) {
+	if len(data) == 0 {
+		return nil, &fleet.BadRequestError{Message: "missing data for PKIOperation"}
+	}
+
+	if err := cryptoutil.ValidateBERDepth(data, cryptoutil.MaxBERDepth); err != nil {
+		return nil, &fleet.BadRequestError{
+			Message:     "invalid request body",
+			InternalErr: err,
+		}
+	}
+
+	msg, err := scep.ParsePKIMessage(data, scep.WithLogger(kitlogadapter.NewLogger(svc.debugLogger)))
+	if err != nil {
+		return nil, err
+	}
+
+	cert, err := assets.CAKeyPair(ctx, svc.ds)
+	if err != nil {
+		return nil, ctxerr.Wrap(ctx, err, "parsing SCEP certificate")
+	}
+
+	pk, ok := cert.PrivateKey.(*rsa.PrivateKey)
+	if !ok {
+		return nil, errors.New("private key not in RSA format")
+	}
+
+	if err := msg.DecryptPKIEnvelope(cert.Leaf, pk); err != nil {
+		svc.debugLogger.ErrorContext(ctx, "failed to decrypt PKI envelope", "err", err)
+		certRep, err := msg.Fail(cert.Leaf, pk, scep.BadRequest)
+		if err != nil {
+			return nil, err
+		}
+		return certRep.Raw, nil
+	}
+
+	crt, err := svc.signer.SignCSRContext(ctx, msg.CSRReqMessage)
+	if err == nil && crt == nil {
+		err = errors.New("no signed certificate")
+	}
+	if err != nil {
+		svc.debugLogger.ErrorContext(ctx, "failed to sign CSR", "err", err)
+		certRep, err := msg.Fail(cert.Leaf, pk, scep.BadRequest)
+		if err != nil {
+			return nil, err
+		}
+		return certRep.Raw, nil
+	}
+
+	certRep, err := msg.Success(cert.Leaf, pk, crt)
+	if err != nil {
+		return nil, err
+	}
+	return certRep.Raw, nil
+}
+
+func (svc *service) GetNextCACert(ctx context.Context) ([]byte, error) {
+	return nil, errors.New("not implemented")
+}
+
+// NewService creates a new scep service
+func NewSCEPService(ds fleet.MDMAssetRetriever, signer scepserver.CSRSignerContext, logger *slog.Logger) scepserver.Service {
+	return &service{
+		signer:      signer,
+		debugLogger: slog.New(slog.DiscardHandler),
+		ds:          ds,
+	}
+}

@@ -1,0 +1,135 @@
+.software-self-service {
+  @include vertical-page-tab-panel-layout;
+
+  // TODO: empty table styling differs slightly from figma (font size, color, spacing), why?
+  .empty-table__container {
+    margin: 64px 0;
+  }
+
+  &__self-service-card {
+    @include vertical-card-layout;
+  }
+
+  &__mobile-installers {
+    @include flex-column-16px-gap;
+    min-height: 300px; // Prevents category dropdown from being cut off from short software list's UI
+  }
+
+  &__content {
+    display: flex;
+    flex-direction: column;
+    gap: $gap-table-elements;
+  }
+
+  &__header-filters {
+    display: flex;
+    flex-direction: row;
+    flex-wrap: wrap;
+    gap: $pad-medium;
+    align-items: center;
+
+    // Groups Install all + Search on the right of CategoryFilter with a
+    // tighter internal gap than the parent's $pad-medium.
+    &__actions {
+      display: flex;
+      align-items: center;
+      gap: $pad-small;
+      margin-left: auto;
+    }
+
+    .search-field__tooltip-container {
+      width: 100%;
+    }
+  }
+
+  // Under $break-sm AND when CategoryFilter is rendered: search jumps to its
+  // own full-width top row, leaving CategoryFilter (left) and Install all
+  // (right) on row 2. Skip the row-wrap when there are no categories — the
+  // remaining Install all + Search comfortably fit on one row at any width.
+  &__header-filters--with-categories {
+    @media (max-width: ($break-sm - 1)) {
+      // Unwrap __actions so Search and Install all reorder as direct
+      // siblings of __header-filters for the split-row layout.
+      .software-self-service__header-filters__actions {
+        display: contents;
+      }
+      .software-self-service__header-filters__search {
+        order: -1;
+        flex-basis: 100%;
+      }
+      .software-self-service__header-filters__install-all {
+        margin-left: auto;
+      }
+    }
+  }
+
+  &__table {
+    display: flex;
+    flex-direction: column;
+
+    .data-table-block .data-table__wrapper {
+      margin-top: 0;
+    }
+
+    .self-service-table__status-content,
+    .table-container .children-wrapper {
+      display: flex;
+      align-items: center;
+      gap: $pad-small;
+    }
+
+    // No column shift when changed statuses
+    // min-width longest status: "Failed (uninstall)"
+    .self-service-table__status-content {
+      min-width: 138px;
+    }
+
+    .self-service-table__item-status-button {
+      height: auto;
+    }
+
+    .self-service-table__item-actions {
+      display: flex;
+      flex-direction: row;
+      gap: $pad-small;
+    }
+  }
+
+  /* Ensures table doesn't bleed over 100% */
+  .data-table__table {
+    table-layout: fixed;
+    width: 100%;
+  }
+
+  /* Override any defaults for fixed column width */
+  .data-table__table th.ui_status__header,
+  .data-table__table td.ui_status__cell {
+    width: 140px;
+    max-width: 140px;
+    min-width: 140px;
+    white-space: nowrap;
+    text-overflow: ellipsis;
+  }
+
+  /* Override any defaults for fixed column width */
+  .data-table__table th.status__header,
+  .data-table__table td.status__cell {
+    width: 230px;
+    max-width: 230px;
+    min-width: 230px;
+    white-space: nowrap;
+    text-overflow: ellipsis;
+  }
+
+  .data-table-block .data-table tbody {
+    .self-service-table__item-action {
+      min-width: 94px; // Fits the "Reinstall" button without shifting second item action
+
+      .component__tooltip-wrapper {
+        margin: 0; // Override 10px vertical margin
+      }
+    }
+  }
+
+}
+

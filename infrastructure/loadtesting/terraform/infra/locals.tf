@@ -1,0 +1,163 @@
+locals {
+  customer    = "fleet-${terraform.workspace}"
+  prefix      = "fleet-${terraform.workspace}"
+  fleet_image = "${aws_ecr_repository.fleet.repository_url}:${var.tag}-${split(":", data.docker_registry_image.dockerhub.sha256_digest)[1]}"
+
+  # Tracing configuration. OpenTelemetry is the only option: Elastic APM instrumentation is gorilla-specific, so
+  # MakeHandler turns off the stdlib ServeMux fast path whenever it is active, which costs more than the traces are
+  # worth in a loadtest. Tracing is off entirely unless enable_otel is set.
+  otel_environment_variables = var.enable_otel ? {
+    OTEL_SERVICE_NAME             = "fleet"
+    OTEL_RESOURCE_ATTRIBUTES      = "deployment.environment.name=${terraform.workspace},deployment.environment=${terraform.workspace}"
+    OTEL_EXPORTER_OTLP_ENDPOINT   = "http://${data.terraform_remote_state.signoz[0].outputs.otel_collector_endpoint}"
+    FLEET_LOGGING_TRACING_ENABLED = "true"
+    FLEET_LOGGING_TRACING_TYPE    = "opentelemetry"
+  } : {}
+
+  # Single label under loadtest.fleetdm.com so the *.loadtest.fleetdm.com
+  # wildcard cert would cover it if the mock ever moves to the HTTPS listener.
+  # A nested name would not: wildcards match exactly one label.
+  apple_apns_mock_hostname = "${local.customer}-apns-mock.loadtest.fleetdm.com"
+  apple_apns_mock_port     = 8378
+
+  # MDM behaviours we always want in a loadtest, independent of the tracing configuration.
+  mdm_apple_environment_variables = merge(
+    {
+      # Skip verification of Apple certificates for OTA enrollments.
+      FLEET_DEV_MDM_APPLE_DISABLE_DEVICE_INFO_CERT_VERIFY = "1"
+    },
+    # Push traffic must never reach real Apple infrastructure, which would
+    # rate-limit us for pushing to thousands of fake device UUIDs. Either it
+    # goes to the mock, or it goes nowhere.
+    #
+    # These two are mutually exclusive: DISABLE_PUSH short-circuits
+    # initAppleMDMPushService to a nopPusher before the push URL is ever read,
+    # so setting both would silently make the mock unreachable.
+    var.enable_apple_mdm ? {
+      FLEET_DEV_MDM_APPLE_PUSH_SERVER_URL = "http://${local.apple_apns_mock_hostname}"
+      } : {
+      FLEET_DEV_MDM_APPLE_DISABLE_PUSH = "1"
+    }
+  )
+
+  extra_environment_variables = merge(
+    {
+      CLOUDWATCH_NAMESPACE = "fleet-loadtest-migration"
+      CLOUDWATCH_REGION    = "us-east-2"
+      # PROMETHEUS_SCRAPE_URL = "http://localhost:8080/metrics"
+
+      FLEET_VULNERABILITIES_DATABASES_PATH       = "/home/fleet"
+      FLEET_OSQUERY_ENABLE_ASYNC_HOST_PROCESSING = "false"
+      FLEET_LOGGING_JSON                         = "true"
+      FLEET_LOGGING_DEBUG                        = "true"
+      FLEET_OSQUERY_STATUS_LOG_PLUGIN            = "filesystem"
+      FLEET_FILESYSTEM_STATUS_LOG_FILE           = "/dev/null"
+      FLEET_OSQUERY_RESULT_LOG_PLUGIN            = "filesystem"
+      FLEET_FILESYSTEM_RESULT_LOG_FILE           = "/dev/null"
+      FLEET_MYSQL_MAX_OPEN_CONNS                 = tostring(var.mysql_max_open_conns)
+      FLEET_MYSQL_READ_REPLICA_MAX_OPEN_CONNS    = tostring(var.mysql_max_open_conns)
+      # 30 min: recycle connections often enough that pooled reader connections re-spread across replicas after a
+      # replica reboot/failover, and proactively drop bad idles.
+      FLEET_MYSQL_CONN_MAX_LIFETIME                  = "1800"
+      FLEET_MYSQL_READ_REPLICA_CONN_MAX_LIFETIME     = "1800"
+      FLEET_OSQUERY_ASYNC_HOST_REDIS_SCAN_KEYS_COUNT = "10000"
+      FLEET_REDIS_MAX_OPEN_CONNS                     = "500"
+      FLEET_REDIS_MAX_IDLE_CONNS                     = "500"
+      FLEET_AUTH_SSO_SESSION_VALIDITY_PERIOD         = "15m"
+      FLEET_MDM_SSO_RATE_LIMIT_PER_MINUTE            = "500"
+      FLEET_SERVER_GZIP_RESPONSES                    = "true"
+      FLEET_DEV_ANDROID_PROXY_ENDPOINT               = "http://${resource.aws_lb.internal.dns_name}/"
+
+      # Load TLS Certificate for RDS Authentication
+      FLEET_MYSQL_TLS_CA                  = local.cert_path
+      FLEET_MYSQL_READ_REPLICA_TLS_CA     = local.cert_path
+      FLEET_MYSQL_READ_REPLICA_TLS_CONFIG = "custom"
+
+      # Skip backfilling S3 config with dev values for load testing
+      FLEET_DEV_SKIP_S3_CONFIG = "1"
+    },
+    local.otel_environment_variables,
+    local.mdm_apple_environment_variables
+  )
+  extra_secrets = {
+    FLEET_LICENSE_KEY = data.aws_secretsmanager_secret.license.arn
+  }
+  # Private Subnets from VPN VPC
+  vpn_cidr_blocks = [
+    "10.255.1.0/24",
+    "10.255.2.0/24",
+    "10.255.3.0/24",
+  ]
+
+  /* 
+    configurations below are necessary for MySQL TLS authentication
+    MySQL TLS Settings to download and store TLS Certificate
+
+    ca_thumbprint is maintained in the infrastructure/cloud/shared/
+    ca_thumbprint is the sha1 thumbprint value of the following certificate: aws rds describe-db-instances --filters='Name=db-cluster-id,Values='${cluster_name}'' | jq '.DBInstances.[0].CACertificateIdentifier' | sed 's/\"//g'
+    You can retrieve the value with the following command: aws rds describe-certificates --certificate-identifier=${ca_cert_val} | jq '.Certificates.[].Thumbprint' | sed 's/\"//g'
+  */
+  ca_cert_thumbprint = "8cf85e3e2bdbcbe2c4a34c1e85828fb29833e87f"
+  rds_container_path = "/tmp/rds-tls"
+  cert_path          = "${local.rds_container_path}/${data.aws_region.current.region}.pem"
+
+  # load the certificate with a side car into a volume mount
+  sidecars = [
+    {
+      name       = "rds-tls-ca-retriever"
+      image      = "public.ecr.aws/docker/library/alpine@sha256:8a1f59ffb675680d47db6337b49d22281a139e9d709335b492be023728e11715"
+      entrypoint = ["/bin/sh", "-c"]
+      command = [templatefile("./template/mysql_ca_tls_retrieval.sh.tpl", {
+        aws_region         = data.aws_region.current.region
+        container_path     = local.rds_container_path
+        ca_cert_thumbprint = local.ca_cert_thumbprint
+      })]
+      logConfiguration = {
+        logDriver = "awslogs"
+        options = {
+          "awslogs-group"         = local.customer
+          "awslogs-region"        = data.aws_region.current.region
+          "awslogs-stream-prefix" = "rds-tls-ca-retriever"
+        }
+      }
+      environment = []
+      mountPoints = [
+        {
+          sourceVolume  = "rds-tls-certs",
+          containerPath = local.rds_container_path
+        }
+      ]
+      essential = false
+    },
+    # {
+    #   name      = "prometheus-exporter"
+    #   image     = "${data.terraform_remote_state.shared.outputs.ecr.repository_url}:latest"
+    #   entrypoint = []
+    #   command = ["sleep"]
+    #   logConfiguration = {
+    #     logDriver = "awslogs"
+    #     options = {
+    #       "awslogs-group"         = local.customer
+    #       "awslogs-region"        = data.aws_region.current.region
+    #       "awslogs-stream-prefix" = "fleet-prometheus-exporter"
+    #     }
+    #   }
+    #   environment = [
+    #     {
+    #       name  = "CLOUDWATCH_NAMESPACE"
+    #       value = "fleet-loadtest"
+    #     },
+    #     {
+    #       name  = "CLOUDWATCH_REGION"
+    #       value = "us-east-2"
+    #     },
+    #     {
+    #       name  = "PROMETHEUS_SCRAPE_URL"
+    #       value = "http://localhost:8080/metrics"
+    #     },
+    #   ]
+    #   mountPoints = []
+    #   essential = false
+    # }
+  ]
+}

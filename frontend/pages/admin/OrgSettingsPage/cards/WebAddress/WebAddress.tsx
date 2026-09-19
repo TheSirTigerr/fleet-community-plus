@@ -1,0 +1,131 @@
+import { size } from "lodash";
+import React, { useState } from "react";
+
+import Button from "components/buttons/Button";
+import InputField from "components/forms/fields/InputField";
+import validUrl from "components/forms/validators/valid_url";
+import GitOpsModeTooltipWrapper from "components/GitOpsModeTooltipWrapper";
+import { IInputFieldParseTarget } from "interfaces/form_field";
+import SettingsSection from "pages/admin/components/SettingsSection";
+import INVALID_SERVER_URL_MESSAGE from "utilities/error_messages";
+
+import { IAppConfigFormProps } from "../constants";
+
+interface IWebAddressFormData {
+  serverURL: string;
+}
+
+interface IWebAddressFormErrors {
+  server_url?: string | null;
+}
+const baseClass = "app-config-form";
+
+const validateFormData = ({ serverURL }: IWebAddressFormData) => {
+  const errors: IWebAddressFormErrors = {};
+  if (!serverURL) {
+    errors.server_url = "Fleet server URL must be present";
+  } else if (
+    !validUrl({
+      url: serverURL,
+      protocols: ["http", "https"],
+      allowLocalHost: true,
+    })
+  ) {
+    errors.server_url = INVALID_SERVER_URL_MESSAGE;
+  }
+
+  return errors;
+};
+
+const WebAddress = ({
+  appConfig,
+  handleSubmit,
+  isUpdatingSettings,
+}: IAppConfigFormProps): JSX.Element => {
+  const gitOpsModeEnabled = appConfig.gitops.gitops_mode_enabled;
+
+  const [formData, setFormData] = useState<IWebAddressFormData>({
+    serverURL: appConfig.server_settings.server_url || "",
+  });
+
+  const { serverURL } = formData;
+
+  const [formErrors, setFormErrors] = useState<IWebAddressFormErrors>({});
+
+  const onInputChange = ({ name, value }: IInputFieldParseTarget) => {
+    const newFormData = { ...formData, [name]: value };
+    setFormData(newFormData);
+    const newErrs = validateFormData(newFormData);
+    // only set errors that are updates of existing errors
+    // new errors are only set onBlur
+    const errsToSet: Record<string, string> = {};
+    Object.keys(formErrors).forEach((k) => {
+      // @ts-ignore
+      if (newErrs[k]) {
+        // @ts-ignore
+        errsToSet[k] = newErrs[k];
+      }
+    });
+    setFormErrors(errsToSet);
+  };
+
+  const onInputBlur = () => {
+    setFormErrors(validateFormData(formData));
+  };
+
+  const onFormSubmit = (evt: React.FormEvent<HTMLFormElement>) => {
+    evt.preventDefault();
+    // return null if there are errors
+    const errs = validateFormData(formData);
+    if (size(errs)) {
+      setFormErrors(errs);
+      return;
+    }
+
+    // Formatting of API not UI
+    const formDataToSubmit = {
+      server_settings: {
+        server_url: serverURL,
+      },
+    };
+
+    handleSubmit(formDataToSubmit);
+  };
+
+  return (
+    <SettingsSection className={baseClass} title="Fleet web address">
+      <form onSubmit={onFormSubmit} autoComplete="off">
+        <InputField
+          label="URL"
+          helpText={
+            <>
+              Include base path only (eg. no <code>/latest</code>)
+            </>
+          }
+          onChange={onInputChange}
+          name="serverURL"
+          value={serverURL}
+          parseTarget
+          onBlur={onInputBlur}
+          error={formErrors.server_url}
+          tooltip="The base URL of this instance for use in Fleet links."
+          disabled={gitOpsModeEnabled}
+        />
+        <GitOpsModeTooltipWrapper
+          renderChildren={(disableChildren) => (
+            <Button
+              type="submit"
+              disabled={!!size(formErrors) || disableChildren}
+              className="button-wrap"
+              isLoading={isUpdatingSettings}
+            >
+              Save
+            </Button>
+          )}
+        />
+      </form>
+    </SettingsSection>
+  );
+};
+
+export default WebAddress;

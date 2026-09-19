@@ -1,0 +1,12 @@
+.certificates {
+  @include vertical-card-layout;
+
+  &__tab-header {
+    @include tab-header;
+  }
+
+  .list-item__title {
+    max-width: px-to-rem(900);
+    width: 36vw;
+  }
+}

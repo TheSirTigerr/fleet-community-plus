@@ -1,0 +1,71 @@
+import React from "react";
+
+import Button from "components/buttons/Button";
+import GitOpsModeTooltipWrapper from "components/GitOpsModeTooltipWrapper";
+import ListItem from "components/ListItem";
+
+import { ICertAuthorityListData } from "../CertificateAuthorityList/CertificateAuthorityList";
+
+const baseClass = "cert-authority-list-item";
+
+interface IActionsProps {
+  onEdit: () => void;
+  onDelete: () => void;
+}
+
+const Actions = ({ onEdit, onDelete }: IActionsProps) => {
+  return (
+    <>
+      <GitOpsModeTooltipWrapper
+        position="left"
+        renderChildren={(disableChildren) => (
+          <Button
+            disabled={disableChildren}
+            onClick={onEdit}
+            className={`${baseClass}__action-button`}
+            variant="subdued"
+            icon="pencil"
+            ariaLabel="Edit certificate authority"
+          />
+        )}
+      />
+      <GitOpsModeTooltipWrapper
+        position="left"
+        renderChildren={(disableChildren) => (
+          <Button
+            disabled={disableChildren}
+            onClick={onDelete}
+            className={`${baseClass}__action-button`}
+            variant="subdued"
+            icon="trash"
+            ariaLabel="Delete certificate authority"
+          />
+        )}
+      />
+    </>
+  );
+};
+
+interface ICertAuthorityListItemProps {
+  cert: ICertAuthorityListData;
+  onClickEdit: () => void;
+  onClickDelete: () => void;
+}
+
+const CertAuthorityListItem = ({
+  cert,
+  onClickEdit,
+  onClickDelete,
+}: ICertAuthorityListItemProps) => {
+  return (
+    <ListItem
+      className={baseClass}
+      graphic="file-certificate"
+      title={cert.name}
+      details={cert.description}
+      actions={<Actions onEdit={onClickEdit} onDelete={onClickDelete} />}
+    />
+  );
+};
+
+export default CertAuthorityListItem;

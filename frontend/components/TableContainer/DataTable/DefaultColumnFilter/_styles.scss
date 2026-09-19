@@ -1,0 +1,28 @@
+.filter-cell {
+  max-width: 100%;
+  padding-bottom: $pad-small;
+
+  .input-with-icon {
+    height: 32px;
+    width: 100%;
+    font-size: $xx-small;
+    background-color: transparent;
+    border: 1px solid $ui-fleet-black-10;
+    border-radius: $border-radius;
+    padding: 4px;
+    padding-left: 28px;
+    background-color: $core-fleet-white;
+  }
+
+  .search-field__input-wrapper {
+    position: relative;
+    color: $core-fleet-blue;
+    width: 100%;
+  }
+
+  .icon {
+    width: 12px;
+    top: 2px;
+    height: 32px;
+  }
+}

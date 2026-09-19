@@ -1,0 +1,2802 @@
+package mysql
+
+import (
+	"context"
+	"database/sql"
+	"encoding/json"
+	"errors"
+	"fmt"
+	"slices"
+	"strings"
+	"time"
+	"unicode/utf8"
+
+	"github.com/fleetdm/fleet/v4/server/contexts/ctxdb"
+	"github.com/fleetdm/fleet/v4/server/contexts/ctxerr"
+	"github.com/fleetdm/fleet/v4/server/fleet"
+	"github.com/fleetdm/fleet/v4/server/mdm/android"
+	common_mysql "github.com/fleetdm/fleet/v4/server/platform/mysql"
+	"github.com/fleetdm/fleet/v4/server/ptr"
+	"github.com/fleetdm/fleet/v4/server/variables"
+	"github.com/google/uuid"
+	"github.com/jmoiron/sqlx"
+)
+
+// truncateRunes returns s shortened to at most maxRunes characters, preserving the start of the
+// string. utf8mb4 VARCHAR(N) in MySQL counts characters (runes), not bytes, so we slice on runes
+// to align with the column constraint.
+func truncateRunes(s string, maxRunes int) string {
+	if len(s) <= maxRunes {
+		// Fast path: ASCII fits in maxRunes bytes -> maxRunes characters max.
+		return s
+	}
+	if utf8.RuneCountInString(s) <= maxRunes {
+		return s
+	}
+	return string([]rune(s)[:maxRunes])
+}
+
+func (ds *Datastore) NewAndroidHost(ctx context.Context, host *fleet.AndroidHost, companyOwned bool) (*fleet.AndroidHost, error) {
+	if !host.IsValid() {
+		return nil, ctxerr.New(ctx, "valid Android host is required")
+	}
+	ds.setTimesToNonZero(host)
+
+	appCfg, err := ds.AppConfig(ctx)
+	if err != nil {
+		return nil, ctxerr.Wrap(ctx, err, "new Android host get app config")
+	}
+
+	err = ds.withRetryTxx(ctx, func(tx sqlx.ExtContext) error {
+		// If the Fleet Android agent already orbit-enrolled this device, a hosts row exists
+		// keyed by uuid = enterpriseSpecificId. Reuse it instead of inserting a duplicate.
+		// (platform = '' covers agents that didn't send platform on orbit enroll.)
+		params := map[string]any{
+			"node_key":          host.NodeKey,
+			"hostname":          host.Hostname,
+			"computer_name":     host.ComputerName,
+			"platform":          host.Platform,
+			"os_version":        host.OSVersion,
+			"build":             host.Build,
+			"memory":            host.Memory,
+			"team_id":           host.TeamID,
+			"hardware_serial":   host.HardwareSerial,
+			"cpu_type":          host.CPUType,
+			"hardware_model":    host.HardwareModel,
+			"hardware_vendor":   host.HardwareVendor,
+			"detail_updated_at": host.DetailUpdatedAt,
+			"label_updated_at":  host.LabelUpdatedAt,
+			"uuid":              host.UUID,
+		}
+
+		// Only look up an existing host when we have a non-empty UUID. An empty UUID
+		// would match every hosts row with uuid='' and falsely dedupe unrelated hosts.
+		// When multiple rows share this uuid (e.g. one orbit-enrolled with
+		// node_key=<orbitKey> and one Android with node_key=android/<uuid>), prefer the
+		// row whose node_key already matches host.NodeKey. Updating that row's node_key
+		// to itself is a no-op and avoids colliding with the UNIQUE idx_host_unique_nodekey
+		// constraint that would fire if we picked the other duplicate and tried to flip
+		// its node_key over to an already-taken value.
+		var (
+			existingID uint
+			foundHost  bool
+		)
+		if host.UUID != "" {
+			err := sqlx.GetContext(ctx, tx, &existingID,
+				`SELECT id FROM hosts WHERE uuid = ? AND platform IN ('android', '') ORDER BY (node_key = ?) DESC, id LIMIT 1`,
+				host.UUID, host.NodeKey,
+			)
+			if err != nil && !errors.Is(err, sql.ErrNoRows) {
+				return ctxerr.Wrap(ctx, err, "check for existing orbit-enrolled Android host")
+			}
+			foundHost = err == nil
+		}
+
+		if !foundHost {
+			// No orbit-enrolled host for this uuid. Insert as usual.
+			// We use node_key as a unique identifier for the host table row. It matches: android/{enterpriseSpecificID}.
+			insertStmt := `
+			INSERT INTO hosts (
+				node_key,
+				hostname,
+				computer_name,
+				platform,
+				os_version,
+				build,
+				memory,
+				team_id,
+				hardware_serial,
+				cpu_type,
+				hardware_model,
+				hardware_vendor,
+				detail_updated_at,
+				label_updated_at,
+				uuid
+			) VALUES (
+				:node_key,
+				:hostname,
+				:computer_name,
+				:platform,
+				:os_version,
+				:build,
+				:memory,
+				:team_id,
+				:hardware_serial,
+				:cpu_type,
+				:hardware_model,
+				:hardware_vendor,
+				:detail_updated_at,
+				:label_updated_at,
+				:uuid
+			) ON DUPLICATE KEY UPDATE
+				hostname = VALUES(hostname),
+				computer_name = VALUES(computer_name),
+				platform = VALUES(platform),
+				os_version = VALUES(os_version),
+				build = VALUES(build),
+				memory = VALUES(memory),
+				team_id = VALUES(team_id),
+				hardware_serial = VALUES(hardware_serial),
+				cpu_type = VALUES(cpu_type),
+				hardware_model = VALUES(hardware_model),
+				hardware_vendor = VALUES(hardware_vendor),
+				detail_updated_at = VALUES(detail_updated_at),
+				label_updated_at = VALUES(label_updated_at),
+				uuid = VALUES(uuid)
+			`
+			result, err := sqlx.NamedExecContext(ctx, tx, insertStmt, params)
+			if err != nil {
+				return ctxerr.Wrap(ctx, err, "new Android host")
+			}
+			id, _ := result.LastInsertId()
+			if id == 0 {
+				// This was an UPDATE, not an INSERT, so we need to get the host ID
+				var hostID uint
+				err := sqlx.GetContext(ctx, tx, &hostID, `SELECT id FROM hosts WHERE node_key = ?`, host.NodeKey)
+				if err != nil {
+					return ctxerr.Wrap(ctx, err, "get host ID after update")
+				}
+				host.Host.ID = hostID
+			} else {
+				host.Host.ID = uint(id) // nolint:gosec
+			}
+		} else {
+			// Orbit-enrolled Android host already exists; update it in place so both
+			// enrollment paths converge on a single hosts row.
+			params["id"] = existingID
+			updateStmt := `
+			UPDATE hosts SET
+				node_key = :node_key,
+				hostname = :hostname,
+				computer_name = :computer_name,
+				platform = :platform,
+				os_version = :os_version,
+				build = :build,
+				memory = :memory,
+				team_id = :team_id,
+				hardware_serial = :hardware_serial,
+				cpu_type = :cpu_type,
+				hardware_model = :hardware_model,
+				hardware_vendor = :hardware_vendor,
+				detail_updated_at = :detail_updated_at,
+				label_updated_at = :label_updated_at,
+				uuid = :uuid
+			WHERE id = :id`
+			if _, err := sqlx.NamedExecContext(ctx, tx, updateStmt, params); err != nil {
+				return ctxerr.Wrap(ctx, err, "update existing orbit-enrolled Android host")
+			}
+			host.Host.ID = existingID
+		}
+		host.Device.HostID = host.Host.ID
+
+		err = upsertHostDisplayNames(ctx, tx, *host.Host)
+		if err != nil {
+			return ctxerr.Wrap(ctx, err, "new Android host display name")
+		}
+		err = ds.insertAndroidHostLabelMembershipTx(ctx, tx, host.Host.ID)
+		if err != nil {
+			return ctxerr.Wrap(ctx, err, "new Android host label membership")
+		}
+
+		// create entry in host_mdm as enrolled (manually), because currently all
+		// android hosts are necessarily MDM-enrolled when created.
+		if err := upsertAndroidHostMDMInfoDB(ctx, tx, appCfg.ServerSettings.ServerURL, companyOwned, true, host.Host.ID); err != nil {
+			return ctxerr.Wrap(ctx, err, "new Android host MDM info")
+		}
+
+		host.Device, err = ds.CreateDeviceTx(ctx, tx, host.Device)
+		if err != nil {
+			return ctxerr.Wrap(ctx, err, "creating new Android device")
+		}
+
+		// Sync team_id to android_devices so it survives host deletion.
+		if _, err := tx.ExecContext(ctx,
+			`UPDATE android_devices SET team_id = ? WHERE host_id = ?`,
+			host.TeamID, host.Host.ID,
+		); err != nil {
+			return ctxerr.Wrap(ctx, err, "sync android_devices team_id on new host")
+		}
+
+		// insert storage data into host_disks table for API consumption
+		// Check != 0 to allow -1 sentinel value for "not supported" to be stored
+		if host.Host.GigsTotalDiskSpace != 0 || host.Host.GigsDiskSpaceAvailable != 0 {
+			err = ds.SetOrUpdateHostDisksSpace(ctx, host.Host.ID,
+				host.Host.GigsDiskSpaceAvailable,
+				host.Host.PercentDiskSpaceAvailable,
+				host.Host.GigsTotalDiskSpace,
+				nil)
+			if err != nil {
+				return ctxerr.Wrap(ctx, err, "setting Android host disk space")
+			}
+		}
+
+		return nil
+	})
+	return host, err
+}
+
+// setTimesToNonZero to avoid issues with MySQL.
+func (ds *Datastore) setTimesToNonZero(host *fleet.AndroidHost) {
+	if host.DetailUpdatedAt.IsZero() {
+		host.DetailUpdatedAt = common_mysql.GetDefaultNonZeroTime()
+	}
+	if host.LabelUpdatedAt.IsZero() {
+		host.LabelUpdatedAt = common_mysql.GetDefaultNonZeroTime()
+	}
+	if host.PolicyUpdatedAt.IsZero() {
+		host.PolicyUpdatedAt = common_mysql.GetDefaultNonZeroTime()
+	}
+}
+
+func (ds *Datastore) UpdateAndroidHost(ctx context.Context, host *fleet.AndroidHost, fromEnroll, companyOwned bool) error {
+	if !host.IsValid() {
+		return ctxerr.New(ctx, "valid Android host is required")
+	}
+	ds.setTimesToNonZero(host)
+
+	appCfg, err := ds.AppConfig(ctx)
+	if err != nil {
+		return ctxerr.Wrap(ctx, err, "update Android host get app config")
+	}
+
+	err = ds.withRetryTxx(ctx, func(tx sqlx.ExtContext) error {
+		stmt := `
+		UPDATE hosts SET
+			detail_updated_at = :detail_updated_at,
+			label_updated_at = :label_updated_at,
+			hostname = :hostname,
+			computer_name = :computer_name,
+			platform = :platform,
+			os_version = :os_version,
+			build = :build,
+			memory = :memory,
+			hardware_serial = :hardware_serial,
+			cpu_type = :cpu_type,
+			hardware_model = :hardware_model,
+			hardware_vendor = :hardware_vendor,
+			uuid = :uuid
+		WHERE id = :id
+		`
+		_, err := sqlx.NamedExecContext(ctx, tx, stmt, map[string]interface{}{
+			"id":                host.Host.ID,
+			"detail_updated_at": host.DetailUpdatedAt,
+			"label_updated_at":  host.LabelUpdatedAt,
+			"hostname":          host.Hostname,
+			"computer_name":     host.ComputerName,
+			"platform":          host.Platform,
+			"os_version":        host.OSVersion,
+			"build":             host.Build,
+			"memory":            host.Memory,
+			"hardware_serial":   host.HardwareSerial,
+			"cpu_type":          host.CPUType,
+			"hardware_model":    host.HardwareModel,
+			"hardware_vendor":   host.HardwareVendor,
+			"uuid":              host.UUID,
+		})
+		if err != nil {
+			return ctxerr.Wrap(ctx, err, "update Android host")
+		}
+
+		// Keep android_devices.team_id in sync so the team survives host deletion.
+		if _, err := tx.ExecContext(ctx,
+			`UPDATE android_devices SET team_id = ? WHERE host_id = ?`,
+			host.TeamID, host.Host.ID,
+		); err != nil {
+			return ctxerr.Wrap(ctx, err, "sync android_devices team_id")
+		}
+
+		if fromEnroll {
+			// update host_mdm to set enrolled back to true
+			if err := upsertAndroidHostMDMInfoDB(ctx, tx, appCfg.ServerSettings.ServerURL, companyOwned, true, host.Host.ID); err != nil {
+				return ctxerr.Wrap(ctx, err, "update Android host MDM info")
+			}
+			// Certificate template records for re-enrolling hosts are created by the caller
+			// (Service.updateHost) via CreatePendingCertificateTemplatesForNewHost after this
+			// transaction commits. Doing it here would result in a duplicate call.
+		}
+
+		err = ds.UpdateDeviceTx(ctx, tx, host.Device)
+		if err != nil {
+			return ctxerr.Wrap(ctx, err, "update Android device")
+		}
+
+		// update storage data in host_disks table for API consumption
+		// Check != 0 to allow -1 sentinel value for "not supported" to be stored
+		if host.Host.GigsTotalDiskSpace != 0 || host.Host.GigsDiskSpaceAvailable != 0 {
+			err = ds.SetOrUpdateHostDisksSpace(ctx, host.Host.ID,
+				host.Host.GigsDiskSpaceAvailable,
+				host.Host.PercentDiskSpaceAvailable,
+				host.Host.GigsTotalDiskSpace,
+				nil)
+			if err != nil {
+				return ctxerr.Wrap(ctx, err, "updating Android host disk space")
+			}
+		}
+
+		return nil
+	})
+	return err
+}
+
+// AndroidResetOnReenrollment clears the state a re-enrolling Android host no longer
+// has: dynamic label membership, pending MDM commands and their host_mdm_actions refs,
+// and pending software installs. Past host activities are only cleared when
+// preserveHostActivities is false.
+//
+// Note that it deliberately does not clear the host's vitals (host_disks,
+// host_operating_system) the way appleHostRefsForMDMReset does. The enrollment
+// overwrites both unconditionally, so deleting them buys nothing, and it is unsafe
+// with a read replica: SetOrUpdateHostDisksSpace and UpdateHostOperatingSystem both
+// read the current row from the replica and skip the write when the values are
+// unchanged, so a lagging replica makes the enrollment skip a write that the delete
+// was counting on and leaves the host with no vitals row at all.
+//
+// Pending installs are failed rather than deleted, so it returns the users and
+// activities the caller must emit, the same contract as
+// MarkAllPendingVPPInstallsAsFailedForAndroidHost.
+//
+// This must run before the enrollment's own data is written back (see
+// Service.updateHost), otherwise it deletes the vitals that were just reported.
+func (ds *Datastore) AndroidResetOnReenrollment(ctx context.Context, hostID uint, hostUUID string,
+	preserveHostActivities bool,
+) (users []*fleet.User, activities []fleet.ActivityDetails, err error) {
+	// Both are used unqualified in DELETEs below, so a zero value would widen them to
+	// every host with an empty uuid rather than affecting nothing.
+	if hostID == 0 || hostUUID == "" {
+		return nil, nil, ctxerr.New(ctx, "resetting android enrollment requires a host id and uuid")
+	}
+
+	err = ds.withRetryTxx(ctx, func(tx sqlx.ExtContext) error {
+		// withRetryTxx re-runs this closure on a deadlock, so start from empty rather
+		// than appending a second copy of everything.
+		users, activities = nil, nil
+
+		// Clear dynamic label membership only.
+		//
+		// Host-vitals membership (IdP group/department) is deliberately kept: it is
+		// derived from the IdP account, which survives the re-enroll, and only the
+		// 5-minute host-vitals cron re-derives it. Deleting it would open a window in
+		// which the profile scope query reads the host as a confirmed non-member (it
+		// counts any label_membership_type <> 0 as reported), so an explicitly excluded
+		// profile would install and host-vitals-scoped setup experience apps would drop
+		// out of scope for this enrollment entirely.
+		//
+		// Builtin labels are kept for the opposite reason: "All Hosts" is dynamic, and
+		// nothing re-adds the Android builtin memberships outside NewAndroidHost, so a
+		// host that lost them would disappear from the host list for good.
+		if _, err := tx.ExecContext(ctx, `
+			DELETE lm FROM label_membership lm
+			JOIN labels l ON l.id = lm.label_id
+			WHERE lm.host_id = ? AND l.label_membership_type = ? AND l.label_type != ?`,
+			hostID, fleet.LabelMembershipTypeDynamic, fleet.LabelTypeBuiltIn); err != nil {
+			return ctxerr.Wrap(ctx, err, "clear dynamic label membership on android reenroll")
+		}
+
+		// Cancel pending AMAPI commands. These are keyed by host_uuid, and the device that
+		// just re-enrolled will never acknowledge a command issued to the previous install.
+		if _, err := tx.ExecContext(ctx,
+			`DELETE FROM mdm_android_commands WHERE host_uuid = ? AND status = 'Pending'`, hostUUID); err != nil {
+			return ctxerr.Wrap(ctx, err, "cancel pending android commands on reenroll")
+		}
+
+		// Drop the lock/wipe/clear-passcode refs in the same transaction as the commands
+		// they point at. Service.updateHost clears these again later, but doing it here
+		// means a failure in between cannot leave a ref pointing at a deleted command.
+		if _, err := tx.ExecContext(ctx, `DELETE FROM host_mdm_actions WHERE host_id = ?`, hostID); err != nil {
+			return ctxerr.Wrap(ctx, err, "clear host_mdm_actions on android reenroll")
+		}
+
+		// Fail every install that never reached a verdict, and return the activities so
+		// the caller can emit them. This is the same helper the Android unenroll path
+		// uses, so a device that unenrolls and one that re-enrolls report their
+		// interrupted installs identically. Note that it also fails rows flagged
+		// removed = 1 that never reached a verdict, which is the helper's existing
+		// behaviour rather than anything specific to re-enrollment.
+		//
+		// Marking the installs canceled instead would hide them from the host software
+		// list and from the activity feed, losing the record entirely.
+		users, activities, err = ds.markAllPendingVPPInstallsAsFailedForHost(ctx, tx, hostID, "android", softwareTypeVPP)
+		if err != nil {
+			return ctxerr.Wrap(ctx, err, "fail pending android software installs on reenroll")
+		}
+
+		if !preserveHostActivities {
+			if _, err := tx.ExecContext(ctx,
+				`DELETE FROM activity_host_past WHERE host_id = ?`, hostID); err != nil {
+				return ctxerr.Wrap(ctx, err, "clear past host activities on android reenroll")
+			}
+		}
+		return nil
+	})
+	if err != nil {
+		return nil, nil, err
+	}
+	return users, activities, nil
+}
+
+func (ds *Datastore) UpdateTeamIDOnAndroidDevices(ctx context.Context, hostUUIDs []string, teamID *uint) error {
+	hostUUIDs = slices.DeleteFunc(hostUUIDs, func(s string) bool { return s == "" })
+	if len(hostUUIDs) == 0 {
+		return nil
+	}
+	for batch := range slices.Chunk(hostUUIDs, hostIDsFanoutBatchSize) {
+		query, args, err := sqlx.In(
+			`UPDATE android_devices ad JOIN hosts h ON ad.host_id = h.id SET ad.team_id = ? WHERE h.uuid IN (?)`,
+			teamID, batch,
+		)
+		if err != nil {
+			return ctxerr.Wrap(ctx, err, "build update android_devices team_id query")
+		}
+		if _, err := ds.writer(ctx).ExecContext(ctx, query, args...); err != nil {
+			return ctxerr.Wrap(ctx, err, "update android_devices team_id")
+		}
+	}
+	return nil
+}
+
+func (ds *Datastore) GetAndroidDeviceLastTeamID(ctx context.Context, enterpriseSpecificID string) (*uint, bool, error) {
+	var teamID *uint
+	err := sqlx.GetContext(ctx, ds.reader(ctx), &teamID,
+		`SELECT team_id FROM android_devices WHERE enterprise_specific_id = ?`,
+		enterpriseSpecificID,
+	)
+	switch {
+	case errors.Is(err, sql.ErrNoRows):
+		return nil, false, nil
+	case err != nil:
+		return nil, false, ctxerr.Wrap(ctx, err, "get android device last team_id")
+	}
+	return teamID, true, nil
+}
+
+func (ds *Datastore) AndroidHostLite(ctx context.Context, enterpriseSpecificID string) (*fleet.AndroidHost, error) {
+	type liteHost struct {
+		TeamID *uint  `db:"team_id"`
+		UUID   string `db:"uuid"`
+		*android.Device
+	}
+	stmt := `SELECT
+		h.team_id,
+		h.uuid,
+		ad.id,
+		ad.host_id,
+		ad.device_id,
+		ad.enterprise_specific_id,
+		ad.last_policy_sync_time,
+		ad.applied_policy_id,
+		ad.applied_policy_version
+		FROM android_devices ad
+		JOIN hosts h ON ad.host_id = h.id
+		WHERE ad.enterprise_specific_id = ?`
+	var host liteHost
+	err := sqlx.GetContext(ctx, ds.reader(ctx), &host, stmt, enterpriseSpecificID)
+	switch {
+	case errors.Is(err, sql.ErrNoRows):
+		return nil, common_mysql.NotFound("Android device").WithName(enterpriseSpecificID)
+	case err != nil:
+		return nil, ctxerr.Wrap(ctx, err, "getting device by enterprise specific ID")
+	}
+	result := &fleet.AndroidHost{
+		Host: &fleet.Host{
+			ID:     host.Device.HostID,
+			TeamID: host.TeamID,
+			UUID:   host.UUID,
+		},
+		Device: host.Device,
+	}
+	result.SetNodeKey(enterpriseSpecificID)
+	return result, nil
+}
+
+func (ds *Datastore) AndroidHostLiteByHostUUID(ctx context.Context, hostUUID string) (*fleet.AndroidHost, error) {
+	type liteHost struct {
+		TeamID         *uint  `db:"team_id"`
+		Platform       string `db:"platform"`
+		HardwareSerial string `db:"hardware_serial"`
+		*android.Device
+	}
+	stmt := `SELECT
+		h.team_id,
+		h.platform,
+		h.hardware_serial,
+		ad.id,
+		ad.host_id,
+		ad.device_id,
+		ad.enterprise_specific_id,
+		ad.last_policy_sync_time,
+		ad.applied_policy_id,
+		ad.applied_policy_version
+	FROM android_devices ad
+		JOIN hosts h ON ad.host_id = h.id
+	WHERE h.uuid = ?`
+	var host liteHost
+	switch err := sqlx.GetContext(ctx, ds.reader(ctx), &host, stmt, hostUUID); {
+	case errors.Is(err, sql.ErrNoRows):
+		return nil, common_mysql.NotFound("Android device").WithName(hostUUID)
+	case err != nil:
+		return nil, ctxerr.Wrap(ctx, err, "getting android device by host UUID")
+	}
+	result := &fleet.AndroidHost{
+		Host: &fleet.Host{
+			ID:             host.Device.HostID,
+			UUID:           hostUUID,
+			TeamID:         host.TeamID,
+			Platform:       host.Platform,
+			HardwareSerial: host.HardwareSerial,
+		},
+		Device: host.Device,
+	}
+	if host.Device.EnterpriseSpecificID != nil {
+		result.SetNodeKey(*host.Device.EnterpriseSpecificID)
+	}
+	return result, nil
+}
+
+// AndroidDeviceExistsByDeviceID reports whether an android_devices row exists for the given AMAPI device_id (the `Y` in
+// `enterprises/X/devices/Y`).
+func (ds *Datastore) AndroidDeviceExistsByDeviceID(ctx context.Context, deviceID string) (bool, error) {
+	const stmt = `SELECT EXISTS(SELECT 1 FROM android_devices WHERE device_id = ?)`
+	var exists bool
+	if err := sqlx.GetContext(ctx, ds.reader(ctx), &exists, stmt, deviceID); err != nil {
+		return false, ctxerr.Wrap(ctx, err, "checking android device exists by device_id")
+	}
+	return exists, nil
+}
+
+func (ds *Datastore) insertAndroidHostLabelMembershipTx(ctx context.Context, tx sqlx.ExtContext, hostID uint) error {
+	// Insert the host in the builtin label memberships, adding them to the "All
+	// Hosts" and "Android" labels.
+	var labels []struct {
+		ID   uint   `db:"id"`
+		Name string `db:"name"`
+	}
+	err := sqlx.SelectContext(ctx, tx, &labels, `SELECT id, name FROM labels WHERE label_type = 1 AND (name = ? OR name = ?)`,
+		fleet.BuiltinLabelNameAllHosts, fleet.BuiltinLabelNameAndroid)
+	switch {
+	case err != nil:
+		return ctxerr.Wrap(ctx, err, "get builtin labels")
+	case len(labels) != 2:
+		// Builtin labels can get deleted so it is important that we check that
+		// they still exist before we continue.
+		// Note that this is the same behavior as for the iOS/iPadOS host labels.
+		ds.logger.ErrorContext(ctx, fmt.Sprintf("expected 2 builtin labels but got %d", len(labels)))
+		return nil
+	}
+
+	// We cannot assume IDs on labels, thus we look by name.
+	var allHostsLabelID, androidLabelID uint
+	for _, label := range labels {
+		switch label.Name {
+		case fleet.BuiltinLabelNameAllHosts:
+			allHostsLabelID = label.ID
+		case fleet.BuiltinLabelNameAndroid:
+			androidLabelID = label.ID
+		}
+	}
+
+	_, err = tx.ExecContext(ctx, `
+		INSERT INTO label_membership (host_id, label_id) VALUES (?, ?), (?, ?)
+		ON DUPLICATE KEY UPDATE host_id = host_id`,
+		hostID, allHostsLabelID, hostID, androidLabelID)
+	if err != nil {
+		return ctxerr.Wrap(ctx, err, "set label membership")
+	}
+	return nil
+}
+
+// BulkSetAndroidHostsUnenrolled sets all android hosts to unenrolled (for when
+// Android MDM is turned off for all Fleet).
+func (ds *Datastore) BulkSetAndroidHostsUnenrolled(ctx context.Context) error {
+	_, err := ds.writer(ctx).ExecContext(ctx, `
+UPDATE host_mdm
+	SET server_url = '', mdm_id = NULL, enrolled = 0
+	WHERE host_id IN (
+		SELECT id FROM hosts WHERE platform = 'android'
+	)`)
+	if err != nil {
+		return ctxerr.Wrap(ctx, err, "set host_mdm to unenrolled for android hosts in bulk")
+	}
+	// Delete all Android custom OS settings for unenrolled hosts.
+	// We do this in one query using a JOIN to avoid doing it one host at a time.
+	_, err = ds.writer(ctx).ExecContext(ctx, `DELETE FROM host_mdm_android_profiles`)
+	if err != nil {
+		return ctxerr.Wrap(ctx, err, "delete Android custom OS settings for unenrolled hosts in bulk")
+	}
+	// Delete all certificate template records for Android hosts so they get re-created on re-enrollment.
+	_, err = ds.writer(ctx).ExecContext(ctx, `
+		DELETE hct FROM host_certificate_templates hct
+		INNER JOIN hosts h ON h.uuid = hct.host_uuid
+		WHERE h.platform = 'android'`)
+	if err != nil {
+		return ctxerr.Wrap(ctx, err, "delete certificate templates for unenrolled android hosts in bulk")
+	}
+	return nil
+}
+
+// SetAndroidHostUnenrolled sets a single android host to unenrolled in host_mdm and OS settings records
+// associated with it. If the host is not enrolled, it does nothing and returns false.
+func (ds *Datastore) SetAndroidHostUnenrolled(ctx context.Context, hostID uint) (bool, error) {
+	var rows int64
+	err := ds.withTx(ctx, func(tx sqlx.ExtContext) error {
+		// installed_from_dep is also cleared because Android has no DEP/ABM equivalent (no "Pending" state).
+		result, err := tx.ExecContext(ctx, `
+UPDATE host_mdm
+	SET server_url = '', mdm_id = NULL, enrolled = 0, installed_from_dep = 0
+	WHERE host_id = ? AND enrolled = 1`, hostID)
+		if err != nil {
+			return ctxerr.Wrap(ctx, err, "set host_mdm to unenrolled for android host")
+		}
+		rows, err = result.RowsAffected()
+		if err != nil {
+			return ctxerr.Wrap(ctx, err, "get rows affected for set host_mdm unenrolled for android host")
+		}
+		if rows > 0 {
+			var hostUUID string
+			err = sqlx.GetContext(ctx, tx, &hostUUID, `SELECT uuid FROM hosts WHERE id = ?`, hostID)
+			if err != nil {
+				return ctxerr.Wrap(ctx, err, "get host uuid")
+			}
+			err = ds.deleteMDMOSCustomSettingsForHost(ctx, tx, hostUUID, "android")
+			if err != nil {
+				return ctxerr.Wrap(ctx, err, "delete Android custom OS settings for unenrolled host")
+			}
+			// Delete certificate template records so they get re-created fresh on re-enrollment.
+			// The device no longer has these certificates after unenrolling.
+			_, err = tx.ExecContext(ctx, `DELETE FROM host_certificate_templates WHERE host_uuid = ?`, hostUUID)
+			if err != nil {
+				return ctxerr.Wrap(ctx, err, "delete certificate templates for unenrolled android host")
+			}
+		}
+		return nil
+	})
+	if err != nil {
+		return false, err
+	}
+	return rows > 0, nil
+}
+
+// GetAndroidPubSubDedupState returns the last-processed Google Pub/Sub messageId
+// and AMAPI event timestamp recorded for the host, used by the AMAPI notification
+// handler to drop duplicate (same messageId) and stale (older timestamp)
+// deliveries. When the android_devices row exists but nothing has been recorded
+// yet, it returns an empty messageId and nil eventTime with no error. When no
+// android_devices row exists for the host, it returns a NotFound error.
+func (ds *Datastore) GetAndroidPubSubDedupState(ctx context.Context, hostID uint) (messageID string, eventTime *time.Time, err error) {
+	var state struct {
+		MessageID *string    `db:"last_pubsub_message_id"`
+		EventTime *time.Time `db:"last_pubsub_event_time"`
+	}
+	err = sqlx.GetContext(ctx, ds.reader(ctx), &state,
+		`SELECT last_pubsub_message_id, last_pubsub_event_time FROM android_devices WHERE host_id = ?`, hostID)
+	switch {
+	case errors.Is(err, sql.ErrNoRows):
+		return "", nil, ctxerr.Wrap(ctx, notFound("AndroidDevice").WithID(hostID), "get android pubsub dedup state")
+	case err != nil:
+		return "", nil, ctxerr.Wrap(ctx, err, "get android pubsub dedup state")
+	}
+	return ptr.ValOrZero(state.MessageID), state.EventTime, nil
+}
+
+// SetAndroidPubSubDedupState records the last-processed Google Pub/Sub messageId
+// and AMAPI event timestamp for the host after a notification is handled
+// successfully. Returns a NotFound error when no android_devices row matches
+// hostID, so a missing row surfaces (via the caller's log) instead of silently
+// dropping dedup state.
+//
+// An empty messageID or nil eventTime leaves that column at its previous value
+// rather than clearing it. A notification that carries no usable timestamp says
+// nothing about ordering, so overwriting the recorded baseline with NULL would
+// disable staleness protection for the host until some later message happened to
+// carry a parseable timestamp. The columns only ever move forward.
+func (ds *Datastore) SetAndroidPubSubDedupState(ctx context.Context, hostID uint, messageID string, eventTime *time.Time) error {
+	// clientFoundRows is set on the DSN, so RowsAffected below counts matched rows, not
+	// changed rows — a write that preserves both columns still reports 1 for an existing row.
+	result, err := ds.writer(ctx).ExecContext(ctx, `
+UPDATE android_devices
+	SET last_pubsub_message_id = IF(? = '', last_pubsub_message_id, ?),
+		last_pubsub_event_time = CASE
+			WHEN ? IS NULL THEN last_pubsub_event_time
+			WHEN last_pubsub_event_time IS NULL OR ? > last_pubsub_event_time THEN ?
+			ELSE last_pubsub_event_time
+		END
+	WHERE host_id = ?`,
+		messageID, messageID, eventTime, eventTime, eventTime, hostID)
+	if err != nil {
+		return ctxerr.Wrap(ctx, err, "set android pubsub dedup state")
+	}
+	rows, err := result.RowsAffected()
+	if err != nil {
+		return ctxerr.Wrap(ctx, err, "get rows affected for set android pubsub dedup state")
+	}
+	if rows == 0 {
+		return ctxerr.Wrap(ctx, notFound("AndroidDevice").WithID(hostID), "set android pubsub dedup state")
+	}
+	return nil
+}
+
+// SetAndroidHostEnrolled flips host_mdm back to enrolled for an Android host that
+// is currently marked unenrolled. This recovers a host that was wrongly unenrolled
+// by an out-of-order DELETED delivery: a live device sending a STATUS_REPORT is by
+// definition still managed. It is a no-op (returns false) when the host is already
+// enrolled or has no host_mdm row, so it is safe to call on every STATUS_REPORT. It
+// intentionally does not re-run enrollment side effects (setup experience, cert
+// templates, team assignment) — those belong to the ENROLLMENT path.
+//
+// It preserves the existing is_personal_enrollment classification rather than
+// recomputing it: the triggering STATUS_REPORT payload may omit Ownership, which
+// would otherwise misclassify a COBO (company-owned) host as personal.
+func (ds *Datastore) SetAndroidHostEnrolled(ctx context.Context, hostID uint) (bool, error) {
+	// Fast path: this is called on every STATUS_REPORT, but almost always the host is
+	// already enrolled and there is nothing to do. Check that with a cheap read before
+	// opening a write transaction. The transaction below re-reads authoritatively, so a
+	// stale replica read here at worst causes a redundant (still-correct) transaction or
+	// defers recovery to the next report.
+	var enrolled bool
+	switch err := sqlx.GetContext(ctx, ds.reader(ctx), &enrolled,
+		`SELECT enrolled FROM host_mdm WHERE host_id = ?`, hostID); {
+	case errors.Is(err, sql.ErrNoRows):
+		return false, nil
+	case err != nil:
+		return false, ctxerr.Wrap(ctx, err, "check android host_mdm enrolled state")
+	case enrolled:
+		return false, nil
+	}
+
+	appCfg, err := ds.AppConfig(ctx)
+	if err != nil {
+		return false, ctxerr.Wrap(ctx, err, "set android host enrolled get app config")
+	}
+
+	var didEnroll bool
+	err = ds.withTx(ctx, func(tx sqlx.ExtContext) error {
+		var current struct {
+			Enrolled             bool `db:"enrolled"`
+			IsPersonalEnrollment bool `db:"is_personal_enrollment"`
+		}
+		err := sqlx.GetContext(ctx, tx, &current,
+			`SELECT enrolled, is_personal_enrollment FROM host_mdm WHERE host_id = ?`, hostID)
+		switch {
+		case errors.Is(err, sql.ErrNoRows):
+			// No host_mdm row yet; leave enrollment to the ENROLLMENT path.
+			return nil
+		case err != nil:
+			return ctxerr.Wrap(ctx, err, "get android host_mdm enrolled state")
+		case current.Enrolled:
+			// Already enrolled: nothing to recover.
+			return nil
+		}
+		if err := upsertAndroidHostMDMInfoDB(ctx, tx, appCfg.ServerSettings.ServerURL, !current.IsPersonalEnrollment, true, hostID); err != nil {
+			return ctxerr.Wrap(ctx, err, "re-enroll android host_mdm info")
+		}
+		didEnroll = true
+		return nil
+	})
+	if err != nil {
+		return false, err
+	}
+	return didEnroll, nil
+}
+
+func upsertAndroidHostMDMInfoDB(ctx context.Context, tx sqlx.ExtContext, serverURL string, companyOwned, enrolled bool, hostID uint) error {
+	result, err := tx.ExecContext(ctx, `
+		INSERT INTO mobile_device_management_solutions (name, server_url) VALUES (?, ?)
+		ON DUPLICATE KEY UPDATE server_url = VALUES(server_url)`,
+		fleet.WellKnownMDMFleet, serverURL)
+	if err != nil {
+		return ctxerr.Wrap(ctx, err, "upsert mdm solution")
+	}
+
+	var mdmID int64
+	if insertOnDuplicateDidInsertOrUpdate(result) {
+		mdmID, _ = result.LastInsertId()
+	} else {
+		stmt := `SELECT id FROM mobile_device_management_solutions WHERE name = ? AND server_url = ?`
+		if err := sqlx.GetContext(ctx, tx, &mdmID, stmt, fleet.WellKnownMDMFleet, serverURL); err != nil {
+			return ctxerr.Wrap(ctx, err, "query mdm solution id")
+		}
+	}
+
+	args := []any{}
+	parts := []string{}
+	args = append(args, enrolled, serverURL, companyOwned, mdmID, false, !companyOwned, hostID)
+	parts = append(parts, "(?, ?, ?, ?, ?, ?, ?)")
+
+	_, err = tx.ExecContext(ctx, fmt.Sprintf(`
+		INSERT INTO host_mdm (enrolled, server_url, installed_from_dep, mdm_id, is_server, is_personal_enrollment, host_id) VALUES %s
+		ON DUPLICATE KEY UPDATE enrolled = VALUES(enrolled), server_url = VALUES(server_url), installed_from_dep = VALUES(installed_from_dep), mdm_id = VALUES(mdm_id), is_personal_enrollment = VALUES(is_personal_enrollment)`, strings.Join(parts, ",")), args...)
+
+	return ctxerr.Wrap(ctx, err, "upsert host mdm info")
+}
+
+func (ds *Datastore) NewMDMAndroidConfigProfile(ctx context.Context, cp fleet.MDMAndroidConfigProfile, usesFleetVars []fleet.FleetVarName) (*fleet.MDMAndroidConfigProfile, error) {
+	profileUUID := fleet.MDMAndroidProfileUUIDPrefix + uuid.New().String()
+	insertProfileStmt := `
+INSERT INTO
+    mdm_android_configuration_profiles (profile_uuid, team_id, name, raw_json, uploaded_at)
+(SELECT ?, ?, ?, ?, CURRENT_TIMESTAMP() FROM DUAL WHERE
+	NOT EXISTS (
+		SELECT 1 FROM mdm_apple_configuration_profiles WHERE name = ? AND team_id = ?
+	) AND NOT EXISTS (
+		SELECT 1 FROM mdm_apple_declarations WHERE name = ? AND team_id = ?
+	) AND NOT EXISTS (
+		SELECT 1 FROM mdm_windows_configuration_profiles WHERE name = ? AND team_id = ?
+	)
+)`
+
+	var teamID uint
+	if cp.TeamID != nil {
+		teamID = *cp.TeamID
+	}
+
+	err := ds.withTx(ctx, func(tx sqlx.ExtContext) error {
+		res, err := tx.ExecContext(ctx, insertProfileStmt, profileUUID, teamID, cp.Name, cp.RawJSON, cp.Name, teamID, cp.Name, teamID, cp.Name, teamID)
+		if err != nil {
+			switch {
+			case IsDuplicate(err):
+				return &existsError{
+					ResourceType: "MDMAndroidConfigProfile.Name",
+					Identifier:   cp.Name,
+					TeamID:       cp.TeamID,
+				}
+			default:
+				return ctxerr.Wrap(ctx, err, "creating new android mdm config profile")
+			}
+		}
+
+		aff, _ := res.RowsAffected()
+		if aff == 0 {
+			return &existsError{
+				ResourceType: "MDMAndroidConfigProfile.Name",
+				Identifier:   cp.Name,
+				TeamID:       cp.TeamID,
+			}
+		}
+
+		labels := make([]fleet.ConfigurationProfileLabel, 0, len(cp.LabelsIncludeAll)+len(cp.LabelsIncludeAny)+len(cp.LabelsExcludeAny))
+		for i := range cp.LabelsIncludeAll {
+			cp.LabelsIncludeAll[i].ProfileUUID = profileUUID
+			cp.LabelsIncludeAll[i].RequireAll = true
+			cp.LabelsIncludeAll[i].Exclude = false
+			labels = append(labels, cp.LabelsIncludeAll[i])
+		}
+		for i := range cp.LabelsIncludeAny {
+			cp.LabelsIncludeAny[i].ProfileUUID = profileUUID
+			cp.LabelsIncludeAny[i].RequireAll = false
+			cp.LabelsIncludeAny[i].Exclude = false
+			labels = append(labels, cp.LabelsIncludeAny[i])
+		}
+		for i := range cp.LabelsExcludeAny {
+			cp.LabelsExcludeAny[i].ProfileUUID = profileUUID
+			cp.LabelsExcludeAny[i].RequireAll = false
+			cp.LabelsExcludeAny[i].Exclude = true
+			labels = append(labels, cp.LabelsExcludeAny[i])
+		}
+		var profsWithoutLabel []string
+		if len(labels) == 0 {
+			profsWithoutLabel = append(profsWithoutLabel, profileUUID)
+		}
+		if _, err := batchSetProfileLabelAssociationsDB(ctx, tx, labels, profsWithoutLabel, "android"); err != nil {
+			return ctxerr.Wrap(ctx, err, "inserting android profile label associations")
+		}
+		if _, err := batchSetProfileVariableAssociationsDB(ctx, tx, []fleet.MDMProfileUUIDFleetVariables{
+			{ProfileUUID: profileUUID, FleetVariables: usesFleetVars},
+		}, "android", false); err != nil {
+			return ctxerr.Wrap(ctx, err, "inserting android profile variable associations")
+		}
+
+		return nil
+	})
+	if err != nil {
+		return nil, err
+	}
+
+	return &fleet.MDMAndroidConfigProfile{
+		ProfileUUID: profileUUID,
+		Name:        cp.Name,
+		RawJSON:     cp.RawJSON,
+		TeamID:      cp.TeamID,
+	}, nil
+}
+
+func (ds *Datastore) GetMDMAndroidConfigProfile(ctx context.Context, profileUUID string) (*fleet.MDMAndroidConfigProfile, error) {
+	stmt := `SELECT profile_uuid, team_id, name, raw_json, auto_increment, created_at, uploaded_at FROM mdm_android_configuration_profiles WHERE profile_uuid = ?`
+	var profile fleet.MDMAndroidConfigProfile
+	err := sqlx.GetContext(ctx, ds.reader(ctx), &profile, stmt, profileUUID)
+	if err != nil {
+		if err == sql.ErrNoRows {
+			return nil, notFound("MDMAndroidConfigProfile").WithName(profileUUID)
+		}
+		return nil, ctxerr.Wrap(ctx, err, "getting android mdm config profile")
+	}
+	labels, err := ds.listProfileLabelsForProfiles(ctx, nil, nil, []string{profile.ProfileUUID}, nil)
+	if err != nil {
+		return nil, err
+	}
+	for _, lbl := range labels {
+		switch {
+		case lbl.Exclude && lbl.RequireAll:
+			// this should never happen so log it for debugging
+			ds.logger.WarnContext(ctx, "unsupported profile label: cannot be both exclude and require all. Label will be ignored.",
+				"profile_uuid", lbl.ProfileUUID,
+				"label_name", lbl.LabelName,
+			)
+		case lbl.Exclude && !lbl.RequireAll:
+			profile.LabelsExcludeAny = append(profile.LabelsExcludeAny, lbl)
+		case !lbl.Exclude && !lbl.RequireAll:
+			profile.LabelsIncludeAny = append(profile.LabelsIncludeAny, lbl)
+		default:
+			// default include all
+			profile.LabelsIncludeAll = append(profile.LabelsIncludeAll, lbl)
+		}
+	}
+	return &profile, nil
+}
+
+// UpdateMDMAndroidConfigProfile updates an existing profile's contents (if
+// cp.RawJSON is non-empty) and/or label targeting in place. cp.Name must
+// match the existing profile's -- name is an Android profile's only
+// identity, so it never changes on this path.
+func (ds *Datastore) UpdateMDMAndroidConfigProfile(ctx context.Context, cp fleet.MDMAndroidConfigProfile, usesFleetVars []fleet.FleetVarName) (*fleet.MDMAndroidConfigProfile, error) {
+	err := ds.withTx(ctx, func(tx sqlx.ExtContext) error {
+		var existing struct {
+			Name string `db:"name"`
+		}
+		err := sqlx.GetContext(ctx, tx, &existing,
+			`SELECT name FROM mdm_android_configuration_profiles WHERE profile_uuid = ?`, cp.ProfileUUID)
+		if err != nil {
+			if err == sql.ErrNoRows {
+				return ctxerr.Wrap(ctx, notFound("MDMAndroidConfigProfile").WithName(cp.ProfileUUID))
+			}
+			return ctxerr.Wrap(ctx, err, "get existing android config profile")
+		}
+		if existing.Name != cp.Name {
+			return ctxerr.Wrap(ctx, &fleet.BadRequestError{
+				Message: "The new profile's name must match the existing profile's name.",
+			})
+		}
+
+		if len(cp.RawJSON) > 0 {
+			// Preserve uploaded_at on unchanged content (matching the batch
+			// upsert) so a no-op edit doesn't read as a fresh upload. The IF sees
+			// the pre-update raw_json (SET evaluates left to right), and the
+			// parameter must be CAST to JSON -- a json column never equals a
+			// bare string.
+			stmt := `UPDATE mdm_android_configuration_profiles SET uploaded_at = IF(raw_json = CAST(? AS JSON), uploaded_at, CURRENT_TIMESTAMP()), raw_json = ? WHERE profile_uuid = ? AND name = ?`
+			res, err := tx.ExecContext(ctx, stmt, cp.RawJSON, cp.RawJSON, cp.ProfileUUID, cp.Name)
+			if err != nil {
+				return ctxerr.Wrap(ctx, err, "updating android mdm config profile contents")
+			}
+			if aff, _ := res.RowsAffected(); aff == 0 {
+				return ctxerr.Wrap(ctx, notFound("MDMAndroidConfigProfile").WithName(cp.ProfileUUID))
+			}
+
+			// Reset variable associations only on a content update, but then
+			// unconditionally, so an edit that removes the profile's last Fleet
+			// variable still clears the stale association. A labels-only update
+			// must leave them alone or variable-driven redelivery would break.
+			if _, err := batchSetProfileVariableAssociationsDB(ctx, tx, []fleet.MDMProfileUUIDFleetVariables{
+				{ProfileUUID: cp.ProfileUUID, FleetVariables: usesFleetVars},
+			}, "android", false); err != nil {
+				return ctxerr.Wrap(ctx, err, "updating android profile variable associations")
+			}
+		}
+
+		labels := make([]fleet.ConfigurationProfileLabel, 0, len(cp.LabelsIncludeAll)+len(cp.LabelsIncludeAny)+len(cp.LabelsExcludeAny))
+		for i := range cp.LabelsIncludeAll {
+			cp.LabelsIncludeAll[i].ProfileUUID = cp.ProfileUUID
+			cp.LabelsIncludeAll[i].RequireAll = true
+			cp.LabelsIncludeAll[i].Exclude = false
+			labels = append(labels, cp.LabelsIncludeAll[i])
+		}
+		for i := range cp.LabelsIncludeAny {
+			cp.LabelsIncludeAny[i].ProfileUUID = cp.ProfileUUID
+			cp.LabelsIncludeAny[i].RequireAll = false
+			cp.LabelsIncludeAny[i].Exclude = false
+			labels = append(labels, cp.LabelsIncludeAny[i])
+		}
+		for i := range cp.LabelsExcludeAny {
+			cp.LabelsExcludeAny[i].ProfileUUID = cp.ProfileUUID
+			cp.LabelsExcludeAny[i].RequireAll = false
+			cp.LabelsExcludeAny[i].Exclude = true
+			labels = append(labels, cp.LabelsExcludeAny[i])
+		}
+		var profsWithoutLabel []string
+		if len(labels) == 0 {
+			profsWithoutLabel = append(profsWithoutLabel, cp.ProfileUUID)
+		}
+		if _, err := batchSetProfileLabelAssociationsDB(ctx, tx, labels, profsWithoutLabel, "android"); err != nil {
+			return ctxerr.Wrap(ctx, err, "updating android profile label associations")
+		}
+
+		return nil
+	})
+	if err != nil {
+		return nil, err
+	}
+
+	updated, err := ds.GetMDMAndroidConfigProfile(ctxdb.RequirePrimary(ctx, true), cp.ProfileUUID)
+	if err != nil {
+		return nil, ctxerr.Wrap(ctx, err, "get updated android config profile")
+	}
+	return updated, nil
+}
+
+func (ds *Datastore) DeleteMDMAndroidConfigProfile(ctx context.Context, profileUUID string) error {
+	return ds.withTx(ctx, func(tx sqlx.ExtContext) error {
+		stmt := `DELETE FROM mdm_android_configuration_profiles WHERE profile_uuid = ?`
+		res, err := tx.ExecContext(ctx, stmt, profileUUID)
+		if err != nil {
+			return ctxerr.Wrap(ctx, err, "deleting android mdm config profile")
+		}
+
+		deleted, _ := res.RowsAffected()
+		if deleted != 1 {
+			return ctxerr.Wrap(ctx, notFound("MDMAndroidConfigProfile").WithName(profileUUID))
+		}
+
+		if err := cancelAndroidHostInstallsForDeletedMDMProfiles(ctx, tx, []string{profileUUID}); err != nil {
+			return err
+		}
+		return nil
+	})
+}
+
+func (ds *Datastore) GetMDMAndroidProfilesSummary(ctx context.Context, teamID *uint) (*fleet.MDMProfilesSummary, error) {
+	stmt := `
+SELECT
+	COUNT(id) AS count,
+	%s AS status
+FROM
+	hosts h
+	INNER JOIN host_mdm hmdm ON h.id=hmdm.host_id
+	%s
+WHERE
+	platform = 'android' AND
+	hmdm.enrolled = 1 AND
+	 %s
+GROUP BY
+	status HAVING status IS NOT NULL`
+
+	teamFilter := "team_id IS NULL"
+	if teamID != nil && *teamID > 0 {
+		teamFilter = fmt.Sprintf("team_id = %d", *teamID)
+	}
+
+	stmt = fmt.Sprintf(stmt, sqlCaseMDMAndroidStatus(), sqlJoinMDMAndroidProfilesStatus(), teamFilter)
+
+	var dest []struct {
+		Count  uint   `db:"count"`
+		Status string `db:"status"`
+	}
+
+	if err := sqlx.SelectContext(ctx, ds.reader(ctx), &dest, stmt); err != nil {
+		return nil, err
+	}
+
+	byStatus := make(map[string]uint)
+	for _, s := range dest {
+		if _, ok := byStatus[s.Status]; ok {
+			return nil, fmt.Errorf("duplicate status %s from android profiles summary", s.Status)
+		}
+		byStatus[s.Status] = s.Count
+	}
+
+	var res fleet.MDMProfilesSummary
+	for s, c := range byStatus {
+		switch fleet.MDMDeliveryStatus(s) {
+		case fleet.MDMDeliveryFailed:
+			res.Failed = c
+		case fleet.MDMDeliveryPending:
+			res.Pending = c
+		case fleet.MDMDeliveryVerifying:
+			res.Verifying = c
+		case fleet.MDMDeliveryVerified:
+			res.Verified = c
+		default:
+			return nil, fmt.Errorf("unknown status %s", s)
+		}
+	}
+
+	return &res, nil
+}
+
+// sqlJoinMDMAndroidProfilesStatus returns a SQL snippet that can be used to join a table derived from
+// host_mdm_android_profiles and host_certificate_templates (grouped by host_uuid and status) and the hosts table.
+// For each host_uuid, it derives a boolean value for each status category. The value will be 1 if the host has any
+// profile or certificate template in the given status category. The snippet assumes the hosts table to be aliased as 'h'.
+func sqlJoinMDMAndroidProfilesStatus() string {
+	// NOTE: To make this snippet reusable, we're not using sqlx.Named here because it would
+	// complicate usage in other queries (e.g., list hosts).
+	var (
+		failed    = fmt.Sprintf("'%s'", string(fleet.MDMDeliveryFailed))
+		pending   = fmt.Sprintf("'%s'", string(fleet.MDMDeliveryPending))
+		verifying = fmt.Sprintf("'%s'", string(fleet.MDMDeliveryVerifying))
+		verified  = fmt.Sprintf("'%s'", string(fleet.MDMDeliveryVerified))
+		install   = fmt.Sprintf("'%s'", string(fleet.MDMOperationTypeInstall))
+
+		// Certificate template statuses
+		certPending    = fmt.Sprintf("'%s'", string(fleet.CertificateTemplatePending))
+		certDelivering = fmt.Sprintf("'%s'", string(fleet.CertificateTemplateDelivering))
+		certDelivered  = fmt.Sprintf("'%s'", string(fleet.CertificateTemplateDelivered))
+		certFailed     = fmt.Sprintf("'%s'", string(fleet.CertificateTemplateFailed))
+		certVerified   = fmt.Sprintf("'%s'", string(fleet.CertificateTemplateVerified))
+	)
+	return `
+	LEFT JOIN (
+		-- profile and certificate template statuses grouped by host uuid
+		-- boolean value will be 1 if host has any profile or certificate template with the given status
+		SELECT
+			host_uuid,
+			MAX(prof_pending) AS android_prof_pending,
+			MAX(prof_failed) AS android_prof_failed,
+			MAX(prof_verifying) AS android_prof_verifying,
+			MAX(prof_verified) AS android_prof_verified
+		FROM (
+			-- Android profiles
+			SELECT
+				host_uuid,
+				IF(status IS NULL OR status = ` + pending + `, 1, 0) AS prof_pending,
+				IF(status = ` + failed + `, 1, 0) AS prof_failed,
+				IF(status = ` + verifying + ` AND operation_type = ` + install + `, 1, 0) AS prof_verifying,
+				IF(status = ` + verified + ` AND operation_type = ` + install + `, 1, 0) AS prof_verified
+			FROM
+				host_mdm_android_profiles
+			UNION ALL
+			-- Certificate templates (delivering and delivered count as pending)
+			SELECT
+				host_uuid,
+				IF(status IS NULL OR status IN (` + certPending + `, ` + certDelivering + `, ` + certDelivered + `), 1, 0) AS prof_pending,
+				IF(status = ` + certFailed + `, 1, 0) AS prof_failed,
+				0 AS prof_verifying,
+				IF(status = ` + certVerified + ` AND operation_type = ` + install + `, 1, 0) AS prof_verified
+			FROM
+				host_certificate_templates
+		) combined
+		GROUP BY
+			host_uuid) hmgp ON h.uuid = hmgp.host_uuid
+`
+}
+
+// sqlCaseMDMAndroidStatus returns a SQL snippet that can be used to determine the status of an Android host
+// based on the status of its profiles. It should be used in conjunction with sqlJoinMDMAndroidProfilesStatus
+// It assumes the hosts table to be aliased as 'h'
+func sqlCaseMDMAndroidStatus() string {
+	// NOTE: To make this snippet reusable, we're not using sqlx.Named here because it would
+	// complicate usage in other queries (e.g., list hosts).
+	var (
+		failed    = fmt.Sprintf("'%s'", string(fleet.MDMDeliveryFailed))
+		pending   = fmt.Sprintf("'%s'", string(fleet.MDMDeliveryPending))
+		verifying = fmt.Sprintf("'%s'", string(fleet.MDMDeliveryVerifying))
+		verified  = fmt.Sprintf("'%s'", string(fleet.MDMDeliveryVerified))
+	)
+	return `
+	CASE WHEN (android_prof_failed) THEN
+		` + failed + `
+	WHEN (android_prof_pending) THEN
+		` + pending + `
+	WHEN (android_prof_verifying) THEN
+		` + verifying + `
+	WHEN (android_prof_verified) THEN
+		` + verified + `
+	END
+`
+}
+
+func (ds *Datastore) NewAndroidPolicyRequest(ctx context.Context, req *android.MDMAndroidPolicyRequest) error {
+	const stmt = `
+	INSERT INTO android_policy_requests
+		(request_uuid, request_name, policy_id, payload, status_code, error_details, applied_policy_version, policy_version)
+	VALUES
+		(?, ?, ?, ?, ?, ?, ?, ?)
+`
+	if req.RequestUUID == "" {
+		req.RequestUUID = uuid.NewString()
+	}
+
+	_, err := ds.writer(ctx).ExecContext(ctx, stmt,
+		req.RequestUUID,
+		req.RequestName,
+		req.PolicyID,
+		req.Payload,
+		req.StatusCode,
+		req.ErrorDetails,
+		req.AppliedPolicyVersion,
+		req.PolicyVersion,
+	)
+	return ctxerr.Wrap(ctx, err, "inserting android policy request")
+}
+
+func (ds *Datastore) GetAndroidPolicyRequestByUUID(ctx context.Context, requestUUID string) (*android.MDMAndroidPolicyRequest, error) {
+	const stmt = `
+		SELECT
+			request_uuid,
+			request_name,
+			policy_id,
+			payload,
+			status_code,
+			error_details,
+			applied_policy_version,
+			policy_version
+		FROM
+			android_policy_requests
+		WHERE
+			request_uuid = ?
+	`
+
+	req := android.MDMAndroidPolicyRequest{}
+	err := sqlx.GetContext(ctx, ds.reader(ctx), &req, stmt, requestUUID)
+	if err != nil {
+		if errors.Is(err, sql.ErrNoRows) {
+			return nil, common_mysql.NotFound("AndroidPolicyRequest").WithName(requestUUID)
+		}
+		return nil, ctxerr.Wrap(ctx, err, "getting android policy request")
+	}
+
+	return &req, nil
+}
+
+// NewMDMAndroidCommand inserts a row into mdm_android_commands at command-issue time. The caller is responsible for
+// generating cmd.CommandUUID (mirroring the Apple/Windows callsites that pre-populate the UUID).
+func (ds *Datastore) NewMDMAndroidCommand(ctx context.Context, cmd *android.MDMAndroidCommand) error {
+	const stmt = `
+		INSERT INTO mdm_android_commands
+			(command_uuid, host_uuid, operation_name, command_type, status, error_code, error_message)
+		VALUES
+			(?, ?, ?, ?, ?, ?, ?)
+	`
+	_, err := ds.writer(ctx).ExecContext(ctx, stmt,
+		cmd.CommandUUID,
+		cmd.HostUUID,
+		cmd.OperationName,
+		cmd.CommandType,
+		cmd.Status,
+		cmd.ErrorCode,
+		cmd.ErrorMessage,
+	)
+	return ctxerr.Wrap(ctx, err, "inserting mdm android command")
+}
+
+// GetMDMAndroidCommandByUUID returns the command row identified by its Fleet-generated command_uuid.
+func (ds *Datastore) GetMDMAndroidCommandByUUID(ctx context.Context, commandUUID string) (*android.MDMAndroidCommand, error) {
+	return ds.getMDMAndroidCommand(ctx, "command_uuid", commandUUID)
+}
+
+// GetMDMAndroidCommandByOperationName returns the command row identified by its AMAPI operation
+// name. Used by the Pub/Sub COMMAND handler to map an incoming notification back to Fleet state.
+func (ds *Datastore) GetMDMAndroidCommandByOperationName(ctx context.Context, operationName string) (*android.MDMAndroidCommand, error) {
+	return ds.getMDMAndroidCommand(ctx, "operation_name", operationName)
+}
+
+// getMDMAndroidCommand is the shared implementation for the two lookup variants. column is one of
+// the indexed columns on mdm_android_commands (command_uuid or operation_name); we never accept
+// caller-supplied column names so this is not a SQL-injection risk.
+func (ds *Datastore) getMDMAndroidCommand(ctx context.Context, column, value string) (*android.MDMAndroidCommand, error) {
+	stmt := `
+		SELECT
+			command_uuid, host_uuid, operation_name, command_type, raw_command, status,
+			error_code, error_message, raw_result, created_at, updated_at
+		FROM mdm_android_commands
+		WHERE ` + column + ` = ?
+	`
+	cmd := android.MDMAndroidCommand{}
+	err := sqlx.GetContext(ctx, ds.reader(ctx), &cmd, stmt, value)
+	if err != nil {
+		if errors.Is(err, sql.ErrNoRows) {
+			return nil, common_mysql.NotFound("MDMAndroidCommand").WithName(value)
+		}
+		return nil, ctxerr.Wrapf(ctx, err, "getting mdm android command by %s", column)
+	}
+	return &cmd, nil
+}
+
+// LockHostViaAndroidMDM inserts the LOCK row into mdm_android_commands and upserts
+// host_mdm_actions.lock_ref in a single transaction. Mirrors WipeHostViaWindowsMDM.
+func (ds *Datastore) LockHostViaAndroidMDM(ctx context.Context, host *fleet.Host, cmd *android.MDMAndroidCommand) error {
+	return ds.issueAndroidHostMDMRef(ctx, host, cmd, "lock_ref")
+}
+
+// WipeHostViaAndroidMDM inserts the WIPE row into mdm_android_commands and upserts
+// host_mdm_actions.wipe_ref in a single transaction.
+func (ds *Datastore) WipeHostViaAndroidMDM(ctx context.Context, host *fleet.Host, cmd *android.MDMAndroidCommand) error {
+	return ds.issueAndroidHostMDMRef(ctx, host, cmd, "wipe_ref")
+}
+
+// ClearPasscodeHostViaAndroidMDM inserts the RESET_PASSWORD row into mdm_android_commands and
+// upserts host_mdm_actions.clear_passcode_ref in a single transaction.
+func (ds *Datastore) ClearPasscodeHostViaAndroidMDM(ctx context.Context, host *fleet.Host, cmd *android.MDMAndroidCommand) error {
+	return ds.issueAndroidHostMDMRef(ctx, host, cmd, "clear_passcode_ref")
+}
+
+// GetMDMAndroidCommandResults returns the results for an Android command identified by commandUUID.
+// If hostUUID is non-empty, results are filtered to that host.
+func (ds *Datastore) GetMDMAndroidCommandResults(ctx context.Context, commandUUID string, hostUUID string) ([]*fleet.MDMCommandResult, error) {
+	query := `
+		SELECT
+			c.host_uuid,
+			c.command_uuid,
+			c.status,
+			c.updated_at,
+			c.command_type AS request_type,
+			c.raw_command  AS payload,
+			c.raw_result   AS result
+		FROM mdm_android_commands c
+		WHERE c.command_uuid = ?
+	`
+	args := []any{commandUUID}
+	if hostUUID != "" {
+		query += ` AND c.host_uuid = ?`
+		args = append(args, hostUUID)
+	}
+
+	var results []*fleet.MDMCommandResult
+	if err := sqlx.SelectContext(ctx, ds.reader(ctx), &results, query, args...); err != nil {
+		return nil, ctxerr.Wrap(ctx, err, "get android command results")
+	}
+	return results, nil
+}
+
+// InsertMDMAndroidCommand inserts a row into mdm_android_commands without updating host_mdm_actions.
+// Used for custom commands that have no corresponding UI state (lock/wipe/passcode refs).
+func (ds *Datastore) InsertMDMAndroidCommand(ctx context.Context, cmd *android.MDMAndroidCommand) error {
+	const stmt = `
+		INSERT INTO mdm_android_commands
+			(command_uuid, host_uuid, operation_name, command_type, raw_command, status)
+		VALUES
+			(?, ?, ?, ?, ?, ?)
+	`
+	if _, err := ds.writer(ctx).ExecContext(ctx, stmt,
+		cmd.CommandUUID, cmd.HostUUID, cmd.OperationName, cmd.CommandType, cmd.RawCommand, cmd.Status,
+	); err != nil {
+		return ctxerr.Wrap(ctx, err, "insert mdm_android_commands for custom command")
+	}
+	return nil
+}
+
+// ClearHostMDMActions deletes the host_mdm_actions row for the given host. Used by the Android
+// pub/sub re-enrollment path to drop stale lock/wipe/clear-passcode refs from a previous enrollment
+// cycle.
+func (ds *Datastore) ClearHostMDMActions(ctx context.Context, hostID uint) error {
+	if _, err := ds.writer(ctx).ExecContext(ctx, `DELETE FROM host_mdm_actions WHERE host_id = ?`, hostID); err != nil {
+		return ctxerr.Wrap(ctx, err, "clear host_mdm_actions")
+	}
+	return nil
+}
+
+// issueAndroidHostMDMRef performs the two-write transaction. refColumn is hard-coded by callers. The caller is responsible for populating cmd.CommandUUID.
+func (ds *Datastore) issueAndroidHostMDMRef(ctx context.Context, host *fleet.Host, cmd *android.MDMAndroidCommand, refColumn string) error {
+	return ds.withRetryTxx(ctx, func(tx sqlx.ExtContext) error {
+		const insertCmdStmt = `
+			INSERT INTO mdm_android_commands
+				(command_uuid, host_uuid, operation_name, command_type, raw_command, status, error_code, error_message)
+			VALUES
+				(?, ?, ?, ?, ?, ?, ?, ?)
+		`
+		if _, err := tx.ExecContext(ctx, insertCmdStmt,
+			cmd.CommandUUID, cmd.HostUUID, cmd.OperationName, cmd.CommandType, cmd.RawCommand, cmd.Status,
+			cmd.ErrorCode, cmd.ErrorMessage,
+		); err != nil {
+			return ctxerr.Wrap(ctx, err, "insert mdm_android_commands for "+refColumn)
+		}
+
+		actionsStmt := fmt.Sprintf(`
+			INSERT INTO host_mdm_actions (host_id, %s, fleet_platform)
+			VALUES (?, ?, ?)
+			ON DUPLICATE KEY UPDATE %s = VALUES(%s), fleet_platform = VALUES(fleet_platform)
+		`, refColumn, refColumn, refColumn)
+		if _, err := tx.ExecContext(ctx, actionsStmt, host.ID, cmd.CommandUUID, host.FleetPlatform()); err != nil {
+			return ctxerr.Wrap(ctx, err, "upsert host_mdm_actions for android "+refColumn)
+		}
+		return nil
+	})
+}
+
+// mdmAndroidCommandErrorMessageMaxRunes mirrors the VARCHAR(1024) limit on mdm_android_commands.error_message.
+const mdmAndroidCommandErrorMessageMaxRunes = 1024
+
+// UpdateMDMAndroidCommandStatus updates the row at command_uuid with a new status (and optional error code / message / raw result).
+// NotFound is returned if no row matches command_uuid.
+func (ds *Datastore) UpdateMDMAndroidCommandStatus(ctx context.Context, commandUUID, status string, errorCode, errorMessage, rawResult *string) error {
+	if errorMessage != nil {
+		trimmed := truncateRunes(*errorMessage, mdmAndroidCommandErrorMessageMaxRunes)
+		errorMessage = &trimmed
+	}
+	const stmt = `
+		UPDATE mdm_android_commands
+		SET status = ?, error_code = ?, error_message = ?, raw_result = ?
+		WHERE command_uuid = ?
+	`
+	res, err := ds.writer(ctx).ExecContext(ctx, stmt, status, errorCode, errorMessage, rawResult, commandUUID)
+	if err != nil {
+		return ctxerr.Wrap(ctx, err, "updating mdm android command status")
+	}
+	n, err := res.RowsAffected()
+	if err != nil {
+		return ctxerr.Wrap(ctx, err, "rows affected updating mdm android command status")
+	}
+	if n == 0 {
+		return common_mysql.NotFound("MDMAndroidCommand").WithName(commandUUID)
+	}
+	return nil
+}
+
+// ListPendingMDMAndroidCommands returns pending commands created before createdBefore, oldest first, capped at limit
+// rows. The reconciler cron uses the age cutoff to skip commands that Pub/Sub is still likely to deliver, and the limit
+// to bound how many AMAPI calls a single run makes.
+func (ds *Datastore) ListPendingMDMAndroidCommands(ctx context.Context, createdBefore time.Time, limit int) ([]*android.MDMAndroidCommand, error) {
+	const stmt = `
+		SELECT
+			command_uuid, host_uuid, operation_name, command_type, status,
+			error_code, error_message, created_at, updated_at
+		FROM mdm_android_commands
+		WHERE status = ? AND created_at < ?
+		-- command_uuid breaks ties so rows with identical created_at keep a stable order between runs,
+		-- otherwise a full batch could return the same subset every time and starve the rest.
+		ORDER BY created_at, command_uuid
+		LIMIT ?
+	`
+	var cmds []*android.MDMAndroidCommand
+	if err := sqlx.SelectContext(ctx, ds.reader(ctx), &cmds, stmt,
+		string(android.MDMAndroidCommandStatusPending), createdBefore, limit,
+	); err != nil {
+		return nil, ctxerr.Wrap(ctx, err, "listing pending mdm android commands")
+	}
+	return cmds, nil
+}
+
+// androidApplicableProfilesQuery computes, per host, the set of applicable profiles based on team and label scoping. Label
+// semantics must match the in-code Apple/Windows evaluator in server/mdm/reconcile: a dynamic label created after the host's
+// last label scan (h.label_updated_at < lbl.created_at) has unknown membership and preserves the host's current profile state —
+// it counts as a member for include-all and as a non-member for exclude-any only when the profile is already on the host (a
+// host_mdm_android_profiles row with operation_type = 'install', any status; the hmap join below), so scope edits don't remove
+// profiles from hosts that haven't reported yet. Manual (membership_type=1) and host-vitals (2) labels are server-populated, so
+// their membership is always considered known.
+const androidApplicableProfilesQuery = `
+	-- non label-based profiles
+	SELECT
+		macp.profile_uuid,
+		macp.name,
+		macp.checksum,
+		h.uuid as host_uuid,
+		h.id as host_id,
+		0 as count_profile_labels,
+		0 as count_non_broken_labels,
+		0 as count_host_labels,
+		0 as count_host_updated_after_labels
+	FROM
+		mdm_android_configuration_profiles macp
+			JOIN hosts h
+				ON h.team_id = macp.team_id OR (h.team_id IS NULL AND macp.team_id = 0)
+			JOIN android_devices ad
+				ON ad.host_id = h.id
+	WHERE
+		h.platform = 'android' AND
+		NOT EXISTS (
+			SELECT 1
+			FROM mdm_configuration_profile_labels mcpl
+			WHERE mcpl.android_profile_uuid = macp.profile_uuid
+		) AND
+		( %s )
+
+	UNION
+
+	-- include-all only (no exclude labels): host must be a member of every include label.
+	-- broken include labels disqualify the profile. A dynamic include label with unknown
+	-- membership counts as a member only when the profile is already on the host.
+	SELECT
+		macp.profile_uuid,
+		macp.name,
+		macp.checksum,
+		h.uuid as host_uuid,
+		h.id as host_id,
+		COUNT(*) as count_profile_labels,
+		COUNT(mcpl.label_id) as count_non_broken_labels,
+		SUM(
+			CASE WHEN lm.label_id IS NOT NULL THEN 1
+			WHEN lbl.label_membership_type = 0 AND lbl.created_at IS NOT NULL AND h.label_updated_at < lbl.created_at AND COALESCE(hmap.operation_type, '') = 'install' THEN 1
+		ELSE 0 END) as count_host_labels,
+		0 as count_host_updated_after_labels
+	FROM
+		mdm_android_configuration_profiles macp
+			JOIN hosts h
+				ON h.team_id = macp.team_id OR (h.team_id IS NULL AND macp.team_id = 0)
+			JOIN android_devices ad
+				ON ad.host_id = h.id
+			JOIN mdm_configuration_profile_labels mcpl
+				ON mcpl.android_profile_uuid = macp.profile_uuid AND mcpl.exclude = 0 AND mcpl.require_all = 1
+			LEFT OUTER JOIN labels lbl
+				ON lbl.id = mcpl.label_id
+			LEFT OUTER JOIN label_membership lm
+				ON lm.label_id = mcpl.label_id AND lm.host_id = h.id
+			LEFT OUTER JOIN host_mdm_android_profiles hmap
+				ON hmap.host_uuid = h.uuid AND hmap.profile_uuid = macp.profile_uuid
+	WHERE
+		h.platform = 'android' AND
+		NOT EXISTS (
+			SELECT 1 FROM mdm_configuration_profile_labels
+			WHERE android_profile_uuid = macp.profile_uuid AND exclude = 1
+		) AND
+		( %s )
+	GROUP BY
+		macp.profile_uuid, macp.name, h.uuid, h.id
+	HAVING
+		count_profile_labels > 0 AND count_host_labels = count_profile_labels
+
+	UNION
+
+	-- exclude-any only (no include labels): host must NOT be a member of any exclude label.
+	-- broken exclude labels disqualify the profile. A dynamic exclude label with unknown
+	-- membership counts as "known non-member" when the profile is already on the host and
+	-- disqualifies otherwise.
+	SELECT
+		macp.profile_uuid,
+		macp.name,
+		macp.checksum,
+		h.uuid as host_uuid,
+		h.id as host_id,
+		COUNT(*) as count_profile_labels,
+		COUNT(mcpl.label_id) as count_non_broken_labels,
+		COUNT(lm.label_id) as count_host_labels,
+		SUM(
+			CASE WHEN lbl.label_membership_type = 0 AND lbl.created_at IS NOT NULL AND (h.label_updated_at >= lbl.created_at OR COALESCE(hmap.operation_type, '') = 'install') THEN 1
+			WHEN lbl.label_membership_type <> 0 AND lbl.created_at IS NOT NULL THEN 1
+		ELSE 0 END) as count_host_updated_after_labels
+	FROM
+		mdm_android_configuration_profiles macp
+			JOIN hosts h
+				ON h.team_id = macp.team_id OR (h.team_id IS NULL AND macp.team_id = 0)
+			JOIN android_devices ad
+				ON ad.host_id = h.id
+			JOIN mdm_configuration_profile_labels mcpl
+				ON mcpl.android_profile_uuid = macp.profile_uuid AND mcpl.exclude = 1 AND mcpl.require_all = 0
+			LEFT OUTER JOIN labels lbl
+				ON lbl.id = mcpl.label_id
+			LEFT OUTER JOIN label_membership lm
+				ON lm.label_id = mcpl.label_id AND lm.host_id = h.id
+			LEFT OUTER JOIN host_mdm_android_profiles hmap
+				ON hmap.host_uuid = h.uuid AND hmap.profile_uuid = macp.profile_uuid
+	WHERE
+		h.platform = 'android' AND
+		NOT EXISTS (
+			SELECT 1 FROM mdm_configuration_profile_labels
+			WHERE android_profile_uuid = macp.profile_uuid AND exclude = 0
+		) AND
+		( %s )
+	GROUP BY
+		macp.profile_uuid, macp.name, h.uuid, h.id
+	HAVING
+		count_profile_labels > 0 AND count_profile_labels = count_non_broken_labels AND
+		count_profile_labels = count_host_updated_after_labels AND count_host_labels = 0
+
+	UNION
+
+	-- include-any only (no exclude labels): host must be a member of at least one include label.
+	-- broken include labels are skipped (host can't be a member of a deleted label).
+	SELECT
+		macp.profile_uuid,
+		macp.name,
+		macp.checksum,
+		h.uuid as host_uuid,
+		h.id as host_id,
+		COUNT(*) as count_profile_labels,
+		COUNT(mcpl.label_id) as count_non_broken_labels,
+		COUNT(lm.label_id) as count_host_labels,
+		0 as count_host_updated_after_labels
+	FROM
+		mdm_android_configuration_profiles macp
+			JOIN hosts h
+				ON h.team_id = macp.team_id OR (h.team_id IS NULL AND macp.team_id = 0)
+			JOIN android_devices ad
+				ON ad.host_id = h.id
+			JOIN mdm_configuration_profile_labels mcpl
+				ON mcpl.android_profile_uuid = macp.profile_uuid AND mcpl.exclude = 0 AND mcpl.require_all = 0
+			LEFT OUTER JOIN label_membership lm
+				ON lm.label_id = mcpl.label_id AND lm.host_id = h.id
+	WHERE
+		h.platform = 'android' AND
+		NOT EXISTS (
+			SELECT 1 FROM mdm_configuration_profile_labels
+			WHERE android_profile_uuid = macp.profile_uuid AND exclude = 1
+		) AND
+		( %s )
+	GROUP BY
+		macp.profile_uuid, macp.name, h.uuid, h.id
+	HAVING
+		count_profile_labels > 0 AND count_host_labels >= 1
+
+	UNION
+
+	-- include-all + exclude-any: host must be in ALL include labels AND NOT in ANY exclude label.
+	-- broken include or exclude labels disqualify the profile. A dynamic label with unknown
+	-- membership preserves the host's current state: for include it counts as a member, and for
+	-- exclude as a non-member, only when the profile is already on the host.
+	SELECT
+		macp.profile_uuid,
+		macp.name,
+		macp.checksum,
+		h.uuid as host_uuid,
+		h.id as host_id,
+		SUM(CASE WHEN mcpl.exclude = 0 THEN 1 ELSE 0 END) as count_profile_labels,
+		SUM(CASE WHEN mcpl.exclude = 0 AND mcpl.label_id IS NOT NULL THEN 1 ELSE 0 END) as count_non_broken_labels,
+		SUM(CASE WHEN mcpl.exclude = 0 AND lm_inc.label_id IS NOT NULL THEN 1
+			WHEN mcpl.exclude = 0 AND lbl.label_membership_type = 0 AND lbl.created_at IS NOT NULL AND h.label_updated_at < lbl.created_at AND COALESCE(hmap.operation_type, '') = 'install' THEN 1
+			ELSE 0 END) as count_host_labels,
+		SUM(CASE WHEN mcpl.exclude = 1 AND lm_exc.label_id IS NOT NULL THEN 1
+			WHEN mcpl.exclude = 1 AND (lbl.label_membership_type = 0 AND lbl.created_at IS NOT NULL AND h.label_updated_at < lbl.created_at) AND COALESCE(hmap.operation_type, '') <> 'install' THEN 1
+			WHEN mcpl.exclude = 1 AND mcpl.label_id IS NULL THEN 1
+			ELSE 0 END) as count_host_updated_after_labels
+	FROM
+		mdm_android_configuration_profiles macp
+			JOIN hosts h
+				ON h.team_id = macp.team_id OR (h.team_id IS NULL AND macp.team_id = 0)
+			JOIN android_devices ad
+				ON ad.host_id = h.id
+			JOIN mdm_configuration_profile_labels mcpl
+				ON mcpl.android_profile_uuid = macp.profile_uuid
+			LEFT OUTER JOIN labels lbl
+				ON lbl.id = mcpl.label_id
+			LEFT OUTER JOIN label_membership lm_inc
+				ON lm_inc.label_id = mcpl.label_id AND lm_inc.host_id = h.id AND mcpl.exclude = 0
+			LEFT OUTER JOIN label_membership lm_exc
+				ON lm_exc.label_id = mcpl.label_id AND lm_exc.host_id = h.id AND mcpl.exclude = 1
+			LEFT OUTER JOIN host_mdm_android_profiles hmap
+				ON hmap.host_uuid = h.uuid AND hmap.profile_uuid = macp.profile_uuid
+	WHERE
+		h.platform = 'android' AND
+		EXISTS (
+			SELECT 1 FROM mdm_configuration_profile_labels
+			WHERE android_profile_uuid = macp.profile_uuid AND exclude = 0 AND require_all = 1
+		) AND
+		EXISTS (
+			SELECT 1 FROM mdm_configuration_profile_labels
+			WHERE android_profile_uuid = macp.profile_uuid AND exclude = 1
+		) AND
+		( %s )
+	GROUP BY
+		macp.profile_uuid, macp.name, h.uuid, h.id
+	HAVING
+		-- include gate: host in all include labels (no broken include labels)
+		count_profile_labels > 0 AND count_non_broken_labels = count_profile_labels AND count_host_labels = count_profile_labels AND
+		-- exclude gate: host not in any exclude label, no broken/unscanned exclude labels
+		count_host_updated_after_labels = 0
+
+	UNION
+
+	-- include-any + exclude-any: host must be in AT LEAST ONE include label AND NOT in ANY exclude label.
+	-- broken exclude labels disqualify the profile. A dynamic exclude label with unknown membership
+	-- disqualifies only when the profile is not already on the host.
+	SELECT
+		macp.profile_uuid,
+		macp.name,
+		macp.checksum,
+		h.uuid as host_uuid,
+		h.id as host_id,
+		SUM(CASE WHEN mcpl.exclude = 0 THEN 1 ELSE 0 END) as count_profile_labels,
+		SUM(CASE WHEN mcpl.exclude = 0 AND mcpl.label_id IS NOT NULL THEN 1 ELSE 0 END) as count_non_broken_labels,
+		SUM(CASE WHEN mcpl.exclude = 0 AND lm_inc.label_id IS NOT NULL THEN 1 ELSE 0 END) as count_host_labels,
+		SUM(CASE WHEN mcpl.exclude = 1 AND lm_exc.label_id IS NOT NULL THEN 1
+			WHEN mcpl.exclude = 1 AND (lbl.label_membership_type = 0 AND lbl.created_at IS NOT NULL AND h.label_updated_at < lbl.created_at) AND COALESCE(hmap.operation_type, '') <> 'install' THEN 1
+			WHEN mcpl.exclude = 1 AND mcpl.label_id IS NULL THEN 1
+			ELSE 0 END) as count_host_updated_after_labels
+	FROM
+		mdm_android_configuration_profiles macp
+			JOIN hosts h
+				ON h.team_id = macp.team_id OR (h.team_id IS NULL AND macp.team_id = 0)
+			JOIN android_devices ad
+				ON ad.host_id = h.id
+			JOIN mdm_configuration_profile_labels mcpl
+				ON mcpl.android_profile_uuid = macp.profile_uuid
+			LEFT OUTER JOIN labels lbl
+				ON lbl.id = mcpl.label_id
+			LEFT OUTER JOIN label_membership lm_inc
+				ON lm_inc.label_id = mcpl.label_id AND lm_inc.host_id = h.id AND mcpl.exclude = 0
+			LEFT OUTER JOIN label_membership lm_exc
+				ON lm_exc.label_id = mcpl.label_id AND lm_exc.host_id = h.id AND mcpl.exclude = 1
+			LEFT OUTER JOIN host_mdm_android_profiles hmap
+				ON hmap.host_uuid = h.uuid AND hmap.profile_uuid = macp.profile_uuid
+	WHERE
+		h.platform = 'android' AND
+		EXISTS (
+			SELECT 1 FROM mdm_configuration_profile_labels
+			WHERE android_profile_uuid = macp.profile_uuid AND exclude = 0 AND require_all = 0
+		) AND
+		EXISTS (
+			SELECT 1 FROM mdm_configuration_profile_labels
+			WHERE android_profile_uuid = macp.profile_uuid AND exclude = 1
+		) AND
+		( %s )
+	GROUP BY
+		macp.profile_uuid, macp.name, h.uuid, h.id
+	HAVING
+		-- include gate: host in at least one include label
+		count_host_labels >= 1 AND
+		-- exclude gate: host not in any exclude label, no broken/unscanned exclude labels
+		count_host_updated_after_labels = 0
+`
+
+// GetMDMAndroidReconcileCursor is a no-op on the bare mysql.Datastore;
+// the mysqlredis wrapper backs it with Redis.
+func (ds *Datastore) GetMDMAndroidReconcileCursor(_ context.Context) (string, error) {
+	return "", nil
+}
+
+// SetMDMAndroidReconcileCursor is a no-op on the bare mysql.Datastore;
+// the mysqlredis wrapper writes to Redis.
+func (ds *Datastore) SetMDMAndroidReconcileCursor(_ context.Context, _ string) error {
+	return nil
+}
+
+// ListMDMAndroidProfilesToSend is the android platform equivalent to
+// ListMDMAppleProfilesToInstall/Remove and
+// ListMDMWindowsProfilesToInstall/Remove. It plays a similar role but is quite
+// different in implementation since Android profiles are fundamentally
+// different from those platforms - the "configuration profiles" are just
+// fragments of the full (and unique per host) "Android policy" to apply to a
+// host, so as soon as there is a change to the set of profiles to apply to a
+// host, the full list of applicable profiles are needed to generate the
+// resulting policy.
+//
+// That is, profiles are not applied individually, but as a merged set. For
+// that reason, there is no "to install" and "to remove", as removing a profile
+// is just not including it in the merged set of profiles to apply.
+//
+// So with that in mind, what this method does is return the full set of
+// applicable profiles for each host that has a change in that set of
+// applicable profiles, so that it needs to be sent again, along with the list
+// of of previously-applied profiles that need to be removed (which is just
+// "not merging them" in the Android policy, but until this policy is fully
+// applied on the host we need to mark those profiles as pending removal).
+//
+// See https://github.com/fleetdm/fleet/issues/32032#issuecomment-3229548389
+// for more details on the rationale of that approach.
+func (ds *Datastore) ListMDMAndroidProfilesToSend(ctx context.Context, cursor string, batchSize int) ([]*fleet.MDMAndroidProfilePayload, []*fleet.MDMAndroidProfilePayload, error) {
+	var toApplyProfiles, toRemoveProfiles []*fleet.MDMAndroidProfilePayload
+	err := ds.withTx(ctx, func(tx sqlx.ExtContext) error {
+		var installCursorPred, removeCursorPred string
+		var args []any
+		if cursor != "" {
+			installCursorPred = "AND ds.host_uuid > ?"
+			removeCursorPred = "AND hmap.host_uuid > ?"
+			args = []any{cursor, fleet.MDMOperationTypeRemove, fleet.MDMDeliveryPending, cursor}
+		} else {
+			args = []any{fleet.MDMOperationTypeRemove, fleet.MDMDeliveryPending}
+		}
+
+		var limitClause string
+		if batchSize > 0 {
+			limitClause = fmt.Sprintf("LIMIT %d", batchSize)
+		}
+
+		hostsWithChangesStmt := fmt.Sprintf(`
+	WITH ds AS ( %s )
+
+	SELECT host_uuid FROM (
+	SELECT
+		DISTINCT ds.host_uuid
+	FROM ds
+		INNER JOIN android_devices ad
+			ON ad.host_id = ds.host_id
+		INNER JOIN host_mdm hmdm
+			ON ad.host_id=hmdm.host_id
+		LEFT OUTER JOIN host_mdm_android_profiles hmap
+			ON hmap.host_uuid = ds.host_uuid AND hmap.profile_uuid = ds.profile_uuid
+	WHERE
+	  -- host is enrolled
+	    hmdm.enrolled = 1 AND
+		(
+		-- at least one profile is missing from host_mdm_android_profiles
+			hmap.host_uuid IS NULL OR
+			-- profile content changed (checksum mismatch)
+			hmap.checksum != ds.checksum OR
+			-- profile needs retry (status reset to NULL after transient failure)
+			hmap.status IS NULL
+		)
+		%s
+
+	UNION
+
+	SELECT
+		DISTINCT hmap.host_uuid
+	FROM host_mdm_android_profiles hmap
+		INNER JOIN hosts h
+			ON h.uuid = hmap.host_uuid
+		INNER JOIN android_devices ad
+			ON ad.host_id = h.id
+		INNER JOIN host_mdm hmdm
+			ON hmdm.host_id = h.id
+		LEFT OUTER JOIN ds
+			ON hmap.host_uuid = ds.host_uuid AND hmap.profile_uuid = ds.profile_uuid
+	WHERE
+	  -- at least one profile was removed from the set of applicable profiles
+	    hmdm.enrolled = 1 AND
+		ds.host_uuid IS NULL AND
+		-- and it is not in pending remove status (in which case it was processed)
+		( hmap.operation_type != ? OR COALESCE(hmap.status, '') <> ? )
+		%s
+	) AS all_changes
+	ORDER BY host_uuid
+	%s
+`, fmt.Sprintf(androidApplicableProfilesQuery, "TRUE", "TRUE", "TRUE", "TRUE", "TRUE", "TRUE"),
+			installCursorPred,
+			removeCursorPred,
+			limitClause,
+		)
+
+		// NOTE: we explicitly don't "ignore" profiles to remove based on broken labels,
+		// because of how Android profiles are applied vs other platforms (ignoring
+		// a broken profile would effectively remove it anyway, and including it so
+		// we don't remove it could cause errors applying the rest of the policy if
+		// the setting is invalid, which is worse and contrary to the "broken profiles
+		// are ignored" general behavior).
+		//
+		// So unlike for Apple/Windows, for Android we effectively remove broken
+		// profiles from the host.
+		//
+		// see https://github.com/fleetdm/fleet/issues/25557#issuecomment-3246496873
+
+		var hostUUIDs []string
+		if err := sqlx.SelectContext(ctx, tx, &hostUUIDs, hostsWithChangesStmt, args...); err != nil {
+			return ctxerr.Wrap(ctx, err, "list android hosts with profile changes")
+		}
+
+		if len(hostUUIDs) == 0 {
+			return nil
+		}
+
+		// retrieve all the applicable profiles for those hosts
+		listToInstallProfilesStmt := fmt.Sprintf(`
+	SELECT
+		ds.profile_uuid,
+		ds.name as profile_name,
+		ds.checksum,
+		ds.host_uuid,
+		COALESCE(hmap.request_fail_count, 0) as request_fail_count,
+		COALESCE(apr.error_details, '') as last_error_details
+	FROM ( %s ) ds
+		LEFT OUTER JOIN host_mdm_android_profiles hmap
+			ON hmap.host_uuid = ds.host_uuid AND hmap.profile_uuid = ds.profile_uuid
+		LEFT OUTER JOIN android_policy_requests apr
+			ON apr.request_uuid = hmap.policy_request_uuid
+`, fmt.Sprintf(androidApplicableProfilesQuery, "h.uuid IN (?)", "h.uuid IN (?)", "h.uuid IN (?)", "h.uuid IN (?)", "h.uuid IN (?)", "h.uuid IN (?)"))
+
+		query, args, err := sqlx.In(listToInstallProfilesStmt, hostUUIDs, hostUUIDs, hostUUIDs, hostUUIDs, hostUUIDs, hostUUIDs)
+		if err != nil {
+			return ctxerr.Wrap(ctx, err, "building list android host applicable profiles query")
+		}
+		if err := sqlx.SelectContext(ctx, tx, &toApplyProfiles, query, args...); err != nil {
+			return ctxerr.Wrap(ctx, err, "list android host applicable profiles")
+		}
+
+		listToRemoveProfilesStmt := fmt.Sprintf(`
+	SELECT
+		hmap.profile_uuid,
+		hmap.profile_name,
+		hmap.checksum,
+		hmap.host_uuid,
+		hmap.request_fail_count,
+		COALESCE(apr.error_details, '') as last_error_details
+	FROM ( %s ) ds
+		RIGHT OUTER JOIN host_mdm_android_profiles hmap
+			ON hmap.host_uuid = ds.host_uuid AND hmap.profile_uuid = ds.profile_uuid
+		LEFT OUTER JOIN android_policy_requests apr
+			ON apr.request_uuid = hmap.policy_request_uuid
+	WHERE
+		hmap.host_uuid IN (?) AND
+		ds.host_uuid IS NULL
+`, fmt.Sprintf(androidApplicableProfilesQuery, "h.uuid IN (?)", "h.uuid IN (?)", "h.uuid IN (?)", "h.uuid IN (?)", "h.uuid IN (?)", "h.uuid IN (?)"))
+
+		query, args, err = sqlx.In(listToRemoveProfilesStmt, hostUUIDs, hostUUIDs, hostUUIDs, hostUUIDs, hostUUIDs, hostUUIDs, hostUUIDs)
+		if err != nil {
+			return ctxerr.Wrap(ctx, err, "building list android host to remove profiles query")
+		}
+		if err := sqlx.SelectContext(ctx, tx, &toRemoveProfiles, query, args...); err != nil {
+			return ctxerr.Wrap(ctx, err, "list android host to remove profiles")
+		}
+
+		return nil
+	})
+	return toApplyProfiles, toRemoveProfiles, err
+}
+
+func (ds *Datastore) GetMDMAndroidProfilesContents(ctx context.Context, uuids []string) (map[string]json.RawMessage, error) {
+	if len(uuids) == 0 {
+		return nil, nil
+	}
+
+	stmt := `
+		SELECT profile_uuid, raw_json
+		FROM mdm_android_configuration_profiles
+		WHERE profile_uuid IN (?)
+	`
+	query, args, err := sqlx.In(stmt, uuids)
+	if err != nil {
+		return nil, ctxerr.Wrap(ctx, err, "building get android profiles contents query")
+	}
+
+	rows, err := ds.reader(ctx).QueryxContext(ctx, query, args...)
+	if err != nil {
+		return nil, ctxerr.Wrap(ctx, err, "querying android profiles contents")
+	}
+	defer rows.Close()
+
+	results := make(map[string]json.RawMessage, len(uuids))
+	for rows.Next() {
+		var (
+			uid     string
+			rawJSON json.RawMessage
+		)
+		if err := rows.Scan(&uid, &rawJSON); err != nil {
+			return nil, ctxerr.Wrap(ctx, err, "scanning android profile content")
+		}
+		results[uid] = rawJSON
+	}
+
+	if err := rows.Err(); err != nil {
+		return nil, ctxerr.Wrap(ctx, err, "iterating android profiles contents")
+	}
+	return results, nil
+}
+
+func (ds *Datastore) BulkUpsertMDMAndroidHostProfiles(ctx context.Context, payload []*fleet.MDMAndroidProfilePayload) error {
+	return ds.bulkUpsertMDMAndroidHostProfiles(ctx, payload, false)
+}
+
+// bulkUpsertMDMAndroidHostProfiles upserts host/profile rows.
+func (ds *Datastore) bulkUpsertMDMAndroidHostProfiles(ctx context.Context, payload []*fleet.MDMAndroidProfilePayload, preserveExistingDetail bool) error {
+	if len(payload) == 0 {
+		return nil
+	}
+
+	detailUpdate := "detail = VALUES(detail),"
+	if preserveExistingDetail {
+		// detail intentionally omitted from the ON DUPLICATE KEY UPDATE clause:
+		// the reconciler owns this field and may carry a forward-looking message
+		// (e.g. "Waiting for certificate ..." on withheld ONC profiles) that
+		// must survive this state reset.
+		detailUpdate = ""
+	}
+
+	executeUpsertBatch := func(valuePart string, args []any) error {
+		stmt := fmt.Sprintf(`
+			INSERT INTO host_mdm_android_profiles (
+				host_uuid,
+				status,
+				operation_type,
+				detail,
+				profile_uuid,
+				profile_name,
+				policy_request_uuid,
+				device_request_uuid,
+				request_fail_count,
+				included_in_policy_version,
+				checksum,
+				can_reverify
+			)
+			VALUES %s
+			ON DUPLICATE KEY UPDATE
+				status = VALUES(status),
+				operation_type = VALUES(operation_type),
+				%s
+				profile_name = VALUES(profile_name),
+				policy_request_uuid = VALUES(policy_request_uuid),
+				device_request_uuid = VALUES(device_request_uuid),
+				request_fail_count = VALUES(request_fail_count),
+				included_in_policy_version = VALUES(included_in_policy_version),
+				checksum = VALUES(checksum),
+				can_reverify = VALUES(can_reverify)
+`, strings.TrimSuffix(valuePart, ","), detailUpdate,
+		)
+
+		// Taken from BulkUpsertMDMAppleHostProfiles: We need to run with retry
+		// due to deadlocks. The INSERT/ON DUPLICATE KEY UPDATE pattern is prone
+		// to deadlocks when multiple threads are modifying nearby rows. That's
+		// because this statement uses gap locks. When two transactions acquire
+		// the same gap lock, they may deadlock. Two simultaneous transactions
+		// may happen when cron job runs and the user is updating via the UI at
+		// the same time.
+		err := ds.withRetryTxx(ctx, func(tx sqlx.ExtContext) error {
+			_, err := tx.ExecContext(ctx, stmt, args...)
+			return err
+		})
+		return err
+	}
+
+	generateValueArgs := func(p *fleet.MDMAndroidProfilePayload) (string, []any) {
+		valuePart := "(?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?),"
+		checksum := p.Checksum
+		if checksum == nil {
+			checksum = make([]byte, 16)
+		}
+		args := []any{
+			p.HostUUID, p.Status, p.OperationType,
+			p.Detail, p.ProfileUUID, p.ProfileName,
+			p.PolicyRequestUUID, p.DeviceRequestUUID, p.RequestFailCount,
+			p.IncludedInPolicyVersion, checksum, p.CanReverify,
+		}
+		return valuePart, args
+	}
+
+	const defaultBatchSize = 1000 // number of parameters is this times number of placeholders
+	batchSize := defaultBatchSize
+	if ds.testUpsertMDMDesiredProfilesBatchSize > 0 {
+		batchSize = ds.testUpsertMDMDesiredProfilesBatchSize
+	}
+
+	if err := batchProcessDB(payload, batchSize, generateValueArgs, executeUpsertBatch); err != nil {
+		return err
+	}
+
+	return nil
+}
+
+func (ds *Datastore) GetHostMDMAndroidProfiles(ctx context.Context, hostUUID string) ([]fleet.HostMDMAndroidProfile, error) {
+	// TODO(AP): confirm whether we should be hiding any profile names for Android like we do
+	// for other platforms
+	stmt := fmt.Sprintf(`
+SELECT
+	profile_uuid,
+	profile_name AS name,
+	-- internally, a NULL status implies that the cron needs to pick up
+	-- this profile, for the user that difference doesn't exist, the
+	-- profile is effectively pending. This is consistent with all our
+	-- aggregation functions.
+	COALESCE(status, '%s') AS status,
+	COALESCE(operation_type, '') AS operation_type,
+	COALESCE(detail, '') AS detail
+FROM
+	host_mdm_android_profiles
+WHERE
+host_uuid = ? AND NOT (operation_type = '%s' AND COALESCE(status, '%s') IN('%s', '%s'))`,
+		fleet.MDMDeliveryPending,
+		fleet.MDMOperationTypeRemove,
+		fleet.MDMDeliveryPending,
+		fleet.MDMDeliveryVerifying,
+		fleet.MDMDeliveryVerified,
+	)
+	args := []interface{}{hostUUID}
+
+	var profiles []fleet.HostMDMAndroidProfile
+	if err := sqlx.SelectContext(ctx, ds.reader(ctx), &profiles, stmt, args...); err != nil {
+		return nil, err
+	}
+	return profiles, nil
+}
+
+func (ds *Datastore) ListHostMDMAndroidProfilesPendingOrFailedInstallWithVersion(ctx context.Context, hostUUID string, policyVersion int64) ([]*fleet.MDMAndroidProfilePayload, error) {
+	stmt := `
+		SELECT profile_uuid, host_uuid, status, operation_type, detail, profile_name, policy_request_uuid, device_request_uuid, request_fail_count, included_in_policy_version, checksum
+		FROM host_mdm_android_profiles
+		WHERE host_uuid = ? AND included_in_policy_version <= ? AND operation_type = ?
+		AND (status = 'pending' OR (status = 'failed' AND can_reverify = true))
+	`
+
+	var profiles []*fleet.MDMAndroidProfilePayload
+	err := sqlx.SelectContext(ctx, ds.reader(ctx), &profiles, stmt, hostUUID, policyVersion, fleet.MDMOperationTypeInstall)
+	if err != nil {
+		return nil, ctxerr.Wrap(ctx, err, "listing host MDM Android profiles pending or failed install")
+	}
+
+	return profiles, nil
+}
+
+func (ds *Datastore) BulkDeleteMDMAndroidHostProfiles(ctx context.Context, hostUUID string, policyVersionId int64) error {
+	stmt := `
+		DELETE FROM host_mdm_android_profiles
+		WHERE host_uuid = ? AND included_in_policy_version <= ? AND operation_type = ? AND status IN (?)
+	`
+
+	stmt, args, err := sqlx.In(stmt, hostUUID, policyVersionId, fleet.MDMOperationTypeRemove, []fleet.MDMDeliveryStatus{fleet.MDMDeliveryPending, fleet.MDMDeliveryFailed})
+	if err != nil {
+		return ctxerr.Wrap(ctx, err, "building query to delete host MDM Android profiles")
+	}
+
+	_, err = ds.writer(ctx).ExecContext(ctx, stmt, args...)
+	if err != nil {
+		return ctxerr.Wrap(ctx, err, "deleting host MDM Android profiles")
+	}
+	return nil
+}
+
+func (ds *Datastore) deleteAllAndroidProfiles(ctx context.Context, tx sqlx.ExtContext, tmID *uint) (int, error) {
+	var teamID uint
+	if tmID != nil {
+		teamID = *tmID
+	}
+	res, err := tx.ExecContext(ctx, `DELETE FROM mdm_android_configuration_profiles WHERE team_id = ?`, teamID)
+	if err != nil {
+		return 0, ctxerr.Wrap(ctx, err, "deleting all android profiles for team")
+	}
+	rows, err := res.RowsAffected()
+	if err != nil {
+		return 0, ctxerr.Wrap(ctx, err, "getting rows affected when deleting all android profiles for team")
+	}
+	return int(rows), nil
+}
+
+func (ds *Datastore) batchSetMDMAndroidProfiles(
+	ctx context.Context,
+	tx sqlx.ExtContext,
+	tmID *uint,
+	profiles []*fleet.MDMAndroidConfigProfile,
+	profilesVariablesByIdentifier []fleet.MDMProfileIdentifierFleetVariables,
+) (updatedDB bool, err error) {
+	if len(profiles) == 0 {
+		rowsAffected, err := ds.deleteAllAndroidProfiles(ctx, tx, tmID)
+		if err != nil {
+			return false, err
+		}
+
+		return rowsAffected > 0, nil
+	}
+
+	// Select and delete profiles that are not incoming so we can cancel the install.
+	const loadToBeDeletedProfilesNotInList = `
+SELECT
+  profile_uuid
+FROM
+  mdm_android_configuration_profiles
+WHERE
+  team_id = ? AND
+  name NOT IN (?)
+`
+
+	// use a profile team id of 0 if no-team
+	var profileTeamID uint
+	if tmID != nil {
+		profileTeamID = *tmID
+	}
+
+	// Create list of names from profiles
+	incomingNames := make([]string, len(profiles))
+	incomingUUIDS := make([]string, len(profiles))
+	for i, p := range profiles {
+		incomingNames[i] = p.Name
+		incomingUUIDS[i] = p.ProfileUUID
+	}
+
+	var (
+		stmt                string
+		args                []interface{}
+		deletedProfileUUIDs []string
+	)
+	stmt, args, err = sqlx.In(loadToBeDeletedProfilesNotInList, profileTeamID, incomingNames)
+	if err != nil {
+		return false, ctxerr.Wrap(ctx, err, "build query to load profiles to be deleted")
+	}
+	if err := sqlx.SelectContext(ctx, tx, &deletedProfileUUIDs, stmt, args...); err != nil {
+		return false, ctxerr.Wrap(ctx, err, "load profiles to be deleted")
+	}
+
+	// Delete profiles that are not incoming
+	const deleteProfilesNotInList = `
+DELETE FROM
+  mdm_android_configuration_profiles
+WHERE
+  profile_uuid IN (?)
+`
+	if len(deletedProfileUUIDs) > 0 {
+		var result sql.Result
+		stmt, args, err = sqlx.In(deleteProfilesNotInList, deletedProfileUUIDs)
+		if err != nil {
+			return false, ctxerr.Wrap(ctx, err, "build query to delete profiles")
+		}
+		if result, err = tx.ExecContext(ctx, stmt, args...); err != nil {
+			return false, ctxerr.Wrap(ctx, err, "delete profiles")
+		}
+
+		if result != nil {
+			rows, _ := result.RowsAffected()
+			updatedDB = rows > 0
+		}
+
+		if err := cancelAndroidHostInstallsForDeletedMDMProfiles(ctx, tx, deletedProfileUUIDs); err != nil {
+			return false, ctxerr.Wrap(ctx, err, "cancel android host installs for deleted profiles")
+		}
+	}
+
+	// Insert or update incoming profiles
+	const insertNewOrEditedProfile = `
+	INSERT INTO mdm_android_configuration_profiles (
+		profile_uuid,
+		team_id,
+		name,
+		raw_json,
+		uploaded_at
+	) VALUES (CONCAT('` + fleet.MDMAndroidProfileUUIDPrefix + `', CONVERT(uuid() USING utf8mb4)), ?, ?, ?, CURRENT_TIMESTAMP(6))
+	ON DUPLICATE KEY UPDATE
+		raw_json = VALUES(raw_json),
+		name = VALUES(name),
+		uploaded_at = IF(raw_json = VALUES(raw_json) AND name = VALUES(name), uploaded_at, CURRENT_TIMESTAMP(6))
+`
+	for _, p := range profiles {
+		var res sql.Result
+		if res, err = tx.ExecContext(ctx, insertNewOrEditedProfile, profileTeamID, p.Name, p.RawJSON); err != nil {
+			return false, ctxerr.Wrap(ctx, err, "insert or update profile")
+		}
+
+		if insertOnDuplicateDidInsertOrUpdate(res) {
+			updatedDB = true
+		}
+	}
+
+	// Mark every row backing an incoming profile as needing reprocessing. We do NOT
+	// touch `detail` here: that column is owned by the reconciler and may carry a
+	// forward-looking message (e.g. "Waiting for certificate ..." on ONC profiles)
+	const updateIncludedInPolicyVersionStmt = `
+	UPDATE
+		host_mdm_android_profiles
+	SET
+		included_in_policy_version = NULL,
+		policy_request_uuid = NULL,
+		device_request_uuid = NULL,
+		status = NULL,
+		request_fail_count = 0
+	WHERE
+		profile_uuid IN (SELECT profile_uuid FROM mdm_android_configuration_profiles WHERE team_id = ? AND name IN (?))
+	`
+	stmt, args, err = sqlx.In(updateIncludedInPolicyVersionStmt, profileTeamID, incomingNames)
+	if err != nil {
+		return false, ctxerr.Wrap(ctx, err, "build query to update included in policy version")
+	}
+	if _, err := tx.ExecContext(ctx, stmt, args...); err != nil {
+		return false, ctxerr.Wrap(ctx, err, "update included in policy version")
+	}
+
+	var mappedIncomingProfiles []*BatchSetAssociationIncomingProfile
+	for _, p := range profiles {
+		mappedIncomingProfiles = append(mappedIncomingProfiles, &BatchSetAssociationIncomingProfile{
+			Name:             p.Name,
+			ProfileUUID:      p.ProfileUUID,
+			LabelsIncludeAll: p.LabelsIncludeAll,
+			LabelsIncludeAny: p.LabelsIncludeAny,
+			LabelsExcludeAny: p.LabelsExcludeAny,
+		})
+	}
+
+	didUpdateLabels, err := ds.batchSetLabelAndVariableAssociations(ctx, tx, "android", tmID, mappedIncomingProfiles, profilesVariablesByIdentifier)
+	if err != nil {
+		return false, ctxerr.Wrap(ctx, err, "setting labels and variable associations")
+	}
+
+	return updatedDB || didUpdateLabels, nil
+}
+
+func cancelAndroidHostInstallsForDeletedMDMProfiles(ctx context.Context, tx sqlx.ExtContext, profileUUIDs []string) error {
+	// For Android profiles, we can safely delete the rows where STATUS is null and operation is install.
+	// For any other profiles, we update the operating to remove and set the STATUS to null
+	// to let it be picked up by the reconciler.
+
+	if len(profileUUIDs) == 0 {
+		return nil
+	}
+
+	const delStmt = `
+	DELETE FROM
+		host_mdm_android_profiles
+	WHERE
+		profile_uuid IN (?) AND
+		status IS NULL AND
+		operation_type = ?`
+
+	stmt, args, err := sqlx.In(delStmt, profileUUIDs, fleet.MDMOperationTypeInstall)
+	if err != nil {
+		return ctxerr.Wrap(ctx, err, "build query to cancel android host installs for deleted profiles")
+	}
+
+	if _, err := tx.ExecContext(ctx, stmt, args...); err != nil {
+		return ctxerr.Wrap(ctx, err, "cancel android host installs for deleted profiles")
+	}
+
+	const updateStmt = `
+	UPDATE
+		host_mdm_android_profiles
+	SET
+		status = NULL,
+		operation_type = ?
+	WHERE
+		profile_uuid IN (?) AND
+		status IS NOT NULL AND
+		operation_type = ?`
+
+	stmt, args, err = sqlx.In(updateStmt, fleet.MDMOperationTypeRemove, profileUUIDs, fleet.MDMOperationTypeInstall)
+	if err != nil {
+		return ctxerr.Wrap(ctx, err, "build query to update android host installs for deleted profiles")
+	}
+
+	if _, err := tx.ExecContext(ctx, stmt, args...); err != nil {
+		return ctxerr.Wrap(ctx, err, "update android host installs for deleted profiles")
+	}
+
+	return nil
+}
+
+// bulkSetPendingMDMAndroidHostProfilesDB resets the status of every applicable
+// Android host profile to NULL so the next reconciler tick picks them up. New
+// rows are inserted with an empty detail; for existing rows we deliberately
+// leave the detail column alone so forward-looking messages (e.g. the
+// "Waiting for certificate ..." text on ONC profiles withheld pending a cert
+// install) are not wiped between this call and the next reconciler run.
+func (ds *Datastore) bulkSetPendingMDMAndroidHostProfilesDB(
+	ctx context.Context,
+	hostUUIDs []string,
+) (updatedDB bool, err error) {
+	if len(hostUUIDs) == 0 {
+		return false, nil
+	}
+
+	profilesToInstall, profilesToRemove, err := ds.ListMDMAndroidProfilesToSend(ctx, "", 0)
+	if err != nil {
+		return false, ctxerr.Wrap(ctx, err, "list android profiles to send")
+	}
+
+	if len(profilesToInstall) == 0 && len(profilesToRemove) == 0 {
+		return false, nil
+	}
+
+	var profilesToUpsert []*fleet.MDMAndroidProfilePayload
+	for setIndex, profiles := range [][]*fleet.MDMAndroidProfilePayload{profilesToInstall, profilesToRemove} {
+		operationType := fleet.MDMOperationTypeInstall
+		if setIndex == 1 {
+			operationType = fleet.MDMOperationTypeRemove
+		}
+
+		for _, p := range profiles {
+			profilesToUpsert = append(profilesToUpsert, &fleet.MDMAndroidProfilePayload{
+				ProfileUUID:             p.ProfileUUID,
+				ProfileName:             p.ProfileName,
+				HostUUID:                p.HostUUID,
+				OperationType:           operationType,
+				Status:                  nil,
+				Detail:                  "",
+				PolicyRequestUUID:       nil,
+				DeviceRequestUUID:       nil,
+				RequestFailCount:        0,
+				IncludedInPolicyVersion: nil,
+			})
+		}
+	}
+
+	if err := ds.bulkUpsertMDMAndroidHostProfiles(ctx, profilesToUpsert, true); err != nil {
+		return false, ctxerr.Wrap(ctx, err, "bulk reset android host profiles to pending")
+	}
+
+	return true, nil
+}
+
+// ListAndroidEnrolledDevicesForReconcile returns Android devices currently marked as enrolled in Fleet.
+func (ds *Datastore) ListAndroidEnrolledDevicesForReconcile(ctx context.Context) ([]*android.Device, error) {
+	var devices []*android.Device
+	stmt := `SELECT
+		ad.id,
+		ad.host_id,
+		ad.device_id,
+		ad.enterprise_specific_id,
+		ad.last_policy_sync_time,
+		ad.applied_policy_id,
+		ad.applied_policy_version
+	FROM android_devices ad
+	JOIN host_mdm hm ON hm.host_id = ad.host_id AND hm.enrolled = 1
+	JOIN hosts h ON h.id = ad.host_id AND h.platform = 'android'`
+	if err := sqlx.SelectContext(ctx, ds.reader(ctx), &devices, stmt); err != nil {
+		return nil, ctxerr.Wrap(ctx, err, "list enrolled android devices for reconcile")
+	}
+	return devices, nil
+}
+
+func isAndroidHostConnectedToFleetMDM(ctx context.Context, q sqlx.QueryerContext, h *fleet.Host) (bool, error) {
+	var isEnrolled bool
+
+	err := sqlx.GetContext(ctx, q, &isEnrolled, `
+		SELECT 1 FROM host_mdm
+			WHERE host_id = ? AND enrolled = 1
+	`, h.ID)
+	if err != nil {
+		if errors.Is(err, sql.ErrNoRows) {
+			return false, nil
+		}
+		return false, ctxerr.Wrap(ctx, err, "check android host mdm enrolled")
+	}
+
+	return isEnrolled, nil
+}
+
+func (ds *Datastore) InsertAndroidSetupExperienceSoftwareInstall(ctx context.Context, payload *fleet.HostAndroidVPPSoftwareInstall) error {
+	const stmt = `
+		INSERT INTO
+			host_vpp_software_installs (
+				host_id,
+				adam_id,
+				command_uuid,
+				self_service,
+				associated_event_id,
+				platform
+			)
+		VALUES
+			(?, ?, ?, ?, ?, ?)`
+
+	_, err := ds.writer(ctx).ExecContext(ctx, stmt,
+		payload.HostID,
+		payload.AdamID,
+		payload.CommandUUID,
+		false,
+		payload.AssociatedEventID,
+		fleet.AndroidPlatform,
+	)
+	return ctxerr.Wrap(ctx, err, "inserting android setup experience software install")
+}
+
+func (ds *Datastore) ListHostMDMAndroidVPPAppsPendingInstallWithVersion(ctx context.Context, hostUUID string, policyVersion int64) ([]*fleet.HostAndroidVPPSoftwareInstall, error) {
+	const stmt = `
+SELECT
+	hvsi.host_id,
+	hvsi.adam_id,
+	hvsi.command_uuid,
+	hvsi.associated_event_id
+FROM
+	host_vpp_software_installs hvsi
+	INNER JOIN hosts h ON hvsi.host_id = h.id
+WHERE
+	h.uuid = ? AND
+	h.platform = ? AND
+	CAST(hvsi.associated_event_id AS SIGNED INT) <= ? AND
+	hvsi.verification_at IS NULL AND
+	hvsi.verification_failed_at IS NULL
+`
+
+	var pendingInstalls []*fleet.HostAndroidVPPSoftwareInstall
+	err := sqlx.SelectContext(ctx, ds.reader(ctx), &pendingInstalls, stmt, hostUUID, fleet.AndroidPlatform, policyVersion)
+	if err != nil {
+		return nil, ctxerr.Wrap(ctx, err, "listing host mdm android vpp apps pending install")
+	}
+	return pendingInstalls, nil
+}
+
+func (ds *Datastore) BulkSetVPPInstallsAsVerified(ctx context.Context, hostID uint, commandUUIDs []string) error {
+	return ds.bulkSetVPPInstallsAsFinalState(ctx, hostID, commandUUIDs, "verification_at")
+}
+
+func (ds *Datastore) BulkSetVPPInstallsAsFailed(ctx context.Context, hostID uint, commandUUIDs []string) error {
+	return ds.bulkSetVPPInstallsAsFinalState(ctx, hostID, commandUUIDs, "verification_failed_at")
+}
+
+func (ds *Datastore) bulkSetVPPInstallsAsFinalState(ctx context.Context, hostID uint, commandUUIDs []string, column string) error {
+	if len(commandUUIDs) == 0 {
+		return nil
+	}
+
+	// For Android, we don't care about the verification command uuid (at least currently),
+	// we just set a random one.
+	stmt := fmt.Sprintf(`
+UPDATE
+	host_vpp_software_installs
+SET
+	%s = CURRENT_TIMESTAMP(6),
+	verification_command_uuid = ?
+WHERE
+	command_uuid IN (?)
+`, column)
+
+	return ds.withTx(ctx, func(tx sqlx.ExtContext) error {
+		verificationUUID := uuid.NewString()
+		stmt, args, err := sqlx.In(stmt, verificationUUID, commandUUIDs)
+		if err != nil {
+			return ctxerr.Wrap(ctx, err, "build set vpp installs as final state query")
+		}
+		if _, err := tx.ExecContext(ctx, stmt, args...); err != nil {
+			return ctxerr.Wrap(ctx, err, "set vpp installs as final state")
+		}
+
+		// TODO(mna): for now we don't use the upcoming queue for Android app installs,
+		// but when we implement the standard Android app installs we probably will. Leaving
+		// this here as a reminder.
+		// if _, err := ds.activateNextUpcomingActivity(ctx, tx, hostID, ...); err != nil {
+		// 	return ctxerr.Wrap(ctx, err, "activate next activity from VPP app install verify")
+		// }
+
+		return nil
+	})
+}
+
+// HasAndroidAppConfigurationChanged checks if the new configuration for an Android app
+// identified by application_id and global_or_team_id is different from the existing one. This
+// is a datastore method so that we rely on mysql's canonicalisation of JSON for comparison.
+func (ds *Datastore) HasAndroidAppConfigurationChanged(ctx context.Context, applicationID string, teamID uint, newConfig []byte) (bool, error) {
+	const stmt = `
+SELECT
+	CAST(? AS JSON) != configuration AS has_changed
+FROM
+	android_app_configurations
+WHERE
+	application_id = ? AND
+	global_or_team_id = ?
+`
+
+	newConfigStr := string(newConfig)
+	if len(newConfigStr) == 0 {
+		newConfigStr = "{}" // consider an empty config as an empty JSON for comparison's sake
+	}
+
+	var hasChanged bool
+	err := sqlx.GetContext(ctx, ds.reader(ctx), &hasChanged, stmt, newConfigStr, applicationID, teamID)
+	if err != nil {
+		if err == sql.ErrNoRows {
+			// old config does not exist, so old one is changed if not empty
+			return len(newConfig) > 0, nil
+		}
+		return false, ctxerr.Wrap(ctx, err, "compare android app configuration")
+	}
+	return hasChanged, nil
+}
+
+// GetAndroidAppConfiguration retrieves the configuration for an Android app by app ID and team
+func (ds *Datastore) GetAndroidAppConfiguration(ctx context.Context, applicationID string, teamID uint) ([]byte, error) {
+	stmt := `SELECT configuration FROM android_app_configurations WHERE application_id = ? AND global_or_team_id = ?`
+
+	var config []byte
+	err := sqlx.GetContext(ctx, ds.reader(ctx), &config, stmt, applicationID, teamID)
+	if err != nil {
+		if err == sql.ErrNoRows {
+			return nil, ctxerr.Wrap(ctx, notFound("AndroidAppConfiguration"))
+		}
+		return nil, ctxerr.Wrap(ctx, err, "get android app configuration")
+	}
+
+	return config, nil
+}
+
+func (ds *Datastore) GetAndroidAppConfigurationByAppTeamID(ctx context.Context, vppAppTeamID uint) ([]byte, error) {
+	stmt := `
+	SELECT aac.configuration
+	FROM android_app_configurations aac
+	JOIN vpp_apps_teams vat
+		ON vat.adam_id = aac.application_id AND vat.global_or_team_id = aac.global_or_team_id
+	WHERE vat.id = ?
+`
+
+	var config []byte
+	err := sqlx.GetContext(ctx, ds.reader(ctx), &config, stmt, vppAppTeamID)
+	if err != nil {
+		if err == sql.ErrNoRows {
+			return nil, ctxerr.Wrap(ctx, notFound("AndroidAppConfiguration"))
+		}
+		return nil, ctxerr.Wrap(ctx, err, "get android app configuration")
+	}
+
+	return config, nil
+}
+
+func (ds *Datastore) BulkGetAndroidAppConfigurations(ctx context.Context, appIDs []string, teamID uint) (map[string][]byte, error) {
+	const bulkGetStmt = `
+	SELECT
+		application_id,
+		configuration
+	FROM android_app_configurations
+	WHERE application_id IN (?) AND global_or_team_id = ?
+	`
+
+	if len(appIDs) == 0 {
+		return nil, nil
+	}
+
+	stmt, args, err := sqlx.In(bulkGetStmt, appIDs, teamID)
+	if err != nil {
+		return nil, ctxerr.Wrap(ctx, err, "building bulk get android app configurations query")
+	}
+
+	var configs []*struct {
+		ApplicationID string `db:"application_id"`
+		Configuration []byte `db:"configuration"`
+	}
+	err = sqlx.SelectContext(ctx, ds.reader(ctx), &configs, stmt, args...)
+	if err != nil {
+		return nil, ctxerr.Wrap(ctx, err, "bulk get android app configurations")
+	}
+
+	m := make(map[string][]byte, len(configs))
+	for _, c := range configs {
+		m[c.ApplicationID] = c.Configuration
+	}
+	return m, nil
+}
+
+func (ds *Datastore) SetAndroidAppInstallPendingApplyConfig(ctx context.Context, hostUUID, applicationID string, policyVersion int64) error {
+	const stmt = `
+UPDATE
+	host_vpp_software_installs
+	JOIN hosts h ON
+		h.id = host_vpp_software_installs.host_id
+SET
+	verification_at = NULL,
+	verification_command_uuid = NULL,
+	associated_event_id = ?
+WHERE
+	h.uuid = ? AND
+	host_vpp_software_installs.adam_id = ? AND
+	host_vpp_software_installs.platform = ? AND
+	-- not removed or canceled
+	host_vpp_software_installs.removed = 0 AND
+	host_vpp_software_installs.canceled = 0 AND
+	-- only if successfull or pending install
+	host_vpp_software_installs.verification_failed_at IS NULL
+`
+	_, err := ds.writer(ctx).ExecContext(ctx, stmt, fmt.Sprint(policyVersion), hostUUID, applicationID, fleet.AndroidPlatform)
+	if err != nil {
+		return ctxerr.Wrap(ctx, err, "set android app install pending apply config")
+	}
+	return nil
+}
+
+// DeleteAndroidAppConfiguration removes an Android app configuration.
+func (ds *Datastore) DeleteAndroidAppConfiguration(ctx context.Context, appID string, teamID uint) error {
+	stmt := `
+		DELETE FROM android_app_configurations
+		WHERE application_id = ? AND global_or_team_id = ?
+	`
+
+	result, err := ds.writer(ctx).ExecContext(ctx, stmt, appID, teamID)
+	if err != nil {
+		return ctxerr.Wrap(ctx, err, "delete android app configuration")
+	}
+
+	rows, err := result.RowsAffected()
+	if err != nil {
+		return ctxerr.Wrap(ctx, err, "delete android app configuration rows affected")
+	}
+
+	if rows == 0 {
+		return ctxerr.Wrap(ctx, notFound("AndroidAppConfiguration"))
+	}
+
+	return nil
+}
+
+// updateAndroidAppConfigurationTx inserts or updates an app configuration using a transaction
+func (ds *Datastore) updateAndroidAppConfigurationTx(ctx context.Context, tx sqlx.ExtContext, teamID uint, appID string, config []byte) error {
+	err := fleet.ValidateAndroidAppConfiguration(config)
+	if err != nil {
+		return ctxerr.Wrap(ctx, err, "validating android app configuration")
+	}
+
+	stmt := `
+		INSERT INTO
+			android_app_configurations (application_id, team_id, global_or_team_id, configuration)
+		VALUES (?, ?, ?, ?)
+		ON DUPLICATE KEY UPDATE
+			configuration = VALUES(configuration)
+	`
+
+	_, err = tx.ExecContext(ctx, stmt, appID, ptr.UintOrNilIfZero(teamID), teamID, config)
+	if err != nil {
+		return ctxerr.Wrap(ctx, err, "updateAndroidAppConfiguration")
+	}
+
+	// Track which fleet variables this app config uses so SCIM can trigger resends.
+	var appConfigID uint
+	if err := sqlx.GetContext(ctx, tx, &appConfigID,
+		`SELECT id FROM android_app_configurations WHERE application_id = ? AND global_or_team_id = ?`,
+		appID, teamID,
+	); err != nil {
+		return ctxerr.Wrap(ctx, err, "getting android app configuration id for variable tracking")
+	}
+
+	found := variables.Find(string(config))
+	fleetVars := make([]fleet.FleetVarName, len(found))
+	for i, v := range found {
+		fleetVars[i] = fleet.FleetVarName(v)
+	}
+	if err := setAppConfigVariableAssociations(ctx, tx, appConfigID, fleetVars); err != nil {
+		return ctxerr.Wrap(ctx, err, "setting app config variable associations")
+	}
+
+	return nil
+}
+
+// setAppConfigVariableAssociations replaces the variable associations for an
+// android app configuration in mdm_configuration_profile_variables.
+func setAppConfigVariableAssociations(ctx context.Context, tx sqlx.ExtContext, appConfigID uint, fleetVars []fleet.FleetVarName) error {
+	if _, err := tx.ExecContext(ctx, `DELETE FROM mdm_configuration_profile_variables WHERE android_app_configuration_id = ?`, appConfigID); err != nil {
+		return ctxerr.Wrap(ctx, err, "deleting app config variable associations")
+	}
+
+	if len(fleetVars) == 0 {
+		return nil
+	}
+
+	type varDef struct {
+		ID       uint   `db:"id"`
+		Name     string `db:"name"`
+		IsPrefix bool   `db:"is_prefix"`
+	}
+	var varDefs []varDef
+	if err := sqlx.SelectContext(ctx, tx, &varDefs, `SELECT id, name, is_prefix FROM fleet_variables`); err != nil {
+		return ctxerr.Wrap(ctx, err, "loading fleet variables")
+	}
+
+	var values strings.Builder
+	var args []any
+	for _, v := range fleetVars {
+		varWithPrefix := "FLEET_VAR_" + string(v)
+		for _, def := range varDefs {
+			match := (!def.IsPrefix && def.Name == varWithPrefix) || (def.IsPrefix && strings.HasPrefix(varWithPrefix, def.Name))
+			if match {
+				values.WriteString("(?, ?),")
+				args = append(args, appConfigID, def.ID)
+				break
+			}
+		}
+	}
+
+	if len(args) == 0 {
+		return nil
+	}
+
+	stmt := fmt.Sprintf(`
+		INSERT INTO mdm_configuration_profile_variables (android_app_configuration_id, fleet_variable_id)
+		VALUES %s
+		ON DUPLICATE KEY UPDATE fleet_variable_id = VALUES(fleet_variable_id)
+	`, strings.TrimSuffix(values.String(), ","))
+
+	if _, err := tx.ExecContext(ctx, stmt, args...); err != nil {
+		return ctxerr.Wrap(ctx, err, "inserting app config variable associations")
+	}
+	return nil
+}
+
+func (ds *Datastore) ListMDMAndroidUUIDsToHostIDs(ctx context.Context, hostIDs []uint) (map[string]uint, error) {
+	if len(hostIDs) == 0 {
+		return nil, nil
+	}
+
+	stmt := `
+SELECT
+	h.id AS id, h.uuid AS uuid
+FROM
+	hosts h
+	JOIN android_devices ad ON ad.host_id = h.id
+WHERE
+	h.id IN (?) AND
+	h.platform = 'android'
+`
+
+	results := make(map[string]uint)
+	if err := common_mysql.BatchProcessSimple(hostIDs, hostIDsFanoutBatchSize, func(batch []uint) error {
+		inStmt, args, err := sqlx.In(stmt, batch)
+		if err != nil {
+			return ctxerr.Wrap(ctx, err, "prepare statement arguments")
+		}
+		var rows []struct {
+			ID   uint   `db:"id"`
+			UUID string `db:"uuid"`
+		}
+		if err := sqlx.SelectContext(ctx, ds.reader(ctx), &rows, inStmt, args...); err != nil {
+			return ctxerr.Wrap(ctx, err, "list mdm android uuids to host ids")
+		}
+		for _, r := range rows {
+			results[r.UUID] = r.ID
+		}
+		return nil
+	}); err != nil {
+		return nil, err
+	}
+
+	return results, nil
+}

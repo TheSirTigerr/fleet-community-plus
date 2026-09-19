@@ -1,0 +1,98 @@
+module.exports = {
+
+
+  friendlyName: 'Get android enterprise applications',
+
+
+  description: 'Gets an android enterprise application',
+
+
+  inputs: {
+    androidEnterpriseId: {
+      type: 'string',
+      required: true,
+    },
+    applicationId: {
+      type: 'string',
+      required: true,
+    },
+  },
+
+
+  exits: {
+    success: { description: 'The device of an Android enterprise was successfully retrieved.' },
+    missingAuthHeader: { description: 'This request was missing an authorization header.', responseType: 'unauthorized'},
+    unauthorized: { description: 'Invalid authentication token.', responseType: 'unauthorized'},
+    notFound: { description: 'App not found', responseType: 'notFound' },
+    enterpriseNotAccessible: { description: 'Fleet is not authorized to manage this Android enterprise.', responseType: 'notFound' },
+    deviceNoLongerManaged: { description: 'The device is no longer managed by the Android enterprise.', responseType: 'notFound' },
+  },
+
+
+  fn: async function ({ androidEnterpriseId, applicationId}) {
+
+    // Extract fleetServerSecret from the Authorization header
+    let authHeader = this.req.get('authorization');
+    let fleetServerSecret;
+
+    if (authHeader && authHeader.startsWith('Bearer')) {
+      fleetServerSecret = authHeader.replace('Bearer', '').trim();
+    } else {
+      throw 'missingAuthHeader';
+    }
+
+    // Authenticate this request
+    let thisAndroidEnterprise = await AndroidEnterprise.findOne({
+      androidEnterpriseId: androidEnterpriseId
+    });
+
+    // Return a 404 response if no records are found.
+    if (!thisAndroidEnterprise) {
+      throw 'notFound';
+    }
+    // Return an unauthorized response if the provided secret does not match.
+    if (thisAndroidEnterprise.fleetServerSecret !== fleetServerSecret) {
+      throw 'unauthorized';
+    }
+
+    // Get the shared Google API auth client with the getAndroidManagementAuthorizationClient helper.
+    // Note: we are doing this outside of the sails.helpers.flow.build() so any errors related to the website's credentials returned by the helper are not intercepted.
+    let androidManagementAuthClient = await sails.helpers.androidProxy.getAndroidManagementAuthorizationClient();
+
+    // Get the device for this Android enterprise.
+    // Note: We're using sails.helpers.flow.build here to handle any errors that occur using google's node library.
+    let getApplicationsResponse = await sails.helpers.flow.build(async () => {
+      let { google } = require('googleapis');
+      let androidManagementConnection = google.androidmanagement({version: 'v1', auth: androidManagementAuthClient});
+      // [?]: https://googleapis.dev/nodejs/googleapis/latest/androidmanagement/classes/Resource$Enterprises$Applications.html#get
+      sails.androidProxyApiRequestCount++;// Count this Android Management API request toward the per-minute total logged in api/hooks/custom/index.js.
+      sails.androidProxyApiRequestCountByEnterpriseId[androidEnterpriseId] = (sails.androidProxyApiRequestCountByEnterpriseId[androidEnterpriseId] || 0) + 1;// Count this request for the per-enterprise-per-minute total logged in api/hooks/custom/index.js.
+      let getApplicationsResult = await androidManagementConnection.enterprises.applications.get({
+        name: `enterprises/${androidEnterpriseId}/applications/${applicationId}`,
+      });
+      return getApplicationsResult.data;
+    }).intercept({status: 429}, (err)=>{
+      // If the Android management API returns a 429 response, log an additional warning that will trigger a help-p1 alert.
+      sails.log.warn(`p1: Android management API rate limit exceeded!`);
+      return new Error(`When attempting to get an application for an Android enterprise (${androidEnterpriseId}), an error occurred. Error: ${err}`);
+    }).intercept({status: 403}, ()=>{
+      // If the Android management API returns a 403 response, return a enterpriseNotAccessible (notFound) response to the Fleet server.
+      return {'enterpriseNotAccessible': 'Fleet is not authorized to manage this Android enterprise.'};
+    }).intercept({status: 404}, () => {
+      return {'notFound': 'App not found.'};
+    }).intercept((err) => {
+      let errorString = err.toString();
+      if (errorString.includes('Device is no longer being managed')) {
+        return {'deviceNoLongerManaged': 'The device is no longer managed by the Android enterprise.'};
+      }
+      return new Error(`When attempting to get an application for an Android enterprise (${androidEnterpriseId}), an error occurred. Error: ${require('util').inspect(err)}`);
+    });
+
+
+    // Return the device data back to the Fleet server.
+    return getApplicationsResponse;
+
+  }
+
+
+};

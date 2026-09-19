@@ -1,0 +1,258 @@
+import { IConfig, ILicense, IMdmConfig } from "interfaces/config";
+
+const DEFAULT_CONFIG_MDM_MOCK: IMdmConfig = {
+  apple_server_url: "",
+  enable_disk_encryption: false,
+  enable_recovery_lock_password: false,
+  windows_require_bitlocker_pin: false,
+  enable_turn_on_windows_mdm_manually: false,
+  windows_enabled_and_configured: true,
+  windows_entra_tenant_ids: [],
+  windows_entra_client_ids: [],
+  microsoft_graph_credential_invalid: false,
+  apple_bm_default_team: "Apples",
+  apple_bm_enabled_and_configured: true,
+  apple_bm_terms_expired: false,
+  enabled_and_configured: true,
+  android_enabled_and_configured: false,
+  apple_require_hardware_attestation: false,
+  only_allow_apple_business_enrollment: false,
+  macos_updates: {
+    minimum_version: "",
+    deadline: "",
+    deadline_days: null,
+  },
+  ios_updates: {
+    minimum_version: "",
+    deadline: "",
+    deadline_days: null,
+  },
+  ipados_updates: {
+    minimum_version: "",
+    deadline: "",
+    deadline_days: null,
+  },
+  apple_settings: {
+    configuration_profiles: null,
+    enable_disk_encryption: false,
+    enable_escrow_disk_encryption_key: false,
+  },
+  windows_settings: {
+    enable_disk_encryption: false,
+    require_bitlocker_pin: false,
+  },
+  linux_settings: {
+    enable_escrow_disk_encryption_key: false,
+  },
+  setup_experience: {
+    macos_bootstrap_package: "",
+    macos_manual_agent_install: false,
+    enable_end_user_authentication: false,
+    apple_setup_assistant: null,
+    apple_enable_release_device_manually: false,
+    require_all_software_macos: false,
+    require_all_software_windows: false,
+    lock_end_user_info: false,
+  },
+  macos_migration: {
+    enable: false,
+    mode: "",
+    webhook_url: "",
+  },
+  windows_updates: {
+    deadline_days: null,
+    grace_period_days: null,
+  },
+  windows_migration_enabled: false,
+  end_user_authentication: {
+    entity_id: "",
+    issuer_uri: "",
+    metadata: "",
+    metadata_url: "",
+    idp_name: "",
+  },
+};
+
+export const createMockMdmConfig = (
+  overrides?: Partial<IMdmConfig>
+): IMdmConfig => {
+  return { ...DEFAULT_CONFIG_MDM_MOCK, ...overrides };
+};
+
+export const DEFAULT_LICENSE_MOCK: ILicense = {
+  tier: "free",
+  expiration: "0001-01-01T00:00:00Z",
+  device_count: 4,
+  note: "",
+  organization: "",
+  allow_disable_telemetry: false,
+};
+
+const DEFAULT_CONFIG_MOCK: IConfig = {
+  org_info: {
+    org_name: "fleet",
+    org_logo_url: "",
+    org_logo_url_light_background: "",
+    contact_url: "https://fleetdm.com/company/contact",
+  },
+  server_settings: {
+    server_url: "https://localhost:8080",
+    live_query_disabled: false,
+    enable_analytics: true,
+    deferred_save_host: false,
+    query_reports_disabled: false,
+    scripts_disabled: false,
+    ai_features_disabled: false,
+  },
+  smtp_settings: {
+    enable_smtp: false,
+    configured: false,
+    sender_address: "",
+    server: "",
+    port: 587,
+    authentication_type: "authtype_username_password",
+    user_name: "",
+    password: "********",
+    enable_ssl_tls: true,
+    authentication_method: "authmethod_plain",
+    domain: "",
+    verify_ssl_certs: true,
+    enable_start_tls: true,
+  },
+  sso_settings: {
+    entity_id: "",
+    issuer_uri: "",
+    metadata: "",
+    metadata_url: "",
+    idp_name: "",
+    idp_image_url: "",
+    enable_sso: false,
+    enable_sso_idp_login: false,
+    enable_jit_provisioning: false,
+    enable_jit_role_sync: false,
+  },
+  conditional_access: {
+    microsoft_entra_tenant_id: "123",
+    microsoft_entra_connection_configured: true,
+    okta_idp_id: "",
+    okta_assertion_consumer_service_url: "",
+    okta_audience_uri: "",
+    okta_certificate: "",
+  },
+  host_expiry_settings: {
+    host_expiry_enabled: false,
+    host_expiry_window: 0,
+  },
+  activity_expiry_settings: {
+    activity_expiry_enabled: true,
+    activity_expiry_window: 90,
+    preserve_host_activities_on_reenrollment: false,
+  },
+  agent_options: "",
+  license: DEFAULT_LICENSE_MOCK,
+  webhook_settings: {
+    host_status_webhook: {
+      enable_host_status_webhook: true,
+      destination_url: "https://server.com",
+      host_percentage: 5,
+      days_count: 7,
+    },
+    failing_policies_webhook: {
+      enable_failing_policies_webhook: true,
+      destination_url: "https://server.com",
+      policy_ids: [1, 2, 3],
+      host_batch_size: 1000,
+    },
+    vulnerabilities_webhook: {
+      enable_vulnerabilities_webhook: true,
+      destination_url: "https://server.com",
+      host_batch_size: 1000,
+    },
+    activities_webhook: {
+      enable_activities_webhook: true,
+      destination_url: "https://server.com",
+    },
+  },
+  integrations: {
+    jira: [],
+    zendesk: [],
+    google_calendar: [],
+    google_workspace: [],
+  },
+  logging: {
+    debug: false,
+    json: false,
+    result: {
+      plugin: "filesystem",
+      config: {
+        status_log_file:
+          "/var/folders/xh/bxm1d2615tv3vrg4zrxq540h0000gn/T/osquery_status",
+        result_log_file:
+          "/var/folders/xh/bxm1d2615tv3vrg4zrxq540h0000gn/T/osquery_result",
+        enable_log_rotation: false,
+        enable_log_compression: false,
+      },
+    },
+    status: {
+      plugin: "filesystem",
+      config: {
+        status_log_file:
+          "/var/folders/xh/bxm1d2615tv3vrg4zrxq540h0000gn/T/osquery_status",
+        result_log_file:
+          "/var/folders/xh/bxm1d2615tv3vrg4zrxq540h0000gn/T/osquery_result",
+        enable_log_rotation: false,
+        enable_log_compression: false,
+      },
+    },
+    audit: {
+      plugin: "",
+      config: null,
+    },
+  },
+  update_interval: {
+    osquery_detail: 3600000000000,
+    osquery_policy: 3600000000000,
+  },
+  vulnerabilities: {
+    cpe_database_url: "",
+    current_instance_checks: "auto",
+    cve_feed_prefix_url: "",
+    databases_path: "",
+    disable_data_sync: false,
+    periodicity: 3600000000000,
+    recent_vulnerability_max_age: 2592000000000000,
+  },
+  sandbox_enabled: false,
+  features: {
+    enable_host_users: true,
+    enable_software_inventory: true,
+    enable_conditional_access: true,
+    enable_conditional_access_bypass: true,
+    historical_data: {
+      uptime: true,
+      vulnerabilities: true,
+    },
+  },
+  fleet_desktop: {
+    transparency_url: "https://fleetdm.com/transparency",
+    alternative_browser_host: "",
+    sso_enabled: false,
+  },
+  mdm: createMockMdmConfig(),
+  gitops: {
+    gitops_mode_enabled: false,
+    repository_url: "",
+    exceptions: {
+      labels: false,
+      software: false,
+      secrets: true,
+    },
+  },
+  max_software_package_size: 10 * 1024 * 1024 * 1024,
+};
+
+export const createMockConfig = (overrides?: Partial<IConfig>): IConfig => {
+  return { ...DEFAULT_CONFIG_MOCK, ...overrides };
+};
+
+export default createMockConfig;

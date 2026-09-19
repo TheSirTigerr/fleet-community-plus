@@ -1,0 +1,27 @@
+{
+  "name": "fleetctl",
+  "version": "v4.91.1",
+  "description": "Installer for the fleetctl CLI tool",
+  "bin": {
+    "fleetctl": "./run.js"
+  },
+  "repository": {
+    "type": "git",
+    "url": "https://github.com/fleetdm/fleet"
+  },
+  "author": "Fleet Developers",
+  "license": "MIT",
+  "bugs": {
+    "url": "https://github.com/fleetdm/fleet/issues"
+  },
+  "homepage": "https://fleetdm.com",
+  "dependencies": {
+    "axios": "1.18.0",
+    "rimraf": "6.1.2",
+    "tar": "7.5.22"
+  },
+  "keywords": [
+    "osquery",
+    "security"
+  ]
+}

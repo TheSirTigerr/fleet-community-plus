@@ -1,0 +1,1526 @@
+package update
+
+import (
+	"bytes"
+	"errors"
+	"fmt"
+	"io"
+	"sync"
+	"sync/atomic"
+	"testing"
+	"time"
+
+	"github.com/fleetdm/fleet/v4/orbit/pkg/bitlocker"
+	"github.com/fleetdm/fleet/v4/orbit/pkg/scripts"
+	"github.com/fleetdm/fleet/v4/server/fleet"
+	"github.com/fleetdm/fleet/v4/server/ptr"
+	"github.com/rs/zerolog/log"
+	"github.com/stretchr/testify/require"
+)
+
+func TestRenewEnrollmentProfile(t *testing.T) {
+	var logBuf bytes.Buffer
+
+	oldLog := log.Logger
+	log.Logger = log.Output(&logBuf)
+	t.Cleanup(func() { log.Logger = oldLog })
+
+	cases := []struct {
+		desc          string
+		renewFlag     bool
+		cmdErr        error
+		wantCmdCalled bool
+		wantLog       string
+	}{
+		{"renew=false", false, nil, false, ""},
+		{"renew=true; success", true, nil, true, "successfully called /usr/bin/profiles to renew enrollment profile"},
+		{"renew=true; fail", true, io.ErrUnexpectedEOF, true, "calling /usr/bin/profiles to renew enrollment profile failed"},
+	}
+
+	for _, c := range cases {
+		t.Run(c.desc, func(t *testing.T) {
+			logBuf.Reset()
+
+			testConfig := &fleet.OrbitConfig{Notifications: fleet.OrbitConfigNotifications{RenewEnrollmentProfile: c.renewFlag}}
+
+			var cmdGotCalled bool
+			var depAssignedCheckGotCalled bool
+			renewReceiver := &renewEnrollmentProfileConfigReceiver{
+				Frequency: time.Hour, // doesn't matter for this test
+				runCmdFn: func() error {
+					cmdGotCalled = true
+					return c.cmdErr
+				},
+				checkEnrollmentFn: func() (bool, string, error) {
+					return false, "", nil
+				},
+				checkAssignedEnrollmentProfileFn: func(url string) error {
+					depAssignedCheckGotCalled = true
+					return nil
+				},
+			}
+
+			err := renewReceiver.Run(testConfig)
+			require.NoError(t, err) // the dummy receiver never returns an error
+
+			require.Equal(t, c.wantCmdCalled, cmdGotCalled)
+			require.Equal(t, c.wantCmdCalled, depAssignedCheckGotCalled)
+			require.Contains(t, logBuf.String(), c.wantLog)
+		})
+	}
+}
+
+func TestRenewEnrollmentProfilePrevented(t *testing.T) {
+	var logBuf bytes.Buffer
+
+	oldLog := log.Logger
+	log.Logger = log.Output(&logBuf)
+	t.Cleanup(func() { log.Logger = oldLog })
+
+	testConfig := &fleet.OrbitConfig{Notifications: fleet.OrbitConfigNotifications{RenewEnrollmentProfile: true}}
+
+	var cmdCallCount int
+	isEnrolled := false
+	isAssigned := true
+	chProceed := make(chan struct{})
+	renewReceiver := &renewEnrollmentProfileConfigReceiver{
+		Frequency: 2 * time.Second, // just to be safe with slow environments (CI)
+		runCmdFn: func() error {
+			cmdCallCount++ // no need for sync, single-threaded call of this func is guaranteed by the receiver's mutex
+			return nil
+		},
+		checkEnrollmentFn: func() (bool, string, error) {
+			<-chProceed // will be unblocked only when allowed
+			return isEnrolled, "", nil
+		},
+		checkAssignedEnrollmentProfileFn: func(url string) error {
+			<-chProceed // will be unblocked only when allowed
+			if !isAssigned {
+				return errors.New("not assigned")
+			}
+			return nil
+		},
+	}
+
+	// One of the calls to renewReceiver.Run() will run first and get blocked in checkEnrollmentFn. The
+	// second won't call the command (won't be able to lock the mutex). So, it will still complete successfully
+	// without being blocked by the other call in progress. Whichever one exits first then needs to close
+	// chProceed so the other one is unblocked.
+	var shouldCloseChProceed atomic.Bool
+	shouldCloseChProceed.Store(true)
+
+	started := make(chan struct{})
+	frequencyMu := sync.Mutex{}
+	go func() {
+		frequencyMu.Lock()
+		defer frequencyMu.Unlock()
+		close(started)
+
+		err := renewReceiver.Run(testConfig)
+		require.NoError(t, err)
+		if shouldCloseChProceed.CompareAndSwap(true, false) {
+			close(chProceed)
+			t.Logf("%v unblock the first call from the goroutine", time.Now())
+		}
+	}()
+
+	<-started
+	t.Logf("%v started", time.Now())
+
+	err := renewReceiver.Run(testConfig)
+	require.NoError(t, err)
+
+	if shouldCloseChProceed.CompareAndSwap(true, false) {
+		// unblock the first call
+		close(chProceed)
+		t.Logf("%v unblock the first call", time.Now())
+	}
+
+	// this next call won't execute the command because of the frequency
+	// restriction (it got called less than N seconds ago)
+	err = renewReceiver.Run(testConfig)
+	require.NoError(t, err)
+	t.Logf("%v frequency restriction check done", time.Now())
+
+	frequencyMu.Lock()
+	renewReceiver.Frequency = 200 * time.Millisecond
+	frequencyMu.Unlock()
+	// wait for the receiver's frequency to pass
+	time.Sleep(renewReceiver.Frequency)
+
+	// this call executes the command
+	err = renewReceiver.Run(testConfig)
+	require.NoError(t, err)
+
+	// wait for the receiver's frequency to pass
+	time.Sleep(renewReceiver.Frequency)
+
+	// this call doesn't execute the command since the host is already
+	// enrolled
+	isEnrolled = true
+	err = renewReceiver.Run(testConfig)
+	require.NoError(t, err)
+
+	require.Equal(t, 2, cmdCallCount) // the initial call and the one after sleep
+
+	// wait for the receiver's frequency to pass
+	time.Sleep(renewReceiver.Frequency)
+
+	// this call doesn't execute the command since the assigned profile check fails
+	isAssigned = false
+	isEnrolled = false
+	err = renewReceiver.Run(testConfig)
+	require.NoError(t, err)
+
+	require.Equal(t, 2, cmdCallCount) // the initial call and the one after sleep
+
+	// wait for the receiver's frequency to pass
+	time.Sleep(renewReceiver.Frequency)
+
+	// this next call won't execute the command because the backoff
+	// for a failed assigned check is always 2 minutes
+	err = renewReceiver.Run(testConfig)
+	require.NoError(t, err)
+}
+
+type mockNodeKeyGetter struct{}
+
+func (m mockNodeKeyGetter) GetNodeKey() (string, error) {
+	return "nodekey-test", nil
+}
+
+func TestWindowsMDMEnrollment(t *testing.T) {
+	var logBuf bytes.Buffer
+
+	oldLog := log.Logger
+	log.Logger = log.Output(&logBuf)
+	t.Cleanup(func() { log.Logger = oldLog })
+
+	cases := []struct {
+		desc          string
+		enrollFlag    *bool
+		unenrollFlag  *bool
+		migrateFlag   *bool
+		discoveryURL  string
+		apiErr        error
+		wantAPICalled bool
+		wantLog       string
+	}{
+		{"enroll=false", ptr.Bool(false), nil, nil, "", nil, false, ""},
+		{"enroll=true,discovery=''", ptr.Bool(true), nil, nil, "", nil, false, "discovery endpoint is empty"},
+		{"enroll=true,discovery!='',success", ptr.Bool(true), nil, nil, "http://example.com", nil, true, "successfully called RegisterDeviceWithManagement"},
+		{"enroll=true,discovery!='',fail", ptr.Bool(true), nil, nil, "http://example.com", io.ErrUnexpectedEOF, true, "enroll Windows device failed"},
+		{"enroll=true,discovery!='',server", ptr.Bool(true), nil, nil, "http://example.com", errIsWindowsServer, true, "device is a Windows Server, skipping enrollment"},
+
+		{"unenroll=false", nil, ptr.Bool(false), nil, "", nil, false, ""},
+		{"unenroll=true,success", nil, ptr.Bool(true), nil, "", nil, true, "successfully called UnregisterDeviceWithManagement to unenroll"},
+		{"unenroll=true,fail", nil, ptr.Bool(true), nil, "", io.ErrUnexpectedEOF, true, "unenroll Windows device failed"},
+		{"unenroll=true,server", nil, ptr.Bool(true), nil, "", errIsWindowsServer, true, "device is a Windows Server, skipping unenroll"},
+
+		{"migrate=false", nil, nil, ptr.Bool(false), "", nil, false, ""},
+		{"migrate=true,success", nil, nil, ptr.Bool(true), "", nil, true, "successfully called UnregisterDeviceWithManagement to migrate"},
+		{"migrate=true,fail", nil, nil, ptr.Bool(true), "", io.ErrUnexpectedEOF, true, "migrate Windows device failed"},
+		{"migrate=true,server", nil, nil, ptr.Bool(true), "", errIsWindowsServer, true, "device is a Windows Server, skipping migrate"},
+	}
+
+	for _, c := range cases {
+		t.Run(c.desc, func(t *testing.T) {
+			logBuf.Reset()
+
+			var (
+				enroll     = c.enrollFlag != nil && *c.enrollFlag
+				unenroll   = c.unenrollFlag != nil && *c.unenrollFlag
+				migrate    = c.migrateFlag != nil && *c.migrateFlag
+				isUnenroll = c.unenrollFlag != nil
+			)
+
+			testConfig := &fleet.OrbitConfig{Notifications: fleet.OrbitConfigNotifications{
+				NeedsProgrammaticWindowsMDMEnrollment:   enroll,
+				NeedsProgrammaticWindowsMDMUnenrollment: unenroll,
+				NeedsMDMMigration:                       migrate,
+				WindowsMDMDiscoveryEndpoint:             c.discoveryURL,
+			}}
+
+			var enrollGotCalled, unenrollGotCalled bool
+			enrollReceiver := &windowsMDMEnrollmentConfigReceiver{
+				Frequency: time.Hour, // doesn't matter for this test
+				execEnrollFn: func(args WindowsMDMEnrollmentArgs) error {
+					enrollGotCalled = true
+					return c.apiErr
+				},
+				execUnenrollFn: func(args WindowsMDMEnrollmentArgs) error {
+					unenrollGotCalled = true
+					return c.apiErr
+				},
+				nodeKeyGetter: mockNodeKeyGetter{},
+			}
+
+			err := enrollReceiver.Run(testConfig)
+			require.NoError(t, err) // the dummy receiver never returns an error
+
+			if isUnenroll || migrate {
+				require.Equal(t, c.wantAPICalled, unenrollGotCalled)
+				require.False(t, enrollGotCalled)
+			} else {
+				require.Equal(t, c.wantAPICalled, enrollGotCalled)
+				require.False(t, unenrollGotCalled)
+			}
+			require.Contains(t, logBuf.String(), c.wantLog)
+		})
+	}
+}
+
+func TestWindowsMDMEnrollmentPrevented(t *testing.T) {
+	var logBuf bytes.Buffer
+
+	oldLog := log.Logger
+	log.Logger = log.Output(&logBuf)
+	t.Cleanup(func() { log.Logger = oldLog })
+
+	cfgs := []fleet.OrbitConfigNotifications{
+		{
+			NeedsProgrammaticWindowsMDMEnrollment: true,
+			WindowsMDMDiscoveryEndpoint:           "http://example.com",
+		},
+		{
+			NeedsProgrammaticWindowsMDMUnenrollment: true,
+		},
+	}
+	for _, cfg := range cfgs {
+		t.Run(fmt.Sprintf("%+v", cfg), func(t *testing.T) {
+			testConfig := &fleet.OrbitConfig{Notifications: cfg}
+
+			var (
+				apiCallCount int
+				apiErr       error
+			)
+			chProceed := make(chan struct{})
+			receiver := &windowsMDMEnrollmentConfigReceiver{
+				Frequency:     2 * time.Second, // just to be safe with slow environments (CI)
+				nodeKeyGetter: mockNodeKeyGetter{},
+			}
+			if cfg.NeedsProgrammaticWindowsMDMEnrollment {
+				receiver.execEnrollFn = func(args WindowsMDMEnrollmentArgs) error {
+					<-chProceed    // will be unblocked only when allowed
+					apiCallCount++ // no need for sync, single-threaded call of this func is guaranteed by the receiver's mutex
+					return apiErr
+				}
+				receiver.execUnenrollFn = func(args WindowsMDMEnrollmentArgs) error {
+					panic("should not be called")
+				}
+			} else {
+				receiver.execUnenrollFn = func(args WindowsMDMEnrollmentArgs) error {
+					<-chProceed    // will be unblocked only when allowed
+					apiCallCount++ // no need for sync, single-threaded call of this func is guaranteed by the receiver's mutex
+					return apiErr
+				}
+				receiver.execEnrollFn = func(args WindowsMDMEnrollmentArgs) error {
+					panic("should not be called")
+				}
+			}
+
+			go func() {
+				// the first call will block in enroll/unenroll func
+				err := receiver.Run(testConfig)
+				require.NoError(t, err)
+			}()
+
+			// wait a little bit to ensure the first `receiver.Run` call runs first.
+			time.Sleep(100 * time.Millisecond)
+
+			// this call will happen while the first call is blocked in
+			// enroll/unenrollfn, so it won't call the API (won't be able to lock the
+			// mutex). However it will still complete successfully without being
+			// blocked by the other call in progress.
+			err := receiver.Run(testConfig)
+			require.NoError(t, err)
+
+			// unblock the first call and wait for it to complete
+			close(chProceed)
+			time.Sleep(100 * time.Millisecond)
+
+			// this next call won't execute the command because of the frequency
+			// restriction (it got called less than N seconds ago)
+			err = receiver.Run(testConfig)
+			require.NoError(t, err)
+
+			// wait for the receiver's frequency to pass
+			time.Sleep(receiver.Frequency)
+
+			// this call executes the command, and it returns the Is Windows Server error
+			apiErr = errIsWindowsServer
+			err = receiver.Run(testConfig)
+			require.NoError(t, err)
+
+			// this next call won't execute the command (both due to frequency and the
+			// detection of windows server)
+			err = receiver.Run(testConfig)
+			require.NoError(t, err)
+
+			// wait for the receiver's frequency to pass
+			time.Sleep(receiver.Frequency)
+
+			// this next call still won't execute the command (due to the detection of
+			// windows server)
+			err = receiver.Run(testConfig)
+			require.NoError(t, err)
+
+			require.Equal(t, 2, apiCallCount) // the initial call and the one that returned errIsWindowsServer after first sleep
+		})
+	}
+}
+
+func TestRunScripts(t *testing.T) {
+	var logBuf bytes.Buffer
+
+	oldLog := log.Logger
+	log.Logger = log.Output(&logBuf)
+	t.Cleanup(func() { log.Logger = oldLog })
+
+	var (
+		callsCount atomic.Int64
+		runFailure error
+		blockRun   chan struct{}
+	)
+
+	mockRun := func(r *scripts.Runner, ids []string) error {
+		callsCount.Add(1)
+		if blockRun != nil {
+			<-blockRun
+		}
+		return runFailure
+	}
+
+	waitForRun := func(t *testing.T, r *runScriptsConfigReceiver) {
+		var ok bool
+		for start := time.Now(); !ok && time.Since(start) < time.Second; {
+			ok = r.mu.TryLock()
+		}
+		require.True(t, ok, "timed out waiting for the lock to become available")
+		r.mu.Unlock()
+	}
+
+	t.Run("no pending scripts", func(t *testing.T) {
+		t.Cleanup(func() { callsCount.Store(0); logBuf.Reset() })
+
+		testConfig := &fleet.OrbitConfig{Notifications: fleet.OrbitConfigNotifications{
+			PendingScriptExecutionIDs: nil,
+		}}
+
+		runner := &runScriptsConfigReceiver{
+			runScriptsFn: mockRun,
+		}
+		err := runner.Run(testConfig)
+		require.NoError(t, err) // the dummy receiver never returns an error
+
+		// the lock should be available because no goroutine was started
+		require.True(t, runner.mu.TryLock())
+		require.Zero(t, callsCount.Load()) // no calls to execute scripts
+		require.Empty(t, logBuf.String())  // no logs written
+	})
+
+	t.Run("pending scripts succeed", func(t *testing.T) {
+		t.Cleanup(func() { callsCount.Store(0); logBuf.Reset() })
+
+		testConfig := &fleet.OrbitConfig{Notifications: fleet.OrbitConfigNotifications{
+			PendingScriptExecutionIDs: []string{"a", "b", "c"},
+		}}
+
+		runner := &runScriptsConfigReceiver{
+			runScriptsFn: mockRun,
+		}
+		err := runner.Run(testConfig)
+		require.NoError(t, err) // the dummy receiver never returns an error
+
+		waitForRun(t, runner)
+		require.Equal(t, int64(1), callsCount.Load()) // all scripts executed in a single run
+		require.Contains(t, logBuf.String(), "received notification to run scripts [a b c]")
+		require.Contains(t, logBuf.String(), "running scripts [a b c] succeeded")
+	})
+
+	t.Run("pending scripts failed", func(t *testing.T) {
+		t.Cleanup(func() { callsCount.Store(0); logBuf.Reset(); runFailure = nil })
+
+		testConfig := &fleet.OrbitConfig{Notifications: fleet.OrbitConfigNotifications{
+			PendingScriptExecutionIDs: []string{"a", "b", "c"},
+		}}
+
+		runFailure = io.ErrUnexpectedEOF
+		runner := &runScriptsConfigReceiver{
+			runScriptsFn: mockRun,
+		}
+
+		err := runner.Run(testConfig)
+		require.NoError(t, err) // the dummy receiver never returns an error
+
+		waitForRun(t, runner)
+		require.Equal(t, int64(1), callsCount.Load()) // all scripts executed in a single run
+		require.Contains(t, logBuf.String(), "received notification to run scripts [a b c]")
+		require.Contains(t, logBuf.String(), "running scripts failed")
+		require.Contains(t, logBuf.String(), io.ErrUnexpectedEOF.Error())
+	})
+
+	t.Run("concurrent run prevented", func(t *testing.T) {
+		t.Cleanup(func() { callsCount.Store(0); logBuf.Reset(); blockRun = nil })
+
+		testConfig := &fleet.OrbitConfig{Notifications: fleet.OrbitConfigNotifications{
+			PendingScriptExecutionIDs: []string{"a", "b", "c"},
+		}}
+
+		blockRun = make(chan struct{})
+		runner := &runScriptsConfigReceiver{
+			runScriptsFn: mockRun,
+		}
+
+		err := runner.Run(testConfig)
+		require.NoError(t, err) // the dummy receiver never returns an error
+
+		// call it again, while the previous run is still running
+		err = runner.Run(testConfig)
+		require.NoError(t, err) // the dummy receiver never returns an error
+
+		// unblock the initial run
+		close(blockRun)
+
+		waitForRun(t, runner)
+		require.Equal(t, int64(1), callsCount.Load()) // only called once because of mutex
+		require.Contains(t, logBuf.String(), "received notification to run scripts [a b c]")
+		require.Contains(t, logBuf.String(), "running scripts [a b c] succeeded")
+	})
+
+	t.Run("dynamic enabling of scripts", func(t *testing.T) {
+		t.Cleanup(logBuf.Reset)
+
+		testConfig := &fleet.OrbitConfig{Notifications: fleet.OrbitConfigNotifications{
+			PendingScriptExecutionIDs: []string{"a"},
+		}}
+
+		var (
+			scriptsEnabledCalls []bool
+			dynamicEnabled      atomic.Bool
+
+			dynamicInterval = 300 * time.Millisecond
+		)
+
+		runner := &runScriptsConfigReceiver{
+			ScriptsExecutionEnabled: false,
+			runScriptsFn: func(r *scripts.Runner, s []string) error {
+				scriptsEnabledCalls = append(scriptsEnabledCalls, r.ScriptExecutionEnabled)
+				return nil
+			},
+			testGetFleetdConfig: func() (*fleet.MDMAppleFleetdConfig, error) {
+				return &fleet.MDMAppleFleetdConfig{
+					EnableScripts: dynamicEnabled.Load(),
+				}, nil
+			},
+			dynamicScriptsEnabledCheckInterval: dynamicInterval,
+		}
+
+		// the static Scripts Enabled flag is false, so it relies on the dynamic check
+		runner.runDynamicScriptsEnabledCheck()
+
+		// first call, scripts are disabled
+		err := runner.Run(testConfig)
+		require.NoError(t, err) // the dummy receiver never returns an error
+		waitForRun(t, runner)
+
+		// swap scripts execution to true and wait to ensure the dynamic check
+		// did run.
+		dynamicEnabled.Store(true)
+		time.Sleep(dynamicInterval + 100*time.Millisecond)
+
+		// second call, scripts are enabled (change exec ID to "b")
+		testConfig.Notifications.PendingScriptExecutionIDs[0] = "b"
+		err = runner.Run(testConfig)
+		require.NoError(t, err) // the dummy receiver never returns an error
+		waitForRun(t, runner)
+
+		// swap scripts execution back to false and wait to ensure the dynamic
+		// check did run.
+		dynamicEnabled.Store(false)
+		time.Sleep(dynamicInterval + 100*time.Millisecond)
+
+		// third call, scripts are disabled (change exec ID to "c")
+		testConfig.Notifications.PendingScriptExecutionIDs[0] = "c"
+		err = runner.Run(testConfig)
+		require.NoError(t, err) // the dummy receiver never returns an error
+		waitForRun(t, runner)
+
+		// validate the Scripts Enabled flags that were passed to the runScriptsFn
+		require.Equal(t, []bool{false, true, false}, scriptsEnabledCalls)
+		require.Contains(t, logBuf.String(), "received notification to run scripts [a]")
+		require.Contains(t, logBuf.String(), "running scripts [a] succeeded")
+		require.Contains(t, logBuf.String(), "received notification to run scripts [b]")
+		require.Contains(t, logBuf.String(), "running scripts [b] succeeded")
+		require.Contains(t, logBuf.String(), "received notification to run scripts [c]")
+		require.Contains(t, logBuf.String(), "running scripts [c] succeeded")
+	})
+}
+
+type mockDiskEncryptionKeySetter struct {
+	SetOrUpdateDiskEncryptionKeyImpl    func(diskEncryptionStatus fleet.OrbitHostDiskEncryptionKeyPayload) error
+	SetOrUpdateDiskEncryptionKeyInvoked bool
+	ProtectionOutcome                   fleet.DiskEncryptionProtectionOutcome
+	ProtectionClientError               string
+	ProtectionReportInvoked             bool
+	Capabilities                        fleet.CapabilityMap
+	GetPINDetailsImpl                   func() (pin, requestUUID string, err error)
+	GetPINDetailsCalls                  int
+	SetPINResultImpl                    func(outcome pinOutcome) error
+	PINResults                          []pinOutcome
+}
+
+func (m *mockDiskEncryptionKeySetter) GetServerCapabilities() fleet.CapabilityMap {
+	return m.Capabilities
+}
+
+func (m *mockDiskEncryptionKeySetter) SetOrUpdateDiskEncryptionKey(diskEncryptionStatus fleet.OrbitHostDiskEncryptionKeyPayload) error {
+	m.SetOrUpdateDiskEncryptionKeyInvoked = true
+	return m.SetOrUpdateDiskEncryptionKeyImpl(diskEncryptionStatus)
+}
+
+func (m *mockDiskEncryptionKeySetter) GetDiskEncryptionPINDetails() (string, string, error) {
+	m.GetPINDetailsCalls++
+	return m.GetPINDetailsImpl()
+}
+
+func (m *mockDiskEncryptionKeySetter) SetDiskEncryptionPINResult(requestUUID string, outcome fleet.BitLockerPINRequestStatus,
+	clientError string,
+) error {
+	reported := pinOutcome{requestUUID: requestUUID, outcome: outcome, clientError: clientError}
+	m.PINResults = append(m.PINResults, reported)
+	return m.SetPINResultImpl(reported)
+}
+
+func (m *mockDiskEncryptionKeySetter) SetOrUpdateDiskEncryptionProtection(outcome fleet.DiskEncryptionProtectionOutcome, clientError string) error {
+	m.ProtectionReportInvoked = true
+	m.ProtectionOutcome = outcome
+	m.ProtectionClientError = clientError
+	return nil
+}
+
+func TestBitlockerOperations(t *testing.T) {
+	var logBuf bytes.Buffer
+
+	oldLog := log.Logger
+	log.Logger = log.Output(&logBuf)
+	t.Cleanup(func() { log.Logger = oldLog })
+
+	var (
+		shouldEncrypt          = true
+		shouldFailEncryption   = false
+		shouldFailServerUpdate = false
+		encryptFnCalled        = false
+	)
+
+	clientMock := &mockDiskEncryptionKeySetter{}
+	clientMock.SetOrUpdateDiskEncryptionKeyImpl = func(diskEncryptionStatus fleet.OrbitHostDiskEncryptionKeyPayload) error {
+		if shouldFailServerUpdate {
+			return errors.New("server error")
+		}
+		return nil
+	}
+
+	var rotateKeyFnCalled bool
+	var shouldFailKeyRotation bool
+
+	var enrollReceiver *windowsMDMBitlockerConfigReceiver
+	setupTest := func() {
+		enrollReceiver = &windowsMDMBitlockerConfigReceiver{
+			Frequency:            time.Hour, // doesn't matter for this test
+			encryptionRetryAfter: time.Now().Add(-2 * time.Hour),
+			EncryptionResult:     clientMock,
+			execGetEncryptionStatusFn: func() ([]bitlocker.VolumeStatus, error) {
+				// Default: an ordinary unencrypted host. This has to state C: is fully decrypted.
+				return []bitlocker.VolumeStatus{
+					{DriveVolume: "C:", Status: &bitlocker.EncryptionStatus{ConversionStatus: bitlocker.ConversionStatusFullyDecrypted}},
+				}, nil
+			},
+			execEncryptVolumeFn: func(string) (string, error) {
+				encryptFnCalled = true
+				if shouldFailEncryption {
+					return "", errors.New("error encrypting")
+				}
+
+				return "123456", nil
+			},
+			execResumeConversionFn:    func(string) error { return nil },
+			execHasRecoveryPasswordFn: func(string) (bool, error) { return false, nil },
+			execRotateRecoveryKeyFn: func(string) (string, error) {
+				rotateKeyFnCalled = true
+				if shouldFailKeyRotation {
+					return "", errors.New("error rotating key")
+				}
+				return "rotated-key-789", nil
+			},
+		}
+		shouldEncrypt = true
+		shouldFailEncryption = false
+		shouldFailKeyRotation = false
+		shouldFailServerUpdate = false
+		encryptFnCalled = false
+		rotateKeyFnCalled = false
+		clientMock.SetOrUpdateDiskEncryptionKeyInvoked = false
+		clientMock.ProtectionReportInvoked = false
+		clientMock.ProtectionOutcome = ""
+		clientMock.ProtectionClientError = ""
+		clientMock.Capabilities = fleet.CapabilityMap{fleet.CapabilityWindowsDiskEncryptionErrorKeepsKey: {}}
+		logBuf.Reset()
+	}
+
+	makeConfig := func() *fleet.OrbitConfig {
+		return &fleet.OrbitConfig{
+			Notifications: fleet.OrbitConfigNotifications{
+				EnforceBitLockerEncryption: shouldEncrypt,
+			},
+		}
+	}
+
+	t.Run("bitlocker encryption is performed", func(t *testing.T) {
+		setupTest()
+		// shouldEncrypt defaults to true from setupTest
+		err := enrollReceiver.Run(makeConfig())
+		require.NoError(t, err) // the dummy receiver never returns an error
+	})
+
+	t.Run("bitlocker encryption is not performed when not enforced", func(t *testing.T) {
+		setupTest()
+		shouldEncrypt = false
+		err := enrollReceiver.Run(makeConfig())
+		require.NoError(t, err)
+		require.False(t, encryptFnCalled, "encryption function should not be called when not enforced")
+		require.False(t, rotateKeyFnCalled, "rotate key function should not be called when not enforced")
+	})
+
+	t.Run("bitlocker encryption returns an error", func(t *testing.T) {
+		setupTest()
+		shouldFailEncryption = true
+		err := enrollReceiver.Run(makeConfig())
+		require.NoError(t, err) // the dummy receiver never returns an error
+		require.True(t, encryptFnCalled, "encryption function should have been called")
+	})
+
+	t.Run("encryption skipped based on various current statuses", func(t *testing.T) {
+		setupTest()
+		// Paused conversions are deliberately absent: they are not transient and are handled separately below.
+		statusesToTest := []int32{
+			bitlocker.ConversionStatusDecryptionInProgress,
+			bitlocker.ConversionStatusEncryptionInProgress,
+		}
+
+		for _, status := range statusesToTest {
+			t.Run(fmt.Sprintf("status %d", status), func(t *testing.T) {
+				mockStatus := &bitlocker.EncryptionStatus{ConversionStatus: status}
+				enrollReceiver.execGetEncryptionStatusFn = func() ([]bitlocker.VolumeStatus, error) {
+					return []bitlocker.VolumeStatus{{DriveVolume: "C:", Status: mockStatus}}, nil
+				}
+
+				err := enrollReceiver.Run(makeConfig())
+				require.NoError(t, err)
+				require.Contains(t, logBuf.String(), "skipping encryption as the disk is not available")
+				require.False(t, encryptFnCalled, "encryption function should not be called")
+				logBuf.Reset() // Reset the log buffer for the next iteration
+			})
+		}
+	})
+
+	t.Run("handle misreported decryption error", func(t *testing.T) {
+		setupTest()
+		mockStatus := &bitlocker.EncryptionStatus{ConversionStatus: bitlocker.ConversionStatusFullyDecrypted}
+		enrollReceiver.execGetEncryptionStatusFn = func() ([]bitlocker.VolumeStatus, error) {
+			return []bitlocker.VolumeStatus{{DriveVolume: "C:", Status: mockStatus}}, nil
+		}
+		enrollReceiver.execEncryptVolumeFn = func(string) (string, error) {
+			return "", bitlocker.NewEncryptionError("", bitlocker.ErrorCodeNotDecrypted)
+		}
+
+		err := enrollReceiver.Run(makeConfig())
+		require.NoError(t, err)
+		require.Contains(t, logBuf.String(), "disk encryption failed due to previous unsuccessful attempt, user action required")
+		require.False(t, encryptFnCalled, "encryption function should not be called")
+	})
+
+	t.Run("rotates recovery key if disk already encrypted", func(t *testing.T) {
+		setupTest()
+		mockStatus := &bitlocker.EncryptionStatus{ConversionStatus: bitlocker.ConversionStatusFullyEncrypted}
+		enrollReceiver.execGetEncryptionStatusFn = func() ([]bitlocker.VolumeStatus, error) {
+			return []bitlocker.VolumeStatus{{DriveVolume: "C:", Status: mockStatus}}, nil
+		}
+		err := enrollReceiver.Run(makeConfig())
+		require.NoError(t, err)
+		require.Contains(t, logBuf.String(), "disk is already encrypted, rotating recovery key")
+		require.True(t, clientMock.SetOrUpdateDiskEncryptionKeyInvoked, "should escrow the rotated key")
+		require.True(t, rotateKeyFnCalled, "rotate key function should have been called")
+		require.False(t, encryptFnCalled, "encryption function should not be called")
+	})
+
+	t.Run("reports to the server if key rotation fails", func(t *testing.T) {
+		setupTest()
+		shouldFailKeyRotation = true
+		mockStatus := &bitlocker.EncryptionStatus{ConversionStatus: bitlocker.ConversionStatusFullyEncrypted}
+		enrollReceiver.execGetEncryptionStatusFn = func() ([]bitlocker.VolumeStatus, error) {
+			return []bitlocker.VolumeStatus{{DriveVolume: "C:", Status: mockStatus}}, nil
+		}
+
+		err := enrollReceiver.Run(makeConfig())
+		require.NoError(t, err)
+		require.Contains(t, logBuf.String(), "disk is already encrypted, rotating recovery key")
+		require.Contains(t, logBuf.String(), "recovery key rotation failed")
+		require.True(t, clientMock.SetOrUpdateDiskEncryptionKeyInvoked)
+		require.True(t, rotateKeyFnCalled, "rotate key function should have been called")
+		require.False(t, encryptFnCalled, "encryption function should not be called")
+	})
+
+	// Regression for #51098: an unreadable status must never be read as "not encrypted".
+	t.Run("never encrypts when the status for C: is unreadable", func(t *testing.T) {
+		for _, tc := range []struct {
+			name   string
+			status func() ([]bitlocker.VolumeStatus, error)
+		}{
+			{
+				name: "C: missing from the enumeration",
+				status: func() ([]bitlocker.VolumeStatus, error) {
+					return []bitlocker.VolumeStatus{
+						{DriveVolume: "D:", Status: &bitlocker.EncryptionStatus{ConversionStatus: bitlocker.ConversionStatusFullyDecrypted}},
+					}, nil
+				},
+			},
+			{
+				name: "per-volume read error for C:",
+				status: func() ([]bitlocker.VolumeStatus, error) {
+					return []bitlocker.VolumeStatus{
+						{DriveVolume: "C:", Err: errors.New("execQuery: WMI unavailable")},
+					}, nil
+				},
+			},
+			{
+				name: "whole status call fails",
+				status: func() ([]bitlocker.VolumeStatus, error) {
+					return nil, errors.New("connecting to the volume: WMI unavailable")
+				},
+			},
+		} {
+			t.Run(tc.name, func(t *testing.T) {
+				setupTest()
+				enrollReceiver.execGetEncryptionStatusFn = tc.status
+
+				err := enrollReceiver.Run(makeConfig())
+				require.NoError(t, err)
+				require.False(t, encryptFnCalled, "must not encrypt a volume whose state is unknown")
+				require.False(t, rotateKeyFnCalled, "must not rotate a volume whose state is unknown")
+				require.False(t, clientMock.SetOrUpdateDiskEncryptionKeyInvoked, "must not report a result it did not produce")
+				require.Contains(t, logBuf.String(), "cannot read encryption status")
+			})
+		}
+	})
+
+	// Restoring protection on a volume that is encrypted but unprotected.
+	t.Run("restore bitlocker protection", func(t *testing.T) {
+		statusFor := func(conversion, protection int32) func() ([]bitlocker.VolumeStatus, error) {
+			return func() ([]bitlocker.VolumeStatus, error) {
+				return []bitlocker.VolumeStatus{{
+					DriveVolume: "C:",
+					Status:      &bitlocker.EncryptionStatus{ConversionStatus: conversion, ProtectionStatus: protection},
+				}}, nil
+			}
+		}
+		suspended := statusFor(bitlocker.ConversionStatusFullyEncrypted, bitlocker.ProtectionStatusOff)
+		unreadable := func() ([]bitlocker.VolumeStatus, error) {
+			return []bitlocker.VolumeStatus{{DriveVolume: "C:", Err: errors.New("WMI unavailable")}}, nil
+		}
+		protectionCfg := &fleet.OrbitConfig{
+			Notifications: fleet.OrbitConfigNotifications{EnableBitLockerProtection: true},
+		}
+
+		// wantOutcome empty means the agent must report nothing at all. wantBackoff pins whether protectionRetryAfter is
+		// stamped, which is what stops a host that cannot be repaired from retrying on every config poll.
+		for _, tc := range []struct {
+			name            string
+			status          func() ([]bitlocker.VolumeStatus, error)
+			hasProtector    bool
+			hasProtectorErr error
+			addErr          error
+			enableErr       error
+			restartPending  bool
+			restartErr      error
+			wantAdd         bool
+			wantEnable      bool
+			wantOutcome     fleet.DiskEncryptionProtectionOutcome
+			wantErrContains string
+			wantBackoff     bool
+			// shortBackoff means the retry window must be the success backoff, not the full failure Frequency.
+			shortBackoff bool
+			reason       string
+		}{
+			{
+				name:         "enables protection when a TPM protector already exists",
+				status:       suspended,
+				hasProtector: true,
+				wantEnable:   true,
+				wantOutcome:  fleet.DiskEncryptionProtectionRestored,
+				wantBackoff:  true,
+				shortBackoff: true,
+			},
+			{
+				name:            "reports failure when enabling fails",
+				status:          suspended,
+				hasProtector:    true,
+				enableErr:       errors.New("0x80310000 the volume cannot be unlocked"),
+				wantEnable:      true,
+				wantOutcome:     fleet.DiskEncryptionProtectionFailed,
+				wantErrContains: "cannot be unlocked",
+				wantBackoff:     true,
+			},
+			{
+				name:            "does not enable when the protector cannot be added",
+				status:          suspended,
+				addErr:          errors.New("0x80310066 policy does not permit TPM-only"),
+				wantAdd:         true,
+				wantOutcome:     fleet.DiskEncryptionProtectionFailed,
+				wantErrContains: "policy does not permit TPM-only",
+				wantBackoff:     true,
+				reason:          "enabling without an auto-unlock protector would cause a recovery prompt",
+			},
+			{
+				name:            "reports and backs off when the protector check fails",
+				status:          suspended,
+				hasProtectorErr: errors.New("WMI query failed"),
+				wantOutcome:     fleet.DiskEncryptionProtectionFailed,
+				wantErrContains: "WMI query failed",
+				wantBackoff:     true,
+				reason:          "must not enable without knowing whether the volume can unseal at boot",
+			},
+			{
+				name:           "reports deferred when a restart is pending",
+				status:         suspended,
+				hasProtector:   true,
+				restartPending: true,
+				wantOutcome:    fleet.DiskEncryptionProtectionDeferred,
+				wantBackoff:    true,
+				reason:         "re-sealing before a staged update applies risks a recovery prompt",
+			},
+			{
+				// A deferral promises the volume was left alone, so the protector must not be added first. Adding one
+				// is not itself unsafe, since the later enable re-seals, but it contradicts the reported outcome.
+				name:           "defers without adding a protector when a restart is pending",
+				status:         suspended,
+				restartPending: true,
+				wantOutcome:    fleet.DiskEncryptionProtectionDeferred,
+				wantBackoff:    true,
+				reason:         "a staged restart must stop the repair before the volume is modified",
+			},
+			{
+				// The pending restart is the actionable fact, so it is reported even when the protector state cannot be
+				// read. The earlier ordering surfaced the query failure and lost the deferral.
+				name:            "prefers the deferral over a protector query failure",
+				status:          suspended,
+				hasProtectorErr: errors.New("WMI query failed"),
+				restartPending:  true,
+				wantOutcome:     fleet.DiskEncryptionProtectionDeferred,
+				wantBackoff:     true,
+				reason:          "a staged restart stops the repair before the protector is queried",
+			},
+			{
+				name:            "reports and backs off when the restart check fails",
+				status:          suspended,
+				hasProtector:    true,
+				restartErr:      errors.New("registry unavailable"),
+				wantOutcome:     fleet.DiskEncryptionProtectionFailed,
+				wantErrContains: "registry unavailable",
+				wantBackoff:     true,
+				reason:          "an unknown restart state could still re-seal against stale measurements",
+			},
+			{
+				// Deliberately reports nothing: an unreadable status is not evidence of anything (#51098).
+				name:         "does nothing when the status cannot be read",
+				status:       unreadable,
+				hasProtector: true,
+				wantBackoff:  true,
+			},
+			{
+				// The encrypt flow owns a decrypted volume, and no backoff so the next report is acted on immediately.
+				name:         "does nothing when the volume is not fully encrypted",
+				status:       statusFor(bitlocker.ConversionStatusFullyDecrypted, bitlocker.ProtectionStatusOff),
+				hasProtector: true,
+			},
+			{
+				name:         "does nothing when protection is already on and the volume can unseal at boot",
+				status:       statusFor(bitlocker.ConversionStatusFullyEncrypted, bitlocker.ProtectionStatusOn),
+				hasProtector: true,
+				wantBackoff:  true,
+			},
+			{
+				name:         "adds a protector without re-enabling when protection is already on",
+				status:       statusFor(bitlocker.ConversionStatusFullyEncrypted, bitlocker.ProtectionStatusOn),
+				wantAdd:      true,
+				wantOutcome:  fleet.DiskEncryptionProtectionRestored,
+				wantBackoff:  true,
+				shortBackoff: true,
+				reason:       "protection is already on, so it must not be re-enabled",
+			},
+			{
+				name:           "a pending restart does not defer the repair when protection is already on",
+				status:         statusFor(bitlocker.ConversionStatusFullyEncrypted, bitlocker.ProtectionStatusOn),
+				restartPending: true,
+				wantAdd:        true,
+				wantOutcome:    fleet.DiskEncryptionProtectionRestored,
+				wantBackoff:    true,
+				shortBackoff:   true,
+				reason:         "protection is already on, so it must not be re-enabled",
+			},
+			{
+				name:            "names the missing boot protector when the add fails and protection is already on",
+				status:          statusFor(bitlocker.ConversionStatusFullyEncrypted, bitlocker.ProtectionStatusOn),
+				addErr:          errors.New("0x80310066 policy does not permit TPM-only"),
+				wantAdd:         true,
+				wantOutcome:     fleet.DiskEncryptionProtectionFailed,
+				wantErrContains: "could not add a TPM protector, " + repairCostNoBootProtector,
+				wantBackoff:     true,
+				reason:          "protection is already on, so it must not be re-enabled",
+			},
+		} {
+			t.Run(tc.name, func(t *testing.T) {
+				setupTest()
+				var addCalled, enableCalled bool
+				enrollReceiver.execGetEncryptionStatusFn = tc.status
+				enrollReceiver.execHasBootUnsealProtectorFn = func(string) (bool, error) { return tc.hasProtector, tc.hasProtectorErr }
+				enrollReceiver.execAddTPMProtectorFn = func(string) error { addCalled = true; return tc.addErr }
+				enrollReceiver.execEnableProtectionFn = func(string) error { enableCalled = true; return tc.enableErr }
+				enrollReceiver.restartPendingFn = func() (bool, error) { return tc.restartPending, tc.restartErr }
+
+				require.NoError(t, enrollReceiver.Run(protectionCfg))
+
+				require.Equal(t, tc.wantAdd, addCalled, "adding a TPM protector")
+				require.Equal(t, tc.wantEnable, enableCalled, tc.reason)
+				if tc.wantOutcome == "" {
+					require.False(t, clientMock.ProtectionReportInvoked, "must not report an outcome it could not determine")
+				} else {
+					// The admin needs the real reason, not an inferred one: this is what reaches the disk encryption detail.
+					require.Equal(t, tc.wantOutcome, clientMock.ProtectionOutcome)
+				}
+				if tc.wantErrContains != "" {
+					require.Contains(t, clientMock.ProtectionClientError, tc.wantErrContains)
+				}
+				require.Equal(t, tc.wantBackoff, !enrollReceiver.protectionRetryAfter.IsZero(), "throttling the restore path")
+				if tc.wantBackoff {
+					wait := time.Until(enrollReceiver.protectionRetryAfter)
+					if tc.shortBackoff {
+						require.LessOrEqual(t, wait, protectionSuccessBackoff, "success should back off briefly")
+					} else {
+						require.Greater(t, wait, protectionSuccessBackoff, "a failure should back off for the full frequency")
+					}
+				}
+				// The restore path must never reach the encrypt path, whose first act is deleting every key protector.
+				require.False(t, encryptFnCalled, "restoring protection must never delete key protectors")
+				// setupTest reports no recovery password, which is the case this repair exists for, so every pass that
+				// gets past the protector check rotates and escrows before it adds a protector or enables protection.
+				// The decision itself is covered below.
+				wantRotate := tc.wantEnable || tc.wantAdd
+				require.Equal(t, wantRotate, rotateKeyFnCalled, "rotating the recovery key")
+				require.Equal(t, wantRotate, clientMock.SetOrUpdateDiskEncryptionKeyInvoked, "escrowing the rotated key")
+			})
+		}
+
+		t.Run("rotates only when the recovery password is gone, and stops the repair when it cannot", func(t *testing.T) {
+			for _, tc := range []struct {
+				name string
+				// protectionOn models a volume whose boot protectors were deleted while protection stayed on.
+				protectionOn bool
+				hasKey       bool
+				hasKeyErr    error
+				rotateErr    error
+				escrowErr    error
+				wantRotate   bool
+				wantEnable   bool
+				wantErr      string // empty means the repair is expected to succeed
+			}{
+				{name: "recovery password present, so nothing is rotated", hasKey: true, wantEnable: true},
+				{name: "recovery password missing, so it is rotated", wantRotate: true, wantEnable: true},
+				{name: "unknown counts as missing", hasKeyErr: errors.New("WMI unavailable"), wantRotate: true, wantEnable: true},
+				{
+					name: "a failed rotation stops the repair", rotateErr: errors.New("WMI refused"),
+					wantRotate: true, wantErr: "could not rotate the recovery key, so protection was not re-enabled",
+				},
+				{
+					name: "a failed escrow stops the repair", escrowErr: errors.New("server unreachable"),
+					wantRotate: true, wantErr: "could not send the rotated recovery key to Fleet, so protection was not re-enabled",
+				},
+				{
+					name: "a failed rotation on a protected volume names the missing boot protector", protectionOn: true,
+					rotateErr: errors.New("WMI refused"), wantRotate: true,
+					wantErr: "could not rotate the recovery key, " + repairCostNoBootProtector,
+				},
+				{
+					name: "a failed escrow on a protected volume names the lost recovery key", protectionOn: true,
+					escrowErr: errors.New("server unreachable"), wantRotate: true,
+					wantErr: "could not send the rotated recovery key to Fleet, " + repairCostNoWorkingKey,
+				},
+				{name: "a protected volume is repaired without re-enabling", protectionOn: true, wantRotate: true},
+			} {
+				t.Run(tc.name, func(t *testing.T) {
+					setupTest()
+					var enableCalled, addCalled bool
+					enrollReceiver.execGetEncryptionStatusFn = suspended
+					if tc.protectionOn {
+						enrollReceiver.execGetEncryptionStatusFn = statusFor(bitlocker.ConversionStatusFullyEncrypted, bitlocker.ProtectionStatusOn)
+					}
+					// A protected volume with a boot protector has nothing to repair, so it is modeled without one.
+					enrollReceiver.execHasBootUnsealProtectorFn = func(string) (bool, error) { return !tc.protectionOn, nil }
+					enrollReceiver.execAddTPMProtectorFn = func(string) error { addCalled = true; return nil }
+					enrollReceiver.execHasRecoveryPasswordFn = func(string) (bool, error) { return tc.hasKey, tc.hasKeyErr }
+					enrollReceiver.execRotateRecoveryKeyFn = func(string) (string, error) {
+						rotateKeyFnCalled = true
+						return "rotated-key", tc.rotateErr
+					}
+					enrollReceiver.execEnableProtectionFn = func(string) error { enableCalled = true; return nil }
+					prevEscrow := clientMock.SetOrUpdateDiskEncryptionKeyImpl
+					t.Cleanup(func() { clientMock.SetOrUpdateDiskEncryptionKeyImpl = prevEscrow })
+					clientMock.SetOrUpdateDiskEncryptionKeyImpl = func(fleet.OrbitHostDiskEncryptionKeyPayload) error {
+						return tc.escrowErr
+					}
+
+					require.NoError(t, enrollReceiver.Run(protectionCfg))
+
+					require.Equal(t, tc.wantRotate, rotateKeyFnCalled, "rotating the recovery key")
+					// The escrow is only reached when a rotation produced a key to send.
+					wantEscrow := tc.wantRotate && tc.rotateErr == nil
+					require.Equal(t, wantEscrow, clientMock.SetOrUpdateDiskEncryptionKeyInvoked, "escrowing the rotated key")
+					require.Equal(t, tc.wantEnable, enableCalled, "restoring protection")
+					// The protector is added only after the recovery password is dealt with, because adding it is what stops
+					// the server asking for this repair.
+					require.Equal(t, tc.protectionOn && tc.wantErr == "", addCalled, "adding a TPM protector")
+					if tc.wantErr == "" {
+						require.Equal(t, fleet.DiskEncryptionProtectionRestored, clientMock.ProtectionOutcome)
+					} else {
+						require.Equal(t, fleet.DiskEncryptionProtectionFailed, clientMock.ProtectionOutcome)
+						require.Contains(t, clientMock.ProtectionClientError, tc.wantErr)
+					}
+				})
+			}
+		})
+
+		// On a protected volume, rotating also adds a boot protector.
+		t.Run("retries a failed escrow after the server stops asking for the repair", func(t *testing.T) {
+			setupTest()
+			enrollReceiver.execGetEncryptionStatusFn = statusFor(bitlocker.ConversionStatusFullyEncrypted, bitlocker.ProtectionStatusOn)
+			enrollReceiver.execHasBootUnsealProtectorFn = func(string) (bool, error) { return false, nil }
+			enrollReceiver.execHasRecoveryPasswordFn = func(string) (bool, error) { return false, nil }
+			var rotations int
+			enrollReceiver.execRotateRecoveryKeyFn = func(string) (string, error) { rotations++; return "rotated-key", nil }
+			escrowFails := true
+			var escrowAttempts int
+			var escrowed []string
+			prevEscrow := clientMock.SetOrUpdateDiskEncryptionKeyImpl
+			t.Cleanup(func() { clientMock.SetOrUpdateDiskEncryptionKeyImpl = prevEscrow })
+			clientMock.SetOrUpdateDiskEncryptionKeyImpl = func(p fleet.OrbitHostDiskEncryptionKeyPayload) error {
+				escrowAttempts++
+				if escrowFails {
+					return errors.New("server unreachable")
+				}
+				escrowed = append(escrowed, string(p.EncryptionKey))
+				return nil
+			}
+			noRequestCfg := &fleet.OrbitConfig{}
+
+			require.NoError(t, enrollReceiver.Run(protectionCfg))
+			require.Empty(t, escrowed, "the first pass must fail to escrow")
+			require.Equal(t, "rotated-key", enrollReceiver.pendingRecoveryKey, "the key has to be held for the retry")
+
+			// The failure backoff still applies when nothing is being asked.
+			escrowFails = false
+			require.NoError(t, enrollReceiver.Run(noRequestCfg))
+			require.Equal(t, 1, escrowAttempts, "a retry inside the backoff window must be skipped")
+
+			enrollReceiver.protectionRetryAfter = time.Time{}
+			require.NoError(t, enrollReceiver.Run(noRequestCfg))
+			require.Equal(t, []string{"rotated-key"}, escrowed, "the held key must be escrowed without the server asking")
+			require.Empty(t, enrollReceiver.pendingRecoveryKey, "a successful escrow clears the held key")
+			require.Equal(t, 1, rotations, "retrying the escrow must not rotate again")
+
+			require.NoError(t, enrollReceiver.Run(noRequestCfg))
+			require.Equal(t, 2, escrowAttempts, "with no key held and nothing asked, nothing is sent")
+		})
+
+		t.Run("a failed rotation on a protected volume leaves the boot protector missing so the server keeps asking", func(t *testing.T) {
+			setupTest()
+			enrollReceiver.execGetEncryptionStatusFn = statusFor(bitlocker.ConversionStatusFullyEncrypted, bitlocker.ProtectionStatusOn)
+			enrollReceiver.execHasBootUnsealProtectorFn = func(string) (bool, error) { return false, nil }
+			var addCalled bool
+			enrollReceiver.execAddTPMProtectorFn = func(string) error { addCalled = true; return nil }
+			enrollReceiver.execRotateRecoveryKeyFn = func(string) (string, error) { return "", errors.New("WMI refused") }
+
+			require.NoError(t, enrollReceiver.Run(protectionCfg))
+			require.False(t, addCalled, "adding the protector would stop the server asking while the recovery password is still gone")
+			require.Equal(t, fleet.DiskEncryptionProtectionFailed, clientMock.ProtectionOutcome)
+		})
+
+		t.Run("rotates, then escrows, then adds a TPM protector, then enables", func(t *testing.T) {
+			setupTest()
+			var order []string
+			enrollReceiver.execGetEncryptionStatusFn = suspended
+			enrollReceiver.execHasBootUnsealProtectorFn = func(string) (bool, error) { return false, nil }
+			enrollReceiver.execAddTPMProtectorFn = func(string) error { order = append(order, "add"); return nil }
+			enrollReceiver.execRotateRecoveryKeyFn = func(string) (string, error) { order = append(order, "rotate"); return "k", nil }
+			enrollReceiver.execEnableProtectionFn = func(string) error { order = append(order, "enable"); return nil }
+			prevEscrow := clientMock.SetOrUpdateDiskEncryptionKeyImpl
+			t.Cleanup(func() { clientMock.SetOrUpdateDiskEncryptionKeyImpl = prevEscrow })
+			clientMock.SetOrUpdateDiskEncryptionKeyImpl = func(fleet.OrbitHostDiskEncryptionKeyPayload) error {
+				order = append(order, "escrow")
+				return nil
+			}
+
+			require.NoError(t, enrollReceiver.Run(protectionCfg))
+			// Escrow has to land before protection is enabled. Leaving it out of this assertion is what would let a
+			// regression enable protection on a volume whose recovery key Fleet never received.
+			require.Equal(t, []string{"rotate", "escrow", "add", "enable"}, order)
+		})
+
+		// Rotation puts the new protector on the volume before the escrow is attempted, so a second pass would find a
+		// recovery password, skip rotating, and enable protection on a volume whose key Fleet never received. The key
+		// has to survive the failed escrow and be retried.
+		t.Run("a failed escrow is retried on the next pass without rotating again", func(t *testing.T) {
+			setupTest()
+			var rotations, escrows, enables int
+			escrowFails := true
+			enrollReceiver.execGetEncryptionStatusFn = suspended
+			enrollReceiver.execHasBootUnsealProtectorFn = func(string) (bool, error) { return true, nil }
+			// After the first rotation the volume carries a recovery password again, which is the trap.
+			enrollReceiver.execHasRecoveryPasswordFn = func(string) (bool, error) { return rotations > 0, nil }
+			enrollReceiver.execRotateRecoveryKeyFn = func(string) (string, error) { rotations++; return "rotated-key", nil }
+			enrollReceiver.execEnableProtectionFn = func(string) error { enables++; return nil }
+			prevEscrow := clientMock.SetOrUpdateDiskEncryptionKeyImpl
+			t.Cleanup(func() { clientMock.SetOrUpdateDiskEncryptionKeyImpl = prevEscrow })
+			var escrowed string
+			clientMock.SetOrUpdateDiskEncryptionKeyImpl = func(p fleet.OrbitHostDiskEncryptionKeyPayload) error {
+				escrows++
+				if escrowFails {
+					return errors.New("server unreachable")
+				}
+				escrowed = string(p.EncryptionKey)
+				return nil
+			}
+
+			require.NoError(t, enrollReceiver.Run(protectionCfg))
+			require.Equal(t, 1, rotations)
+			require.Equal(t, 1, escrows)
+			require.Zero(t, enables, "protection must not be enabled before the key reaches Fleet")
+			require.Equal(t, "rotated-key", enrollReceiver.pendingRecoveryKey, "the key must survive a failed escrow")
+
+			// Second pass: the server keeps asking because protection is still off.
+			escrowFails = false
+			enrollReceiver.protectionRetryAfter = time.Time{}
+			require.NoError(t, enrollReceiver.Run(protectionCfg))
+
+			require.Equal(t, 1, rotations, "must not rotate a second time and orphan the first key")
+			require.Equal(t, 2, escrows)
+			require.Equal(t, "rotated-key", escrowed, "the key Fleet receives must be the one on the volume")
+			require.Equal(t, 1, enables, "protection is restored only once the key is escrowed")
+			require.Empty(t, enrollReceiver.pendingRecoveryKey, "the held key is cleared after a successful escrow")
+		})
+
+		t.Run("skips a second attempt inside the throttle window", func(t *testing.T) {
+			setupTest()
+			var enableCalls int
+			enrollReceiver.execGetEncryptionStatusFn = suspended
+			enrollReceiver.execHasBootUnsealProtectorFn = func(string) (bool, error) { return true, nil }
+			enrollReceiver.execEnableProtectionFn = func(string) error { enableCalls++; return nil }
+
+			require.NoError(t, enrollReceiver.Run(protectionCfg))
+			require.Equal(t, 1, enableCalls)
+
+			require.NoError(t, enrollReceiver.Run(protectionCfg))
+			require.Equal(t, 1, enableCalls, "a second attempt inside the throttle window must be skipped")
+			require.Contains(t, logBuf.String(), "skipped BitLocker protection restore, next attempt after")
+		})
+	})
+
+	t.Run("encryption skipped while the success backoff is running", func(t *testing.T) {
+		setupTest()
+		enrollReceiver.encryptionRetryAfter = time.Now().Add(30 * time.Minute)
+		enrollReceiver.Frequency = 1 * time.Hour
+
+		err := enrollReceiver.Run(makeConfig())
+		require.NoError(t, err)
+		require.Contains(t, logBuf.String(), "skipped BitLocker encryption, next attempt after")
+		require.False(t, encryptFnCalled, "encryption function should not be called")
+	})
+
+	t.Run("successful fleet server update", func(t *testing.T) {
+		setupTest()
+		shouldFailEncryption = false
+		mockStatus := &bitlocker.EncryptionStatus{ConversionStatus: bitlocker.ConversionStatusFullyDecrypted}
+		enrollReceiver.execGetEncryptionStatusFn = func() ([]bitlocker.VolumeStatus, error) {
+			return []bitlocker.VolumeStatus{{DriveVolume: "C:", Status: mockStatus}}, nil
+		}
+
+		err := enrollReceiver.Run(makeConfig())
+		require.NoError(t, err)
+		require.True(t, clientMock.SetOrUpdateDiskEncryptionKeyInvoked)
+		require.True(t, encryptFnCalled, "encryption function should have been called")
+	})
+
+	t.Run("failed fleet server update", func(t *testing.T) {
+		setupTest()
+		shouldFailEncryption = false
+		shouldFailServerUpdate = true
+		mockStatus := &bitlocker.EncryptionStatus{ConversionStatus: bitlocker.ConversionStatusFullyDecrypted}
+		enrollReceiver.execGetEncryptionStatusFn = func() ([]bitlocker.VolumeStatus, error) {
+			return []bitlocker.VolumeStatus{{DriveVolume: "C:", Status: mockStatus}}, nil
+		}
+
+		err := enrollReceiver.Run(makeConfig())
+		require.NoError(t, err)
+		require.Contains(t, logBuf.String(), "failed to send encryption result to Fleet Server")
+		require.True(t, clientMock.SetOrUpdateDiskEncryptionKeyInvoked)
+		require.True(t, encryptFnCalled, "encryption function should have been called")
+	})
+
+	t.Run("failed escrow caches key for retry", func(t *testing.T) {
+		setupTest()
+		shouldFailServerUpdate = true
+		retryAfterBefore := enrollReceiver.encryptionRetryAfter
+		mockStatus := &bitlocker.EncryptionStatus{ConversionStatus: bitlocker.ConversionStatusFullyEncrypted}
+		enrollReceiver.execGetEncryptionStatusFn = func() ([]bitlocker.VolumeStatus, error) {
+			return []bitlocker.VolumeStatus{{DriveVolume: "C:", Status: mockStatus}}, nil
+		}
+
+		// First run: rotation succeeds but escrow fails, key should be cached
+		err := enrollReceiver.Run(makeConfig())
+		require.NoError(t, err)
+		require.True(t, rotateKeyFnCalled, "rotate key function should have been called")
+		require.Equal(t, "rotated-key-789", enrollReceiver.pendingRecoveryKey, "key should be cached after failed escrow")
+		require.Equal(t, retryAfterBefore, enrollReceiver.encryptionRetryAfter, "a failed escrow must not start the success backoff")
+	})
+
+	t.Run("cached key retried without re-rotating", func(t *testing.T) {
+		setupTest()
+		shouldFailServerUpdate = true
+		mockStatus := &bitlocker.EncryptionStatus{ConversionStatus: bitlocker.ConversionStatusFullyEncrypted}
+		enrollReceiver.execGetEncryptionStatusFn = func() ([]bitlocker.VolumeStatus, error) {
+			return []bitlocker.VolumeStatus{{DriveVolume: "C:", Status: mockStatus}}, nil
+		}
+
+		// First run: rotation succeeds, escrow fails, key cached
+		err := enrollReceiver.Run(makeConfig())
+		require.NoError(t, err)
+		require.True(t, rotateKeyFnCalled)
+		require.Equal(t, "rotated-key-789", enrollReceiver.pendingRecoveryKey)
+
+		// Second run: escrow succeeds, key cleared, no re-rotation
+		rotateKeyFnCalled = false
+		encryptFnCalled = false
+		shouldFailServerUpdate = false
+		logBuf.Reset()
+
+		err = enrollReceiver.Run(makeConfig())
+		require.NoError(t, err)
+		require.Contains(t, logBuf.String(), "retrying escrow of previously rotated recovery key")
+		require.False(t, rotateKeyFnCalled, "should NOT rotate again")
+		require.False(t, encryptFnCalled, "should NOT encrypt again")
+		require.Empty(t, enrollReceiver.pendingRecoveryKey, "cached key should be cleared after successful escrow")
+		require.True(t, enrollReceiver.encryptionRetryAfter.After(time.Now()), "a successful escrow must start the success backoff")
+	})
+
+	t.Run("cached key is still escrowed when the status is unreadable", func(t *testing.T) {
+		setupTest()
+		shouldFailServerUpdate = true
+		mockStatus := &bitlocker.EncryptionStatus{ConversionStatus: bitlocker.ConversionStatusFullyEncrypted}
+		enrollReceiver.execGetEncryptionStatusFn = func() ([]bitlocker.VolumeStatus, error) {
+			return []bitlocker.VolumeStatus{{DriveVolume: "C:", Status: mockStatus}}, nil
+		}
+
+		require.NoError(t, enrollReceiver.Run(makeConfig()))
+		require.Equal(t, "rotated-key-789", enrollReceiver.pendingRecoveryKey)
+
+		// Escrow is a server call that touches no disk state, so an unreadable volume status must not strand a key that
+		// already exists on disk but that Fleet does not hold yet.
+		shouldFailServerUpdate = false
+		rotateKeyFnCalled, encryptFnCalled = false, false
+		enrollReceiver.execGetEncryptionStatusFn = func() ([]bitlocker.VolumeStatus, error) {
+			return []bitlocker.VolumeStatus{{DriveVolume: "C:", Err: errors.New("WMI unavailable")}}, nil
+		}
+
+		require.NoError(t, enrollReceiver.Run(makeConfig()))
+		require.Empty(t, enrollReceiver.pendingRecoveryKey, "cached key must be escrowed even when WMI is down")
+		require.False(t, rotateKeyFnCalled, "must not rotate against an unreadable volume")
+		require.False(t, encryptFnCalled, "must not encrypt against an unreadable volume")
+	})
+
+	// A running conversion finishes on its own, so waiting is correct. A paused one never does.
+	t.Run("conversion status decides whether to wait, resume, or report", func(t *testing.T) {
+		for _, tc := range []struct {
+			name        string
+			conversion  int32
+			resumeErr   error
+			wantResume  bool
+			wantBackoff bool
+			// serverDiscardsKey models a server too old to record an error without wiping the stored key.
+			serverDiscardsKey bool
+			// Substrings the reported reason must contain. Empty means nothing is reported at all.
+			wantReport []string
+		}{
+			{name: "encryption in progress waits", conversion: bitlocker.ConversionStatusEncryptionInProgress},
+			{name: "decryption in progress waits", conversion: bitlocker.ConversionStatusDecryptionInProgress},
+			{
+				name: "encryption paused is resumed", conversion: bitlocker.ConversionStatusEncryptionPaused,
+				wantResume: true, wantBackoff: true,
+			},
+			{
+				name: "a failed resume is reported", conversion: bitlocker.ConversionStatusEncryptionPaused,
+				resumeErr: errors.New("WMI refused"), wantResume: true, wantBackoff: true,
+				wantReport: []string{"encryption is paused", "WMI refused"},
+			},
+			{
+				name: "decryption paused is reported, never resumed", conversion: bitlocker.ConversionStatusDecryptionPaused,
+				wantBackoff: true, wantReport: []string{"decryption is paused"},
+			},
+			{
+				// A server without the capability overwrites the escrowed key with the empty value this report carries,
+				// so staying silent leaves the admin with a key rather than none.
+				name: "nothing is reported to a server that would discard the key", conversion: bitlocker.ConversionStatusDecryptionPaused,
+				serverDiscardsKey: true, wantBackoff: true,
+			},
+			{
+				name: "a failed resume is not reported to a server that would discard the key", conversion: bitlocker.ConversionStatusEncryptionPaused,
+				resumeErr: errors.New("WMI refused"), serverDiscardsKey: true, wantResume: true, wantBackoff: true,
+			},
+		} {
+			t.Run(tc.name, func(t *testing.T) {
+				setupTest()
+				if tc.serverDiscardsKey {
+					clientMock.Capabilities = fleet.CapabilityMap{}
+				}
+				var resumeCalled bool
+				enrollReceiver.execResumeConversionFn = func(string) error { resumeCalled = true; return tc.resumeErr }
+				enrollReceiver.execGetEncryptionStatusFn = func() ([]bitlocker.VolumeStatus, error) {
+					return []bitlocker.VolumeStatus{
+						{DriveVolume: "C:", Status: &bitlocker.EncryptionStatus{ConversionStatus: tc.conversion}},
+					}, nil
+				}
+				var reported string
+				prevEscrow := clientMock.SetOrUpdateDiskEncryptionKeyImpl
+				t.Cleanup(func() { clientMock.SetOrUpdateDiskEncryptionKeyImpl = prevEscrow })
+				clientMock.SetOrUpdateDiskEncryptionKeyImpl = func(p fleet.OrbitHostDiskEncryptionKeyPayload) error {
+					reported = p.ClientError
+					return nil
+				}
+
+				enrollReceiver.encryptionRetryAfter = time.Time{}
+				require.NoError(t, enrollReceiver.Run(makeConfig()))
+
+				require.Equal(t, tc.wantResume, resumeCalled, "resuming the conversion")
+				require.Equal(t, tc.wantBackoff, enrollReceiver.encryptionRetryAfter.After(time.Now()),
+					"a paused volume must not be retried on every config poll")
+				// Whatever the state, a conversion in flight must never reach the encrypt or rotate paths.
+				require.False(t, encryptFnCalled, "encrypt")
+				require.False(t, rotateKeyFnCalled, "rotate")
+				for _, want := range tc.wantReport {
+					require.Contains(t, reported, want)
+				}
+				if len(tc.wantReport) == 0 {
+					require.Empty(t, reported, "nothing should be reported")
+				}
+			})
+		}
+	})
+}
+
+func TestWindowsMDMSync(t *testing.T) {
+	var logBuf bytes.Buffer
+	oldLog := log.Logger
+	log.Logger = log.Output(&logBuf)
+	t.Cleanup(func() { log.Logger = oldLog })
+
+	syncCfg := func(req bool) *fleet.OrbitConfig {
+		return &fleet.OrbitConfig{Notifications: fleet.OrbitConfigNotifications{WindowsMDMSyncRequest: req}}
+	}
+
+	// newCounting builds a receiver whose sync increments calls and returns err: the common shape for most subtests below.
+	newCounting := func(freq time.Duration, err error) (*windowsMDMSyncConfigReceiver, *atomic.Int32) {
+		var calls atomic.Int32
+		r := &windowsMDMSyncConfigReceiver{Frequency: freq, execSyncFn: func() error { calls.Add(1); return err }}
+		return r, &calls
+	}
+
+	// The sync runs in a background goroutine that holds w.mu until it finishes. waitIdle blocks until that goroutine has released the
+	// lock, so afterwards the test can read the call counter, lastRun, and the shared log buffer without racing the goroutine's writes.
+	// Subtests must stay sequential (no t.Parallel): they share logBuf and the global log.Logger.
+	waitIdle := func(t *testing.T, r *windowsMDMSyncConfigReceiver) {
+		t.Helper()
+		require.Eventually(t, func() bool {
+			if r.mu.TryLock() {
+				r.mu.Unlock()
+				return true
+			}
+			return false
+		}, 2*time.Second, time.Millisecond)
+	}
+
+	// runSync delivers cfg and blocks until any spawned sync goroutine has finished.
+	runSync := func(t *testing.T, r *windowsMDMSyncConfigReceiver, req bool) {
+		t.Helper()
+		require.NoError(t, r.Run(syncCfg(req)))
+		waitIdle(t, r)
+	}
+
+	t.Run("no sync request does not trigger", func(t *testing.T) {
+		logBuf.Reset()
+		r, calls := newCounting(time.Hour, nil)
+		runSync(t, r, false)
+		require.Equal(t, int32(0), calls.Load())
+	})
+
+	t.Run("sync request triggers once and records the run", func(t *testing.T) {
+		logBuf.Reset()
+		r, calls := newCounting(time.Hour, nil)
+		runSync(t, r, true)
+		require.Equal(t, int32(1), calls.Load())
+		require.False(t, r.lastRun.IsZero(), "a successful sync must record lastRun")
+	})
+
+	t.Run("second run within frequency is throttled", func(t *testing.T) {
+		logBuf.Reset()
+		r, calls := newCounting(time.Hour, nil)
+		runSync(t, r, true)
+		runSync(t, r, true)
+		require.Equal(t, int32(1), calls.Load(), "second run within Frequency should be throttled")
+	})
+
+	t.Run("not throttled once frequency elapsed", func(t *testing.T) {
+		logBuf.Reset()
+		r, calls := newCounting(0, nil)
+		runSync(t, r, true)
+		time.Sleep(time.Millisecond)
+		runSync(t, r, true)
+		require.Equal(t, int32(2), calls.Load())
+	})
+
+	t.Run("sync already in flight is dropped", func(t *testing.T) {
+		logBuf.Reset()
+		var calls atomic.Int32
+		release, started := make(chan struct{}), make(chan struct{})
+		r := &windowsMDMSyncConfigReceiver{Frequency: 0, execSyncFn: func() error {
+			calls.Add(1)
+			close(started)
+			<-release // hold w.mu so a concurrent Run observes TryLock failing
+			return nil
+		}}
+		require.NoError(t, r.Run(syncCfg(true))) // returns immediately; the sync goroutine now holds w.mu
+		<-started
+		require.NoError(t, r.Run(syncCfg(true))) // a sync is in flight, so this attempt must be dropped, not queued
+		require.Equal(t, int32(1), calls.Load(), "a second sync must not start while one is in flight")
+		close(release)
+		waitIdle(t, r)
+		require.Equal(t, int32(1), calls.Load())
+	})
+
+	t.Run("failure does not set lastRun and retries on next run", func(t *testing.T) {
+		logBuf.Reset()
+		r, calls := newCounting(time.Hour, io.ErrUnexpectedEOF)
+		runSync(t, r, true)
+		runSync(t, r, true)
+		require.Equal(t, int32(2), calls.Load(), "failed sync should not be throttled on the next run")
+		require.True(t, r.lastRun.IsZero(), "lastRun must remain unset after failures")
+		require.Contains(t, logBuf.String(), "triggering on-demand Windows MDM sync failed")
+	})
+}

@@ -1,0 +1,346 @@
+import { AxiosError, AxiosResponse } from "axios";
+import { isBefore } from "date-fns";
+import React, { useContext, useEffect, useState, useCallback } from "react";
+import { ErrorBoundary } from "react-error-boundary";
+import { useQuery } from "react-query";
+import { InjectedRouter } from "react-router";
+
+import Spinner from "components/Spinner";
+import ToastNotification from "components/ToastNotification";
+import { AppContext } from "context/app";
+import PolicyProvider from "context/policy";
+import QueryProvider from "context/query";
+import TableProvider from "context/table";
+import useDeepEffect from "hooks/useDeepEffect";
+import ErrorPageLayout from "layouts/ErrorPageLayout";
+// @ts-ignore
+import Fleet403 from "pages/errors/Fleet403";
+// @ts-ignore
+import Fleet404 from "pages/errors/Fleet404";
+// @ts-ignore
+import Fleet500 from "pages/errors/Fleet500";
+import page_titles from "router/page_titles";
+import PATHS from "router/paths";
+import configAPI from "services/entities/config";
+import hostCountAPI from "services/entities/host_count";
+import mdmAndroidAPI from "services/entities/mdm_android";
+import mdmAppleAPI, {
+  IGetVppTokensResponse,
+} from "services/entities/mdm_apple";
+import mdmAppleBMAPI, {
+  IGetAbTokensResponse,
+} from "services/entities/mdm_apple_bm";
+import usersAPI from "services/entities/users";
+import authToken from "utilities/auth_token";
+import { DEFAULT_USE_QUERY_OPTIONS } from "utilities/constants";
+import { QueryParams } from "utilities/url";
+
+interface IAppProps {
+  children: JSX.Element;
+  router: InjectedRouter;
+  location?: {
+    pathname: string;
+    search: string;
+    hash?: string;
+    query: QueryParams;
+  };
+}
+
+interface RecordWithRenewDate {
+  renew_date: string;
+}
+
+const GUARANTEED_PAST_DATE = "2000-01-01T01:00:00Z";
+
+// TODO: add tests for this function
+export const getEarliestExpiry = (records: RecordWithRenewDate[]): string => {
+  const earliest = records.reduce((acc, record) => {
+    const renewDate = new Date(record.renew_date);
+    return isBefore(acc, renewDate) ? acc : renewDate;
+  }, new Date(NaN));
+
+  if (isNaN(earliest.valueOf())) {
+    // this should never happen assuming the API always returns valid dates, but just in case we'll
+    // return a guaranteed past date and log a warning to aid debugging
+    console.warn("No valid renew dates found, returning guaranteed past date.");
+    return GUARANTEED_PAST_DATE;
+  }
+
+  return earliest.toISOString();
+};
+
+const baseClass = "app";
+
+const App = ({ children, location, router }: IAppProps): JSX.Element => {
+  const {
+    config,
+    currentUser,
+    isGlobalAdmin,
+    isGlobalObserver,
+    isOnlyObserver,
+    isAnyTeamMaintainerOrTeamAdmin,
+    setAvailableTeams,
+    setUserSettings,
+    setCurrentUser,
+    setConfig,
+    setEnrollSecret,
+    setAndroidEnterpriseDeleted,
+    setABMExpiry,
+    setAPNsExpiry,
+    setVppExpiry,
+    setSandboxExpiry,
+    setNoSandboxHosts,
+    isPremiumTier,
+  } = useContext(AppContext);
+
+  const [isLoading, setIsLoading] = useState(false);
+
+  // We will do a series of API calls to get the data that we need to display
+  // warnings to the user about various token expirations.
+
+  useQuery(["android_enterprise"], () => mdmAndroidAPI.getAndroidEnterprise(), {
+    ...DEFAULT_USE_QUERY_OPTIONS,
+    retry: false,
+    enabled: !!isGlobalAdmin && !!config?.mdm.android_enabled_and_configured,
+    onSuccess: () => {
+      setAndroidEnterpriseDeleted(false);
+    },
+    onError: (error: AxiosError) => {
+      // Only set androidEnterpriseDeleted for 404 errors (actual deletion)
+      // Don't set it for 403 errors (credential/permission issues)
+      // Check both error.response?.status and error.status for different error formats
+      const statusCode = error.response?.status || error.status;
+      if (statusCode === 404) {
+        setAndroidEnterpriseDeleted(true);
+      } else {
+        setAndroidEnterpriseDeleted(false);
+      }
+    },
+  });
+
+  // Get the Apple Business (AB) tokens
+  useQuery<IGetAbTokensResponse, AxiosError>(
+    ["ab_tokens"],
+    () => mdmAppleBMAPI.getTokens(),
+    {
+      ...DEFAULT_USE_QUERY_OPTIONS,
+      enabled:
+        !!isGlobalAdmin &&
+        !!config?.mdm.enabled_and_configured &&
+        !!isPremiumTier,
+      onSuccess: ({ ab_tokens }) => {
+        // Always update the context, even when the list is empty (e.g., the
+        // last token was deleted) -- otherwise stale expiry/banner state from
+        // a previous non-empty response would linger indefinitely.
+        if (ab_tokens.length === 0) {
+          setABMExpiry({
+            earliestExpiry: "",
+            needsAbmTermsRenewal: false,
+            hasInvalidABMToken: false,
+            invalidAbmTokenOrgNames: [],
+          });
+          return;
+        }
+
+        setABMExpiry({
+          earliestExpiry: getEarliestExpiry(ab_tokens),
+          needsAbmTermsRenewal: ab_tokens.some((token) => token.terms_expired),
+          hasInvalidABMToken: ab_tokens.some((token) => token.token_invalid),
+          invalidAbmTokenOrgNames: ab_tokens
+            .filter((token) => token.token_invalid)
+            .map((token) => token.org_name),
+        });
+      },
+      // TODO: Do we need to catch and check for a 400 status code? The old
+      // API behaved this way when the token is already expired or invalid.
+      onError: (err) => {
+        if (err.status === 400) {
+          setABMExpiry({
+            earliestExpiry: GUARANTEED_PAST_DATE,
+            needsAbmTermsRenewal: true, // TODO: if order of precedence for banners changes, we may need to upate this
+            hasInvalidABMToken: false,
+            invalidAbmTokenOrgNames: [],
+          });
+        }
+      },
+    }
+  );
+
+  // Get the Apple Push Notification token expiration date
+  useQuery(["apns"], () => mdmAppleAPI.getAppleAPNInfo(), {
+    ...DEFAULT_USE_QUERY_OPTIONS,
+    enabled: !!isGlobalAdmin && !!config?.mdm.enabled_and_configured,
+    onSuccess: (data) => {
+      setAPNsExpiry(data.renew_date);
+    },
+  });
+
+  // Get the Apple VPP token expiration date
+  useQuery<IGetVppTokensResponse>(
+    ["vpp_tokens"],
+    () => mdmAppleAPI.getVppTokens(),
+    {
+      ...DEFAULT_USE_QUERY_OPTIONS,
+      enabled:
+        !!isGlobalAdmin &&
+        !!config?.mdm.enabled_and_configured &&
+        !!isPremiumTier,
+      onSuccess: ({ vpp_tokens }) => {
+        vpp_tokens.length && setVppExpiry(getEarliestExpiry(vpp_tokens));
+      },
+    }
+  );
+
+  const fetchConfig = useCallback(async () => {
+    try {
+      const configResponse = await configAPI.loadAll();
+      if (configResponse.sandbox_enabled) {
+        const timestamp = await configAPI.loadSandboxExpiry();
+        setSandboxExpiry(timestamp as string);
+        const hostCount = await hostCountAPI.load({});
+        const noSandboxHosts = hostCount.count === 0;
+        setNoSandboxHosts(noSandboxHosts);
+      }
+      setConfig(configResponse);
+    } catch (error) {
+      console.error(error);
+      return false;
+    } finally {
+      setIsLoading(false);
+    }
+    return true;
+  }, [setConfig, setSandboxExpiry, setNoSandboxHosts]);
+
+  const fetchCurrentUser = useCallback(async () => {
+    try {
+      const { user, available_teams, settings } = await usersAPI.me();
+      setCurrentUser(user);
+      setAvailableTeams(user, available_teams);
+      setUserSettings(settings);
+      fetchConfig();
+    } catch (error) {
+      if (
+        // reseting a user's password requires the current token
+        location?.pathname.includes("/login/reset") ||
+        // these errors can occur when user refreshes their page at certain intervals,
+        // in which case we don't want to log them out
+        (typeof error === "string" &&
+          // in Firefox and Chrome, this error is "Request aborted"
+          // in Safari, it's "Network Error"
+          error.match(/request aborted|network error/i))
+      ) {
+        return true;
+      }
+      authToken.remove();
+      // if this is not the device user page,
+      // redirect to login
+      if (!location?.pathname.includes("/device/")) {
+        window.location.href = PATHS.LOGIN;
+      }
+    }
+    return true;
+  }, [
+    location?.pathname,
+    setCurrentUser,
+    setAvailableTeams,
+    setUserSettings,
+    fetchConfig,
+  ]);
+
+  useEffect(() => {
+    // Skip on `/logout`: this request races the session-destroy call, and
+    // a 401 back here triggers the hard-reload branch below, which flashes
+    // the viewport white in dark mode.
+    if (
+      authToken.get() &&
+      !location?.pathname.includes("/device/") &&
+      !location?.pathname.includes("/logout")
+    ) {
+      fetchCurrentUser();
+    }
+  }, [location?.pathname, fetchCurrentUser]);
+
+  // Updates title that shows up on browser tabs
+  useEffect(() => {
+    // Also applies title to subpaths such as settings/organization/webaddress
+    // TODO - handle different kinds of paths from PATHS - string, function w/params
+    const curTitle = page_titles.find((item) =>
+      location?.pathname.startsWith(item.path)
+    );
+
+    if (curTitle && curTitle.title) {
+      document.title = curTitle.title;
+    }
+  }, [location?.pathname, config]);
+
+  useDeepEffect(() => {
+    const canGetEnrollSecret =
+      currentUser &&
+      typeof isGlobalObserver !== "undefined" &&
+      !isGlobalObserver &&
+      typeof isOnlyObserver !== "undefined" &&
+      !isOnlyObserver &&
+      typeof isAnyTeamMaintainerOrTeamAdmin !== "undefined" &&
+      !isAnyTeamMaintainerOrTeamAdmin &&
+      !location?.pathname.includes("/device/");
+
+    const getEnrollSecret = async () => {
+      try {
+        const { spec } = await configAPI.loadEnrollSecret();
+        setEnrollSecret(spec.secrets);
+      } catch (error) {
+        console.error(error);
+      }
+    };
+
+    if (canGetEnrollSecret) {
+      getEnrollSecret();
+    }
+  }, [currentUser, isGlobalObserver, isOnlyObserver]);
+
+  // "any" is used on purpose. We are using Axios but this
+  // function expects a native React Error type, which is incompatible.
+  // eslint-disable-next-line @typescript-eslint/no-explicit-any
+  const renderErrorOverlay = ({ error }: any) => {
+    // @ts-ignore
+    console.error(error);
+
+    const overlayError = error as AxiosResponse;
+
+    let errorPage = <Fleet500 />;
+    if (overlayError.status === 403 || overlayError.status === 402) {
+      errorPage = <Fleet403 />;
+    } else if (overlayError.status === 404) {
+      errorPage = <Fleet404 />;
+    }
+
+    return (
+      <ErrorPageLayout router={router} location={location}>
+        {errorPage}
+      </ErrorPageLayout>
+    );
+  };
+
+  return isLoading ? (
+    <Spinner />
+  ) : (
+    <TableProvider>
+      <QueryProvider>
+        <PolicyProvider>
+          {/* Sonner toaster — single global mount; renders toasts
+          dispatched from `notify.*` anywhere in the app. Outside the
+          ErrorBoundary so toasts survive page-level error overlays. */}
+          <ToastNotification />
+          <ErrorBoundary
+            fallbackRender={renderErrorOverlay}
+            resetKeys={[location?.pathname]}
+          >
+            <div className={baseClass}>{children}</div>
+          </ErrorBoundary>
+        </PolicyProvider>
+      </QueryProvider>
+    </TableProvider>
+  );
+};
+
+export default App;

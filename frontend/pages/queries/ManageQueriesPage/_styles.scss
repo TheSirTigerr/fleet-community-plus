@@ -1,0 +1,147 @@
+.manage-queries-page {
+  @include vertical-page-layout;
+
+  &__header-wrap {
+    display: flex;
+    flex-direction: column;
+    gap: $pad-large;
+  }
+
+  &__header {
+    @include normalize-team-header;
+  }
+
+  &__manage-automations {
+    white-space: nowrap;
+  }
+
+  &__text {
+    margin-right: $pad-large;
+  }
+
+  &__title {
+    font-size: $large;
+
+    .fleeticon {
+      color: $core-fleet-blue;
+      margin-right: 15px;
+    }
+
+    .fleeticon-success-check {
+      color: $ui-success;
+    }
+
+    .fleeticon-offline {
+      color: $ui-error;
+    }
+  }
+
+  &__manage-automations-tooltip {
+    text-align: center;
+  }
+
+  &__action-button-container {
+    display: flex;
+    gap: $gap-action-elements;
+  }
+
+  .queries-table {
+    &__platform-dropdown {
+      width: 200px;
+    }
+
+    .data-table-block {
+      .data-table {
+        &__wrapper {
+          overflow-y: hidden;
+        }
+        &__table {
+          thead {
+            .name__header {
+              width: auto;
+            }
+            .platform__header {
+              width: $col-sm;
+            }
+            .interval__header {
+              max-width: $col-xs;
+            }
+            .updated_at__header {
+              display: none;
+              width: 0;
+            }
+            .performance__header {
+              display: none;
+              width: 0;
+              @media (min-width: $break-md) {
+                display: table-cell;
+              }
+            }
+            .automations_enabled__header {
+              max-width: $col-xs;
+            }
+            @media (min-width: $break-lg) {
+              .author_name__header {
+                width: $col-md;
+              }
+              .updated_at__header {
+                display: table-cell;
+                width: auto;
+                max-width: $col-md;
+              }
+            }
+          }
+          tbody {
+            .name__cell {
+              width: auto;
+            }
+
+            @media (max-width: $break-md) {
+              .name__cell {
+                .w400 {
+                  max-width: calc(400px - 81px);
+                }
+              }
+            }
+            .platform__cell {
+              max-width: $col-sm;
+            }
+            .interval__cell {
+              max-width: $col-xs;
+            }
+            .updated_at__cell {
+              display: none;
+              max-width: $col-md;
+            }
+            .performance__cell {
+              display: none;
+            }
+            @media (min-width: $break-md) {
+              .performance__cell {
+                display: table-cell;
+                max-width: $col-sm;
+              }
+            }
+
+            .automations_enabled__cell {
+              max-width: $col-xs;
+            }
+
+            @media (min-width: $break-lg) {
+              .updated_at__cell {
+                display: table-cell;
+              }
+            }
+          }
+        }
+      }
+    }
+    .empty-table {
+      &__additional-info {
+        * {
+          font-size: $xx-small;
+        }
+      }
+    }
+  }
+}

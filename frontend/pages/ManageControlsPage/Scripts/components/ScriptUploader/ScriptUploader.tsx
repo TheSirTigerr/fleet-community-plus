@@ -1,0 +1,64 @@
+import React from "react";
+
+import FileUploader, { ISupportedGraphicNames } from "components/FileUploader";
+import { getFileDetails } from "utilities/file/fileUtils";
+
+import { SCRIPT_UPLOADER_TEXT } from "../../helpers";
+
+const baseClass = "script-uploader";
+
+interface IScriptPackageUploaderProps {
+  onFileSelected?: (file: File) => void;
+  selectedFile?: File | null;
+  forModal?: boolean;
+  onButtonClick?: () => void;
+}
+
+const ScriptPackageUploader = ({
+  forModal,
+  onFileSelected,
+  selectedFile,
+  onButtonClick,
+}: IScriptPackageUploaderProps) => {
+  const onFileSelect = (files: FileList | null) => {
+    if (files && files.length > 0) {
+      onFileSelected?.(files[0]);
+    }
+  };
+
+  const buttonType = forModal ? "secondary" : undefined;
+  const buttonMessage = forModal ? "Choose file" : "Add script";
+  const extension = selectedFile?.name.match(/(sh|py|ps1)$/i)?.[1];
+  let graphicName: ISupportedGraphicNames[];
+  switch (extension) {
+    case "ps1":
+      graphicName = ["file-ps1"];
+      break;
+    case "py":
+      graphicName = ["file-py"];
+      break;
+    case "sh":
+      graphicName = ["file-sh"];
+      break;
+    default:
+      graphicName = ["file-sh", "file-py", "file-ps1"];
+  }
+
+  return (
+    <FileUploader
+      className={baseClass}
+      graphicName={graphicName}
+      message={SCRIPT_UPLOADER_TEXT}
+      title="Upload script"
+      accept=".sh,.py,.ps1"
+      onFileUpload={onFileSelect}
+      fileDetails={selectedFile ? getFileDetails(selectedFile) : undefined}
+      buttonType={buttonType}
+      buttonMessage={buttonMessage}
+      gitopsCompatible
+      onButtonClick={onButtonClick}
+    />
+  );
+};
+
+export default ScriptPackageUploader;

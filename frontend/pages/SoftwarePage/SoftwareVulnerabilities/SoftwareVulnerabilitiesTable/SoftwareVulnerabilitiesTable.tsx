@@ -1,0 +1,292 @@
+/** software/vulnerabilities Vulnerabilities tab > Table */
+
+import React, { useCallback, useContext, useMemo } from "react";
+import { InjectedRouter } from "react-router";
+import { SingleValue } from "react-select-5";
+import { Row } from "react-table";
+
+import CustomLink from "components/CustomLink";
+import DropdownWrapper from "components/forms/fields/DropdownWrapper";
+import { CustomOptionType } from "components/forms/fields/DropdownWrapper/DropdownWrapper";
+import LastUpdatedText from "components/LastUpdatedText";
+import TableContainer from "components/TableContainer";
+import { ITableQueryData } from "components/TableContainer/TableContainer";
+import TableCount from "components/TableContainer/TableCount";
+import { AppContext } from "context/app";
+import EmptyVulnerabilitiesTable from "pages/SoftwarePage/components/tables/SoftwareVulnerabilitiesTable/EmptyVulnerabilitiesTable";
+import PATHS from "router/paths";
+import {
+  IVulnerabilitiesResponse,
+  IVulnerabilitiesEmptyStateReason,
+} from "services/entities/vulnerabilities";
+import {
+  GITHUB_NEW_ISSUE_LINK,
+  VULNERABILITIES_SEARCH_BOX_TOOLTIP,
+} from "utilities/constants";
+import { getNextLocationPath } from "utilities/helpers";
+import { isIncompleteQuoteQuery } from "utilities/strings/stringUtils";
+import { getPathWithQueryParams } from "utilities/url";
+
+import { getExploitedVulnerabilitiesDropdownOptions } from "./helpers";
+import generateTableConfig from "./VulnerabilitiesTableConfig";
+
+const baseClass = "software-vulnerabilities-table";
+
+interface IRowProps extends Row {
+  original: {
+    cve?: string;
+  };
+}
+
+interface ISoftwareVulnerabilitiesTableProps {
+  router: InjectedRouter;
+  isSoftwareEnabled: boolean;
+  data?: IVulnerabilitiesResponse;
+  emptyStateReason?: IVulnerabilitiesEmptyStateReason;
+  query?: string;
+  perPage: number;
+  orderDirection: "asc" | "desc";
+  orderKey: string;
+  showExploitedVulnerabilitiesOnly: boolean;
+  currentPage: number;
+  teamId?: number;
+  isLoading: boolean;
+}
+
+const SoftwareVulnerabilitiesTable = ({
+  router,
+  isSoftwareEnabled,
+  data,
+  emptyStateReason,
+  query = "",
+  perPage,
+  orderDirection,
+  orderKey,
+  showExploitedVulnerabilitiesOnly,
+  currentPage,
+  teamId,
+  isLoading,
+}: ISoftwareVulnerabilitiesTableProps) => {
+  const { isPremiumTier } = useContext(AppContext);
+
+  const determineQueryParamChange = useCallback(
+    (newTableQuery: ITableQueryData) => {
+      const changedEntry = Object.entries(newTableQuery).find(([key, val]) => {
+        switch (key) {
+          case "sortDirection":
+            return val !== orderDirection;
+          case "sortHeader":
+            return val !== orderKey;
+          case "pageIndex":
+            return val !== currentPage;
+          case "searchQuery":
+            return val !== query;
+          case "exploit":
+            return val !== showExploitedVulnerabilitiesOnly.toString();
+          default:
+            return false;
+        }
+      });
+      return changedEntry?.[0] ?? "";
+    },
+    [
+      currentPage,
+      orderDirection,
+      orderKey,
+      query,
+      showExploitedVulnerabilitiesOnly,
+    ]
+  );
+
+  const generateNewQueryParams = useCallback(
+    (newTableQuery: ITableQueryData, changedParam: string) => {
+      return {
+        fleet_id: teamId,
+        exploit: showExploitedVulnerabilitiesOnly.toString(),
+        query: newTableQuery.searchQuery,
+        order_direction: newTableQuery.sortDirection,
+        order_key: newTableQuery.sortHeader,
+        page: changedParam === "pageIndex" ? newTableQuery.pageIndex : 0,
+      };
+    },
+    [teamId, showExploitedVulnerabilitiesOnly]
+  );
+
+  const onQueryChange = useCallback(
+    (newTableQuery: ITableQueryData) => {
+      // We don't want to start searching until a user completes their quote query
+      if (isIncompleteQuoteQuery(newTableQuery.searchQuery)) {
+        return;
+      }
+
+      // we want to determine which query param has changed in order to
+      // reset the page index to 0 if any other param has changed.
+      const changedParam = determineQueryParamChange(newTableQuery);
+
+      // if nothing has changed, don't update the route. this can happen when
+      // this handler is called on the inital render.
+      if (changedParam === "") return;
+
+      const newRoute = getNextLocationPath({
+        pathPrefix: PATHS.SOFTWARE_VULNERABILITIES,
+        routeTemplate: "",
+        queryParams: generateNewQueryParams(newTableQuery, changedParam),
+      });
+
+      router.replace(newRoute);
+    },
+    [determineQueryParamChange, generateNewQueryParams, router]
+  );
+
+  const hasData = (data?.vulnerabilities?.length ?? 0) > 0;
+  const hasQuery = query !== "";
+
+  const isTrulyEmpty =
+    !hasData && !hasQuery && !showExploitedVulnerabilitiesOnly;
+  const controlsDisabled = !isSoftwareEnabled || isTrulyEmpty;
+
+  const vulnerabilitiesTableHeaders = useMemo(() => {
+    if (!data) return [];
+    return generateTableConfig(
+      isPremiumTier,
+      router,
+      {
+        includeName: true,
+        includeVulnerabilities: true,
+        includeIcon: true,
+      },
+      teamId
+    );
+  }, [data, isPremiumTier, router, teamId]);
+
+  const handleExploitedVulnFilterDropdownChange = (
+    isFilterExploited: string
+  ) => {
+    router.replace(
+      getNextLocationPath({
+        pathPrefix: PATHS.SOFTWARE_VULNERABILITIES,
+        routeTemplate: "",
+        queryParams: {
+          query,
+          fleet_id: teamId,
+          order_direction: orderDirection,
+          order_key: orderKey,
+          exploit: isFilterExploited,
+          page: 0, // resets page index
+        },
+      })
+    );
+  };
+
+  const handleRowSelect = (row: IRowProps) => {
+    if (row.original.cve) {
+      const cveName = row.original.cve.toString();
+
+      const softwareVulnerabilityDetailsPath = getPathWithQueryParams(
+        PATHS.SOFTWARE_VULNERABILITY_DETAILS(cveName),
+        {
+          fleet_id: teamId,
+        }
+      );
+
+      router.push(softwareVulnerabilityDetailsPath);
+    }
+  };
+
+  const renderVulnerabilityCount = () => {
+    if (!data) return null;
+
+    const count = data?.count;
+
+    return (
+      <>
+        <TableCount name="items" count={count} />
+        {data?.vulnerabilities && data?.counts_updated_at && (
+          <LastUpdatedText
+            lastUpdatedAt={data.counts_updated_at}
+            customTooltipText={
+              <>
+                The last time software data was <br />
+                updated, including vulnerabilities <br />
+                and host counts.
+              </>
+            }
+          />
+        )}
+      </>
+    );
+  };
+
+  const renderTableHelpText = () => {
+    return (
+      <div>
+        Seeing unexpected software or vulnerabilities?{" "}
+        <CustomLink
+          url={GITHUB_NEW_ISSUE_LINK}
+          text="File an issue on GitHub"
+          newTab
+        />
+      </div>
+    );
+  };
+
+  // Exploited vulnerabilities is a premium feature
+  const renderExploitedVulnerabilitiesDropdown = () => {
+    return (
+      <DropdownWrapper
+        name="exploited-vuln-filter"
+        value={showExploitedVulnerabilitiesOnly.toString()}
+        className={`${baseClass}__exploited-vulnerabilities-filter`}
+        options={getExploitedVulnerabilitiesDropdownOptions(isPremiumTier)}
+        onChange={(newValue: SingleValue<CustomOptionType>) =>
+          newValue && handleExploitedVulnFilterDropdownChange(newValue.value)
+        }
+        variant="table-filter"
+        isDisabled={controlsDisabled}
+      />
+    );
+  };
+
+  return (
+    <div className={baseClass}>
+      <TableContainer
+        columnConfigs={vulnerabilitiesTableHeaders}
+        data={data?.vulnerabilities || []}
+        isLoading={isLoading}
+        resultsTitle="items"
+        emptyComponent={() => (
+          <EmptyVulnerabilitiesTable
+            isPremiumTier={isPremiumTier}
+            teamId={teamId}
+            exploitedFilter={showExploitedVulnerabilitiesOnly}
+            isSoftwareDisabled={!isSoftwareEnabled}
+            emptyStateReason={emptyStateReason}
+          />
+        )}
+        defaultSearchQuery={query}
+        defaultSortHeader={orderKey}
+        defaultSortDirection={orderDirection}
+        pageIndex={currentPage}
+        manualSortBy
+        pageSize={perPage}
+        showMarkAllPages={false}
+        isAllPagesSelected={false}
+        disableNextPage={!data?.meta.has_next_results}
+        searchable
+        disableSearch={controlsDisabled}
+        searchQueryColumn="vulnerability"
+        inputPlaceHolder="Search by CVE"
+        searchToolTipText={VULNERABILITIES_SEARCH_BOX_TOOLTIP}
+        onQueryChange={onQueryChange}
+        customControl={renderExploitedVulnerabilitiesDropdown}
+        stackControls
+        renderCount={renderVulnerabilityCount}
+        renderTableHelpText={renderTableHelpText}
+        disableMultiRowSelect
+        onSelectSingleRow={handleRowSelect}
+      />
+    </div>
+  );
+};
+
+export default SoftwareVulnerabilitiesTable;

@@ -1,0 +1,119 @@
+# Custom variables
+
+<div purpose="embedded-content">
+   <iframe src="https://www.youtube.com/embed/VRK-3rN7-aY" frameborder="0" allowfullscreen></iframe>
+</div>
+
+In Fleet you can use custom variables in [scripts](https://fleetdm.com/guides/scripts), [script-only packages](https://fleetdm.com/guides/deploy-software-packages#script-only-packages), [configuration profiles](https://fleetdm.com/guides/custom-os-settings), and [host name templates](https://fleetdm.com/guides/rename-hosts-with-a-naming-template).
+
+Scripts and configuration profiles can also use any of Fleet's [built-in variables](https://fleetdm.com/guides/fleet-variables).
+
+Custom variables use the same value for all hosts. To use unique per-host values, use [custom host vitals](https://fleetdm.com/guides/custom-host-vitals) (`$FLEET_HOST_VITAL_*`) instead.
+
+## Add variables
+
+A variable can be used in a script or configuration profile by specifying a variable in the format `$FLEET_SECRET_MYNAME` or `${FLEET_SECRET_MYNAME}`. When the script or profile is sent to the host, Fleet will replace the variable with the variable's value. The prefix `FLEET_SECRET_` is required to indicate that this is a variable, and Fleet reserves this prefix for variables.
+
+For macOS and Linux scripts, if a variable doesn't have the `$FLEET_SECRET_` prefix, it will be treated as a [local environment variable](https://support.apple.com/en-my/guide/terminal/apd382cc5fa-4f58-4449-b20a-41c53c006f8f/mac).
+
+### UI
+
+To add or delete a variable in the UI, go to `Controls` > `Variables` and click `+ Add custom variable`:
+
+![Add variable](../website/assets/images/articles/controls-add-variable-337x209@2x.png)
+
+Variables are global, meaning they can be used in scripts, configuration profiles, and host name templates across all fleets.
+
+### GitOps
+
+1. Add the variable to your [GitHub](https://docs.github.com/en/actions/how-tos/write-workflows/choose-what-workflows-do/use-secrets#creating-secrets-for-a-repository) or [GitLab](https://docs.gitlab.com/ci/variables/#define-a-cicd-variable-in-the-ui) repository's secrets to use the variable in GitOps.
+
+2. Define the variable in the `env` section of in your `workflows.yml` file, as shown below. Any variable defined here that begins with `FLEET_SECRET` will be automatically uploaded to Fleet during GitOps runs:
+
+```yaml
+    env:
+      ###  Local variables used by the GitOps workflow ###
+      FLEET_URL: ${{ secrets.FLEET_URL }}
+      FLEET_SECRET_API_TOKEN: ${{ secrets.FLEET_API_TOKEN }}
+      WORKSTATIONS_ENROLL_SECRET: ${{ secrets.WORKSTATIONS_ENROLL_SECRET }}
+      ### Variables to upload to Fleet for use in scripts and profiles. Any variable
+      FLEET_SECRET_EXAMPLE_API_TOKEN: ${{ secrets.FLEET_SECRET_EXAMPLE_API_TOKEN }}
+```
+
+> For GitLab, this typically goes in the `.gitlab-ci.yml` file, and uses `variables:` rather than `env:`.
+
+### Scripts and configuration profiles
+
+During a GitOps run, Fleet scans scripts and profiles for variables, pulls their values from GitHub or GitLab, and uploads them to Fleet.
+
+Profiles with variables aren’t validated during a GitOps dry run because the variables may be missing or incorrect in Fleet. This means they’re more likely to fail during a real run. Best practice: test the script or profile by adding it to Fleet via the UI first.
+
+Some variables trigger an Apple (macOS, iOS, iPadOS) profile resend when their value changes. Automatic re-send for Windows profiles is [coming soon](https://github.com/fleetdm/fleet/issues/44852). See which variables support this in the [Fleet variable](https://fleetdm.com/guides/fleet-variables) guide.
+
+If a variable is a secret (for example, an API token), prefix it with FLEET_SECRET_. This masks the value when viewed or downloaded from the Fleet UI or API.
+
+Variables aren't removed on GitOps runs. To remove a variable, delete it on the `Controls` > `Variables` page.
+
+> Profiles with variables are not entirely validated during a GitOps dry run because the required variables may not exist or may be incorrect in the database. As a result, these profiles have a higher chance of failing during a non-dry run. Test them by uploading to a small fleet first.
+
+## Using the secret on a configuration profile
+
+Here's an example profile with `$FLEET_SECRET_CERT_PASSWORD` and `$FLEET_SECRET_CERT_BASE64` variables:
+```xml
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0">
+<dict>
+    <key>PayloadDisplayName</key>
+    <!-- Note: Do not use $FLEET_SECRET_ variables in PayloadDisplayName -->
+    <string>Certificate PKCS12</string>
+    <key>PayloadIdentifier</key>
+    <string>com.example.certificate</string>
+    <key>PayloadType</key>
+    <string>Configuration</string>
+    <key>PayloadUUID</key>
+    <string>918ee83d-ebd5-4192-bcd4-8b4feb750e4b</string>
+    <key>PayloadVersion</key>
+    <integer>1</integer>
+    <key>PayloadContent</key>
+    <array>
+      <dict>
+            <key>Password</key>
+            <string>$FLEET_SECRET_CERT_PASSWORD</string>
+            <key>PayloadContent</key>
+            <data>${FLEET_SECRET_CERT_BASE64}</data>
+            <key>PayloadDisplayName</key>
+            <string>Certificate PKCS12</string>
+            <key>PayloadIdentifier</key>
+            <string>com.example.certificate</string>
+            <key>PayloadType</key>
+            <string>com.apple.security.pkcs12</string>
+            <key>PayloadUUID</key>
+            <string>25cdd076-f1e7-4932-aa30-1d4240534fb0</string>
+            <key>PayloadVersion</key>
+            <integer>1</integer>
+        </dict>
+    </array>
+</dict>
+</plist>
+```
+
+> The dollar sign (`$`) can be escaped so it's not considered a variable by using a backslash (e.g. `\$100`). Additionally, `MY${variable}HERE` syntax can be used to put strings around the variable.
+
+> In XML, certain characters (`&`, `<`, `>`, `"`, `'`) must be escaped because they have special meanings in the markup language. GitHub and GitLab environment variables, as well as Fleet's reserved variables, will be automatically escaped when used in Apple (`.mobileconfig`) and Windows (`.xml`) configuration profiles. For example, `&` will become `&amp;`. These characters must be manually escaped outside of the variables.
+
+## Known limitations and issues
+
+- **Apple MDM profiles**: Fleet secret variables (`$FLEET_SECRET_*`) cannot be used in the `PayloadDisplayName` field of Apple configuration profiles. This field becomes the visible name of the profile and using secrets here could expose sensitive information. Place secrets in other fields like `PayloadDescription`, `Password`, or `PayloadContent` instead.
+- **Host name templates**: A custom variable used in a [host name template](https://fleetdm.com/guides/rename-hosts-with-a-naming-template) isn't hidden — its value becomes the host's name in Fleet and on the device. Only use custom variables for values that are safe to display (for example, a site or location code).
+- After changing a variable used by a Windows profile, that profile is currently not re-sent to the device when the GitHub action (or GitLab pipeline) runs: [story #27351](https://github.com/fleetdm/fleet/issues/27351)
+- Fleet expands secret variables to plaintext before delivering scripts and profiles to the host, so anyone with root access can retrieve the value. This holds even if the script never echoes it. On macOS, package installer scripts are logged in full, secrets included, to the world-readable `/var/log/install.log`. Only use secret variables for values you're OK having exposed on the host.
+- There is no way to explicitly delete a secret variable. Instead, you can overwrite it with any value.
+- Do not use deprecated API endpoint(s) to upload profiles containing secret variables. Use endpoints documented in [Fleet's REST API](https://fleetdm.com/docs/rest-api/rest-api).
+
+<meta name="articleTitle" value="Custom variables in scripts and configuration profiles">
+<meta name="authorFullName" value="Victor Lyuboslavsky">
+<meta name="authorGitHubUsername" value="getvictor">
+<meta name="category" value="guides">
+<meta name="publishedOn" value="2025-01-02">
+<meta name="description" value="A guide on using custom variables in scripts and configuration profiles.">

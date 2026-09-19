@@ -1,0 +1,57 @@
+.inventory-versions {
+  display: flex;
+  flex-direction: column;
+  gap: $pad-small;
+
+  dt {
+    white-space: nowrap;
+  }
+
+  &__versions {
+    display: flex;
+    flex-direction: column;
+    gap: $pad-medium;
+  }
+
+  &__version {
+    display: flex;
+    flex-direction: column;
+    gap: $pad-large;
+  }
+  &__row {
+    display: flex;
+    flex-wrap: wrap;
+    gap: $pad-xxlarge;
+  }
+
+  // Fill the row so TruncatedTextList has a bounded width to measure against.
+  // min-width sets the narrowest width where a "CVE-YYYY-NNNNN, +N more" row
+  // still fits — below that, flex-wrap on the parent bumps Vulnerabilities to
+  // its own row so it doesn't get squeezed by neighboring DataSets.
+  &__vulnerabilities {
+    flex: 1;
+    min-width: 200px;
+
+    // dd is display:flex, so TruncatedTextList's outer div would size to its
+    // content by default and truncate too early. Stretch it to fill.
+    .truncated-text-list {
+      min-width: 100%;
+    }
+  }
+
+  &__sig-info {
+    display: flex;
+    flex-direction: column;
+
+    dt {
+      min-width: 40px;
+    }
+
+    // Show entire hash and file path, easier to read/compare not hidden in tooltip
+    dd {
+      width: 100%;
+      text-wrap: wrap;
+      overflow-wrap: anywhere;
+    }
+  }
+}

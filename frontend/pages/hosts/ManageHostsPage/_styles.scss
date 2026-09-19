@@ -1,0 +1,257 @@
+.manage-hosts {
+  @include vertical-page-layout;
+
+  &__header-wrap {
+    @include normalize-team-header;
+  }
+
+  &__button-wrap {
+    display: flex;
+    align-items: center;
+    gap: $gap-action-elements;
+  }
+
+  .ace-fleet {
+    margin-bottom: $pad-medium;
+  }
+
+  &__header {
+    display: flex;
+    align-items: center;
+
+    .form-field {
+      margin-bottom: 0;
+    }
+  }
+
+  &__text {
+    margin-right: $pad-large;
+  }
+
+  &__title {
+    font-size: $large;
+
+    .fleeticon {
+      color: $core-fleet-blue;
+      margin-right: 15px;
+    }
+
+    .fleeticon-success-check {
+      color: $ui-success;
+    }
+
+    .fleeticon-offline {
+      color: $ui-error;
+    }
+  }
+
+  &__label-actions {
+    button {
+      &:first-child {
+        margin-right: $pad-medium;
+      }
+    }
+  }
+
+  &__label-block {
+    .title {
+      display: flex;
+      align-items: center;
+      span {
+        font-size: $x-small;
+        font-weight: $bold;
+      }
+      button {
+        margin-left: $pad-small;
+        padding: 0;
+        height: auto;
+
+        img {
+          margin: 0;
+        }
+      }
+    }
+    .description {
+      span {
+        vertical-align: text-top;
+        font-size: $x-small;
+        opacity: 0.5;
+      }
+    }
+  }
+
+  &__toggle-view {
+    .fleeticon {
+      width: 24px;
+      height: 24px;
+      margin-left: 12px;
+      fill: $ui-gray;
+    }
+
+    &--active {
+      .fleeticon {
+        fill: $core-fleet-purple;
+      }
+    }
+  }
+
+  .table-container {
+    &__header-left {
+      .controls {
+        display: flex;
+        align-items: center;
+
+        .manage-hosts__table-actions {
+          display: flex;
+          align-items: center;
+          gap: $gap-table-elements; // grouping secondary buttons
+        }
+
+        .manage-hosts__filter-dropdowns {
+          display: flex;
+          flex-direction: row;
+          margin-left: $gap-table-elements;
+          align-items: center;
+
+          // Dropdown height matches search bar height
+          .manage-hosts__status-filter {
+            .Select-control,
+            .Select-input {
+              height: 33px;
+            }
+            .Select-value {
+              line-height: 36px;
+            }
+          }
+        }
+      }
+    }
+
+    // table header content responsive styles
+    @media (max-width: $table-controls-break) {
+      &__header {
+        flex-direction: column;
+      }
+
+      .table-container__search {
+        order: 1;
+        width: 100%;
+
+        .table-container__search-input {
+          margin-left: 0;
+
+          .input-with-icon {
+            width: 100%;
+          }
+
+          & .search-field__input-wrapper {
+            width: auto;
+          }
+        }
+      }
+
+      &__header-left {
+        order: 2;
+        display: flex;
+        flex-direction: column;
+        align-items: stretch;
+
+        .results-count {
+          order: 2;
+        }
+
+        .controls {
+          order: -2;
+
+          .manage-hosts__filter-dropdowns {
+            display: flex;
+            flex-direction: row;
+            flex: 1;
+
+            .form-field--dropdown,
+            .manage-hosts__label-filter-dropdown {
+              flex: 1;
+            }
+
+            .manage-hosts__status-filter {
+              width: auto;
+            }
+          }
+        }
+      }
+    }
+
+    .table-container__data-table-block {
+      .data-table-block {
+        .data-table {
+          &__table {
+            tbody {
+              .issues {
+                &__cell {
+                  display: flex;
+                  align-items: center;
+                  gap: $pad-small;
+                  .issue-cell__icon {
+                    display: flex;
+                    align-items: center;
+                  }
+                }
+              }
+
+              .device_mapping__cell,
+              .mdm_enrollment_status__cell,
+              .mdm_server_url__cell,
+              .public_ip__cell,
+              .issues__cell {
+                .text-cell {
+                  display: inline;
+                }
+                .text-muted {
+                  color: $ui-fleet-black-50;
+                }
+              }
+            }
+          }
+        }
+      }
+    }
+  }
+
+  .form-field--dropdown {
+    margin: 0;
+  }
+
+  &__status-filter {
+    width: 195px;
+
+    // Matches .label-filter-select__menu-list so both filter menus are the
+    // same height and neither scrolls.
+    .react-select__menu-list {
+      max-height: 590px;
+      padding-bottom: 0.75rem;
+    }
+    .Select-value {
+      padding-left: $pad-medium;
+      padding-right: $pad-medium;
+    }
+    .Select-value-label {
+      padding-left: $pad-large;
+      font-size: $small !important;
+    }
+  }
+
+  &__label-filter-dropdown {
+    margin-left: $gap-table-elements;
+  }
+
+  &__info-banners {
+    padding-top: $pad-xxlarge;
+    padding-bottom: $pad-large;
+  }
+}
+
+// The tooltip renders in a portal outside .manage-hosts, so this can't be
+// nested under that selector.
+.host-table-header-tooltip {
+  text-align: left;
+}

@@ -1,0 +1,47 @@
+.main-content {
+  max-width: $break-lg;
+  margin: 0 auto;
+  padding: $pad-page;
+  flex-grow: 1;
+  // min-width: 0 lets this flex item shrink below its content's intrinsic
+  // min size so wide descendants don't push the document past the viewport.
+  // Pages with intrinsically wide content (data tables, etc.) must handle
+  // their own horizontal overflow scoped to that content — see #47029.
+  min-width: 0;
+
+  > :not(.main-content--animation-disabled) {
+    animation: fade-in 250ms ease-out;
+  }
+
+  &__warning-banner {
+    margin-bottom: $pad-large;
+    // TODO: figure out if sticky styling is needed?
+    position: sticky; // Needed for settings page scroll
+    z-index: 4; // Needed for settings page scroll
+
+    // The AB token invalid banner sits directly above page content that
+    // already provides its own top spacing, so it doesn't need this margin.
+    &:has(.apple-bm-token-invalid-message) {
+      margin-bottom: 0;
+    }
+  }
+
+  &.manage-hosts,
+  &.query-details-page,
+  &.run-query-page,
+  &.live-policy-page {
+    max-width: 100%;
+  }
+}
+
+@media (max-width: ($break-xs - 1)) {
+  .main-content {
+    padding: $pad-large $pad-medium $pad-medium; // 24px top, 16px sides according to #32247
+  }
+}
+
+@media (max-width: ($break-mobile-md - 1)) {
+  .main-content {
+    padding: 20px;
+  }
+}

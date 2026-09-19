@@ -1,0 +1,21 @@
+import PropTypes from "prop-types";
+import { ReactNode } from "react";
+
+export default PropTypes.shape({
+  disabled: PropTypes.bool,
+  label: PropTypes.string,
+  value: PropTypes.oneOfType([PropTypes.string, PropTypes.number]),
+});
+
+export type TooltipContent = ReactNode;
+
+export interface IDropdownOption {
+  disabled?: boolean;
+  hasDividerBefore?: boolean;
+  label: string | JSX.Element;
+  value: string | number;
+  helpText?: ReactNode;
+  premiumOnly?: boolean;
+  tooltipContent?: TooltipContent;
+  onClick?: (() => void) | void | null;
+}

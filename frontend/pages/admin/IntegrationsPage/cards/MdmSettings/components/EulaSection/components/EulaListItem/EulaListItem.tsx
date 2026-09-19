@@ -1,0 +1,70 @@
+import React from "react";
+
+import Button from "components/buttons/Button";
+import GitOpsModeTooltipWrapper from "components/GitOpsModeTooltipWrapper";
+import Graphic from "components/Graphic";
+import Icon from "components/Icon";
+import { IEulaMetadataResponse } from "services/entities/mdm";
+import { timeAgo } from "utilities/date_format";
+import endpoints from "utilities/endpoints";
+
+const baseClass = "eula-list-item";
+
+interface IEulaListItemProps {
+  eulaData: IEulaMetadataResponse;
+  onDelete: () => void;
+}
+
+const EulaListItem = ({ eulaData, onDelete }: IEulaListItemProps) => {
+  const onOpenEula = () => {
+    window.open(`/api${endpoints.MDM_EULA(eulaData.token)}`, "_blank");
+  };
+
+  return (
+    <div className={baseClass}>
+      <div className={`${baseClass}__value-group ${baseClass}__list-item-data`}>
+        <Graphic name="file-pdf" />
+        <div className={`${baseClass}__list-item-info`}>
+          <span className={`${baseClass}__list-item-name`}>
+            {eulaData.name}
+          </span>
+          <span className={`${baseClass}__list-item-uploaded`}>
+            {`Uploaded ${timeAgo(new Date(eulaData.created_at), {
+              addSuffix: true,
+            })}`}
+          </span>
+        </div>
+      </div>
+
+      <div
+        className={`${baseClass}__value-group ${baseClass}__list-item-actions`}
+      >
+        <Button
+          className={`${baseClass}__list-item-button`}
+          variant="subdued"
+          onClick={onOpenEula}
+        >
+          <Icon
+            name="external-link"
+            size="medium"
+            className={`${baseClass}__external-icon`}
+          />
+        </Button>
+        <GitOpsModeTooltipWrapper
+          renderChildren={(disableChildren) => (
+            <Button
+              className={`${baseClass}__list-item-button`}
+              variant="subdued"
+              onClick={() => onDelete()}
+              disabled={disableChildren}
+            >
+              <Icon name="trash" />
+            </Button>
+          )}
+        />
+      </div>
+    </div>
+  );
+};
+
+export default EulaListItem;

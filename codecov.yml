@@ -1,0 +1,34 @@
+coverage:
+  status:
+    project: false
+    patch: false
+
+flag_management:
+  default_rules:
+    carryforward: true
+    statuses:
+      - type: project
+        informational: true
+      - type: patch
+        informational: true
+  individual_flags:
+    - name: backend
+      paths:
+        - cmd/
+        - pkg/
+        - server/
+        - ee/
+        - orbit/
+    - name: backend-activity
+      paths:
+        - server/activity/
+    - name: frontend
+      paths:
+        - frontend/
+    - name: android
+      paths:
+        - android/
+
+ignore:
+  - "server/mock"
+  - "server/fleet/activities.go" # mostly contains code for documentation -- not interesting for tests

@@ -1,0 +1,191 @@
+import classnames from "classnames";
+import React, { ReactNode } from "react";
+import AceEditor from "react-ace";
+
+import "ace-builds/src-noconflict/mode-sh";
+import "ace-builds/src-noconflict/mode-powershell";
+import "ace-builds/src-noconflict/mode-python";
+import "ace-builds/src-noconflict/mode-xml";
+import "ace-builds/src-noconflict/mode-json";
+
+import { Ace } from "ace-builds";
+
+import CopyButton from "components/buttons/CopyButton";
+import TooltipWrapper from "components/TooltipWrapper";
+import { releaseStuckSelectionOnScroll } from "utilities/ace_editor";
+
+import "utilities/ace_theme";
+
+const baseClass = "editor";
+
+export type EditorMode =
+  | "sh"
+  | "powershell"
+  | "python"
+  | "xml"
+  | "json"
+  | "text";
+
+export interface IEditorProps {
+  focus?: boolean;
+  label?: string;
+  labelTooltip?: string | JSX.Element;
+  error?: string | null;
+  readOnly?: boolean;
+  /**
+   * Help text to display below the editor.
+   */
+  helpText?: ReactNode;
+  /** Sets the value of the input. Use this if you'd like the editor
+   * to be a controlled component */
+  value?: string;
+  /** Sets the default value of the input. Use this if you'd like the editor
+   * to be an uncontrolled component */
+  defaultValue?: string;
+  /** Enable copying the value of the editor.
+   * @default false
+   */
+  enableCopy?: boolean;
+  /** Enabled wrapping lines.
+   * @default false
+   */
+  wrapEnabled?: boolean;
+  /** A unique name for the editor.
+   * @default "editor"
+   */
+  name?: string;
+  /** The syntax highlighting mode to use.
+   */
+  mode?: EditorMode;
+  /** Include correct styles as a form field.
+   * @default true
+   */
+  isFormField?: boolean;
+  maxLines?: number;
+  className?: string;
+  onChange?: (value: string, event?: Ace.Delta) => void;
+  onBlur?: () => void;
+  /** Called after the Ace editor mounts with the editor instance. */
+  onLoad?: (editor: Ace.Editor) => void;
+}
+
+/**
+ * This component is a generic editor that uses the AceEditor component.
+ * TODO: We should move SQLEditor and YamlAce into here and deprecate importing
+ * them directly. This component should be used for all editor components and
+ * be configurable from the props. We should look into dynmaic imports for
+ * this.
+ */
+const Editor = ({
+  helpText,
+  label,
+  labelTooltip,
+  error,
+  focus,
+  value,
+  defaultValue,
+  readOnly = false,
+  enableCopy = false,
+  wrapEnabled = false,
+  name = "editor",
+  mode = "text",
+  isFormField = true,
+  maxLines = 20,
+  className,
+  onChange,
+  onBlur,
+  onLoad: onLoadProp,
+}: IEditorProps) => {
+  const classNames = classnames(baseClass, className, {
+    "form-field": isFormField,
+    [`${baseClass}__error`]: !!error,
+  });
+
+  const renderCopyButton = () => {
+    return (
+      <div className={`${baseClass}__copy-wrapper`}>
+        <CopyButton copyText={value ?? ""} variant="subdued" />
+      </div>
+    );
+  };
+
+  const onLoadHandler = (editor: Ace.Editor) => {
+    // Lose focus using the Escape key so you can Tab forward (or Shift+Tab backwards) through app
+    editor.commands.addCommand({
+      name: "escapeToBlur",
+      bindKey: { win: "Esc", mac: "Esc" },
+      exec: (aceEditor) => {
+        aceEditor.blur(); // Lose focus from the editor
+        return true;
+      },
+      readOnly: true,
+    });
+
+    // Prevent scrolling from selecting text after a stationary click (#48490).
+    releaseStuckSelectionOnScroll(editor);
+
+    onLoadProp?.(editor);
+  };
+
+  const renderLabel = () => {
+    const labelText = error || label;
+    const labelClassName = classnames(`${baseClass}__label`, {
+      [`${baseClass}__label--error`]: !!error,
+    });
+
+    if (!labelText) {
+      return null;
+    }
+
+    if (labelTooltip) {
+      return (
+        <TooltipWrapper
+          className={labelClassName}
+          tipContent={labelTooltip}
+          position="top-start"
+        >
+          {labelText}
+        </TooltipWrapper>
+      );
+    }
+
+    return <div className={labelClassName}>{labelText}</div>;
+  };
+
+  const renderHelpText = () => {
+    if (helpText) {
+      return <div className={`${baseClass}__help-text`}>{helpText}</div>;
+    }
+    return null;
+  };
+
+  return (
+    <div className={classNames}>
+      {renderLabel()}
+      {enableCopy && renderCopyButton()}
+      <AceEditor
+        mode={mode}
+        wrapEnabled={wrapEnabled}
+        name={name}
+        className={baseClass}
+        fontSize={14}
+        theme="fleet"
+        width="100%"
+        readOnly={readOnly}
+        minLines={2}
+        maxLines={maxLines}
+        editorProps={{ $blockScrolling: Infinity }}
+        value={value}
+        defaultValue={defaultValue}
+        tabSize={2}
+        focus={focus}
+        onChange={onChange}
+        onBlur={onBlur}
+        onLoad={onLoadHandler}
+      />
+      {renderHelpText()}
+    </div>
+  );
+};
+
+export default Editor;

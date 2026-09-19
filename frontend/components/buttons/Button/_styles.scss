@@ -1,0 +1,423 @@
+/** Button universal styling:
+- Border radius: 4px
+- Darken on hover
+- Darker on active
+- Outline on focus with no offset or "jump"
+- Lighten on disabled
+*/
+
+$base-class: "button";
+
+@mixin button-focus-outline() {
+  &::after {
+    content: "";
+    width: 100%;
+    height: 100%;
+    position: absolute;
+    border: 1px solid $core-focused-outline;
+    border-radius: $border-radius;
+  }
+}
+
+@mixin unstyled-button-focus-outline($offset: 1px) {
+  outline-color: $core-focused-outline;
+  outline-offset: $offset;
+  outline-style: solid;
+  outline-width: 1px;
+}
+
+// Buttons with background colors
+@mixin button-pad-8px-16px {
+  padding: $pad-small $pad-medium;
+  height: 36px;
+}
+
+// Buttons without background colors
+@mixin button-pad-8px-8px {
+  padding: $pad-small $pad-small;
+  height: 36px;
+}
+
+// Size small buttons (with and without background colors)
+@mixin button-pad-4px-8px {
+  padding: $pad-xsmall $pad-small;
+  height: 28px;
+}
+
+@mixin button-variant(
+  $color,
+  $hover: null,
+  $active: null,
+  $inverse: false,
+  $unstyled: false
+) {
+  background-color: $color;
+
+  @if $inverse {
+    @include button-pad-8px-8px;
+
+    &__small {
+      @include button-pad-4px-8px;
+    }
+
+    &:hover {
+      background-color: $ui-fleet-black-5;
+
+      &:active {
+        background-color: $ui-fleet-black-5-down;
+      }
+    }
+
+    &:focus-visible {
+      @include button-focus-outline();
+    }
+  } @else if $unstyled {
+    &:hover:not(.button--disabled) {
+      background-color: $hover;
+
+      &:active {
+        background-color: $active;
+      }
+    }
+
+    &:focus-visible {
+      @include unstyled-button-focus-outline();
+    }
+  } @else {
+    &:hover:not(.button--disabled) {
+      background-color: $hover;
+
+      &:active {
+        background-color: $active;
+      }
+    }
+
+    &:focus-visible {
+      @include button-focus-outline();
+    }
+  }
+}
+
+.#{$base-class} {
+  @include button-pad-8px-16px;
+  box-sizing: border-box;
+  transition: color 150ms ease-in-out, background 150ms ease-in-out,
+    top 50ms ease-in-out, box-shadow 50ms ease-in-out, border 50ms ease-in-out;
+  position: relative;
+  color: $core-fleet-white;
+  text-decoration: none;
+  flex-direction: row;
+  justify-content: center;
+  align-items: center;
+  border-radius: $border-radius;
+  font-size: $x-small;
+  font-family: "Inter", sans-serif;
+  font-weight: $bold;
+  display: inline-flex;
+  top: 0;
+  border: 0;
+  position: relative;
+  cursor: pointer;
+  white-space: nowrap;
+
+  &:focus {
+    outline: none;
+  }
+
+  .transparent-text {
+    opacity: 0;
+  }
+
+  // Wraps children so the loading spinner can swap in without a layout shift.
+  // Do NOT hide-then-reveal buttons by fading `.children-wrapper` alone —
+  // bordered/filled variants (`secondary` etc.) will leave an empty button
+  // box behind. Fade the whole button, or use `.row-hover-button`
+  // (see PaginatedList / TableContainer styles).
+  .children-wrapper {
+    display: flex;
+    flex-direction: row;
+    align-items: center;
+  }
+
+  // `loadingText` puts the spinner beside a visible label, so this spinner is inline and takes the variant's own text color.
+  .children-wrapper--loading-text {
+    gap: $pad-xsmall;
+
+    .loading-spinner {
+      .background {
+        display: none;
+      }
+
+      .path {
+        stroke: currentColor;
+      }
+    }
+  }
+
+  &--default {
+    @include button-variant(
+      $core-fleet-green,
+      $core-fleet-green-over,
+      $core-fleet-green-down
+    );
+    display: flex;
+
+    &__small {
+      @include button-pad-4px-8px;
+    }
+  }
+
+  &--alert {
+    @include button-variant(
+      $core-vibrant-red,
+      $core-vibrant-red-over,
+      $core-vibrant-red-down
+    );
+    display: flex;
+
+    &__small {
+      @include button-pad-4px-8px;
+    }
+
+    .loading-spinner {
+      &__ring {
+        div {
+          border-color: $ui-error transparent transparent transparent;
+        }
+      }
+    }
+  }
+
+  &--pill {
+    @include button-variant(
+      $ui-off-white,
+      $core-vibrant-blue-over,
+      null,
+      $inverse: true
+    );
+    color: $core-fleet-green;
+    border: 1px solid $core-fleet-green;
+    box-sizing: border-box;
+    font-size: $xx-small;
+    padding: $pad-xsmall 10px;
+    height: 24px;
+
+    &:active {
+      box-shadow: inset 2px 2px 2px rgba(0, 0, 0, 0.25);
+    }
+
+    &:hover,
+    &:focus {
+      border: 1px solid $core-fleet-green;
+    }
+  }
+
+  // Looks exactly like a CustomLink but is a <button>
+  &--link {
+    @include link;
+    font-weight: $regular;
+    text-decoration: underline;
+    text-decoration-color: $ui-fleet-black-75;
+    text-underline-offset: 3px;
+    background: transparent;
+    border: 0;
+    box-shadow: none;
+    cursor: pointer;
+    margin: 0;
+    padding: 0;
+    height: auto;
+    line-height: $line-height;
+    display: inline-flex;
+    align-items: center;
+    gap: $pad-xsmall;
+    white-space: normal;
+
+    &:hover {
+      text-decoration-color: $core-fleet-black;
+    }
+
+    &:focus {
+      outline: none;
+    }
+
+    &:focus-visible {
+      @include unstyled-button-focus-outline(3px);
+    }
+
+    &:active {
+      box-shadow: none;
+      top: 0;
+    }
+  }
+
+  // Bordered secondary button (off-white fill + gray border). The new preferred
+  // secondary — see #35329. Options: default, icon before/after, icon only.
+  &--secondary {
+    @include button-variant($ui-off-white, null, null, $inverse: true);
+    @include button-pad-8px-16px; // full-size padding (override the $inverse 8/8)
+    color: $ui-fleet-black-75;
+    border: 1px solid $ui-fleet-black-25;
+    box-sizing: border-box;
+
+    &__small {
+      @include button-pad-4px-8px;
+    }
+
+    &:hover:not(.button--disabled) {
+      background-color: $ui-fleet-black-5;
+
+      &:active {
+        background-color: $ui-fleet-black-10;
+      }
+    }
+
+    // Spacing between an icon and the label (icon before/after)
+    .children-wrapper {
+      gap: $pad-small;
+    }
+  }
+
+  // Low-emphasis borderless text + icon button. Not to be confused with a link.
+  // Options: icon before/after, icon only. Transparent fill, light-gray hover,
+  // and deliberately does NOT recolor the SVG on hover, so it works with both
+  // fill- and stroke-based icons (e.g. chevrons) without artifacts — see #35329.
+  &--subdued {
+    @include button-variant(
+      $core-fleet-white,
+      $core-fleet-green-over,
+      $core-fleet-green-down,
+      $inverse: true
+    );
+    background-color: transparent;
+    color: $ui-fleet-black-75;
+    box-sizing: border-box;
+
+    // Spacing between an icon and the label (icon before/after)
+    .children-wrapper {
+      gap: $pad-small;
+    }
+  }
+
+  // Icon-only secondary/subdued buttons render as a square so a lone icon is
+  // centered (mirrors &--icon). The isIconOnly flag in Button.tsx adds this class.
+  &--secondary.button--icon-only,
+  &--subdued.button--icon-only {
+    width: 36px;
+    padding: 0;
+  }
+
+  &--secondary__small.button--icon-only,
+  &--subdued__small.button--icon-only {
+    width: 28px;
+  }
+
+  // Buttons with an icon + label get an 8px gap between them (4px on small).
+  // Only default, alert, secondary, and subdued carry icons — scoped so the
+  // `icon` prop is a no-op on link, pill, unstyled, etc. Horizontal padding
+  // is left to the base variant/size.
+  &--default.button--with-icon,
+  &--alert.button--with-icon,
+  &--secondary.button--with-icon,
+  &--subdued.button--with-icon {
+    .children-wrapper {
+      gap: $pad-small;
+    }
+  }
+
+  &--default__small.button--with-icon,
+  &--alert__small.button--with-icon,
+  &--secondary__small.button--with-icon,
+  &--subdued__small.button--with-icon {
+    .children-wrapper {
+      gap: $pad-xsmall;
+    }
+  }
+
+  &--disabled {
+    @include disabled;
+  }
+
+  &--unstyled {
+    @include button-variant(transparent, null, null, false, $unstyled: true);
+    border: 0;
+    box-shadow: none;
+    color: $core-fleet-black;
+    cursor: pointer;
+    margin: 0;
+    padding: 0;
+    height: auto;
+    line-height: normal;
+    font-weight: normal;
+    white-space: normal;
+
+    &:active {
+      box-shadow: none;
+      top: 0;
+    }
+  }
+
+  &--unstyled-modal-query {
+    @include button-variant(transparent, null, null, false, $unstyled: true);
+    border: 0;
+    box-shadow: none;
+    color: $core-fleet-black;
+    cursor: pointer;
+    margin: 0;
+    padding: 15px 12px;
+    height: auto;
+    line-height: normal;
+    display: block;
+    width: 100%;
+    border-radius: 0px;
+    border-bottom: 1px solid $ui-fleet-black-10;
+    white-space: normal;
+
+    &:active {
+      box-shadow: none;
+      top: 0;
+    }
+
+    &:focus {
+      outline: none;
+    }
+
+    &:hover,
+    &:focus {
+      background-color: $ui-fleet-black-5;
+      box-shadow: none;
+    }
+
+    .children-wrapper {
+      display: flex;
+      width: 100%;
+      flex-direction: column;
+      gap: $pad-xsmall;
+      align-items: flex-start;
+
+      .info {
+        &__header {
+          display: block;
+          text-align: left;
+        }
+        &__data {
+          display: block;
+          width: 100%;
+          font-weight: normal;
+          text-align: left;
+        }
+      }
+    }
+  }
+
+  &--oversized {
+    background-color: $core-fleet-black;
+    padding: $pad-large $pad-small;
+    font-size: $medium;
+    width: 100%;
+  }
+
+  // Used in registration/auth pages
+  &__wide {
+    width: 200px;
+  }
+}

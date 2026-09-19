@@ -1,0 +1,57 @@
+import React from "react";
+
+import TooltipWrapper from "components/TooltipWrapper";
+import { timeAgo } from "utilities/date_format";
+import { abbreviateTimeUnits } from "utilities/helpers";
+
+const baseClass = "component__last-updated-text";
+
+interface ILastUpdatedTextBase {
+  lastUpdatedAt?: string | null;
+}
+
+interface ILastUpdatedTextWithCustomTooltip extends ILastUpdatedTextBase {
+  customTooltipText: React.ReactNode;
+  whatToRetrieve?: never;
+}
+
+interface ILastUpdatedTextWithWhatToRetrieve extends ILastUpdatedTextBase {
+  customTooltipText?: never;
+  whatToRetrieve: string;
+}
+
+const LastUpdatedText = ({
+  lastUpdatedAt,
+  whatToRetrieve,
+  customTooltipText,
+}:
+  | ILastUpdatedTextWithCustomTooltip
+  | ILastUpdatedTextWithWhatToRetrieve): JSX.Element => {
+  if (!lastUpdatedAt || lastUpdatedAt === "0001-01-01T00:00:00Z") {
+    lastUpdatedAt = "never";
+  } else {
+    lastUpdatedAt = abbreviateTimeUnits(
+      timeAgo(new Date(lastUpdatedAt), {
+        addSuffix: true,
+        strict: true,
+      })
+    );
+  }
+
+  const tooltipContent = customTooltipText || (
+    <>
+      Fleet periodically queries all hosts <br />
+      to retrieve {whatToRetrieve}.
+    </>
+  );
+
+  return (
+    <span className={baseClass}>
+      <TooltipWrapper tipContent={tooltipContent}>
+        {`Updated ${lastUpdatedAt}`}
+      </TooltipWrapper>
+    </span>
+  );
+};
+
+export default LastUpdatedText;

@@ -1,0 +1,15 @@
+.filter-pill {
+  // Strip the inline baseline gap so the pill vertically centers alongside
+  // sibling dropdowns in `.hosts-filter-block__labels-active-filter-wrap`.
+  display: inline-flex;
+  align-items: center;
+
+  &__label {
+    overflow: hidden;
+  }
+
+  &__tooltip-text {
+    display: block;
+    @include ellipse-text(166px);
+  }
+}

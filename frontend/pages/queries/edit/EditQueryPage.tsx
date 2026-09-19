@@ -1,0 +1,471 @@
+import { Location } from "history";
+import React, { useState, useEffect, useContext } from "react";
+import { useErrorHandler } from "react-error-boundary";
+import { useQuery, useQueryClient } from "react-query";
+import { InjectedRouter, Params } from "react-router/lib/Router";
+
+import BackButton from "components/BackButton";
+import CustomLink from "components/CustomLink";
+import InfoBanner from "components/InfoBanner";
+import MainContent from "components/MainContent";
+import QuerySidePanel from "components/side_panels/QuerySidePanel";
+import SidePanelContent from "components/SidePanelContent";
+import SidePanelPage from "components/SidePanelPage";
+import { notify } from "components/ToastNotification";
+import { AppContext } from "context/app";
+import { QueryContext } from "context/query";
+import useTeamIdParam from "hooks/useTeamIdParam";
+import { IConfig } from "interfaces/config";
+import { getErrorReason } from "interfaces/errors";
+import {
+  IGetQueryResponse,
+  ICreateQueryFormData,
+  ISchedulableQuery,
+} from "interfaces/schedulable_query";
+import PATHS from "router/paths";
+import configAPI from "services/entities/config";
+import queryAPI from "services/entities/queries";
+import statusAPI from "services/entities/status";
+import {
+  DEFAULT_QUERY,
+  DOCUMENT_TITLE_SUFFIX,
+  INVALID_PLATFORMS_FLASH_MESSAGE,
+  INVALID_PLATFORMS_REASON,
+} from "utilities/constants";
+import debounce from "utilities/debounce";
+import deepDifference from "utilities/deep_difference";
+import { getPathWithQueryParams } from "utilities/url";
+
+import EditQueryForm from "./components/EditQueryForm";
+
+interface IEditQueryPageProps {
+  router: InjectedRouter;
+  params: Params;
+  location: Location<{ host_id: string; fleet_id?: string }>;
+}
+
+const baseClass = "edit-query-page";
+
+const EditQueryPage = ({
+  router,
+  params: { id: paramsQueryId },
+  location,
+}: IEditQueryPageProps): JSX.Element => {
+  const queryId = paramsQueryId ? parseInt(paramsQueryId, 10) : null;
+  const hostId = location.query.host_id
+    ? parseInt(location.query.host_id as string, 10)
+    : undefined;
+
+  const {
+    currentTeamName: teamNameForQuery,
+    teamIdForApi: apiTeamIdForQuery,
+    currentTeamId,
+  } = useTeamIdParam({
+    location,
+    router,
+    includeAllTeams: true,
+    includeNoTeam: false,
+  });
+
+  const handlePageError = useErrorHandler();
+  const queryClient = useQueryClient();
+  const {
+    isGlobalAdmin,
+    isGlobalMaintainer,
+    isTeamMaintainerOrTeamAdmin,
+    isAnyTeamMaintainerOrTeamAdmin,
+    isObserverPlus,
+    isAnyTeamObserverPlus,
+    config,
+    filteredQueriesPath,
+    isOnGlobalTeam,
+  } = useContext(AppContext);
+  const {
+    editingExistingQuery,
+    selectedOsqueryTable,
+    setSelectedOsqueryTable,
+    lastEditedQueryName,
+    lastEditedQueryDescription,
+    lastEditedQueryBody,
+    lastEditedQueryObserverCanRun,
+    lastEditedQueryFrequency,
+    lastEditedQueryAutomationsEnabled,
+    lastEditedQueryPlatforms,
+    lastEditedQueryLoggingType,
+    lastEditedQueryMinOsqueryVersion,
+    lastEditedQueryDiscardData,
+    setLastEditedQueryId,
+    setLastEditedQueryName,
+    setLastEditedQueryDescription,
+    setLastEditedQueryBody,
+    setLastEditedQueryObserverCanRun,
+    setLastEditedQueryFrequency,
+    setLastEditedQueryAutomationsEnabled,
+    setLastEditedQueryLoggingType,
+    setLastEditedQueryMinOsqueryVersion,
+    setLastEditedQueryPlatforms,
+    setLastEditedQueryDiscardData,
+  } = useContext(QueryContext);
+  const { setConfig, availableTeams, setCurrentTeam } = useContext(AppContext);
+
+  const [isLiveQueryRunnable, setIsLiveQueryRunnable] = useState(true);
+  const [isSidebarOpen, setIsSidebarOpen] = useState(true);
+  const [showOpenSchemaActionText, setShowOpenSchemaActionText] = useState(
+    false
+  );
+  const [
+    showConfirmSaveChangesModal,
+    setShowConfirmSaveChangesModal,
+  ] = useState(false);
+
+  const { data: appConfig } = useQuery<IConfig, Error, IConfig>(
+    ["config"],
+    () => configAPI.loadAll(),
+    {
+      select: (data: IConfig) => data,
+      onSuccess: (data) => {
+        setConfig(data);
+      },
+    }
+  );
+
+  // disabled on page load so we can control the number of renders
+  // else it will re-populate the context on occasion
+  const {
+    isLoading: isStoredQueryLoading,
+    data: storedQuery,
+    refetch: refetchStoredQuery,
+  } = useQuery<IGetQueryResponse, Error, ISchedulableQuery>(
+    ["query", queryId],
+    () => queryAPI.load(queryId as number),
+    {
+      enabled: !!queryId && !editingExistingQuery,
+      refetchOnWindowFocus: false,
+      select: (data) => data.query,
+      onSuccess: (returnedQuery) => {
+        setLastEditedQueryId(returnedQuery.id);
+        setLastEditedQueryName(returnedQuery.name);
+        setLastEditedQueryDescription(returnedQuery.description);
+        setLastEditedQueryBody(returnedQuery.query);
+        setLastEditedQueryObserverCanRun(returnedQuery.observer_can_run);
+        setLastEditedQueryFrequency(returnedQuery.interval);
+        setLastEditedQueryAutomationsEnabled(returnedQuery.automations_enabled);
+        setLastEditedQueryPlatforms(returnedQuery.platform);
+        setLastEditedQueryLoggingType(returnedQuery.logging);
+        setLastEditedQueryMinOsqueryVersion(returnedQuery.min_osquery_version);
+        setLastEditedQueryDiscardData(returnedQuery.discard_data);
+      },
+      onError: (error) => handlePageError(error),
+    }
+  );
+
+  /** Pesky bug affecting team level users:
+   - Navigating to queries/:id immediately defaults the user to the first team they're on
+  with the most permissions, in the URL bar because of useTeamIdParam
+  even if the queries/:id entity has a team attached to it
+  Hacky fix:
+   - Push entity's team id to url for team level users
+  */
+  if (
+    !isOnGlobalTeam &&
+    !isStoredQueryLoading &&
+    storedQuery?.team_id &&
+    !(storedQuery?.team_id?.toString() === location.query.fleet_id)
+  ) {
+    router.push(
+      getPathWithQueryParams(location.pathname, {
+        fleet_id: storedQuery?.team_id?.toString(),
+        host_id: hostId,
+      })
+    );
+  }
+
+  // Used to set host's team in AppContext for RBAC actions
+  useEffect(() => {
+    if (storedQuery?.team_id) {
+      const querysTeam = availableTeams?.find(
+        (team) => team.id === storedQuery.team_id
+      );
+      setCurrentTeam(querysTeam);
+    }
+  }, [storedQuery]);
+
+  const detectIsFleetQueryRunnable = () => {
+    statusAPI.live_query().catch(() => {
+      setIsLiveQueryRunnable(false);
+    });
+  };
+
+  /* Observer/Observer+ cannot edit existing query (O+ has access to edit new query to run live),
+  Team admin/team maintainer cannot edit existing query,
+ reroute edit existing query page (/:queryId/edit) to query report page (/:queryId) */
+  useEffect(() => {
+    const canEditExistingQuery =
+      isGlobalAdmin ||
+      isGlobalMaintainer ||
+      (isTeamMaintainerOrTeamAdmin && storedQuery?.team_id);
+
+    if (
+      !isStoredQueryLoading && // Confirms teamId for storedQuery before RBAC reroute
+      queryId &&
+      queryId > 0 &&
+      !canEditExistingQuery
+    ) {
+      // Reroute to query report page still maintains query params for live query purposes
+      router.push(
+        getPathWithQueryParams(PATHS.REPORT_DETAILS(queryId), {
+          host_id: location.query.host_id,
+          fleet_id: location.query.fleet_id,
+        })
+      );
+    }
+  }, [queryId, isTeamMaintainerOrTeamAdmin, isStoredQueryLoading]);
+
+  useEffect(() => {
+    detectIsFleetQueryRunnable();
+    if (!queryId) {
+      setLastEditedQueryId(DEFAULT_QUERY.id);
+      setLastEditedQueryName(DEFAULT_QUERY.name);
+      setLastEditedQueryDescription(DEFAULT_QUERY.description);
+      // Persist lastEditedQueryBody through live query flow instead of resetting to DEFAULT_QUERY.query
+      setLastEditedQueryObserverCanRun(DEFAULT_QUERY.observer_can_run);
+      setLastEditedQueryFrequency(DEFAULT_QUERY.interval);
+      setLastEditedQueryAutomationsEnabled(DEFAULT_QUERY.automations_enabled);
+      setLastEditedQueryLoggingType(DEFAULT_QUERY.logging);
+      setLastEditedQueryMinOsqueryVersion(DEFAULT_QUERY.min_osquery_version);
+      setLastEditedQueryPlatforms(DEFAULT_QUERY.platform);
+      setLastEditedQueryDiscardData(DEFAULT_QUERY.discard_data);
+    }
+  }, [queryId]);
+
+  const [isQuerySaving, setIsQuerySaving] = useState(false);
+  const [isQueryUpdating, setIsQueryUpdating] = useState(false);
+  const [backendValidators, setBackendValidators] = useState<{
+    [key: string]: string;
+  }>({});
+
+  // Updates title that shows up on browser tabs
+  useEffect(() => {
+    // e.g., Editing Discover TLS certificates | Queries | Fleet
+    const storedQueryTitleCopy = storedQuery?.name
+      ? `Editing ${storedQuery.name} | `
+      : "";
+    document.title = `${storedQueryTitleCopy}Reports | ${DOCUMENT_TITLE_SUFFIX}`;
+    // }
+  }, [location.pathname, storedQuery?.name]);
+
+  useEffect(() => {
+    setShowOpenSchemaActionText(!isSidebarOpen);
+  }, [isSidebarOpen]);
+
+  const onSubmitNewQuery = debounce(async (formData: ICreateQueryFormData) => {
+    setIsQuerySaving(true);
+    try {
+      const { query } = await queryAPI.create(formData);
+      queryClient.invalidateQueries({ queryKey: [{ scope: "queries" }] });
+      notify.success("Report created.");
+      router.push(
+        getPathWithQueryParams(PATHS.REPORT_DETAILS(query.id), {
+          fleet_id: query.team_id,
+          host_id: hostId,
+        })
+      );
+      setBackendValidators({});
+    } catch (createError) {
+      if (getErrorReason(createError).includes("already exists")) {
+        const teamErrorText =
+          teamNameForQuery && apiTeamIdForQuery !== 0
+            ? `the ${teamNameForQuery} fleet`
+            : "all fleets";
+        setBackendValidators({
+          name: `A report with that name already exists for ${teamErrorText}.`,
+        });
+      } else {
+        notify.error(
+          "Something went wrong creating your report. Please try again.",
+          { response: createError }
+        );
+        setBackendValidators({});
+      }
+    } finally {
+      setIsQuerySaving(false);
+    }
+  });
+
+  const onUpdateQuery = async (formData: ICreateQueryFormData) => {
+    if (!queryId) {
+      return false;
+    }
+
+    setIsQueryUpdating(true);
+
+    const updatedQuery = deepDifference(formData, {
+      lastEditedQueryName,
+      lastEditedQueryDescription,
+      lastEditedQueryBody,
+      lastEditedQueryObserverCanRun,
+      lastEditedQueryFrequency,
+      lastEditedQueryAutomationsEnabled,
+      lastEditedQueryPlatforms,
+      lastEditedQueryLoggingType,
+      lastEditedQueryMinOsqueryVersion,
+      lastEditedQueryDiscardData,
+    });
+
+    try {
+      await queryAPI.update(queryId, updatedQuery);
+      queryClient.invalidateQueries({ queryKey: [{ scope: "queries" }] });
+      notify.success("Report updated.");
+      router.push(
+        getPathWithQueryParams(PATHS.REPORT_DETAILS(queryId), {
+          host_id: location.query.host_id,
+          fleet_id: location.query.fleet_id,
+        })
+      );
+    } catch (updateError) {
+      console.error(updateError);
+      const reason = getErrorReason(updateError);
+      if (reason.includes("Duplicate")) {
+        notify.error("A report with this name already exists.", {
+          response: updateError,
+        });
+      } else if (reason.includes(INVALID_PLATFORMS_REASON)) {
+        notify.error(INVALID_PLATFORMS_FLASH_MESSAGE, {
+          response: updateError,
+        });
+      } else {
+        notify.error(
+          "Something went wrong updating your report. Please try again.",
+          { response: updateError }
+        );
+      }
+    }
+
+    setIsQueryUpdating(false);
+    setShowConfirmSaveChangesModal(false); // Closes conditionally opened modal when discarding previous results
+
+    return false;
+  };
+
+  const onOsqueryTableSelect = (tableName: string) => {
+    setSelectedOsqueryTable(tableName);
+  };
+
+  const onCloseSchemaSidebar = () => {
+    setIsSidebarOpen(false);
+  };
+
+  const onOpenSchemaSidebar = () => {
+    setIsSidebarOpen(true);
+  };
+
+  const renderLiveQueryWarning = (): JSX.Element | null => {
+    if (isLiveQueryRunnable || config?.server_settings.live_query_disabled) {
+      return null;
+    }
+
+    return (
+      <InfoBanner color="yellow">
+        Fleet is unable to run a live report. Refresh the page or log in again.
+        If this keeps happening please{" "}
+        <CustomLink
+          url="https://github.com/fleetdm/fleet/issues/new/choose"
+          text="file an issue"
+          newTab
+          variant="banner-link"
+        />
+      </InfoBanner>
+    );
+  };
+
+  // Function instead of constant eliminates race condition
+  // Returns to queries details page, manage queries page with filters, or default manage queries page
+  const backPath = () => {
+    if (queryId) {
+      return getPathWithQueryParams(PATHS.REPORT_DETAILS(queryId), {
+        fleet_id: currentTeamId,
+        host_id: hostId,
+      });
+    }
+
+    if (hostId) {
+      return getPathWithQueryParams(PATHS.HOST_DETAILS(hostId, currentTeamId));
+    }
+
+    if (filteredQueriesPath) return filteredQueriesPath;
+
+    return getPathWithQueryParams(PATHS.MANAGE_REPORTS, {
+      fleet_id: currentTeamId,
+    });
+  };
+
+  const backButtonText = () => {
+    if (queryId) {
+      return "Back to report";
+    }
+
+    if (hostId) {
+      return "Back to host details";
+    }
+
+    return "Back to reports";
+  };
+
+  const showSidebar =
+    isSidebarOpen &&
+    (isGlobalAdmin ||
+      isGlobalMaintainer ||
+      isAnyTeamMaintainerOrTeamAdmin ||
+      isObserverPlus ||
+      isAnyTeamObserverPlus);
+
+  return (
+    <SidePanelPage>
+      <>
+        <MainContent className={baseClass}>
+          <>
+            <div className={`${baseClass}__header-links`}>
+              <BackButton text={backButtonText()} path={backPath()} />
+            </div>
+            <EditQueryForm
+              router={router}
+              location={location}
+              onSubmitNewQuery={onSubmitNewQuery}
+              onOsqueryTableSelect={onOsqueryTableSelect}
+              onUpdate={onUpdateQuery}
+              storedQuery={storedQuery}
+              queryIdForEdit={queryId}
+              apiTeamIdForQuery={apiTeamIdForQuery}
+              currentTeamId={currentTeamId}
+              currentTeamName={teamNameForQuery}
+              isStoredQueryLoading={isStoredQueryLoading}
+              showOpenSchemaActionText={showOpenSchemaActionText}
+              onOpenSchemaSidebar={onOpenSchemaSidebar}
+              renderLiveQueryWarning={renderLiveQueryWarning}
+              backendValidators={backendValidators}
+              isQuerySaving={isQuerySaving}
+              isQueryUpdating={isQueryUpdating}
+              hostId={hostId}
+              queryReportsDisabled={
+                appConfig?.server_settings.query_reports_disabled
+              }
+              showConfirmSaveChangesModal={showConfirmSaveChangesModal}
+              setShowConfirmSaveChangesModal={setShowConfirmSaveChangesModal}
+            />
+          </>
+        </MainContent>
+        {showSidebar && (
+          <SidePanelContent>
+            <QuerySidePanel
+              onOsqueryTableSelect={onOsqueryTableSelect}
+              selectedOsqueryTable={selectedOsqueryTable}
+              onClose={onCloseSchemaSidebar}
+            />
+          </SidePanelContent>
+        )}
+      </>
+    </SidePanelPage>
+  );
+};
+
+export default EditQueryPage;

@@ -1,0 +1,14 @@
+.fleet-maintained-apps-table {
+  .macos__header,
+  .windows__header {
+    .column-header {
+      display: flex;
+      justify-content: center;
+    }
+  }
+
+  &__filters {
+    display: flex;
+    gap: $gap-table-elements;
+  }
+}

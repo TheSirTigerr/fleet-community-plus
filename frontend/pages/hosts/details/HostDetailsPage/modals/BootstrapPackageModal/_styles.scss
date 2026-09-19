@@ -1,0 +1,15 @@
+.bootstrap-package-modal {
+  &__package-name {
+    margin: 0 0 $pad-xsmall;
+  }
+
+  &__details {
+    background-color: $ui-fleet-black-10;
+    font-family: "SourceCodePro", $monospace;
+    color: $core-fleet-blue;
+    padding: 10px;
+    border: 1px solid $ui-fleet-black-10;
+    margin: 0;
+    border-radius: $border-radius;
+  }
+}

@@ -1,0 +1,172 @@
+import React from "react";
+
+import ActionsDropdown from "components/ActionsDropdown";
+import Button from "components/buttons/Button";
+import Icon from "components/Icon";
+import TooltipTruncatedTextCell from "components/TableContainer/DataTable/TooltipTruncatedTextCell";
+import TooltipWrapper from "components/TooltipWrapper";
+import { IDropdownOption } from "interfaces/dropdownOption";
+import { IHostScript, ILastExecution } from "interfaces/script";
+import { IUser } from "interfaces/user";
+import {
+  isGlobalAdmin,
+  isTeamMaintainer,
+  isTeamAdmin,
+  isGlobalMaintainer,
+  isGlobalObserver,
+  isTeamObserver,
+  isGlobalTechnician,
+  isTeamTechnician,
+} from "utilities/permissions/permissions";
+
+import ScriptStatusCell from "./components/ScriptStatusCell";
+
+interface IRowProps {
+  row: {
+    original: IHostScript;
+  };
+}
+interface ICellProps extends IRowProps {
+  cell: {
+    value: string;
+  };
+}
+
+interface IStatusCellProps {
+  cell: {
+    value: ILastExecution | null;
+  };
+}
+
+interface IActionsDropdownProps {
+  cell: {
+    value: IDropdownOption[];
+  };
+  row: {
+    original: IHostScript;
+  };
+}
+
+export const generateActionDropdownOptions = (
+  currentUser: IUser | null,
+  teamId: number | null,
+  { last_execution }: IHostScript
+): IDropdownOption[] => {
+  const isPending = last_execution?.status === "pending";
+  const hasRunPermission =
+    !!currentUser &&
+    (isGlobalAdmin(currentUser) ||
+      isTeamAdmin(currentUser, teamId) ||
+      isGlobalMaintainer(currentUser) ||
+      isTeamMaintainer(currentUser, teamId) ||
+      // TODO - refactor all permissions to be clear and granular
+      // each of these (confusingly) cover both observer and observer+
+      isGlobalObserver(currentUser) ||
+      isTeamObserver(currentUser, teamId) ||
+      isGlobalTechnician(currentUser) ||
+      isTeamTechnician(currentUser, teamId));
+  const options: IDropdownOption[] = [
+    {
+      label: "Show run details",
+      disabled: last_execution === null,
+      value: "showRunDetails",
+    },
+  ];
+  hasRunPermission &&
+    options.unshift({
+      label: "Run",
+      disabled: isPending,
+      value: "run",
+      tooltipContent: isPending ? "Script is already running." : undefined,
+    });
+  return options;
+};
+
+// eslint-disable-next-line import/prefer-default-export
+export const generateTableColumnConfigs = (
+  currentUser: IUser | null,
+  hostTeamId: number | null,
+  scriptsDisabled: boolean,
+  onClickViewScript: (scriptDetails: IHostScript) => void,
+  onSelectAction: (value: string, script: IHostScript) => void
+) => {
+  return [
+    {
+      title: "Name",
+      Header: "Name",
+      disableSortBy: true,
+      accessor: "name",
+      Cell: (cellProps: ICellProps) => {
+        const onClickScriptName = (e: React.MouseEvent) => {
+          // Allows for a button to be clickable in a clickable row
+          e.stopPropagation();
+          onClickViewScript(cellProps.row.original);
+        };
+
+        return (
+          <Button
+            className="script-info"
+            onClick={onClickScriptName}
+            variant="link"
+          >
+            <TooltipTruncatedTextCell
+              value={cellProps.row.original.name}
+              className="w400" // Funky workaround for a truncation text cell WITHIN a button
+            />
+          </Button>
+        );
+      },
+    },
+    {
+      title: "Status",
+      Header: "Status",
+      disableSortBy: true,
+      accessor: "last_execution",
+      Cell: ({ cell: { value } }: IStatusCellProps) => {
+        return <ScriptStatusCell lastExecution={value} />;
+      },
+    },
+    {
+      title: "Actions",
+      Header: "",
+      disableSortBy: true,
+      accessor: "actions",
+      Cell: (cellProps: IActionsDropdownProps) => {
+        if (scriptsDisabled) {
+          // create a basic span that doesn't use the dropdown component (which relies on react-select
+          // and makes it difficult for us to style the disabled tooltip underline on the placeholder text.
+          return (
+            <span className="run-script-action--disabled">
+              <TooltipWrapper
+                tipContent={
+                  <>Running scripts is disabled in organization settings.</>
+                }
+              >
+                Actions
+              </TooltipWrapper>
+              <Icon name="chevron-down" color="ui-fleet-black-50" />
+            </span>
+          );
+        }
+
+        const opts = generateActionDropdownOptions(
+          currentUser,
+          hostTeamId,
+          cellProps.row.original
+        );
+        return (
+          <ActionsDropdown
+            options={opts}
+            onChange={(value: string) =>
+              onSelectAction(value, cellProps.row.original)
+            }
+            placeholder="Actions"
+            disabled={scriptsDisabled}
+            menuAlign="right"
+            variant="secondary"
+          />
+        );
+      },
+    },
+  ];
+};

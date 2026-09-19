@@ -1,0 +1,120 @@
+.dashboard-page {
+  @include vertical-page-layout;
+
+  h2 {
+    font-size: $small;
+    margin: 0;
+  }
+
+  .form-field--dropdown {
+    margin-bottom: 0;
+  }
+
+  &__header {
+    @include normalize-team-header;
+    .Select-control {
+      background-color: $ui-off-white !important;
+    }
+  }
+
+  &__title {
+    .fleeticon {
+      color: $core-fleet-blue;
+      margin-right: 15px;
+    }
+
+    .fleeticon-success-check {
+      color: $ui-success;
+    }
+
+    .fleeticon-offline {
+      color: $ui-error;
+    }
+  }
+
+  .card {
+    box-sizing: border-box;
+    overflow-x: hidden;
+  }
+
+  &__platforms {
+    display: flex;
+    align-items: center;
+
+    span {
+      font-size: $small;
+    }
+    .Select-control,
+    .Select-value {
+      background-color: $core-fleet-white !important;
+    }
+  }
+
+  &__platform-filter {
+    width: 138px;
+  }
+
+  &__section {
+    width: 100%;
+    display: grid;
+    row-gap: $gap-page-component;
+
+    @media screen and (min-width: $break-md) {
+      grid-template-columns: repeat(2, minmax(0, 1fr));
+      column-gap: $gap-page-component;
+
+      // if we have an odd number of elements, take
+      // the last one and stretch it across the grid
+      .dashboard-info-card:nth-child(odd):last-child {
+        grid-column-start: span 2;
+      }
+    }
+  }
+
+  &__host-sections {
+    display: flex;
+    flex-direction: column;
+  }
+
+  &__charts-row {
+    display: grid;
+    row-gap: $gap-page-component;
+
+    @media screen and (min-width: $break-md) {
+      grid-template-columns: repeat(2, minmax(0, 1fr));
+      column-gap: $gap-page-component;
+    }
+  }
+
+  // >= 320px 12 pt gap
+  @media (min-width: $break-mobile-xs) {
+    .dashboard-page__host-sections {
+      gap: $gap-page-component-responsiveness;
+    }
+  }
+
+  // >= 880px 16pt gap
+  @media (min-width: $break-sm) {
+    .dashboard-page__host-sections {
+      gap: $gap-page-component;
+    }
+  }
+
+  .spinner {
+    z-index: 11;
+    opacity: 1;
+    position: absolute;
+    width: 100%;
+    height: 100%;
+    display: flex;
+    justify-content: center;
+    align-items: center;
+  }
+
+  // this is needed to make changes to the activity feed dropodown filters layout
+  // based on the activity feed card width
+  .activity-feed-card {
+    container-type: inline-size;
+    container-name: activity-feed-card;
+  }
+}

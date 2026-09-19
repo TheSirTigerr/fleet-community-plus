@@ -1,0 +1,46 @@
+receivers:
+  otlp:
+    protocols:
+      grpc:
+        endpoint: "0.0.0.0:4317"
+
+exporters:
+  prometheus:
+    endpoint: "0.0.0.0:8889"
+
+  debug:
+
+  # Jaeger ingests OTLP natively (COLLECTOR_OTLP_ENABLED=true in
+  # docker-compose.yml); the dedicated jaeger exporter was removed
+  # from the collector.
+  otlp/jaeger:
+    endpoint: jaeger-all-in-one:4317
+    tls:
+      insecure: true
+
+processors:
+  batch:
+
+connectors:
+  # Replaces the removed spanmetrics processor: consumes traces,
+  # emits metrics into the metrics pipeline.
+  spanmetrics:
+
+extensions:
+  health_check:
+  pprof:
+    endpoint: :1888
+  zpages:
+    endpoint: :55679
+
+service:
+  extensions: [zpages, pprof, health_check]
+  pipelines:
+    traces:
+      receivers: [otlp]
+      processors: [batch]
+      exporters: [debug, otlp/jaeger, spanmetrics]
+    metrics:
+      receivers: [otlp, spanmetrics]
+      processors: [batch]
+      exporters: [debug, prometheus]

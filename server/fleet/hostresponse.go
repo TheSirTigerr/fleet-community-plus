@@ -1,0 +1,63 @@
+package fleet
+
+import (
+	"context"
+	"time"
+)
+
+// HostResponse is the response struct that contains the full host information
+// along with the host online status and the "display text" to be used when
+// rendering in the UI.
+type HostResponse struct {
+	*Host
+	// Add alias fields for team name and ID for use in CSV reports.
+	// TODO: clean up in Fleet 5.
+	FleetID               *uint        `json:"-" csv:"fleet_id"`
+	FleetName             *string      `json:"-" csv:"fleet_name"`
+	Status                HostStatus   `json:"status" csv:"status"`
+	DisplayText           string       `json:"display_text" csv:"display_text"`
+	DisplayName           string       `json:"display_name" csv:"display_name"`
+	Labels                []*Label     `json:"labels,omitempty" csv:"-"`
+	Geolocation           *GeoLocation `json:"geolocation,omitempty" csv:"-"`
+	CSVDeviceMapping      string       `json:"-" db:"-" csv:"device_mapping"`
+	HardwareMarketingName string       `json:"hardware_marketing_name" csv:"hardware_marketing_name"`
+}
+
+// HostResponseForHost returns a HostResponse from Host with Geolocation.
+func HostResponseForHost(ctx context.Context, svc Service, host *Host) *HostResponse {
+	hr := HostResponseForHostCheap(host)
+	hr.Geolocation = svc.LookupGeoIP(ctx, host.PublicIP)
+	return hr
+}
+
+// HostResponseForHostCheap returns a new HostResponse from a Host without computing Geolocation.
+func HostResponseForHostCheap(host *Host) *HostResponse {
+	return &HostResponse{
+		Host:                  host,
+		Status:                host.Status(time.Now()),
+		DisplayText:           host.Hostname,
+		DisplayName:           host.DisplayName(),
+		HardwareMarketingName: host.HardwareMarketingName(),
+	}
+}
+
+// HostResponsesForHostsCheap returns a HostResponses from Hosts without computing Geolocation.
+func HostResponsesForHostsCheap(hosts []Host) []HostResponse {
+	hrs := make([]HostResponse, len(hosts))
+	for i, h := range hosts {
+		h := h
+		hrs[i] = *HostResponseForHostCheap(&h)
+	}
+	return hrs
+}
+
+// HostDetailResponse is the response struct that contains the full host information
+// with the HostDetail details.
+type HostDetailResponse struct {
+	HostDetail
+	Status                HostStatus   `json:"status"`
+	DisplayText           string       `json:"display_text"`
+	DisplayName           string       `json:"display_name"`
+	Geolocation           *GeoLocation `json:"geolocation,omitempty"`
+	HardwareMarketingName string       `json:"hardware_marketing_name"`
+}

@@ -1,0 +1,96 @@
+import React, { useContext, useState } from "react";
+
+import { renderAppleManualEnrollmentDisabled } from "components/AddHostsModal/helpers";
+import CustomLink from "components/CustomLink";
+import InputField from "components/forms/fields/InputField";
+import Radio from "components/forms/fields/Radio";
+import { AppContext } from "context/app";
+import PATHS from "router/paths";
+import { getPathWithQueryParams } from "utilities/url";
+
+import EnrollQrCode from "../EnrollQrCode";
+
+type EnrollmentType = "personal" | "companyOwned";
+
+const baseClass = "ios-ipados-panel";
+
+interface IosIpadosPanelProps {
+  enrollSecret: string;
+  isManualAppleEnrollmentsBlocked: boolean;
+}
+
+const IosIpadosPanel = ({
+  enrollSecret,
+  isManualAppleEnrollmentsBlocked,
+}: IosIpadosPanelProps) => {
+  const { config, isMacMdmEnabledAndConfigured } = useContext(AppContext);
+
+  // Default to "Personal (BYOD)" per #23242 design.
+  const [enrollmentType, setEnrollmentType] = useState<EnrollmentType>(
+    "personal"
+  );
+
+  if (!config) return null;
+
+  if (isManualAppleEnrollmentsBlocked) {
+    return renderAppleManualEnrollmentDisabled("iOS & iPadOS");
+  }
+
+  if (!isMacMdmEnabledAndConfigured) {
+    return (
+      <p>
+        <CustomLink
+          url={PATHS.ADMIN_INTEGRATIONS_MDM_APPLE}
+          text="Turn on Apple MDM"
+          emphasized
+        />{" "}
+        to enroll iOS & iPadOS hosts.
+      </p>
+    );
+  }
+
+  const url = getPathWithQueryParams(
+    `${config.server_settings.server_url}/enroll`,
+    {
+      enroll_secret: enrollSecret,
+      byod: enrollmentType === "personal" ? "true" : undefined,
+    }
+  );
+
+  return (
+    <div className={baseClass}>
+      <form>
+        <fieldset className="form-field">
+          <Radio
+            name="iosIpadosEnrollmentType"
+            id="iosIpadosPersonal"
+            label="Personal (BYOD)"
+            value="personal"
+            checked={enrollmentType === "personal"}
+            onChange={() => setEnrollmentType("personal")}
+          />
+          <Radio
+            name="iosIpadosEnrollmentType"
+            id="iosIpadosCompanyOwned"
+            label="Company-owned (fully-managed)"
+            value="companyOwned"
+            checked={enrollmentType === "companyOwned"}
+            onChange={() => setEnrollmentType("companyOwned")}
+          />
+        </fieldset>
+        <InputField
+          label="Share this link with your end users:"
+          enableCopy
+          readOnly
+          inputWrapperClass={`${baseClass}__enroll-link`}
+          name="enroll-link"
+          value={url}
+          helpText="This link must be opened in Safari. If opened in another browser, end users will have to sign in again using Safari."
+        />
+        <EnrollQrCode url={url} />
+      </form>
+    </div>
+  );
+};
+
+export default IosIpadosPanel;

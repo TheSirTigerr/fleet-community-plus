@@ -1,0 +1,10 @@
+.run-script-batch-paginated-list {
+  .paginated-list__row {
+    display: flex;
+    justify-content: space-between;
+    padding: $pad-small $pad-large;
+  }
+  .loading-spinner.centered {
+    margin: auto;
+  }
+}

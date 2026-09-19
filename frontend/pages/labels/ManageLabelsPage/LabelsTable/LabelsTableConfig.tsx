@@ -1,0 +1,203 @@
+import React from "react";
+
+import ActionsDropdown from "components/ActionsDropdown";
+import HeaderCell from "components/TableContainer/DataTable/HeaderCell";
+import TextCell from "components/TableContainer/DataTable/TextCell";
+import TooltipTruncatedTextCell from "components/TableContainer/DataTable/TooltipTruncatedTextCell";
+import ViewAllHostsButton from "components/ViewAllHostsLink";
+import { IDropdownOption } from "interfaces/dropdownOption";
+import { ILabel, LabelMembershipTypeToDisplayCopy } from "interfaces/label";
+import { IUser } from "interfaces/user";
+import { getGitOpsModeTipContent } from "utilities/helpers";
+import {
+  isGlobalAdmin,
+  isGlobalMaintainer,
+  isAnyTeamMaintainerOrTeamAdmin,
+  isTeamAdmin,
+  isTeamMaintainer,
+  isGlobalTechnician,
+  isAnyTeamTechnician,
+  isTeamTechnician,
+} from "utilities/permissions/permissions";
+
+interface IHeaderProps {
+  column: {
+    title: string;
+    isSortedDesc: boolean;
+  };
+}
+
+interface IRowProps {
+  row: {
+    original: ILabel;
+  };
+}
+
+interface ICellProps extends IRowProps {
+  cell: {
+    value: string;
+  };
+}
+
+interface IDropdownCellProps extends IRowProps {
+  cell: {
+    value: IDropdownOption[];
+  };
+}
+
+interface IDataColumn {
+  title: string;
+  Header: ((props: IHeaderProps) => JSX.Element) | string;
+  accessor: string;
+  Cell:
+    | ((props: ICellProps) => JSX.Element)
+    | ((props: IDropdownCellProps) => JSX.Element);
+  disableHidden?: boolean;
+  disableSortBy?: boolean;
+  sortType?: string;
+}
+
+const hasEditPermission = (currentUser: IUser, label: ILabel): boolean => {
+  return (
+    // global permissions
+    isGlobalAdmin(currentUser) ||
+    isGlobalMaintainer(currentUser) ||
+    isGlobalTechnician(currentUser) ||
+    // author permission
+    (label.author_id === currentUser.id &&
+      (isAnyTeamMaintainerOrTeamAdmin(currentUser) ||
+        isAnyTeamTechnician(currentUser))) ||
+    // team permission
+    (label.team_id != null &&
+      (isTeamAdmin(currentUser, label.team_id) ||
+        isTeamMaintainer(currentUser, label.team_id) ||
+        isTeamTechnician(currentUser, label.team_id)))
+  );
+};
+
+const generateActionDropdownOptions = (
+  currentUser: IUser,
+  label: ILabel,
+  labelsGitOpsManaged: boolean,
+  repoURL?: string
+): IDropdownOption[] => {
+  const options: IDropdownOption[] = [
+    {
+      label: "View all hosts",
+      disabled: false,
+      value: "view_hosts",
+    },
+  ];
+
+  const gitOpsTooltip =
+    labelsGitOpsManaged && repoURL
+      ? getGitOpsModeTipContent(repoURL)
+      : undefined;
+
+  if (hasEditPermission(currentUser, label)) {
+    if (label.label_membership_type !== "host_vitals") {
+      options.push({
+        label: "Edit",
+        disabled: false,
+        value: "edit",
+      });
+    }
+
+    options.push({
+      label: "Delete",
+      disabled: labelsGitOpsManaged,
+      value: "delete",
+      tooltipContent: gitOpsTooltip,
+    });
+  }
+
+  return options;
+};
+
+const generateTableHeaders = (
+  currentUser: IUser,
+  onClickAction: (action: string, label: ILabel) => void,
+  labelsGitOpsManaged = false,
+  repoURL?: string
+): IDataColumn[] => {
+  return [
+    {
+      title: "Name",
+      Header: (cellProps) => (
+        <HeaderCell
+          value={cellProps.column.title}
+          isSortedDesc={cellProps.column.isSortedDesc}
+        />
+      ),
+      accessor: "name",
+      disableSortBy: false,
+      Cell: (cellProps: ICellProps) => (
+        <TooltipTruncatedTextCell value={cellProps.cell.value} />
+      ),
+    },
+    {
+      title: "Description",
+      Header: (cellProps) => (
+        <HeaderCell
+          value={cellProps.column.title}
+          isSortedDesc={cellProps.column.isSortedDesc}
+        />
+      ),
+      accessor: "description",
+      Cell: (cellProps: ICellProps) => (
+        <TooltipTruncatedTextCell value={cellProps.cell.value || ""} />
+      ),
+    },
+    {
+      title: "Type",
+      Header: (cellProps) => (
+        <HeaderCell
+          value={cellProps.column.title}
+          isSortedDesc={cellProps.column.isSortedDesc}
+        />
+      ),
+      accessor: "label_membership_type",
+      Cell: (cellProps: ICellProps) => {
+        const type = cellProps.row.original.label_membership_type;
+        return <TextCell value={LabelMembershipTypeToDisplayCopy[type]} />;
+      },
+    },
+    {
+      title: "Actions",
+      Header: "",
+      disableSortBy: true,
+      accessor: "actions",
+      Cell: (cellProps: IDropdownCellProps) => {
+        const label = cellProps.row.original;
+        const dropdownOptions = generateActionDropdownOptions(
+          currentUser,
+          label,
+          labelsGitOpsManaged,
+          repoURL
+        );
+
+        if (
+          dropdownOptions.length === 1 &&
+          dropdownOptions[0].value === "view_hosts"
+        ) {
+          return <ViewAllHostsButton platformLabelId={label.id} rowHover />;
+        }
+
+        return (
+          <ActionsDropdown
+            options={dropdownOptions}
+            onChange={(value: string) => onClickAction(value, label)}
+            placeholder="Actions"
+            menuAlign="right"
+            variant="secondary"
+          />
+        );
+      },
+    },
+  ];
+};
+
+const generateDataSet = (labels: ILabel[]) =>
+  labels.filter((label) => label.label_type !== "builtin");
+
+export { generateTableHeaders, generateDataSet, hasEditPermission };

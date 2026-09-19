@@ -1,0 +1,97 @@
+import classnames from "classnames";
+import React from "react";
+
+import Card from "components/Card";
+import CardHeader from "components/CardHeader";
+import DataError from "components/DataError";
+import DeviceUserError from "components/DeviceUserError";
+import { IHostCertificate } from "interfaces/certificates";
+import { IListSort } from "interfaces/list_options";
+import { HostPlatform } from "interfaces/platform";
+import { IGetHostCertificatesResponse } from "services/entities/hosts";
+
+import CertificatesTable from "./CertificatesTable";
+
+const baseClass = "certificates-card";
+
+interface ICertificatesProps {
+  // data may be undefined while the fetch is in flight or has errored; in the
+  // error case the card renders DataError below without reading it.
+  data?: IGetHostCertificatesResponse;
+  hostPlatform: HostPlatform;
+  page: number;
+  pageSize: number;
+  sortHeader: string;
+  sortDirection: string;
+  isError: boolean;
+  isMyDevicePage?: boolean;
+  className?: string;
+  onSelectCertificate: (certificate: IHostCertificate) => void;
+  onNextPage: () => void;
+  onPreviousPage: () => void;
+  onSortChange: ({ order_key, order_direction }: IListSort) => void;
+}
+
+const CertificatesCard = ({
+  data,
+  hostPlatform,
+  isError,
+  page,
+  pageSize,
+  sortHeader,
+  sortDirection,
+  isMyDevicePage = false,
+  className,
+  onSelectCertificate,
+  onNextPage,
+  onPreviousPage,
+  onSortChange,
+}: ICertificatesProps) => {
+  const renderContent = () => {
+    if (isError) {
+      return isMyDevicePage ? (
+        <DeviceUserError />
+      ) : (
+        <DataError verticalPaddingSize="pad-large" />
+      );
+    }
+
+    if (!data) {
+      return null;
+    }
+
+    return (
+      <CertificatesTable
+        data={data}
+        hostPlatform={hostPlatform}
+        showHelpText={
+          !isMyDevicePage &&
+          (hostPlatform === "darwin" || hostPlatform === "windows")
+        }
+        page={page}
+        pageSize={pageSize}
+        sortDirection={sortDirection}
+        sortHeader={sortHeader}
+        onSortChange={onSortChange}
+        onSelectCertificate={onSelectCertificate}
+        onNextPage={onNextPage}
+        onPreviousPage={onPreviousPage}
+      />
+    );
+  };
+
+  const classNames = classnames(baseClass, className);
+
+  return (
+    <Card
+      className={classNames}
+      borderRadiusSize="xxlarge"
+      paddingSize="xlarge"
+    >
+      <CardHeader header="Certificates" />
+      {renderContent()}
+    </Card>
+  );
+};
+
+export default CertificatesCard;

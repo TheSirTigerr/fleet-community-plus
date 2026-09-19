@@ -1,0 +1,465 @@
+package mdmlifecycle
+
+import (
+	"context"
+	"log/slog"
+
+	"github.com/fleetdm/fleet/v4/server/contexts/ctxerr"
+	"github.com/fleetdm/fleet/v4/server/contexts/license"
+	"github.com/fleetdm/fleet/v4/server/fleet"
+	"github.com/fleetdm/fleet/v4/server/mdm/nanomdm/mdm"
+	"github.com/fleetdm/fleet/v4/server/ptr"
+	"github.com/fleetdm/fleet/v4/server/worker"
+)
+
+// HostAction is a supported MDM lifecycle action that can be performed on a
+// host.
+type HostAction string
+
+// TODO: we're hooking into the reset step for processing related to mdm idp accounts, but should
+// consider if we need to do anything in the turn-on step or other lifecycle steps
+const (
+	// HostActionTurnOn performs tasks right after a host turns on MDM.
+	HostActionTurnOn HostAction = "turn-on"
+	// HostActionTurnOff performs tasks right after a host turns off MDM.
+	HostActionTurnOff HostAction = "turn-off"
+	// HostActionReset performs tasks to reset mdm-related information.
+	HostActionReset HostAction = "reset"
+	// HostActionDelete performs tasks to cleanup MDM information when a
+	// host is deleted from fleet.
+	HostActionDelete HostAction = "delete"
+)
+
+// HostOptions are the options that can be provided for an action.
+//
+// Not all options are required for all actions, each individual action should
+// validate that it receives the required information.
+type HostOptions struct {
+	Action                  HostAction
+	Platform                string
+	UUID                    string
+	UserEnrollmentID        string
+	HardwareSerial          string
+	HardwareModel           string
+	EnrollReference         string
+	Host                    *fleet.Host
+	HasSetupExperienceItems bool
+	SCEPRenewalInProgress   bool
+	FromMDMMigration        bool
+	// TeamID is currently only used for resetApple to assign the host to the correct team for account driven enrollments.
+	TeamID *uint
+	// IsPersonalEnrollment indicates a manual (profile-driven) BYOD enrollment
+	// where the end user chose "Personal" on the /enroll page. For Account-Driven
+	// User Enrollments (UserEnrollmentID != "") this is set automatically.
+	IsPersonalEnrollment bool
+}
+
+// HostLifecycle manages MDM host lifecycle actions
+type HostLifecycle struct {
+	ds              fleet.Datastore
+	logger          *slog.Logger
+	newActivityFunc NewActivityFunc
+}
+
+// NewActivityFunc is the signature type of the service-layer function that can
+// create activities and handle the webhook notification and all other
+// mechanisms required when creating an activity.
+type NewActivityFunc = fleet.NewActivityFunc
+
+// New creates a new HostLifecycle struct
+func New(ds fleet.Datastore, logger *slog.Logger, newActivityFn NewActivityFunc) *HostLifecycle {
+	return &HostLifecycle{
+		ds:              ds,
+		logger:          logger,
+		newActivityFunc: newActivityFn,
+	}
+}
+
+// Do executes the provided HostAction based on the platform requested
+func (t *HostLifecycle) Do(ctx context.Context, opts HostOptions) error {
+	switch opts.Platform {
+	case "darwin", "ios", "ipados":
+		err := t.doApple(ctx, opts)
+		return ctxerr.Wrapf(ctx, err, "running apple lifecycle action %s", opts.Action)
+	case "windows":
+		err := t.doWindows(ctx, opts)
+		return ctxerr.Wrapf(ctx, err, "running windows lifecycle action %s", opts.Action)
+	default:
+		return ctxerr.Errorf(ctx, "unsupported platform %s", opts.Platform)
+	}
+}
+
+func (t *HostLifecycle) doApple(ctx context.Context, opts HostOptions) error {
+	switch opts.Action {
+	case HostActionTurnOn:
+		return t.turnOnApple(ctx, opts)
+
+	case HostActionTurnOff:
+		return t.doWithUUIDValidation(ctx, t.ds.MDMTurnOff, opts)
+
+	case HostActionReset:
+		return t.resetApple(ctx, opts)
+
+	case HostActionDelete:
+		return t.deleteApple(ctx, opts)
+
+	default:
+		return ctxerr.Errorf(ctx, "unknown action %s", opts.Action)
+
+	}
+}
+
+func (t *HostLifecycle) doWindows(ctx context.Context, opts HostOptions) error {
+	switch opts.Action {
+	case HostActionReset, HostActionTurnOn:
+		return t.resetWindows(ctx, opts)
+
+	case HostActionTurnOff:
+		return t.doWithUUIDValidation(ctx, t.ds.MDMTurnOff, opts)
+
+	case HostActionDelete:
+		return nil
+
+	default:
+		return ctxerr.Errorf(ctx, "unknown action %s", opts.Action)
+	}
+}
+
+type uuidFn func(ctx context.Context, uuid string) ([]*fleet.User, []fleet.ActivityDetails, error)
+
+func (t *HostLifecycle) doWithUUIDValidation(ctx context.Context, action uuidFn, opts HostOptions) error {
+	if opts.UUID == "" {
+		return ctxerr.New(ctx, "UUID option is required for this action")
+	}
+
+	users, acts, err := action(ctx, opts.UUID)
+	if err != nil {
+		return err
+	}
+	return t.createActivities(ctx, users, acts)
+}
+
+func (t *HostLifecycle) resetWindows(ctx context.Context, opts HostOptions) error {
+	if opts.UUID == "" {
+		return ctxerr.New(ctx, "UUID option is required for this action")
+	}
+
+	return t.ds.MDMResetEnrollment(ctx, opts.UUID, false)
+}
+
+func (t *HostLifecycle) resetApple(ctx context.Context, opts HostOptions) error {
+	// Account-Driven User Enrollment (BYOD iOS) uses UserEnrollmentID as
+	// the device identifier when UUID/serial are not yet known.
+	isPersonalEnrollment := opts.IsPersonalEnrollment
+	if opts.UUID == "" && opts.HardwareSerial == "" && opts.UserEnrollmentID != "" {
+		opts.UUID = opts.UserEnrollmentID
+		opts.HardwareSerial = opts.UserEnrollmentID
+		isPersonalEnrollment = true
+	}
+	if opts.UUID == "" || opts.HardwareSerial == "" || opts.HardwareModel == "" {
+		return ctxerr.New(ctx, "UUID, HardwareSerial and HardwareModel options are required for this action")
+	}
+
+	host := &fleet.Host{
+		UUID:           opts.UUID,
+		HardwareSerial: opts.HardwareSerial,
+		HardwareModel:  opts.HardwareModel,
+		Platform:       opts.Platform,
+		TeamID:         opts.TeamID,
+	}
+
+	// FIXME: Why skip this step if we're in the middle of a SCEP renewal?
+	// We need to revisit the renewal flow. Short-circuiting in random places means it is
+	// much more difficult to reason about the state of the host. We should try instead
+	// to centralize the flow control in the lifecycle methods.
+	if !opts.SCEPRenewalInProgress {
+		// upsert the host to ensure we have the latest information
+		if err := t.ds.MDMAppleUpsertHost(ctx, host, isPersonalEnrollment); err != nil {
+			return ctxerr.Wrap(ctx, err, "upserting mdm host")
+		}
+	}
+
+	if err := t.ds.MDMResetEnrollment(ctx, opts.UUID, opts.SCEPRenewalInProgress); err != nil {
+		return ctxerr.Wrap(ctx, err, "reset mdm enrollment")
+	}
+
+	// Reconcile host-name template enforcement on (re-)enrollment. Skipped during
+	// SCEP renewal, which isn't a real enrollment change and where host.ID isn't
+	// populated (the upsert above is skipped too).
+	if !opts.SCEPRenewalInProgress {
+		if err := t.reconcileHostNameEnforcement(ctx, host.ID); err != nil {
+			return err
+		}
+	}
+
+	return nil
+}
+
+// reconcileHostNameEnforcement upserts or deletes the host's host-name template
+// enforcement row based on its current team template, so a host enrolling into a
+// team with a template gets a queued row.
+func (t *HostLifecycle) reconcileHostNameEnforcement(ctx context.Context, hostID uint) error {
+	if hostID == 0 {
+		return nil
+	}
+	if err := t.ds.ReconcileHostDeviceNamesForHosts(ctx, []uint{hostID}); err != nil {
+		return ctxerr.Wrap(ctx, err, "reconcile host name enforcement")
+	}
+	return nil
+}
+
+func (t *HostLifecycle) turnOnApple(ctx context.Context, opts HostOptions) error {
+	if opts.UUID == "" {
+		return ctxerr.New(ctx, "UUID option is required for this action")
+	}
+
+	nanoEnroll, err := t.ds.GetNanoMDMEnrollment(ctx, opts.UUID)
+	if err != nil {
+		return ctxerr.Wrap(ctx, err, "retrieving nano enrollment info")
+	}
+
+	userEnrollmentDeviceType := mdm.EnrollType(mdm.UserEnrollmentDevice).String()
+
+	if nanoEnroll == nil ||
+		!nanoEnroll.Enabled ||
+		!(nanoEnroll.Type == mdm.EnrollType(mdm.Device).String() || nanoEnroll.Type == userEnrollmentDeviceType) ||
+		nanoEnroll.TokenUpdateTally != 1 {
+		// something unexpected, so we skip the turn on
+		// and log the details for debugging
+		attrs := []slog.Attr{slog.String("host_uuid", opts.UUID)}
+		if nanoEnroll == nil {
+			attrs = append(attrs, slog.String("nano_enroll", "nil"))
+		} else {
+			attrs = append(attrs,
+				slog.Bool("enabled", nanoEnroll.Enabled),
+				slog.String("type", nanoEnroll.Type),
+				slog.Int("token_update_tally", nanoEnroll.TokenUpdateTally),
+			)
+		}
+		t.logger.LogAttrs(ctx, slog.LevelInfo, "skipping turn on darwin", attrs...)
+
+		return nil
+	}
+
+	info, err := t.ds.GetHostMDMCheckinInfo(ctx, opts.UUID)
+	if err != nil {
+		return ctxerr.Wrap(ctx, err, "getting checkin info")
+	}
+
+	// create MDM enrolled activity if not in the middle of a SCEP renewal
+	if !info.SCEPRenewalInProgress {
+		mdmEnrolledActivity := &fleet.ActivityTypeMDMEnrolled{
+			HostID:           info.HostID,
+			HostDisplayName:  info.DisplayName,
+			InstalledFromDEP: info.DEPAssignedToFleet,
+			MDMPlatform:      fleet.MDMPlatformApple,
+			Platform:         info.Platform,
+		}
+		if nanoEnroll.Type == userEnrollmentDeviceType {
+			// Account-driven user (BYOD) enrollments have no hardware serial, so
+			// report the enrollment ID as the serial too, keeping host_serial
+			// populated for automations regardless of enrollment type.
+			mdmEnrolledActivity.EnrollmentID = new(opts.UserEnrollmentID)
+			mdmEnrolledActivity.HostSerial = new(opts.UserEnrollmentID)
+		} else {
+			mdmEnrolledActivity.HostSerial = ptr.String(info.HardwareSerial)
+		}
+		err = t.newActivityFunc(ctx, nil, mdmEnrolledActivity)
+		if err != nil {
+			return ctxerr.Wrap(ctx, err, "create mdm enrolled activity")
+		}
+	}
+
+	var tmID *uint
+	if info.TeamID != 0 {
+		tmID = &info.TeamID
+	}
+
+	// Reconcile host-name template enforcement now that the host is enrolled: if
+	// its team has a template and it's eligible.
+	// Done before the branches below since they return early.
+	//
+	// resetApple also reconciles, so a normal Authenticate->TokenUpdate enrollment
+	// reconciles twice; that's intentional and idempotent. Both hooks are needed
+	// because a re-enrollment can arrive as Authenticate (resetApple) without a
+	// fresh TokenUpdate reaching this branch (guarded on TokenUpdateTally == 1).
+	if err := t.reconcileHostNameEnforcement(ctx, info.HostID); err != nil {
+		return err
+	}
+
+	// TODO: improve this to not enqueue the job if a host that is
+	// assigned in ABM is manually enrolling for some reason.
+	if info.DEPAssignedToFleet || info.InstalledFromDEP {
+		t.logger.InfoContext(ctx, "queueing post-enroll task for newly enrolled DEP device", "host_uuid", opts.UUID)
+		err := worker.QueueAppleMDMJob(
+			ctx,
+			t.ds,
+			t.logger,
+			worker.AppleMDMPostDEPEnrollmentTask,
+			opts.UUID,
+			opts.Platform,
+			tmID,
+			opts.EnrollReference,
+			!opts.HasSetupExperienceItems || opts.Platform != "darwin",
+			opts.FromMDMMigration,
+		)
+		return ctxerr.Wrap(ctx, err, "queue DEP post-enroll task")
+	}
+
+	// manual MDM enrollments
+	if !info.InstalledFromDEP {
+		t.logger.InfoContext(ctx, "queueing post-enroll task for manual enrolled device", "host_uuid", opts.UUID)
+		if err := worker.QueueAppleMDMJob(
+			ctx,
+			t.ds,
+			t.logger,
+			worker.AppleMDMPostManualEnrollmentTask,
+			opts.UUID,
+			opts.Platform,
+			tmID,
+			opts.EnrollReference,
+			false,
+			false,
+		); err != nil {
+			return ctxerr.Wrap(ctx, err, "queue manual post-enroll task")
+		}
+	}
+
+	return nil
+}
+
+func (t *HostLifecycle) deleteApple(ctx context.Context, opts HostOptions) error {
+	if opts.Host == nil {
+		return ctxerr.New(ctx, "a non-nil Host option is required to perform this action")
+	}
+
+	// NOTE: deletion of mdm-related tables is handled by the ds.DeleteHost method.
+
+	// Try to immediately restore a host if it's assigned to us in ABM
+	if !license.IsPremium(ctx) {
+		// only premium tier supports DEP so nothing more to do
+		return nil
+	}
+
+	ac, err := t.ds.AppConfig(ctx)
+	if err != nil {
+		return ctxerr.Wrap(ctx, err, "get app config")
+	}
+
+	dep, err := t.ds.GetHostDEPAssignment(ctx, opts.Host.ID)
+	if err != nil && !fleet.IsNotFound(err) {
+		return ctxerr.Wrap(ctx, err, "get host dep assignment")
+	}
+
+	if !ac.MDM.AppleBMEnabledAndConfigured {
+		if fleet.IsNotFound(err) || dep == nil || dep.DeletedAt != nil {
+			// Nothing to delete
+			return nil
+		}
+
+		// If ABM is not enabled and configured, mark the host_dep_assignments row as deleted to avoid orphaned rows.
+		if err = t.ds.MarkHostDEPAssignmentDeleted(ctx, opts.Host.ID); err != nil {
+			return ctxerr.Wrap(ctx, err, "mark host dep assignment deleted")
+		}
+
+		return nil
+	}
+
+	if dep != nil && dep.DeletedAt == nil {
+		// Don't recreate a pending "ghost" host if a duplicate host for the same
+		// serial still exists. This happens when an operator deletes one of a set
+		// of duplicate hosts (e.g. from a Migration Assistant flow) to resolve the
+		// duplicate — restoring a ghost here would just recreate the duplicate they
+		// removed. If the surviving duplicate has no DEP assignment of its own, the
+		// deleted host's assignment is transferred to it to preserve the ABM
+		// relationship.
+		dupExists, err := t.ds.ReconcileDuplicateDEPHostOnDelete(ctx, opts.Host.HardwareSerial, opts.Host.Platform, opts.Host.ID)
+		if err != nil {
+			return ctxerr.Wrap(ctx, err, "reconcile duplicate dep host")
+		}
+		if dupExists {
+			return nil
+		}
+
+		return t.restorePendingDEPHost(ctx, opts.Host, dep.ABMTokenID)
+	}
+
+	// no DEP assignment was found or the DEP assignment was deleted in ABM
+	// so nothing more to do
+	return nil
+}
+
+func (t *HostLifecycle) restorePendingDEPHost(ctx context.Context, host *fleet.Host, abmTokenID *uint) error {
+	if abmTokenID == nil {
+		return ctxerr.New(ctx, "cannot restore pending dep host without valid ABM token id")
+	}
+
+	tmID, err := t.getDefaultTeamForABMToken(ctx, host, *abmTokenID)
+	if err != nil {
+		return ctxerr.Wrap(ctx, err, "restore pending dep host")
+	}
+	host.TeamID = tmID
+
+	if err := t.ds.RestoreMDMApplePendingDEPHost(ctx, host); err != nil {
+		return ctxerr.Wrap(ctx, err, "restore pending dep host")
+	}
+
+	if _, err := worker.QueueMacosSetupAssistantJob(ctx, t.ds, t.logger,
+		worker.MacosSetupAssistantHostsTransferred, tmID, host.HardwareSerial); err != nil {
+		return ctxerr.Wrap(ctx, err, "queue macos setup assistant update profile job")
+	}
+
+	return nil
+}
+
+func (t *HostLifecycle) getDefaultTeamForABMToken(ctx context.Context, host *fleet.Host, abmTokenID uint) (*uint, error) {
+	var abmDefaultTeamID *uint
+	tok, err := t.ds.GetABMTokenByID(ctx, abmTokenID)
+	if err != nil {
+		return nil, ctxerr.Wrap(ctx, err, "getting ABM token by id")
+	}
+
+	switch host.FleetPlatform() {
+	case "darwin":
+		abmDefaultTeamID = tok.MacOSDefaultTeamID
+	case "ios":
+		abmDefaultTeamID = tok.IOSDefaultTeamID
+	case "ipados":
+		abmDefaultTeamID = tok.IPadOSDefaultTeamID
+	default:
+		return nil, ctxerr.NewWithData(ctx, "attempting to get default ABM team for host with invalid platform", map[string]any{"host_platform": host.FleetPlatform(), "host_id": host.ID})
+	}
+
+	if abmDefaultTeamID == nil {
+		// The default team is "No team", so we can return nil
+		return nil, nil
+	}
+
+	exists, err := t.ds.TeamExists(ctx, *abmDefaultTeamID)
+	if err != nil {
+		return nil, ctxerr.Wrap(ctx, err, "get default team for mdm devices")
+	}
+
+	if !exists {
+		t.logger.InfoContext(ctx, "unable to find default team assigned to abm token, mdm devices won't be assigned to a team",
+			"team_id", abmDefaultTeamID,
+		)
+		return nil, nil
+	}
+
+	return abmDefaultTeamID, nil
+}
+
+func (t *HostLifecycle) createActivities(ctx context.Context, users []*fleet.User, acts []fleet.ActivityDetails) error {
+	if len(users) != len(acts) {
+		return ctxerr.New(ctx, "number of users and activities must match, this is a Fleet development bug")
+	}
+
+	for i, act := range acts {
+		user := users[i]
+		if err := t.newActivityFunc(ctx, user, act); err != nil {
+			return ctxerr.Wrap(ctx, err, "create activity")
+		}
+	}
+	return nil
+}

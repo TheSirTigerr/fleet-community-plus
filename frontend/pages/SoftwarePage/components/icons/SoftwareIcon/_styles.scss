@@ -1,0 +1,129 @@
+/** Styles are repetitive with .os-icon
+* Future iteration: Better way to combine styling */
+
+.software-icon {
+  flex-shrink: 0;
+
+  &__xsmall {
+    width: 20px;
+    height: 20px;
+    border-radius: $border-radius;
+  }
+
+  &__small {
+    width: 24px;
+    height: 24px;
+    border-radius: $border-radius;
+  }
+
+  &__medium {
+    width: 40px;
+    height: 40px;
+    border-radius: $border-radius-xlarge;
+  }
+
+  &__large {
+    width: 64px;
+    height: 64px;
+    border-radius: $border-radius-xxlarge;
+  }
+
+  &__xlarge {
+    width: 96px;
+    height: 96px;
+    border-radius: $border-radius-xxlarge;
+  }
+
+  &__software-img {
+    display: block;
+  }
+
+  // These following classs are when a software icon is passed a url prop. In
+  // this case we need to add custom width,height, and padding to show these
+  // icons correctly.
+
+  // we use this selector to give higher specifity than the selector
+  // ".core-wrapper a img" which is in /styles/global/_styles.scss
+  // TODO: we should change ".core-wrapper a img" selector in that file
+  // as it too generic and can affect other parts of the app.
+  > img.software-icon__software-img-xsmall {
+    width: 20px;
+    height: 20px;
+    border-radius: $border-radius-small;
+    margin-left: 0;
+  }
+
+  > img.software-icon__software-img-small {
+    width: 24px;
+    height: 24px;
+    border-radius: $border-radius-small;
+    margin-left: 0;
+  }
+
+  > img.software-icon__software-img-medium {
+    width: 40px;
+    height: 40px;
+    border-radius: $border-radius-xlarge;
+    margin-left: 0;
+  }
+
+  > img.software-icon__software-img-large {
+    width: 64px;
+    height: 64px;
+    border-radius: $border-radius-xxlarge;
+    margin-left: 0;
+  }
+
+  > img.software-icon__software-img-xlarge {
+    width: 96px;
+    height: 96px;
+    border-radius: $border-radius-xxlarge;
+    margin-left: 0;
+  }
+}
+
+// A Fleet-maintained app icon renders as an <img> here, where a hand-authored
+// icon renders as an <svg>. ".core-wrapper a img" in
+// layouts/CoreLayout/_styles.scss sets 12x12 and a left margin on any image
+// inside a link, and CSS beats the width/height attributes, so the box has to
+// be restated. Two classes plus an element outranks that rule's one class plus
+// two elements, which is why each size is spelled out rather than set once on
+// img.software-icon.
+//
+// Border radius is deliberately left to the size classes above so raster and
+// vector icons match. All five sizes are covered even though only small,
+// medium and large are used today: a size with no rule here fails silently as
+// a 12px icon rather than loudly.
+img.software-icon {
+  display: block;
+
+  &.software-icon__xsmall {
+    width: 20px;
+    height: 20px;
+    margin-left: 0;
+  }
+
+  &.software-icon__small {
+    width: 24px;
+    height: 24px;
+    margin-left: 0;
+  }
+
+  &.software-icon__medium {
+    width: 40px;
+    height: 40px;
+    margin-left: 0;
+  }
+
+  &.software-icon__large {
+    width: 64px;
+    height: 64px;
+    margin-left: 0;
+  }
+
+  &.software-icon__xlarge {
+    width: 96px;
+    height: 96px;
+    margin-left: 0;
+  }
+}

@@ -1,0 +1,12 @@
+.hash-cell {
+  display: flex;
+  flex-direction: row;
+  gap: $pad-xsmall;
+  align-items: center;
+
+  &__sha256 {
+    display: flex;
+    align-items: center;
+    width: 70px; // Consistent to align copy icons
+  }
+}

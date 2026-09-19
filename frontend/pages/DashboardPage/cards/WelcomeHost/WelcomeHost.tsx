@@ -1,0 +1,309 @@
+import React, { useState } from "react";
+import { useQuery } from "react-query";
+
+import Button from "components/buttons/Button";
+import CustomLink from "components/CustomLink";
+import Icon from "components/Icon/Icon";
+import Modal from "components/Modal";
+import Spinner from "components/Spinner";
+import { notify } from "components/ToastNotification";
+import { IHost, IHostResponse } from "interfaces/host";
+import { IHostPolicy } from "interfaces/policy";
+import PATHS from "router/paths";
+import hostAPI from "services/entities/hosts";
+import { timeAgo } from "utilities/date_format";
+
+import LaptopMac from "../../../../../assets/images/laptop-mac.png";
+import SlackButton from "../../../../../assets/images/slack-button-get-help.png";
+
+interface IWelcomeHostCardProps {
+  totalsHostsCount: number;
+  toggleAddHostsModal: (showAddHostsModal: boolean) => void;
+}
+
+const baseClass = "welcome-host";
+const HOST_ID = 1;
+const POLICY_PASS = "pass";
+const POLICY_FAIL = "fail";
+
+const WelcomeHost = ({
+  totalsHostsCount,
+  toggleAddHostsModal,
+}: IWelcomeHostCardProps): JSX.Element => {
+  const [refetchStartTime, setRefetchStartTime] = useState<number | null>(null);
+  const [currentPolicyShown, setCurrentPolicyShown] = useState<IHostPolicy>();
+  const [showPolicyModal, setShowPolicyModal] = useState(false);
+  const [isPoliciesEmpty, setIsPoliciesEmpty] = useState(false);
+  const [showRefetchLoadingSpinner, setShowRefetchLoadingSpinner] = useState(
+    false
+  );
+
+  const {
+    isLoading: isLoadingHost,
+    data: host,
+    error: loadingHostError,
+    refetch: fullyReloadHost,
+  } = useQuery<IHostResponse, Error, IHost>(
+    ["host"],
+    () => hostAPI.loadHostDetails(HOST_ID),
+    {
+      retry: false,
+      select: (data: IHostResponse) => data.host,
+      onSuccess: (returnedHost) => {
+        setShowRefetchLoadingSpinner(returnedHost.refetch_requested);
+
+        const anyPassingOrFailingPolicy = returnedHost?.policies?.find(
+          (p) => p.response === POLICY_PASS || p.response === POLICY_FAIL
+        );
+        setIsPoliciesEmpty(typeof anyPassingOrFailingPolicy === "undefined");
+
+        if (returnedHost.refetch_requested) {
+          // Code duplicated from HostDetailsPage. See comments there.
+          if (!refetchStartTime) {
+            if (returnedHost.status === "online") {
+              setRefetchStartTime(Date.now());
+              setTimeout(() => {
+                fullyReloadHost();
+              }, 1000);
+            } else {
+              setShowRefetchLoadingSpinner(false);
+            }
+          } else {
+            const totalElapsedTime = Date.now() - refetchStartTime;
+            if (totalElapsedTime < 60000) {
+              if (returnedHost.status === "online") {
+                setTimeout(() => {
+                  fullyReloadHost();
+                }, 1000);
+              } else {
+                notify.error(
+                  `This host is offline. Please try refetching host vitals later.`
+                );
+                setShowRefetchLoadingSpinner(false);
+              }
+            } else {
+              notify.error(
+                `Refetch sent but vitals are taking longer than expected to load. You’ll see an update when the host responds.`
+              );
+              setShowRefetchLoadingSpinner(false);
+            }
+          }
+        }
+      },
+      onError: (error) => {
+        console.error(error);
+      },
+    }
+  );
+
+  const onRefetchHost = async () => {
+    if (host) {
+      setShowRefetchLoadingSpinner(true);
+
+      try {
+        await hostAPI.refetch(host).then(() => {
+          setRefetchStartTime(Date.now());
+          setTimeout(() => fullyReloadHost(), 1000);
+        });
+      } catch (error) {
+        console.error(error);
+        notify.error(`Host "${host.display_name}" refetch error`, {
+          response: error,
+        });
+        setShowRefetchLoadingSpinner(false);
+      }
+    }
+  };
+
+  const handlePolicyModal = (id: number) => {
+    const policy = host?.policies.find((p) => p.id === id);
+
+    if (policy) {
+      setCurrentPolicyShown(policy);
+      setShowPolicyModal(true);
+    }
+  };
+
+  if (isLoadingHost) {
+    return (
+      <div className={baseClass}>
+        <div className={`${baseClass}__loading`}>
+          <Spinner />
+        </div>
+      </div>
+    );
+  }
+
+  if (loadingHostError) {
+    return (
+      <div className={baseClass}>
+        <div className={`${baseClass}__empty-hosts`}>
+          <p>Add your personal device to assess the security of your device.</p>
+          <p>
+            In Fleet, laptops, workstations, and servers are referred to as
+            &quot;hosts&quot;.
+          </p>
+          <Button
+            onClick={toggleAddHostsModal}
+            className={`${baseClass}__add-host`}
+          >
+            <span>Add hosts</span>
+          </Button>
+        </div>
+      </div>
+    );
+  }
+
+  if (totalsHostsCount === 1 && host && host.status === "offline") {
+    return (
+      <div className={baseClass}>
+        <div className={`${baseClass}__error`}>
+          <p className="error-message">
+            <Icon name="disable" color="status-error" />
+            Your device is not communicating with Fleet.
+          </p>
+          <p>Join the #fleet Slack channel for help troubleshooting.</p>
+          <a
+            target="_blank"
+            rel="noreferrer"
+            href="https://osquery.slack.com/archives/C01DXJL16D8"
+          >
+            <img
+              alt="Get help on Slack"
+              className="button-slack"
+              src={SlackButton}
+            />
+          </a>
+        </div>
+      </div>
+    );
+  }
+
+  if (isPoliciesEmpty) {
+    return (
+      <div className={baseClass}>
+        <div className={`${baseClass}__error`}>
+          <p className="error-message">
+            <Icon name="disable" color="status-error" />
+            No policies apply to your device.
+          </p>
+          <p>Join the #fleet Slack channel for help troubleshooting.</p>
+          <a
+            target="_blank"
+            rel="noreferrer"
+            href="https://osquery.slack.com/archives/C01DXJL16D8"
+          >
+            <img
+              alt="Get help on Slack"
+              className="button-slack"
+              src={SlackButton}
+            />
+          </a>
+        </div>
+      </div>
+    );
+  }
+
+  if (totalsHostsCount === 1 && host && host.status === "online") {
+    return (
+      <div className={baseClass}>
+        <div className={`${baseClass}__intro`}>
+          <img alt="" src={LaptopMac} />
+          <div className="info">
+            <CustomLink
+              url={PATHS.HOST_DETAILS(host.id)}
+              text={host.display_name}
+            />
+            <p>Your host is successfully connected to Fleet.</p>
+          </div>
+        </div>
+        <div className={`${baseClass}__blurb`}>
+          <p>
+            Fleet already ran the following policies to assess the security of
+            your device:{" "}
+          </p>
+        </div>
+        <div className={`${baseClass}__policies`}>
+          {host.policies?.slice(0, 3).map((p) => {
+            if (p.response) {
+              return (
+                <Button
+                  variant="unstyled"
+                  onClick={() => handlePolicyModal(p.id)}
+                >
+                  <div className="policy-block">
+                    <Icon
+                      name={
+                        p.response === POLICY_PASS ? "success" : "error-outline"
+                      }
+                    />
+                    <span className="info">{p.name}</span>
+                    <Icon
+                      name="chevron-right"
+                      color="ui-fleet-black-75"
+                      className="policy-arrow"
+                    />
+                  </div>
+                </Button>
+              );
+            }
+
+            return null;
+          })}
+          <div className={`${baseClass}__view-all-policies`}>
+            {host.policies?.length > 3 && (
+              <CustomLink
+                url={PATHS.HOST_POLICIES(host.id)}
+                text="View all host's policies"
+              />
+            )}
+          </div>
+        </div>
+        <div className={`${baseClass}__blurb`}>
+          <p>Resolved a failing policy? Refetch your host vitals to verify.</p>
+        </div>
+        <div className={`${baseClass}__refetch`}>
+          <Button
+            className={`refetch-spinner ${
+              showRefetchLoadingSpinner ? "spin" : ""
+            }`}
+            onClick={onRefetchHost}
+            disabled={showRefetchLoadingSpinner}
+          >
+            <Icon name="refresh" color="core-fleet-white" /> Refetch
+          </Button>
+          <span>
+            Last updated{" "}
+            {timeAgo(new Date(host.detail_updated_at), {
+              addSuffix: true,
+            })}
+          </span>
+        </div>
+        {showPolicyModal && (
+          <Modal
+            title={currentPolicyShown?.name || ""}
+            onExit={() => setShowPolicyModal(false)}
+            onEnter={() => setShowPolicyModal(false)}
+            className={`${baseClass}__policy-modal`}
+          >
+            <>
+              <p>{currentPolicyShown?.description}</p>
+              {currentPolicyShown?.resolution && (
+                <p>
+                  <b>Resolve:</b> {currentPolicyShown.resolution}
+                </p>
+              )}
+              <div className="modal-cta-wrap">
+                <Button onClick={() => setShowPolicyModal(false)}>Close</Button>
+              </div>
+            </>
+          </Modal>
+        )}
+      </div>
+    );
+  }
+
+  return <Spinner />;
+};
+
+export default WelcomeHost;

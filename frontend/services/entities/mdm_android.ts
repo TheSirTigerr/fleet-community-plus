@@ -1,0 +1,95 @@
+import sendRequest from "services";
+import authToken from "utilities/auth_token";
+import endpoints from "utilities/endpoints";
+
+interface IGetAndroidSignupUrlResponse {
+  android_enterprise_signup_url: string;
+}
+
+interface IGetAndroidEnterpriseResponse {
+  android_enterprise_id: boolean;
+}
+
+export default {
+  getSignupUrl: (): Promise<IGetAndroidSignupUrlResponse> => {
+    const { MDM_ANDROID_SIGNUP_URL } = endpoints;
+    return sendRequest("GET", MDM_ANDROID_SIGNUP_URL);
+  },
+
+  getAndroidEnterprise: (): Promise<IGetAndroidEnterpriseResponse> => {
+    const { MDM_ANDROID_ENTERPRISE } = endpoints;
+    return sendRequest("GET", MDM_ANDROID_ENTERPRISE);
+  },
+
+  turnOffAndroidMdm: (): Promise<void> => {
+    const { MDM_ANDROID_ENTERPRISE } = endpoints;
+    return sendRequest("DELETE", MDM_ANDROID_ENTERPRISE);
+  },
+
+  /**
+   * This function starts a Server-Sent Events connection with the fleet server
+   * to get messages about a successful Android mdm connection. We have to use
+   * fetch here because the EventSource API does not support setting headers,
+   * which we need to authenticate the request.
+   */
+  startSSE: (abortSignal: AbortSignal): Promise<void> => {
+    return new Promise(async (resolve, reject) => {
+      try {
+        const response = await fetch(endpoints.MDM_ANDROID_SSE_URL, {
+          method: "GET",
+          headers: {
+            Authorization: `Bearer ${authToken.get()}`,
+            Accept: "text/event-stream",
+          },
+          signal: abortSignal,
+        });
+
+        const reader = response?.body?.getReader();
+        if (!reader) {
+          reject(new Error("Android MDM SSE stream unavailable"));
+          return;
+        }
+        const decoder = new TextDecoder();
+        const successSignal = "data: Android Enterprise successfully connected";
+        const errorMarker = "event: error";
+        // Buffer accumulates decoded text so a frame split across multiple
+        // chunks (valid with chunked transfer encoding) is still detected.
+        const tailLen = Math.max(successSignal.length, errorMarker.length);
+        let buffer = "";
+        let loggedError = false;
+
+        while (true) {
+          // eslint-disable-next-line no-await-in-loop
+          const { done, value } = await reader.read();
+          if (done) {
+            // Server closed the stream without ever sending success.
+            // Reject so callers don't await forever on unmount or backend hiccup.
+            reject(new Error("Android MDM SSE ended before success signal"));
+            return;
+          }
+          buffer += decoder.decode(value, { stream: true });
+          // Surface backend-emitted error events. Chrome's EventStream tab
+          // doesn't attach to fetch-based SSE reliably, so without this log
+          // the only signal of a server-side failure is the generic UI
+          // toast.
+          if (!loggedError && buffer.includes(errorMarker)) {
+            console.error("[android-sse]:", buffer);
+            loggedError = true;
+          }
+          if (buffer.includes(successSignal)) {
+            resolve();
+            return;
+          }
+          buffer = buffer.slice(-tailLen);
+        }
+      } catch (error) {
+        if ((error as Error).name === "AbortError") {
+          // we want to ignore abort errors
+          console.error("SSE Fetch aborted");
+        } else {
+          reject(error);
+        }
+      }
+    });
+  },
+};

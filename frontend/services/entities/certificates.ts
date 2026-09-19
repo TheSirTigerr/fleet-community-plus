@@ -1,0 +1,154 @@
+import {
+  ICertificateAuthorityPartial,
+  ICertificateAuthority,
+  ICertificatesCustomSCEP,
+  ICertificatesDigicert,
+  ICertificatesHydrant,
+  ICertificatesNDES,
+  ICertificatesSmallstep,
+  ICertificatesCustomEST,
+} from "interfaces/certificates";
+import { API_ALL_TEAMS_ID, APP_CONTEXT_ALL_TEAMS_ID } from "interfaces/team";
+import sendRequest from "services";
+import endpoints from "utilities/endpoints";
+import { buildQueryStringFromParams } from "utilities/url";
+
+import {
+  ListEntitiesResponsePaginationCommon,
+  PaginationParams,
+} from "./common";
+
+type IGetCertAuthoritiesListResponse = {
+  certificate_authorities: ICertificateAuthorityPartial[];
+};
+
+type IAddCertAuthorityResponse = ICertificateAuthorityPartial;
+
+type IGetCertAuthorityResponse = ICertificateAuthority;
+
+interface IRequestCertAuthorityResponse {
+  certificate: string;
+}
+
+export type IAddCertAuthorityFormData =
+  | { digicert: ICertificatesDigicert }
+  | { ndes_scep_proxy: ICertificatesNDES }
+  | { custom_scep_proxy: ICertificatesCustomSCEP }
+  | { hydrant: ICertificatesHydrant }
+  | { smallstep: ICertificatesSmallstep }
+  | { custom_est_proxy: ICertificatesCustomEST };
+
+export type IEditCertAuthorityFormData =
+  | { digicert: Partial<ICertificatesDigicert> }
+  | { ndes_scep_proxy: Partial<ICertificatesNDES> }
+  | { custom_scep_proxy: Partial<ICertificatesCustomSCEP> }
+  | { hydrant: Partial<ICertificatesHydrant> }
+  | { smallstep: Partial<ICertificatesSmallstep> }
+  | { custom_est_proxy: Partial<ICertificatesCustomEST> };
+
+interface IGetCertsParams extends PaginationParams {
+  // not supported: after, order key, order direction, match query, meta (always included)
+  fleet_id?: number;
+}
+
+export interface IQueryKeyGetCerts extends IGetCertsParams {
+  scope: "certificates";
+}
+export interface ICertificate {
+  id: number;
+  name: string;
+  subject_name: string;
+  certificate_authority_id: number;
+  certificate_authority_name: string;
+  subject_alternative_name?: string;
+  created_at: string;
+}
+export interface IGetCertsResponse {
+  meta: ListEntitiesResponsePaginationCommon;
+  certificates: ICertificate[];
+}
+
+export interface IAddCert {
+  name: string;
+  certAuthorityId: number;
+  subjectName: string;
+  subjectAlternativeName?: string;
+  teamId?: number;
+}
+
+export default {
+  getCertificateAuthoritiesList: (): Promise<IGetCertAuthoritiesListResponse> => {
+    const { CERTIFICATE_AUTHORITIES } = endpoints;
+    return sendRequest("GET", CERTIFICATE_AUTHORITIES);
+  },
+
+  getCertificateAuthority: (id: number): Promise<IGetCertAuthorityResponse> => {
+    const { CERTIFICATE_AUTHORITY } = endpoints;
+    return sendRequest("GET", CERTIFICATE_AUTHORITY(id));
+  },
+
+  addCertificateAuthority: (
+    certData: IAddCertAuthorityFormData
+  ): Promise<IAddCertAuthorityResponse> => {
+    const { CERTIFICATE_AUTHORITIES } = endpoints;
+    return sendRequest("POST", CERTIFICATE_AUTHORITIES, certData);
+  },
+
+  editCertificateAuthority: (
+    id: number,
+    updateData: IEditCertAuthorityFormData
+  ): Promise<void> => {
+    const { CERTIFICATE_AUTHORITY } = endpoints;
+    return sendRequest("PATCH", CERTIFICATE_AUTHORITY(id), updateData);
+  },
+
+  deleteCertificateAuthority: (id: number): Promise<void> => {
+    const { CERTIFICATE_AUTHORITY } = endpoints;
+    return sendRequest("DELETE", CERTIFICATE_AUTHORITY(id));
+  },
+
+  requestCertificate: (id: number): Promise<IRequestCertAuthorityResponse> => {
+    const { CERTIFICATE_AUTHORITY_REQUEST_CERT } = endpoints;
+    return sendRequest("GET", CERTIFICATE_AUTHORITY_REQUEST_CERT(id));
+  },
+  getCerts: ({
+    fleet_id,
+    page,
+    per_page,
+  }: IGetCertsParams): Promise<IGetCertsResponse> => {
+    const { CERTIFICATES } = endpoints;
+
+    const queryString = buildQueryStringFromParams({
+      fleet_id,
+      page,
+      per_page,
+    });
+
+    return sendRequest(
+      "GET",
+      queryString ? CERTIFICATES.concat(`?${queryString}`) : CERTIFICATES
+    );
+  },
+  addCert: ({
+    name,
+    certAuthorityId,
+    subjectName,
+    subjectAlternativeName,
+    teamId,
+  }: IAddCert) => {
+    const { CERTIFICATES } = endpoints;
+    const trimmedSAN = subjectAlternativeName?.trim() ?? "";
+    const requestBody = {
+      name,
+      certificate_authority_id: certAuthorityId,
+      subject_name: subjectName,
+      // omit when empty so the server treats it as "no SAN"
+      ...(trimmedSAN !== "" && { subject_alternative_name: trimmedSAN }),
+      fleet_id: teamId === APP_CONTEXT_ALL_TEAMS_ID ? API_ALL_TEAMS_ID : teamId,
+    };
+    return sendRequest("POST", CERTIFICATES, requestBody);
+  },
+  deleteCert: (id: number) => {
+    return sendRequest("DELETE", endpoints.CERTIFICATES.concat(`/${id}`));
+  },
+};

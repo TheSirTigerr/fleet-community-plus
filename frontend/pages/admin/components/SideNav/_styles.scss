@@ -1,0 +1,15 @@
+.side-nav {
+  &__container {
+    display: flex;
+    align-items: flex-start;
+  }
+
+  &__nav-list {
+    @include side-nav-list;
+  }
+
+  &__card-container {
+    width: 100%;
+    min-width: 0; // Allow flex child to shrink below content width for horizontal scroll
+  }
+}

@@ -1,0 +1,169 @@
+import React, { useCallback, useContext, useState } from "react";
+import { useQuery } from "react-query";
+import { browserHistory, InjectedRouter } from "react-router";
+import { Params } from "react-router/lib/Router";
+
+import BackButton from "components/BackButton";
+import Button from "components/buttons/Button";
+import MainContent from "components/MainContent";
+import ShowQueryModal from "components/modals/ShowQueryModal";
+import Spinner from "components/Spinner";
+import { AppContext } from "context/app";
+import {
+  IGetQueryResponse,
+  ISchedulableQuery,
+} from "interfaces/schedulable_query";
+import PATHS from "router/paths";
+import hqrAPI, { IGetHQRResponse } from "services/entities/host_query_report";
+import queryAPI from "services/entities/queries";
+import { DOCUMENT_TITLE_SUFFIX } from "utilities/constants";
+import { getPathWithQueryParams } from "utilities/url";
+
+import HQRTable from "./HQRTable";
+
+const baseClass = "host-query-report";
+
+interface IHostQueryReportProps {
+  router: InjectedRouter;
+  params: Params;
+}
+
+const HostQueryReport = ({
+  router,
+  params: { host_id, query_id },
+}: IHostQueryReportProps) => {
+  const { config, currentTeam } = useContext(AppContext);
+  const globalReportsDisabled = config?.server_settings.query_reports_disabled;
+  const hostId = Number(host_id);
+  const queryId = Number(query_id);
+
+  if (globalReportsDisabled) {
+    router.push(PATHS.HOST_REPORTS(hostId));
+  }
+
+  const [showQuery, setShowQuery] = useState(false);
+
+  const {
+    data: hqrResponse,
+    isLoading: hqrLoading,
+    error: hqrError,
+  } = useQuery<IGetHQRResponse, Error>(
+    [hostId, queryId],
+    () => hqrAPI.load(hostId, queryId),
+    {
+      refetchOnMount: false,
+      refetchOnReconnect: false,
+      refetchOnWindowFocus: false,
+    }
+  );
+
+  const {
+    isLoading: queryLoading,
+    data: queryResponse,
+    error: queryError,
+  } = useQuery<IGetQueryResponse, Error, ISchedulableQuery>(
+    ["query", queryId],
+    () => queryAPI.load(queryId),
+
+    {
+      select: (data) => data.query,
+      enabled: !!queryId,
+      refetchOnMount: false,
+      refetchOnReconnect: false,
+      refetchOnWindowFocus: false,
+    }
+  );
+
+  const isLoading = queryLoading || hqrLoading;
+
+  const {
+    host_name: hostName,
+    report_clipped: reportClipped,
+    last_fetched: lastFetched,
+    results,
+  } = hqrResponse || {};
+
+  // API response is nested this way to mirror that of the full Query Reports response (IQueryReport)
+  const rows = results?.map((row) => row.columns) ?? [];
+
+  const {
+    name: queryName,
+    description: queryDescription,
+    query: querySQL,
+    discard_data: queryDiscardData,
+    stats,
+  } = queryResponse || {};
+
+  // previous reroute can be done before API call, not this one, hence 2
+  if (queryDiscardData) {
+    router.push(PATHS.HOST_REPORTS(hostId));
+  }
+
+  // Updates title that shows up on browser tabs
+  if (queryName && hostName) {
+    // e.g., Discover TLS certificates (Rachel's MacBook Pro) | Hosts | Fleet
+    document.title = `${queryName} (${hostName}) |
+   Hosts | ${DOCUMENT_TITLE_SUFFIX}`;
+  } else {
+    document.title = `Hosts | ${DOCUMENT_TITLE_SUFFIX}`;
+  }
+
+  const HQRHeader = useCallback(() => {
+    const fullReportPath = getPathWithQueryParams(
+      PATHS.REPORT_DETAILS(queryId),
+      { fleet_id: currentTeam?.id }
+    );
+    return (
+      <div className={`${baseClass}__header`}>
+        <div className={`${baseClass}__header__row1`}>
+          <BackButton
+            text="Back to host details"
+            path={PATHS.HOST_DETAILS(hostId)}
+          />
+        </div>
+        <div className={`${baseClass}__header__row2`}>
+          {!hqrError && <h1 className="host-name">{hostName}</h1>}
+          <Button
+            onClick={() => {
+              browserHistory.push(fullReportPath);
+            }}
+          >
+            View report for all hosts
+          </Button>
+        </div>
+      </div>
+    );
+  }, [queryId, hostId, hqrError, hostName]);
+
+  return (
+    <MainContent className={baseClass}>
+      {isLoading ? (
+        <Spinner />
+      ) : (
+        <>
+          <HQRHeader />
+          <HQRTable
+            queryId={queryId}
+            queryName={queryName}
+            queryDescription={queryDescription}
+            queryStats={stats}
+            hostName={hostName}
+            rows={rows}
+            reportClipped={reportClipped}
+            lastFetched={lastFetched}
+            onShowQuery={() => setShowQuery(true)}
+            isLoading={false}
+          />
+          {showQuery && (
+            <ShowQueryModal
+              query={querySQL}
+              onCancel={() => setShowQuery(false)}
+            />
+          )}
+        </>
+      )}
+    </MainContent>
+  );
+};
+
+export default HostQueryReport;

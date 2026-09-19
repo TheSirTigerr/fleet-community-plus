@@ -1,0 +1,1978 @@
+package fleet
+
+import (
+	"context"
+	"crypto/x509"
+	"encoding/json"
+	"errors"
+	"io"
+	"iter"
+	"net/url"
+	"slices"
+	"time"
+
+	"github.com/fleetdm/fleet/v4/pkg/optjson"
+	"github.com/fleetdm/fleet/v4/server/mdm/nanodep/godep"
+	"github.com/fleetdm/fleet/v4/server/version"
+	"github.com/fleetdm/fleet/v4/server/websocket"
+)
+
+// EnterpriseOverrides contains the methods that can be overriden by the
+// enterprise service
+//
+// TODO: find if there's a better way to accomplish this and standardize.
+type EnterpriseOverrides struct {
+	HostFeatures   func(context context.Context, host *Host) (*Features, error)
+	TeamByIDOrName func(ctx context.Context, id *uint, name *string) (*Team, error)
+	// UpdateTeamMDMDiskEncryption is the team-specific service method for when
+	// a team ID is provided to the UpdateMDMDiskEncryption method.
+	UpdateTeamMDMDiskEncryption   func(ctx context.Context, tm *Team, changes DiskEncryptionSettingsChanges, requireBitLockerPIN *bool) error
+	UpdateTeamMDMHostNameTemplate func(ctx context.Context, tm *Team, nameTemplate string) error
+
+	// ApplyHostNameTemplateChange reconciles host-name enforcement rows and emits
+	// the edited_host_name_template activity for the given scope (a nil team =
+	// "No team").
+	ApplyHostNameTemplateChange func(ctx context.Context, team *Team, nameTemplate string) error
+
+	// The next two functions are implemented by the ee/service, and called
+	// properly when called from an ee/service method (e.g. Modify Team), but
+	// they also need to be called from the standard server/service method (e.g.
+	// Modify AppConfig), so in this case we need to use the enterprise
+	// overrides.
+	MDMAppleReconcileFileVaultProfile func(ctx context.Context, teamID *uint) error
+	DeleteMDMAppleSetupAssistant      func(ctx context.Context, teamID *uint) error
+	MDMAppleSyncDEPProfiles           func(ctx context.Context) error
+	DeleteMDMAppleBootstrapPackage    func(ctx context.Context, teamID *uint, dryRun bool) error
+	MDMWindowsEnableOSUpdates         func(ctx context.Context, teamID *uint, updates WindowsUpdates) error
+	MDMWindowsDisableOSUpdates        func(ctx context.Context, teamID *uint) error
+	MDMAppleEditedAppleOSUpdates      func(ctx context.Context, teamID *uint, appleDevice AppleDevice, updates AppleOSUpdateSettings) error
+	SetupExperienceNextStep           func(ctx context.Context, host *Host) (bool, error)
+	GetVPPTokenIfCanInstallVPPApps    func(ctx context.Context, appleDevice bool, host *Host) (string, error)
+	InstallVPPAppPostValidation       func(ctx context.Context, host *Host, vppApp *VPPApp, token string, opts HostSoftwareInstallOptions) (string, error)
+}
+
+type OsqueryService interface {
+	EnrollOsquery(
+		ctx context.Context, enrollSecret, hostIdentifier string, hostDetails map[string](map[string]string),
+	) (nodeKey string, err error)
+	// AuthenticateHost loads host identified by nodeKey. Returns an error if the nodeKey doesn't exist.
+	AuthenticateHost(ctx context.Context, nodeKey string) (host *Host, debug bool, err error)
+	GetClientConfig(ctx context.Context) (config map[string]interface{}, err error)
+	// GetClientConfigWithETag returns the osquery configuration for the host in
+	// the provided context plus conditional-request metadata. clientETag is the
+	// agent's "etag" request field: nil means it never opted in and must receive
+	// the pre-feature response bytes with no "etag" key; empty means it opted in
+	// but holds no validator yet. Neither can match, so an agent without history
+	// always receives a full config.
+	//
+	// When the Redis-backed store is enabled and the agent's etag matches, this
+	// returns NotModified WITHOUT BUILDING THE CONFIG — no AppConfig read, no
+	// ListPacksForHost, no agent options, no scheduled queries, and no
+	// host-intervals reconciliation. A side effect that must run on every config
+	// check-in therefore cannot live on the full-build path. Every other outcome,
+	// including every error, falls back to a full build; see ConfigETagMode for
+	// the cache modes and server/service/redis_config_etag for the design.
+	//
+	// GetClientConfig above remains the plain always-full-build variant, still
+	// used by the launcher (gRPC) service.
+	GetClientConfigWithETag(ctx context.Context, clientETag *string) (*ClientConfigResult, error)
+	// GetDistributedQueries retrieves the distributed queries to run for the host in
+	// the provided context. These may be (depending on update intervals):
+	//	- detail queries (including additional queries, if any),
+	//	- label queries,
+	//	- user-initiated distributed queries (aka live queries),
+	//	- policy queries.
+	//
+	// A map from query name to query is returned.
+	//
+	// To enable the osquery "accelerated checkins" feature, a positive integer (number of seconds to activate for)
+	// should be returned. Returning 0 for this will not activate the feature.
+	GetDistributedQueries(ctx context.Context) (queries map[string]string, discovery map[string]string, accelerate uint, err error)
+	SubmitDistributedQueryResults(
+		ctx context.Context,
+		results OsqueryDistributedQueryResults,
+		statuses map[string]OsqueryStatus,
+		messages map[string]string,
+		stats map[string]*Stats,
+	) (err error)
+	SubmitStatusLogs(ctx context.Context, logs []json.RawMessage) (err error)
+	SubmitResultLogs(ctx context.Context, logs []json.RawMessage) (err error)
+	YaraRuleByName(ctx context.Context, name string) (*YaraRule, error)
+
+	// ListHostIDsDueForDistributedRead returns the subset of hostIDs whose next
+	// distributed/read would include interval work or an unanswered live query
+	// campaign, keyed by host ID with the reason it is due (an AgentWSReason
+	// constant or a live-<campaign ID> reason; the first due gate wins). Used
+	// by the WebSocket transport's interval check job; applies the same
+	// staleness gates (including per-host jitter) as GetDistributedQueries.
+	// IDs with no hosts row are returned with AgentWSReasonHostNotFound.
+	ListHostIDsDueForDistributedRead(ctx context.Context, hostIDs []uint) (map[uint]string, error)
+}
+
+// UserLookupService provides methods for looking up users.
+// This interface is extracted for use by components that only need user lookup capabilities.
+type UserLookupService interface {
+	// ListUsers returns all users.
+	ListUsers(ctx context.Context, opt UserListOptions) (users []*User, err error)
+	// UsersByIDs returns minimal user info matching the provided IDs.
+	UsersByIDs(ctx context.Context, ids []uint) ([]*UserSummary, error)
+}
+
+// HostLookupService provides methods for looking up hosts.
+// This interface is extracted for use by components that only need host lookup capabilities.
+type HostLookupService interface {
+	// GetHostLite returns basic host information not requiring table joins.
+	GetHostLite(ctx context.Context, id uint) (host *Host, err error)
+}
+
+// LookupService combines UserLookupService and HostLookupService for components
+// that need both user and host lookup capabilities.
+type LookupService interface {
+	UserLookupService
+	HostLookupService
+}
+
+// ActivityLookupService extends LookupService with methods needed by the
+// activity bounded context's ACL adapter.
+type ActivityLookupService interface {
+	LookupService
+
+	// GetActivitiesWebhookSettings returns the webhook settings for activities.
+	GetActivitiesWebhookSettings(ctx context.Context) (ActivitiesWebhookSettings, error)
+	// GetHostActivitiesWebhookSettings returns the enabled host-activities
+	// webhook settings of the fleets the given hosts belong to, deduplicated by
+	// fleet. Returns nil on Fleet Free.
+	GetHostActivitiesWebhookSettings(ctx context.Context, hostIDs []uint) ([]HostActivitiesWebhookDelivery, error)
+	// ActivateNextUpcomingActivityForHost activates the next upcoming activity for the given host.
+	ActivateNextUpcomingActivityForHost(ctx context.Context, hostID uint, fromCompletedExecID string) error
+}
+
+type Service interface {
+	OsqueryService
+	ActivityLookupService
+
+	// GetTransparencyURL gets the URL to redirect to when an end user clicks About Fleet
+	GetTransparencyURL(ctx context.Context) (string, error)
+
+	// AuthenticateOrbitHost loads host identified by orbit's nodeKey. Returns an error if that nodeKey doesn't exist
+	AuthenticateOrbitHost(ctx context.Context, nodeKey string) (host *Host, debug bool, err error)
+	// EnrollOrbit enrolls an orbit instance to Fleet by using the host information + enroll secret
+	// and returns the orbit node key if successful.
+	//
+	//	- If an entry for the host exists (osquery enrolled first) then it will update the host's orbit node key and team.
+	//	- If an entry for the host doesn't exist (osquery enrolls later) then it will create a new entry in the hosts table.
+	EnrollOrbit(ctx context.Context, hostInfo OrbitHostInfo, enrollSecret string, euaToken string) (orbitNodeKey string, err error)
+	// GetOrbitConfig returns team specific flags and extensions in agent options
+	// if the team id is not nil for host, otherwise it returns flags from global
+	// agent options. It also returns any notifications that fleet wants to surface
+	// to fleetd (formerly orbit).
+	GetOrbitConfig(ctx context.Context) (OrbitConfig, error)
+
+	// LogFleetdError logs an error report from a `fleetd` component
+	LogFleetdError(ctx context.Context, errData FleetdError) error
+
+	// SetOrUpdateDeviceAuthToken creates or updates a device auth token for the given host.
+	SetOrUpdateDeviceAuthToken(ctx context.Context, authToken string) error
+
+	// GetFleetDesktopSummary returns a summary of the host used by Fleet Desktop to operate.
+	GetFleetDesktopSummary(ctx context.Context) (DesktopSummary, error)
+
+	// InitiateDeviceSSO starts the SAML authentication flow for the Fleet
+	// Desktop "My device" page, bound to the host resolved from the
+	// initiating device token.
+	InitiateDeviceSSO(ctx context.Context, deviceURL string) (*DeviceSSOInitiation, error)
+
+	// RequireDeviceSSOSession enforces the Fleet Desktop SSO gate for the given host.
+	// When fleet_desktop.sso_enabled is off it allows the request; when it is on,
+	// sessionID must identify a live device SSO session minted for that host.
+	RequireDeviceSSOSession(ctx context.Context, host *Host, sessionID string) error
+
+	// SetEnterpriseOverrides allows the enterprise service to override specific methods
+	// that can't be easily overridden via embedding.
+	//
+	// TODO: find if there's a better way to accomplish this and standardize.
+	SetEnterpriseOverrides(overrides EnterpriseOverrides)
+
+	// /////////////////////////////////////////////////////////////////////////////
+	// UserService contains methods for managing a Fleet User.
+
+	// CreateUserFromInvite creates a new User from a request payload when there is already an existing invitation.
+	CreateUserFromInvite(ctx context.Context, p UserPayload) (user *User, err error)
+
+	// CreateUser allows an admin to create a new user without first creating  and validating invite tokens.
+	// The sessionKey is only returned (not-nil) when creating API-only (non-SSO) users.
+	CreateUser(ctx context.Context, p UserPayload) (user *User, sessionKey *string, err error)
+
+	// CreateInitialUser creates the first user, skipping authorization checks.  If a user already exists this method
+	// should fail.
+	CreateInitialUser(ctx context.Context, p UserPayload) (user *User, err error)
+
+	// User returns a valid User given a User ID.
+	User(ctx context.Context, id uint) (user *User, err error)
+
+	// NewUser creates a new user with the given payload
+	NewUser(ctx context.Context, p UserPayload) (*User, error)
+
+	// UserUnauthorized returns a valid User given a User ID, *skipping authorization checks*
+	// This method should only be used in middleware where there is not yet a viewer context and we need to load up a
+	// user to create that context.
+	UserUnauthorized(ctx context.Context, id uint) (user *User, err error)
+
+	// AuthenticatedUser returns the current user from the viewer context.
+	AuthenticatedUser(ctx context.Context) (user *User, err error)
+
+	// ChangePassword validates the existing password, and sets the new  password. User is retrieved from the viewer
+	// context.
+	ChangePassword(ctx context.Context, oldPass, newPass string) error
+
+	// RequestPasswordReset generates a password reset request for the user  specified by email. The request results
+	// in a token emailed to the user.
+	RequestPasswordReset(ctx context.Context, email string) (err error)
+
+	// RequirePasswordReset requires a password reset for the user  specified by ID (if require is true). It deletes
+	// all the user's sessions, and requires that their password be reset upon the next login. Setting require to
+	// false will take a user out of this state. The updated user is returned.
+	RequirePasswordReset(ctx context.Context, uid uint, require bool) (*User, error)
+
+	// PerformRequiredPasswordReset resets a password for a user that is in the required reset state. It must be called
+	// with the logged in viewer context of that user.
+	PerformRequiredPasswordReset(ctx context.Context, password string) (*User, error)
+
+	// ResetPassword validates the provided password reset token and updates the user's password.
+	ResetPassword(ctx context.Context, token, password string) (err error)
+
+	// ModifyUser updates a user's parameters given a UserPayload.
+	ModifyUser(ctx context.Context, userID uint, p UserPayload) (user *User, err error)
+
+	// ModifyAPIOnlyUser updates an API-only user
+	ModifyAPIOnlyUser(ctx context.Context, userID uint, p UserPayload) (user *User, err error)
+
+	// DeleteUser permanently deletes the user identified by the provided ID.
+	DeleteUser(ctx context.Context, id uint) (*User, error)
+
+	// ChangeUserEmail is used to confirm new email address and if confirmed,
+	// write the new email address to user.
+	ChangeUserEmail(ctx context.Context, token string) (string, error)
+
+	GetUserSettings(ctx context.Context, id uint) (settings *UserSettings, err error)
+
+	// /////////////////////////////////////////////////////////////////////////////
+	// Session
+
+	// InitiateSSO is used to initiate an SSO session and returns a URL that can be used in a redirect to the IDP.
+	// Arguments: redirectURL is the URL of the protected resource that the user was trying to access when they were
+	// prompted to log in.
+	InitiateSSO(ctx context.Context, redirectURL string) (sessionID string, sessionDurationSeconds int, idpURL string, err error)
+
+	// InitiateMDMSSO initiates SSO for MDM flows, this method is
+	// different from InitiateSSO because it receives a different
+	// configuration and only supports a subset of the features (eg: we
+	// don't want to allow IdP initiated authentications)
+	// When initiated from Orbit, the hostUUID is used to link the SSO
+	// session to a specific host.
+	InitiateMDMSSO(ctx context.Context, initiator, customOriginalURL string, hostUUID string) (sessionID string, sessionDurationSeconds int, idpURL string, err error)
+
+	// InitSSOCallback handles the IdP SAMLResponse and ensures the credentials are valid.
+	// The sessionID is used to identify the SSO session and samlResponse is the raw SAMLResponse.
+	InitSSOCallback(ctx context.Context, sessionID string, samlResponse []byte) (auth Auth, redirectURL string, err error)
+
+	// MDMSSOCallback handles the IdP SAMLResponse and ensures the
+	// credentials are valid, then responds with a URL to the Fleet UI to
+	// handle next steps based on the query parameters provided.
+	//
+	// deviceSSOSessionID and deviceSSOSessionDurationSeconds are set when the
+	// callback was initiated by the Fleet Desktop device SSO flow
+	// (SSOInitiatorFleetDesktop), so the caller can set the device SSO session
+	// cookie.
+	MDMSSOCallback(ctx context.Context, sessionID string, samlResponse []byte) (redirectURL, byodCookieValue, deviceSSOSessionID string, deviceSSOSessionDurationSeconds int)
+
+	// GetMDMAccountDrivenEnrollmentSSOURL returns the URL to redirect to for MDM Account Driven Enrollment SSO Authentication
+	GetMDMAccountDrivenEnrollmentSSOURL(ctx context.Context, enrollmentToken string) (string, error)
+
+	// GetSSOUser handles retrieval of an user that is trying to authenticate
+	// via SSO
+	GetSSOUser(ctx context.Context, auth Auth) (*User, error)
+	// LoginSSOUser logs-in the given SSO user
+	LoginSSOUser(ctx context.Context, user *User, redirectURL string) (*SSOSession, error)
+
+	// SSOSettings returns non-sensitive single sign on information used before authentication
+	SSOSettings(ctx context.Context) (*SessionSSOSettings, error)
+	Login(ctx context.Context, email, password string, supportsEmailVerification bool) (user *User, session *Session, err error)
+	// GetSessionDuration returns the configured session duration
+	GetSessionDuration(ctx context.Context) time.Duration
+	Logout(ctx context.Context) (err error)
+	CompleteMFA(ctx context.Context, token string) (*Session, *User, error)
+	DestroySession(ctx context.Context) (err error)
+	GetInfoAboutSessionsForUser(ctx context.Context, id uint) (sessions []*Session, err error)
+	DeleteSessionsForUser(ctx context.Context, id uint) (err error)
+	GetInfoAboutSession(ctx context.Context, id uint) (session *Session, err error)
+	GetSessionByKey(ctx context.Context, key string) (session *Session, err error)
+	DeleteSession(ctx context.Context, id uint) (err error)
+
+	// /////////////////////////////////////////////////////////////////////////////
+	// PackService is the service interface for managing query packs.
+
+	// ApplyPackSpecs applies a list of PackSpecs to the datastore, creating and updating packs as necessary.
+	ApplyPackSpecs(ctx context.Context, specs []*PackSpec) ([]*PackSpec, error)
+
+	// GetPackSpecs returns all of the stored PackSpecs.
+	GetPackSpecs(ctx context.Context) ([]*PackSpec, error)
+
+	// GetPackSpec gets the spec for the pack with the given name.
+	GetPackSpec(ctx context.Context, name string) (*PackSpec, error)
+
+	// NewPack creates a new pack in the datastore.
+	NewPack(ctx context.Context, p PackPayload) (pack *Pack, err error)
+
+	// ModifyPack modifies an existing pack in the datastore.
+	ModifyPack(ctx context.Context, id uint, p PackPayload) (pack *Pack, err error)
+
+	// ListPacks lists all packs in the application.
+	ListPacks(ctx context.Context, opt PackListOptions) (packs []*Pack, err error)
+
+	// GetPack retrieves a pack by ID.
+	GetPack(ctx context.Context, id uint) (pack *Pack, err error)
+
+	// DeletePack deletes a pack record from the datastore.
+	DeletePack(ctx context.Context, name string) (err error)
+
+	// DeletePackByID is for backwards compatibility with the UI
+	DeletePackByID(ctx context.Context, id uint) (err error)
+
+	// ListPacksForHost lists the packs that a host should execute.
+	ListPacksForHost(ctx context.Context, hid uint) (packs []*Pack, err error)
+
+	// /////////////////////////////////////////////////////////////////////////////
+	// LabelService
+
+	// ApplyLabelSpecs applies a list of LabelSpecs to the datastore, creating and updating labels as necessary,
+	// plus rename existing labels *on other teams* to avoid name conflicts
+	ApplyLabelSpecs(ctx context.Context, specs []*LabelSpec, teamID *uint, namesToMove []string) error
+	// GetLabelSpecs returns either all labels a user can see (no team ID), global labels only (team ID 0),
+	// or team-specific labels
+	GetLabelSpecs(ctx context.Context, teamID *uint) ([]*LabelSpec, error)
+	// GetLabelSpec gets the spec for the label with the given name.
+	GetLabelSpec(ctx context.Context, name string) (*LabelSpec, error)
+
+	NewLabel(ctx context.Context, p LabelPayload) (label *Label, hostIDs []uint, err error)
+	ModifyLabel(ctx context.Context, id uint, payload ModifyLabelPayload) (*LabelWithTeamName, []uint, error)
+	ListLabels(ctx context.Context, opt ListOptions, teamID *uint, includeHostCounts bool) (labels []*Label, err error)
+	LabelsSummary(ctx context.Context, teamID *uint) (labels []*LabelSummary, err error)
+	GetLabel(ctx context.Context, id uint) (label *LabelWithTeamName, hostIDs []uint, err error)
+
+	DeleteLabel(ctx context.Context, name string) (err error)
+	// DeleteLabelByID is for backwards compatibility with the UI
+	DeleteLabelByID(ctx context.Context, id uint) (err error)
+
+	// ListHostsInLabel returns a slice of hosts in the label with the given ID.
+	ListHostsInLabel(ctx context.Context, lid uint, opt HostListOptions) ([]*Host, error)
+
+	// ListLabelsForHost returns a slice of labels for a given host
+	ListLabelsForHost(ctx context.Context, hostID uint) ([]*Label, error)
+
+	// BatchValidateLabels validates that each of the provided label names exists,
+	// and verifies the provided label names belong to the given teamID.
+	//
+	// The returned map is keyed by label name.
+	// Caller must ensure that appropriate authorization checks are performed prior
+	// to calling this method.
+	BatchValidateLabels(ctx context.Context, teamID *uint, labelNames []string) (map[string]LabelIdent, error)
+
+	// /////////////////////////////////////////////////////////////////////////////
+	// QueryService
+
+	// ApplyQuerySpecs applies a list of queries (creating or updating them as necessary)
+	ApplyQuerySpecs(ctx context.Context, specs []*QuerySpec) error
+	// GetQuerySpecs gets the YAML file representing all the stored queries.
+	GetQuerySpecs(ctx context.Context, teamID *uint) ([]*QuerySpec, error)
+	// GetQuerySpec gets the spec for the query with the given name on a team.
+	// A nil or 0 teamID means the query is looked for in the global domain.
+	GetQuerySpec(ctx context.Context, teamID *uint, name string) (*QuerySpec, error)
+
+	// ListQueries returns a list of saved queries. Note only saved queries should be returned (those that are created
+	// for distributed queries but not saved should not be returned).
+	// When is set to scheduled != nil, then only scheduled queries will be returned if `*scheduled == true`
+	// and only non-scheduled queries will be returned if `*scheduled == false`.
+	// If mergeInherited is true and a teamID is provided, then queries from the global team will be
+	// included in the results. The inherited count is only meaningful when mergeInherited is true.
+	ListQueries(ctx context.Context, opt ListOptions, teamID *uint, scheduled *bool, mergeInherited bool, platform *string) ([]*Query, int, int, *PaginationMetadata, error)
+	GetQuery(ctx context.Context, id uint) (*Query, error)
+	// GetQueryReportResults returns all the stored results of a query for hosts the requestor has access to.
+	// Returns a boolean indicating whether the report is clipped.
+	GetQueryReportResults(ctx context.Context, id uint, teamID *uint) ([]HostQueryResultRow, bool, error)
+	// GetHostQueryReportResults returns all stored results of a query for a specific host
+	GetHostQueryReportResults(ctx context.Context, hid uint, queryID uint) (rows []HostQueryReportResult, lastFetched *time.Time, err error)
+	// QueryReportIsClipped returns true if the number of query report rows exceeds the maximum
+	QueryReportIsClipped(ctx context.Context, queryID uint, maxQueryReportRows int) (bool, error)
+	// ListHostReports returns the reports/queries associated with the given host, filtered,
+	// sorted, and paginated according to opts.
+	ListHostReports(ctx context.Context, hostID uint, opts ListHostReportsOptions) (rows []*HostReport, total int, metadata *PaginationMetadata, err error)
+	NewQuery(ctx context.Context, p QueryPayload) (*Query, error)
+	ModifyQuery(ctx context.Context, id uint, p QueryPayload) (*Query, error)
+	DeleteQuery(ctx context.Context, teamID *uint, name string) error
+	// DeleteQueryByID deletes a query by ID. For backwards compatibility with UI
+	DeleteQueryByID(ctx context.Context, id uint) error
+	// DeleteQueries deletes the existing query objects with the provided IDs. The number of deleted queries is returned
+	// along with any error.
+	DeleteQueries(ctx context.Context, ids []uint) (uint, error)
+
+	// /////////////////////////////////////////////////////////////////////////////
+	// CampaignService defines the distributed query campaign related service methods
+
+	// NewDistributedQueryCampaignByIdentifiers creates a new distributed query campaign with the provided query (or the query
+	// referenced by ID) and host/label targets (specified by hostname, UUID, or hardware serial).
+	NewDistributedQueryCampaignByIdentifiers(
+		ctx context.Context, queryString string, queryID *uint, hosts []string, labels []string,
+	) (*DistributedQueryCampaign, error)
+
+	// NewDistributedQueryCampaign creates a new distributed query campaign with the provided query (or the query
+	// referenced by ID) and host/label targets
+	NewDistributedQueryCampaign(
+		ctx context.Context, queryString string, queryID *uint, targets HostTargets,
+	) (*DistributedQueryCampaign, error)
+
+	// StreamCampaignResults streams updates with query results and expected host totals over the provided websocket.
+	// Note that the type signature is somewhat inconsistent due to this being a streaming API and not the typical
+	// go-kit RPC style.
+	StreamCampaignResults(ctx context.Context, conn *websocket.Conn, campaignID uint)
+
+	GetCampaignReader(ctx context.Context, campaign *DistributedQueryCampaign) (<-chan interface{}, context.CancelFunc, error)
+	CompleteCampaign(ctx context.Context, campaign *DistributedQueryCampaign) error
+	RunLiveQueryDeadline(ctx context.Context, queryIDs []uint, query string, hostIDs []uint, deadline time.Duration) (
+		[]QueryCampaignResult, int, error,
+	)
+
+	// /////////////////////////////////////////////////////////////////////////////
+	// AgentOptionsService
+
+	// AgentOptionsForHost gets the agent options for the provided host. The host information should be used for
+	// filtering based on team, platform, etc.
+	AgentOptionsForHost(ctx context.Context, hostTeamID *uint, hostPlatform string) (json.RawMessage, error)
+
+	// /////////////////////////////////////////////////////////////////////////////
+	// HostService
+
+	// AuthenticateDevice loads host identified by the device's auth token.
+	// Returns an error if the auth token doesn't exist.
+	AuthenticateDevice(ctx context.Context, authToken string) (host *Host, debug bool, err error)
+	// AuthenticateIDeviceByURL loads host identified by the URL UUID.
+	// This is used for iOS/iPadOS devices (iDevices) accessing endpoints via a unique URL parameter.
+	// Returns an error if the UUID doesn't exist or if the host is not iOS/iPadOS.
+	AuthenticateIDeviceByURL(ctx context.Context, urlUUID string) (host *Host, debug bool, err error)
+
+	StreamHosts(ctx context.Context, opt HostListOptions) (hostIterator iter.Seq2[*Host, error], err error)
+	ListHosts(ctx context.Context, opt HostListOptions) (hosts []*Host, err error)
+	// GetHost returns the host with the provided ID.
+	//
+	// The return value can also include policy information and CVE scores based
+	// on the values provided to `opts`
+	GetHost(ctx context.Context, id uint, opts HostDetailOptions) (host *HostDetail, err error)
+	GetHostHealth(ctx context.Context, id uint) (hostHealth *HostHealth, err error)
+	GetHostSummary(ctx context.Context, teamID *uint, platform *string, lowDiskSpace *int) (summary *HostSummary, err error)
+	DeleteHost(ctx context.Context, id uint) (err error)
+	// HostByIdentifier returns one host matching the provided identifier.
+	// Possible matches can be on osquery_host_identifier, node_key, UUID, or
+	// hostname.
+	//
+	// The return value can also include policy information and CVE scores based
+	// on the values provided to `opts`
+	//
+	// A caller allowed to resolve the identifier but not to read the host
+	// (GitOps) gets a result with HostDetail.IDOnly set, see that field.
+	HostByIdentifier(ctx context.Context, identifier string, opts HostDetailOptions) (*HostDetail, error)
+	// RefetchHost requests a refetch of host details for the provided host.
+	RefetchHost(ctx context.Context, id uint) (err error)
+	// CleanupExpiredHostsBatch deletes up to batchSize hosts that have exceeded the expiry window and
+	// creates an activity for each deletion. Callers loop until it returns no hosts.
+	CleanupExpiredHostsBatch(ctx context.Context, batchSize int) ([]DeletedHostDetails, error)
+	// AddHostsToTeam adds hosts to an existing team, clearing their team settings if teamID is nil.
+	AddHostsToTeam(ctx context.Context, teamID *uint, hostIDs []uint, skipBulkPending bool) error
+	// AddHostsToTeamByFilter adds hosts to an existing team, clearing their team settings if teamID is nil. Hosts are
+	// selected by the label and HostListOptions provided.
+	AddHostsToTeamByFilter(ctx context.Context, teamID *uint, filter *map[string]interface{}) error
+	DeleteHosts(ctx context.Context, ids []uint, filters *map[string]interface{}) error
+	CountHosts(ctx context.Context, labelID *uint, opts HostListOptions) (int, error)
+	// SearchHosts performs a search on the hosts table using the following criteria:
+	//	- matchQuery is the query SQL
+	//	- queryID is the ID of a saved query to run (used to determine whether this is a query that observers can run)
+	//	- excludedHostIDs is an optional list of IDs to omit from the search
+	SearchHosts(ctx context.Context, matchQuery string, queryID *uint, excludedHostIDs []uint) ([]*Host, error)
+	// ListHostDeviceMapping returns the list of device-mapping of user's email address
+	// for the host.
+	ListHostDeviceMapping(ctx context.Context, id uint) ([]*HostDeviceMapping, error)
+	// SetHostDeviceMapping sets the email address associated with the host.
+	// The source parameter determines the type: "custom" for manually set
+	// mappings or DeviceMappingIDP for identity provider mappings.
+	SetHostDeviceMapping(ctx context.Context, id uint, email, source string) ([]*HostDeviceMapping, error)
+	DeleteHostIDP(ctx context.Context, id uint) error
+	HostLiteByIdentifier(ctx context.Context, identifier string) (*HostLite, error)
+	// HostLiteByIdentifier returns a host and a subset of its fields from its id.
+	HostLiteByID(ctx context.Context, id uint) (*HostLite, error)
+
+	// ListDevicePolicies lists all policies for the given host in their
+	// device-safe representation (which excludes the policy author's identity
+	// and the raw SQL query), including passing / failing responses.
+	ListDevicePolicies(ctx context.Context, host *Host) ([]*DevicePolicy, error)
+
+	// BypassConditionalAccess lets a host skip conditional access checks for one check
+	BypassConditionalAccess(ctx context.Context, host *Host) error
+
+	GetDeviceSoftwareIconsTitleIcon(ctx context.Context, teamID uint, titleID uint) ([]byte, int64, string, error)
+
+	// DisableAuthForPing is used by the /orbit/ping and /device/ping endpoints
+	// to bypass authentication, as they are public
+	DisableAuthForPing(ctx context.Context)
+
+	MacadminsData(ctx context.Context, id uint) (*MacadminsData, error)
+	MDMData(ctx context.Context, id uint) (*HostMDM, error)
+	AggregatedMacadminsData(ctx context.Context, teamID *uint) (*AggregatedMacadminsData, error)
+	AggregatedMDMData(ctx context.Context, id *uint, platform string) (AggregatedMDMData, error)
+	GetMDMSolution(ctx context.Context, mdmID uint) (*MDMSolution, error)
+	GetMunkiIssue(ctx context.Context, munkiIssueID uint) (*MunkiIssue, error)
+
+	HostEncryptionKey(ctx context.Context, id uint) (*HostDiskEncryptionKey, error)
+	// EscrowLUKSData stores a LUKS key or a client error. A non-empty status instead records orbit's
+	// progress: prompting and escrowing keep the request in flight, canceled and timed_out end it.
+	EscrowLUKSData(ctx context.Context, passphrase string, salt string, keySlot *uint, clientError string, keyType string, status string) error
+
+	// EscrowWindowsManagedLocalAccountPassword stores the device-generated password that Windows fleetd escrows after
+	// creating the managed local admin account. When clientError is set no password is stored; the account is marked failed
+	// and the device-reported reason is recorded on it.
+	EscrowWindowsManagedLocalAccountPassword(ctx context.Context, password string, clientError string) error
+
+	// AddLabelsToHost adds the given label names to the host's label membership.
+	//
+	// If a host is already a member of one of the labels then this operation will only
+	// update the membership row update time.
+	//
+	// Returns an error if any of the labels does not exist or if any of the labels
+	// are not manual.
+	AddLabelsToHost(ctx context.Context, id uint, labels []string) error
+	// RemoveLabelsFromHost removes the given label names from the host's label membership.
+	// Labels that the host are already not a member of are ignored.
+	//
+	// Returns an error if any of the labels does not exist or if any of the labels
+	// are not manual.
+	RemoveLabelsFromHost(ctx context.Context, id uint, labels []string) error
+
+	// OSVersions returns a list of operating systems and associated host counts, which may be
+	// filtered using the following optional criteria: team id, platform, or name and version.
+	// Name cannot be used without version, and conversely, version cannot be used without name.
+	OSVersions(ctx context.Context, teamID *uint, platform *string, name *string, version *string, opts ListOptions, includeCVSS bool, maxVulnerabilities *int) (*OSVersions, int, *PaginationMetadata, error)
+	// OSVersion returns an operating system and associated host counts. If maxVulnerabilities is provided,
+	// limits the number of vulnerabilities returned while still providing the total count.
+	OSVersion(ctx context.Context, osVersionID uint, teamID *uint, includeCVSS bool, maxVulnerabilities *int) (*OSVersion, *time.Time, error)
+
+	// ListHostSoftware lists the software installed or available for install on
+	// the specified host.
+	ListHostSoftware(ctx context.Context, hostID uint, opts HostSoftwareTitleListOptions) ([]*HostSoftwareWithInstaller, *PaginationMetadata, error)
+
+	// UpdateSoftwareName updates the name of a software title if the title is uniquely identified by bundle ID
+	// rather than by name
+	UpdateSoftwareName(ctx context.Context, titleID uint, name string) error
+
+	// ListHostCertificates lists the certificates installed on the specified host.
+	ListHostCertificates(ctx context.Context, hostID uint, opts ListOptions) ([]*HostCertificatePayload, *PaginationMetadata, error)
+
+	// GetHostRecoveryLockPassword retrieves the recovery lock password for the specified host.
+	// Requires admin or maintainer role and MDM to be enabled.
+	GetHostRecoveryLockPassword(ctx context.Context, hostID uint) (*HostRecoveryLockPassword, error)
+
+	// HostDeviceURL returns the full "My device" end-user URL for the
+	// specified host, embedding its device auth token. Global admin only —
+	// the URL is effectively a credential to that host's device-user page.
+	// If the host has no token, or its existing token is expired, a new
+	// token is generated on demand so the returned URL is always valid for
+	// the full TTL window. Each call also logs a
+	// ActivityTypeRetrievedHostMyDeviceURL admin activity for the audit
+	// trail. iOS and iPadOS hosts return a BadRequestError because device
+	// token authentication is not supported on those platforms.
+	HostDeviceURL(ctx context.Context, hostID uint) (string, error)
+
+	// /////////////////////////////////////////////////////////////////////////////
+	// AppConfigService provides methods for configuring  the Fleet application
+
+	NewAppConfig(ctx context.Context, p AppConfig) (info *AppConfig, err error)
+	// AppConfigObfuscated returns the global application config with obfuscated credentials.
+	AppConfigObfuscated(ctx context.Context) (info *AppConfig, err error)
+	ModifyAppConfig(ctx context.Context, p []byte, applyOpts ApplySpecOptions) (info *AppConfig, err error)
+	SandboxEnabled() bool
+	// MaxInstallerSizeBytes returns the configured maximum size for software installer uploads.
+	MaxInstallerSizeBytes() int64
+	AppConfigUrls(ctx context.Context) (urls *AppConfigUrls, err error)
+
+	// ApplyEnrollSecretSpec adds and updates the enroll secrets specified in the spec.
+	ApplyEnrollSecretSpec(ctx context.Context, spec *EnrollSecretSpec, applyOpts ApplySpecOptions) error
+	// GetEnrollSecretSpec gets the spec for the current enroll secrets.
+	GetEnrollSecretSpec(ctx context.Context) (*EnrollSecretSpec, error)
+
+	// CertificateChain returns the PEM encoded certificate chain for osqueryd TLS termination. For cases where the
+	// connection is self-signed, the server will attempt to connect using the InsecureSkipVerify option in tls.Config.
+	CertificateChain(ctx context.Context) (cert []byte, err error)
+
+	// SetupRequired returns whether the app config setup needs to be performed (only when first initializing a Fleet
+	// server).
+	SetupRequired(ctx context.Context) (bool, error)
+
+	// Version returns version and build information.
+	Version(ctx context.Context) (*version.Info, error)
+
+	// License returns the licensing information.
+	License(ctx context.Context) (*LicenseInfo, error)
+
+	// PartnershipsConfig returns Fleet partnership-specific configuration
+	PartnershipsConfig(ctx context.Context) (*Partnerships, error)
+
+	// AuthSettings returns the read-only authentication settings sourced from
+	// the server configuration, or nil when none is enabled.
+	AuthSettings(ctx context.Context) (*AuthSettings, error)
+
+	// LoggingConfig parses config.FleetConfig instance and returns a Logging.
+	LoggingConfig(ctx context.Context) (*Logging, error)
+
+	// EmailConfig parses config.FleetConfig and returns an EmailConfig
+	EmailConfig(ctx context.Context) (*EmailConfig, error)
+
+	// UpdateIntervalConfig returns the duration for different update intervals configured in osquery
+	UpdateIntervalConfig(ctx context.Context) (*UpdateIntervalConfig, error)
+
+	// VulnerabilitiesConfig returns the vulnerabilities checks configuration for
+	// the fleet instance.
+	VulnerabilitiesConfig(ctx context.Context) (*VulnerabilitiesConfig, error)
+
+	// /////////////////////////////////////////////////////////////////////////////
+	// InviteService contains methods for a service which deals with user invites.
+
+	// InviteNewUser creates an invite for a new user to join Fleet.
+	InviteNewUser(ctx context.Context, payload InvitePayload) (invite *Invite, err error)
+
+	// DeleteInvite removes an invite.
+	DeleteInvite(ctx context.Context, id uint) (err error)
+
+	// ListInvites returns a list of all invites.
+	ListInvites(ctx context.Context, opt ListOptions) (invites []*Invite, err error)
+
+	// VerifyInvite verifies that an invite exists and that it matches the invite token.
+	VerifyInvite(ctx context.Context, token string) (invite *Invite, err error)
+
+	UpdateInvite(ctx context.Context, id uint, payload InvitePayload) (*Invite, error)
+
+	// /////////////////////////////////////////////////////////////////////////////
+	// TargetService **NOTE: SearchTargets will be removed in Fleet 5.0**
+
+	// SearchTargets will accept a search query, a slice of IDs of hosts to omit, and a slice of IDs of labels to omit,
+	// and it will return a set of targets (hosts and label) which match the supplied search query. If the query ID is
+	// provided and the referenced query allows observers to run, targets will include hosts that the user has observer
+	// role for.
+	SearchTargets(
+		ctx context.Context, searchQuery string, queryID *uint, targets HostTargets,
+	) (*TargetSearchResults, error)
+
+	// CountHostsInTargets returns the metrics of the hosts in the provided label and explicit host IDs. If the query ID
+	// is provided and the referenced query allows observers to run, targets will include hosts that the user has
+	// observer role for.
+	CountHostsInTargets(ctx context.Context, queryID *uint, targets HostTargets) (*TargetMetrics, error)
+
+	// /////////////////////////////////////////////////////////////////////////////
+	// ScheduledQueryService
+
+	GetScheduledQueriesInPack(ctx context.Context, id uint, opts ListOptions) (queries []*ScheduledQuery, err error)
+	GetScheduledQuery(ctx context.Context, id uint) (query *ScheduledQuery, err error)
+	ScheduleQuery(ctx context.Context, sq *ScheduledQuery) (query *ScheduledQuery, err error)
+	DeleteScheduledQuery(ctx context.Context, id uint) (err error)
+	ModifyScheduledQuery(ctx context.Context, id uint, p ScheduledQueryPayload) (query *ScheduledQuery, err error)
+
+	// /////////////////////////////////////////////////////////////////////////////
+	// StatusService
+
+	// StatusResultStore returns nil if the result store is functioning correctly, or an error indicating the problem.
+	StatusResultStore(ctx context.Context) error
+
+	// StatusLiveQuery returns nil if live queries are enabled, or an
+	// error indicating the problem.
+	StatusLiveQuery(ctx context.Context) error
+
+	// /////////////////////////////////////////////////////////////////////////////
+	// CarveService
+
+	CarveBegin(ctx context.Context, payload CarveBeginPayload) (*CarveMetadata, error)
+	CarveBlock(ctx context.Context, payload CarveBlockPayload) error
+	GetCarve(ctx context.Context, id int64) (*CarveMetadata, error)
+	ListCarves(ctx context.Context, opt CarveListOptions) ([]*CarveMetadata, error)
+	GetBlock(ctx context.Context, carveId, blockId int64) ([]byte, error)
+
+	// /////////////////////////////////////////////////////////////////////////////
+	// TeamService
+
+	// NewTeam creates a new team.
+	NewTeam(ctx context.Context, p TeamPayload) (*Team, error)
+	// GetTeam returns a existing team.
+	GetTeam(ctx context.Context, id uint) (*Team, error)
+	// ModifyTeam modifies an existing team (besides agent options).
+	ModifyTeam(ctx context.Context, id uint, payload TeamPayload) (*Team, error)
+	// ModifyTeamAgentOptions modifies agent options for a team.
+	ModifyTeamAgentOptions(ctx context.Context, id uint, teamOptions json.RawMessage, applyOptions ApplySpecOptions) (*Team, error)
+	// AddTeamUsers adds users to an existing team.
+	AddTeamUsers(ctx context.Context, teamID uint, users []TeamUser) (*Team, error)
+	// DeleteTeamUsers deletes users from an existing team.
+	DeleteTeamUsers(ctx context.Context, teamID uint, users []TeamUser) (*Team, error)
+	// DeleteTeam deletes an existing team.
+	DeleteTeam(ctx context.Context, id uint) error
+	// ListTeams lists teams with the ordering and filters in the provided options.
+	ListTeams(ctx context.Context, opt ListOptions) ([]*Team, error)
+	// ListTeamUsers lists users on the team with the provided list options.
+	ListTeamUsers(ctx context.Context, teamID uint, opt ListOptions) ([]*User, error)
+	// ListAvailableTeamsForUser lists the teams the user is permitted to view
+	ListAvailableTeamsForUser(ctx context.Context, user *User) ([]*TeamSummary, error)
+	// TeamEnrollSecrets lists the enroll secrets for the team.
+	TeamEnrollSecrets(ctx context.Context, teamID uint) ([]*EnrollSecret, error)
+	// ModifyTeamEnrollSecrets modifies enroll secrets for a team.
+	ModifyTeamEnrollSecrets(ctx context.Context, teamID uint, secrets []EnrollSecret) ([]*EnrollSecret, error)
+	// ApplyTeamSpecs applies the changes for each team as defined in the specs.
+	// On success, it returns the mapping of team names to team ids.
+	ApplyTeamSpecs(ctx context.Context, specs []*TeamSpec, applyOpts ApplyTeamSpecOptions) (map[string]uint, error)
+
+	// /////////////////////////////////////////////////////////////////////////////
+	// ActivitiesService
+
+	// SetActivityService sets the activity bounded context service for write operations.
+	// This should be called after service creation to inject the activity service dependency.
+	SetActivityService(activitySvc ActivityWriteService)
+
+	// SetConfigETagStore injects the Redis-backed osquery config ETag store,
+	// enabling the config short circuit described on GetClientConfigWithETag.
+	// This should be called after service creation, and ONLY when the
+	// osquery.redis_config_etags feature flag is enabled — leaving the store
+	// unset (nil) is what turns the short circuit off. See
+	// GetClientConfigWithETag and ConfigETagStore for the full contract.
+	SetConfigETagStore(store ConfigETagStore)
+
+	// SetACMEService sets the ACME service module for write operations.
+	// This should be called after service creation to inject the ACME service dependency.
+	SetACMEService(acmeSvc ACMEWriteService)
+
+	// SetAgentCheckInNotifier sets the notifier used to wake up agents
+	// connected over the WebSocket transport. This should be called after
+	// service creation when the transport is enabled.
+	SetAgentCheckInNotifier(notifier AgentCheckInNotifier)
+
+	// NewACMEEnrollment creates a new ACME enrollment using the ACME service module. It returns the
+	// ACME identifier for the new enrollment, which is used to track the enrollment process and link it to a host.
+	NewACMEEnrollment(ctx context.Context, hostIdentifier string) (string, error)
+
+	// NewActivity creates the given activity on the datastore.
+	//
+	// What we call "Activities" are administrative operations,
+	// logins, running a live query, etc.
+	NewActivity(ctx context.Context, user *User, activity ActivityDetails) error
+
+	// ListHostUpcomingActivities lists the upcoming activities for the specified
+	// host. Those are activities that are queued or scheduled to run on the host
+	// but haven't run yet. It also returns the total (unpaginated) count of upcoming
+	// activities.
+	ListHostUpcomingActivities(ctx context.Context, hostID uint, opt ListOptions) ([]*UpcomingActivity, *PaginationMetadata, error)
+
+	// CancelHostUpcomingActivity cancels an upcoming activity for the specified
+	// host. If the activity does not exist in the queue of upcoming activities
+	// (e.g. it did complete), it returns a not found error.
+	CancelHostUpcomingActivity(ctx context.Context, hostID uint, executionID string) error
+
+	// /////////////////////////////////////////////////////////////////////////////
+	// UserRolesService
+
+	// ApplyUserRolesSpecs applies a list of user global and team role changes
+	ApplyUserRolesSpecs(ctx context.Context, specs UsersRoleSpec) error
+
+	// /////////////////////////////////////////////////////////////////////////////
+	// Certificate Templates
+
+	CreateCertificateTemplate(ctx context.Context, name string, teamID uint, certificateAuthorityID uint, subjectName string, subjectAlternativeName string) (*CertificateTemplateResponse, error)
+	ListCertificateTemplates(ctx context.Context, teamID uint, opts ListOptions) ([]*CertificateTemplateResponseSummary, *PaginationMetadata, error)
+	GetDeviceCertificateTemplate(ctx context.Context, id uint) (*CertificateTemplateResponseForHost, error)
+	GetCertificateTemplate(ctx context.Context, id uint) (*CertificateTemplateResponse, error)
+	DeleteCertificateTemplate(ctx context.Context, id uint) error
+	ApplyCertificateTemplateSpecs(ctx context.Context, specs []*CertificateRequestSpec) error
+	DeleteCertificateTemplateSpecs(ctx context.Context, certificateTemplateIDs []uint, teamID uint) error
+	UpdateCertificateStatus(ctx context.Context, update *CertificateStatusUpdate) error
+	ResendHostCertificateTemplate(ctx context.Context, hostID uint, templateID uint) error
+
+	// /////////////////////////////////////////////////////////////////////////////
+	// GlobalScheduleService
+
+	GlobalScheduleQuery(ctx context.Context, sq *ScheduledQuery) (*ScheduledQuery, error)
+	GetGlobalScheduledQueries(ctx context.Context, opts ListOptions) ([]*ScheduledQuery, error)
+	ModifyGlobalScheduledQueries(ctx context.Context, id uint, q ScheduledQueryPayload) (*ScheduledQuery, error)
+	DeleteGlobalScheduledQueries(ctx context.Context, id uint) error
+
+	// /////////////////////////////////////////////////////////////////////////////
+	// TranslatorService
+
+	Translate(ctx context.Context, payloads []TranslatePayload) ([]TranslatePayload, error)
+
+	// /////////////////////////////////////////////////////////////////////////////
+	// TeamScheduleService
+
+	TeamScheduleQuery(ctx context.Context, teamID uint, sq *ScheduledQuery) (*ScheduledQuery, error)
+	GetTeamScheduledQueries(ctx context.Context, teamID uint, opts ListOptions) ([]*ScheduledQuery, error)
+	ModifyTeamScheduledQueries(
+		ctx context.Context, teamID uint, scheduledQueryID uint, q ScheduledQueryPayload,
+	) (*ScheduledQuery, error)
+	DeleteTeamScheduledQueries(ctx context.Context, teamID uint, id uint) error
+
+	// /////////////////////////////////////////////////////////////////////////////
+	// GlobalPolicyService
+
+	NewGlobalPolicy(ctx context.Context, p PolicyPayload) (*Policy, error)
+	ListGlobalPolicies(ctx context.Context, opts ListOptions, platform string) ([]*Policy, error)
+	DeleteGlobalPolicies(ctx context.Context, ids []uint) ([]uint, error)
+	ModifyGlobalPolicy(ctx context.Context, id uint, p ModifyPolicyPayload) (*Policy, error)
+	GetPolicyByID(ctx context.Context, policyID uint) (*Policy, error)
+	// ResetPolicy clears a policy's pass/fail results for all hosts, or for a single host when hostID is set.
+	ResetPolicy(ctx context.Context, policyID uint, hostID *uint) error
+	ListPolicyAutomationActivities(ctx context.Context, policyID uint, opts ListOptions, status string) ([]*PolicyAutomationActivity, *PaginationMetadata, error)
+	ApplyPolicySpecs(ctx context.Context, policies []*PolicySpec) error
+	CountGlobalPolicies(ctx context.Context, matchQuery string, platform string) (int, error)
+	AutofillPolicySql(ctx context.Context, sql string) (description string, resolution string, err error)
+
+	// /////////////////////////////////////////////////////////////////////////////
+	// Software
+
+	ListSoftware(ctx context.Context, opt SoftwareListOptions) ([]Software, *PaginationMetadata, error)
+	SoftwareByID(ctx context.Context, id uint, teamID *uint, includeCVEScores bool) (*Software, error)
+	SoftwareLiteByID(ctx context.Context, id uint) (SoftwareLite, error)
+	CountSoftware(ctx context.Context, opt SoftwareListOptions) (int, error)
+
+	// SaveHostSoftwareInstallResult saves information about execution of a
+	// software installation on a host.
+	SaveHostSoftwareInstallResult(ctx context.Context, result *HostSoftwareInstallResultPayload) error
+
+	// /////////////////////////////////////////////////////////////////////////////
+	// Software Titles
+
+	ListSoftwareTitles(ctx context.Context, opt SoftwareTitleListOptions) ([]SoftwareTitleListResult, int, *PaginationMetadata, error)
+	SoftwareTitleByID(ctx context.Context, id uint, teamID *uint) (*SoftwareTitle, error)
+	SoftwareTitleNameForHostFilter(ctx context.Context, id uint, teamID *uint) (name, displayName string, err error)
+
+	// InstallSoftwareTitle installs a software title in the given host.
+	InstallSoftwareTitle(ctx context.Context, hostID uint, softwareTitleID uint) error
+
+	// UpdateSoftwareTitleAutoUpdateConfig updates the auto-update configuration for a software title.
+	UpdateSoftwareTitleAutoUpdateConfig(ctx context.Context, titleID uint, teamID *uint, config SoftwareAutoUpdateConfig) error
+
+	// GetVPPTokenIfCanInstallVPPApps returns the host team's VPP token if the host can be a target for VPP apps
+	GetVPPTokenIfCanInstallVPPApps(ctx context.Context, appleDevice bool, host *Host) (string, error)
+
+	// InstallVPPAppPostValidation installs a VPP app, assuming that GetVPPTokenIfCanInstallVPPApps has passed and provided a VPP token
+	InstallVPPAppPostValidation(ctx context.Context, host *Host, vppApp *VPPApp, token string, opts HostSoftwareInstallOptions) (string, error)
+
+	// InstallInHouseAppForSetupExperience validates the in-house app's managed configuration for the
+	// host and enqueues its InstallApplication command during setup experience, returning the command UUID.
+	InstallInHouseAppForSetupExperience(ctx context.Context, host *Host, inHouseAppID uint, softwareTitleID uint) (string, error)
+
+	// UninstallSoftwareTitle uninstalls a software title in the given host.
+	UninstallSoftwareTitle(ctx context.Context, hostID uint, softwareTitleID uint) error
+
+	// GetSoftwareInstallResults gets the results for a particular software install attempt.
+	GetSoftwareInstallResults(ctx context.Context, installUUID string) (*HostSoftwareInstallerResult, error)
+
+	// BatchSetSoftwareInstallers asynchronously replaces the software installers for a specified team.
+	// Returns a request UUID that can be used to track an ongoing batch request (with GetBatchSetSoftwareInstallersResult).
+	BatchSetSoftwareInstallers(ctx context.Context, tmName string, payloads []*SoftwareInstallerPayload, dryRun bool) (string, error)
+	// GetBatchSetSoftwareInstallersResult polls for the status of a batch-apply started by BatchSetSoftwareInstallers.
+	GetBatchSetSoftwareInstallersResult(ctx context.Context, tmName string, requestUUID string, dryRun bool) (*BatchSetSoftwareInstallersResult, error)
+
+	// SelfServiceInstallSoftwareTitle installs a software title
+	// initiated by the user
+	SelfServiceInstallSoftwareTitle(ctx context.Context, host *Host, softwareTitleID uint) error
+
+	// SelfServiceInstallAllSoftwareTitles queues a self-service install for every available self-service software
+	// title on the host that isn't already installed. When categoryID is non-nil, only titles assigned to that
+	// self-service category on the host's fleet are queued. When matchQuery is non-empty, only titles whose name
+	// matches the query (same semantics as the self-service list endpoint) are queued.
+	SelfServiceInstallAllSoftwareTitles(ctx context.Context, host *Host, categoryID *uint, matchQuery string) error
+
+	// HasSelfServiceSoftwareInstallers returns whether the host has self-service software installers
+	HasSelfServiceSoftwareInstallers(ctx context.Context, host *Host) (bool, error)
+
+	GetAppStoreApps(ctx context.Context, teamID *uint) ([]*VPPApp, error)
+
+	// AddAppStoreApp persists a VPP app onto a team and returns the resulting title ID and app name
+	AddAppStoreApp(ctx context.Context, teamID *uint, appTeam VPPAppTeam) (uint, string, error)
+	UpdateAppStoreApp(ctx context.Context, titleID uint, teamID *uint, payload AppStoreAppUpdatePayload) (*VPPAppStoreApp, *ActivityEditedAppStoreApp, error)
+
+	// GetInHouseAppManifest returns a manifest XML file that points at the
+	// download URL for the given in-house app. Callers supply the per-install
+	// download token that was minted when the install was enqueued; the token
+	// also pins the (team, host) the install is authorized for.
+	GetInHouseAppManifest(ctx context.Context, titleID uint, token string) ([]byte, error)
+
+	// GetInHouseAppPackage downloads the bytes of the given in-house app.
+	// Callers supply the per-install download token that was minted when the
+	// install was enqueued.
+	GetInHouseAppPackage(ctx context.Context, titleID uint, token string) (*DownloadSoftwareInstallerPayload, error)
+
+	// MDMAppleProcessOTAEnrollment handles OTA enrollment requests.
+	//
+	// Per the [spec][1] OTA enrollment is composed of two phases, each
+	// phase is a request sent by the host to the same endpoint, but it
+	// must be handled differently depending on the signatures of the
+	// request body:
+	//
+	// 1. First request has a certificate signed by Apple's CA as the root
+	// certificate. The server must return a SCEP payload that the device
+	// will use to get a keypair. Note that this keypair is _different_
+	// from the "SCEP identity certificate" that will be generated during
+	// MDM enrollment, and only used for OTA.
+	//
+	// 2. Second request has the SCEP certificate generated in `1` as the
+	// root certificate, the server responds with a "classic" enrollment
+	// profile and the device starts the regular enrollment process from there.
+	//
+	// The extra steps allows us to grab device information like the serial
+	// number and hardware uuid to perform operations before the host even
+	// enrolls in MDM. Currently, this method creates a host records and
+	// assigns a pre-defined team (based on the enrollSecret provided) to
+	// the host, and associates the host if byod idp was enabled.
+	//
+	// [1]: https://developer.apple.com/library/archive/documentation/NetworkingInternet/Conceptual/iPhoneOTAConfiguration/Introduction/Introduction.html#//apple_ref/doc/uid/TP40009505-CH1-SW1
+	MDMAppleProcessOTAEnrollment(ctx context.Context, certificates []*x509.Certificate, rootSigner *x509.Certificate, enrollSecret, idpUUID string, personal bool, deviceInfo MDMAppleMachineInfo) ([]byte, error)
+
+	// /////////////////////////////////////////////////////////////////////////////
+	// Vulnerabilities
+
+	// ListVulnerabilities returns a list of vulnerabilities based on the provided options.
+	ListVulnerabilities(ctx context.Context, opt VulnListOptions) ([]VulnerabilityWithMetadata, *PaginationMetadata, error)
+	// ListVulnerability returns a vulnerability based on the provided CVE.
+	Vulnerability(ctx context.Context, cve string, teamID *uint, useCVSScores bool) (vuln *VulnerabilityWithMetadata, known bool, err error)
+	// CountVulnerabilities returns the number of vulnerabilities based on the provided options.
+	CountVulnerabilities(ctx context.Context, opt VulnListOptions) (uint, error)
+	// ListOSVersionsByCVE returns a list of OS versions affected by the provided CVE.
+	ListOSVersionsByCVE(ctx context.Context, cve string, teamID *uint) (result []*VulnerableOS, updatedAt time.Time, err error)
+	// ListSoftwareByCVE returns a list of software affected by the provided CVE.
+	ListSoftwareByCVE(ctx context.Context, cve string, teamID *uint) (result []*VulnerableSoftware, updatedAt time.Time, err error)
+
+	// /////////////////////////////////////////////////////////////////////////////
+	// Team Policies
+
+	NewTeamPolicy(ctx context.Context, teamID uint, p NewTeamPolicyPayload) (*Policy, error)
+	ListTeamPolicies(ctx context.Context, teamID uint, opts ListOptions, iopts ListOptions, mergeInherited bool, automationType PolicyAutomationType, platform string) (teamPolicies, inheritedPolicies []*Policy, err error)
+	DeleteTeamPolicies(ctx context.Context, teamID uint, ids []uint) ([]uint, error)
+	ModifyTeamPolicy(ctx context.Context, teamID uint, id uint, p ModifyPolicyPayload) (*Policy, error)
+	GetTeamPolicyByID(ctx context.Context, teamID uint, policyID uint) (*Policy, error)
+	CountTeamPolicies(ctx context.Context, teamID uint, matchQuery string, mergeInherited bool, automationType PolicyAutomationType, platform string) (int, int, error)
+
+	// /////////////////////////////////////////////////////////////////////////////
+	// Geolocation
+
+	LookupGeoIP(ctx context.Context, ip string) *GeoLocation
+	// GetHostLocationData gets the given host's location data from the Fleet database, if it exists.
+	// Note: It is a public method because of how the calling methods are set up. It assumes that auth has been done in the caller.
+	GetHostLocationData(ctx context.Context, hostID uint) (*GeoLocation, error)
+
+	////////////////////////////////////////////////////////////////////////////////
+	// Software Installers
+
+	GetSoftwareInstallDetails(ctx context.Context, installUUID string) (*SoftwareInstallDetails, error)
+
+	// /////////////////////////////////////////////////////////////////////////////
+	// Apple MDM
+
+	GetAppleMDM(ctx context.Context) (*AppleMDM, error)
+	GetAppleBM(ctx context.Context) (*AppleBM, error)
+	RequestMDMAppleCSR(ctx context.Context, email, org string) (*AppleCSR, error)
+
+	// GetMDMAppleCSR returns a signed CSR as base64 encoded bytes for Apple MDM. The first time
+	// this method is called, it will create a SCEP certificate, a SCEP key, and an APNS key and
+	// write these to the DB. On subsequent calls, it will use the saved APNS key for generating the CSR.
+	GetMDMAppleCSR(ctx context.Context) ([]byte, error)
+
+	UploadMDMAppleAPNSCert(ctx context.Context, cert io.ReadSeeker) error
+	DeleteMDMAppleAPNSCert(ctx context.Context) error
+
+	UploadVPPToken(ctx context.Context, token io.ReadSeeker) (*VPPTokenDB, error)
+	UpdateVPPToken(ctx context.Context, id uint, token io.ReadSeeker) (*VPPTokenDB, error)
+	UpdateVPPTokenTeams(ctx context.Context, tokenID uint, teamIDs []uint) (*VPPTokenDB, error)
+	GetVPPTokens(ctx context.Context) ([]*VPPTokenDB, error)
+	DeleteVPPToken(ctx context.Context, tokenID uint) error
+
+	CreateAndroidWebApp(ctx context.Context, title, startURL string, icon io.Reader) (string, error)
+
+	BatchAssociateVPPApps(ctx context.Context, teamName string, payloads []VPPBatchPayload, dryRun bool) ([]VPPAppResponse, []string, error)
+
+	// GetHostDEPAssignment retrieves the host DEP assignment for the specified host.
+	GetHostDEPAssignment(ctx context.Context, host *Host) (*HostDEPAssignment, error)
+
+	// GetHostDEPAssignmentDetails retrieves Fleet's DEP assignment record and
+	// Apple's live device details from ABM for the given host ID.
+	// Returns (nil, nil, "", nil) for non-DEP hosts.
+	// If ABM returns an error, dep_device is nil, depError classifies why, and
+	// the original error is logged rather than returned to the caller.
+	GetHostDEPAssignmentDetails(ctx context.Context, hostID uint) (*HostDEPAssignment, *godep.DeviceDetails, DEPDeviceErrorType, error)
+
+	// NewMDMAppleConfigProfile creates a new configuration profile for the specified team.
+	NewMDMAppleConfigProfile(ctx context.Context, teamID uint, data []byte, labelsInclude []string, labelsMembershipMode MDMLabelsMode, labelsExcludeAny []string) (*MDMAppleConfigProfile, error)
+	// NewMDMAppleConfigProfileWithPayload creates a new declaration for the specified team.
+	// activation is an optional custom activation declaration to attach to the
+	// declaration; nil or empty means Fleet generates the activation.
+	NewMDMAppleDeclaration(ctx context.Context, teamID uint, data []byte, labelsInclude []string, name string, labelsMembershipMode MDMLabelsMode, labelsExcludeAny []string, activation []byte) (*MDMAppleDeclaration, error)
+
+	// GetMDMAppleConfigProfileByDeprecatedID retrieves the specified Apple
+	// configuration profile via its numeric ID. This method is deprecated and
+	// should not be used for new endpoints.
+	GetMDMAppleConfigProfileByDeprecatedID(ctx context.Context, profileID uint) (*MDMAppleConfigProfile, error)
+	// GetMDMAppleConfigProfile retrieves the specified configuration profile.
+	GetMDMAppleConfigProfile(ctx context.Context, profileUUID string) (*MDMAppleConfigProfile, error)
+
+	// GetMDMAppleDeclaration retrieves the specified declaration.
+	GetMDMAppleDeclaration(ctx context.Context, declarationUUID string) (*MDMAppleDeclaration, error)
+
+	// DeleteMDMAppleConfigProfileByDeprecatedID deletes the specified Apple
+	// configuration profile via its numeric ID. This method is deprecated and
+	// should not be used for new endpoints.
+	DeleteMDMAppleConfigProfileByDeprecatedID(ctx context.Context, profileID uint) error
+	// DeleteMDMAppleConfigProfile deletes the specified configuration profile.
+	DeleteMDMAppleConfigProfile(ctx context.Context, profileUUID string) error
+
+	// DeleteMDMAppleDeclaration deletes the specified declaration.
+	DeleteMDMAppleDeclaration(ctx context.Context, declarationUUID string) error
+
+	// ListMDMAppleConfigProfiles returns the list of all the configuration profiles for the
+	// specified team.
+	ListMDMAppleConfigProfiles(ctx context.Context, teamID uint) ([]*MDMAppleConfigProfile, error)
+
+	// GetMDMAppleFileVaultSummary summarizes the current state of Apple disk encryption profiles on
+	// each macOS host in the specified team (or, if no team is specified, each host that is not assigned
+	// to any team).
+	GetMDMAppleFileVaultSummary(ctx context.Context, teamID *uint) (*MDMAppleFileVaultSummary, error)
+
+	// GetMDMAppleProfilesSummary summarizes the current state of MDM configuration profiles on
+	// each host in the specified team (or, if no team is specified, each host that is not assigned
+	// to any team).
+	GetMDMAppleProfilesSummary(ctx context.Context, teamID *uint) (*MDMProfilesSummary, error)
+
+	// AuthenticateMDMAppleDEPEnrollment validates an automatic (DEP) enrollment
+	// request: the token must match the automatic enrollment profile and the
+	// device's serial must currently be DEP-assigned to Fleet.
+	AuthenticateMDMAppleDEPEnrollment(ctx context.Context, enrollmentToken string, machineInfo *MDMAppleMachineInfo) error
+
+	// GetMDMAppleEnrollmentProfileByToken returns the Apple enrollment from its secret token.
+	GetMDMAppleEnrollmentProfileByToken(ctx context.Context, enrollmentToken string, enrollmentRef string, machineInfo *MDMAppleMachineInfo) (profile []byte, err error)
+
+	// GetMDMAppleEnrollmentProfileByToken returns the Apple account-driven user enrollment profile for a given enrollment reference.
+	GetMDMAppleAccountEnrollmentProfile(ctx context.Context, enrollReference string) (profile []byte, err error)
+	SkipAuth(ctx context.Context)
+
+	// ReconcileMDMAppleEnrollRef reconciles the enrollment reference for the
+	// specified device. It performs several related tasks:
+	//
+	// 1. Checks given the enroll reference against MDM IdP accounts and associates the matching IdP
+	// account uuid to the given device UUID, if applicable.
+	//
+	// 2. Checks if the given device UUID has a legacy enrollment reference and returns the legacy
+	// enrollment reference, if applicable.
+	ReconcileMDMAppleEnrollRef(ctx context.Context, enrollRef string, machineInfo *MDMAppleMachineInfo) (string, error)
+
+	// GetDeviceMDMAppleEnrollmentProfile loads the raw (PList-format) enrollment
+	// profile for the currently authenticated device.
+	GetDeviceMDMAppleEnrollmentProfile(ctx context.Context) (*url.URL, error)
+
+	// GetMDMAppleCommandResults returns the execution results of a command identified by a CommandUUID.
+	GetMDMAppleCommandResults(ctx context.Context, commandUUID string) ([]*MDMCommandResult, error)
+
+	// ListMDMAppleCommands returns a list of MDM Apple commands corresponding to
+	// the specified options.
+	ListMDMAppleCommands(ctx context.Context, opts *MDMCommandListOptions) ([]*MDMAppleCommand, error)
+
+	// UploadMDMAppleInstaller uploads an Apple installer to Fleet.
+	UploadMDMAppleInstaller(ctx context.Context, name string, size int64, installer io.Reader) (*MDMAppleInstaller, error)
+
+	// GetMDMAppleInstallerByID returns the installer details of an installer, all fields except its content,
+	// (MDMAppleInstaller.Installer is nil).
+	GetMDMAppleInstallerByID(ctx context.Context, id uint) (*MDMAppleInstaller, error)
+
+	// DeleteMDMAppleInstaller deletes an Apple installer from Fleet.
+	DeleteMDMAppleInstaller(ctx context.Context, id uint) error
+
+	// GetMDMAppleInstallerByToken returns the installer with its contents included (MDMAppleInstaller.Installer) from its secret token.
+	GetMDMAppleInstallerByToken(ctx context.Context, token string) (*MDMAppleInstaller, error)
+
+	// GetMDMAppleInstallerDetailsByToken loads the installer details, all fields except its content,
+	// (MDMAppleInstaller.Installer is nil) from its secret token.
+	GetMDMAppleInstallerDetailsByToken(ctx context.Context, token string) (*MDMAppleInstaller, error)
+
+	// ListMDMAppleInstallers lists all the uploaded installers.
+	ListMDMAppleInstallers(ctx context.Context) ([]MDMAppleInstaller, error)
+
+	// ListMDMAppleDevices lists all the MDM enrolled Apple devices.
+	ListMDMAppleDevices(ctx context.Context) ([]MDMAppleDevice, error)
+
+	// NewMDMAppleDEPKeyPair creates a public private key pair for use with the Apple MDM DEP token.
+	//
+	// Deprecated: NewMDMAppleDEPKeyPair exists only to support a deprecated endpoint.
+	NewMDMAppleDEPKeyPair(ctx context.Context) (*MDMAppleDEPKeyPair, error)
+
+	// GenerateABMKeyPair generates and stores in the database public and
+	// private keys to use in ABM to generate an encrypted auth token.
+	GenerateABMKeyPair(ctx context.Context) (*MDMAppleDEPKeyPair, error)
+
+	// UploadABMToken reads and validates if the provided token can be
+	// decrypted using the keys stored in the database, then saves the token.
+	UploadABMToken(ctx context.Context, token io.Reader) (*ABMToken, error)
+
+	// ListABMTokens lists all the ABM tokens in Fleet.
+	ListABMTokens(ctx context.Context) ([]*ABMToken, error)
+
+	// CountABMTokens counts the ABM tokens in Fleet.
+	CountABMTokens(ctx context.Context) (int, error)
+
+	// UpdateABMTokenTeams updates the default macOS, iOS, iPadOS, and BYOD team IDs for a given ABM token.
+	UpdateABMTokenTeams(ctx context.Context, tokenID uint, macOSTeamID, iOSTeamID, iPadOSTeamID, byodTeamID *uint) (*ABMToken, error)
+
+	// SetABMTokenDefault marks the given ABM token as the default one used to
+	// sign GetToken responses for devices not enrolled through ABM, or unsets
+	// it so no token is the default. isDefault is required; nil is rejected.
+	SetABMTokenDefault(ctx context.Context, tokenID uint, isDefault *bool) (*ABMToken, error)
+
+	// DeleteABMToken deletes the given ABM token.
+	DeleteABMToken(ctx context.Context, tokenID uint) error
+
+	// RenewABMToken replaces the contents of the given ABM token with the given bytes.
+	RenewABMToken(ctx context.Context, token io.Reader, tokenID uint) (*ABMToken, error)
+
+	// EnqueueMDMAppleCommand enqueues a command for execution on the given
+	// devices. Note that a deviceID is the same as a host's UUID.
+	EnqueueMDMAppleCommand(ctx context.Context, rawBase64Cmd string, deviceIDs []string) (result *CommandEnqueueResult, err error)
+
+	// BatchSetMDMAppleProfiles replaces the custom macOS profiles for a specified
+	// team or for hosts with no team.
+	BatchSetMDMAppleProfiles(ctx context.Context, teamID *uint, teamName *string, profiles [][]byte, dryRun bool, skipBulkPending bool) error
+
+	// MDMApplePreassignProfile preassigns a profile to a host, pending the match
+	// request that will match the profiles to a team (or create one if needed),
+	// assign the host to that team and assign the profiles to the host.
+	MDMApplePreassignProfile(ctx context.Context, payload MDMApplePreassignProfilePayload) error
+
+	// MDMAppleMatchPreassignment matches the existing preassigned profiles to a
+	// team, creating one if none match, assigns the corresponding host to that
+	// team and assigns the matched team's profiles to the host.
+	MDMAppleMatchPreassignment(ctx context.Context, externalHostIdentifier string) error
+
+	// MDMAppleDeviceLock remote locks a host
+	MDMAppleDeviceLock(ctx context.Context, hostID uint) error
+
+	// MMDAppleEraseDevice erases a host
+	MDMAppleEraseDevice(ctx context.Context, hostID uint) error
+
+	// MDMListHostConfigurationProfiles returns configuration profiles for a given host
+	MDMListHostConfigurationProfiles(ctx context.Context, hostID uint) ([]*MDMAppleConfigProfile, error)
+
+	// MDMAppleReconcileFileVaultProfile brings the FileVault configuration
+	// profile for the given team in line with its two macOS disk encryption
+	// settings: removed when both are off, and otherwise carrying only the
+	// enforcement and/or escrow payloads the settings call for.
+	MDMAppleReconcileFileVaultProfile(ctx context.Context, teamID *uint) error
+
+	// UpdateMDMDiskEncryption updates the disk encryption settings for a
+	// specified team or for hosts with no team.
+	UpdateMDMDiskEncryption(ctx context.Context, teamID *uint, payload MDMDiskEncryptionSettingsPayload) error
+
+	// UpdateMDMHostNameTemplate updates the host name template for the specified
+	// fleet. An empty template clears the setting; clearing never renames hosts.
+	UpdateMDMHostNameTemplate(ctx context.Context, fleetID *uint, nameTemplate string) error
+
+	// VerifyMDMAppleConfigured verifies that the server is configured for
+	// Apple MDM. If an error is returned, authorization is skipped so the
+	// error can be raised to the user.
+	VerifyMDMAppleConfigured(ctx context.Context) error
+
+	// VerifyMDMWindowsConfigured verifies that the server is configured for
+	// Windows MDM. If an error is returned, authorization is skipped so the
+	// error can be raised to the user.
+	VerifyMDMWindowsConfigured(ctx context.Context) error
+
+	// VerifyMDMAndroidConfigured verifies that the server is configured for
+	// Android MDM. If an error is returned, authorization is skipped so the
+	// error can be raised to the user.
+	VerifyMDMAndroidConfigured(ctx context.Context) error
+
+	// VerifyAnyMDMConfigured verifies that the server is configured for any MDM
+	// (Apple, Windows, or Android). If an error is returned, authorization is
+	// skipped so the error can be raised to the user.
+	VerifyAnyMDMConfigured(ctx context.Context) error
+
+	MDMAppleUploadBootstrapPackage(ctx context.Context, name string, pkg io.Reader, teamID uint, dryRun bool) error
+
+	GetMDMAppleBootstrapPackageBytes(ctx context.Context, token string) (*MDMAppleBootstrapPackage, error)
+
+	GetMDMAppleBootstrapPackageMetadata(ctx context.Context, teamID uint, forUpdate bool) (*MDMAppleBootstrapPackage, error)
+
+	DeleteMDMAppleBootstrapPackage(ctx context.Context, teamID *uint, dryRun bool) error
+
+	GetMDMAppleBootstrapPackageSummary(ctx context.Context, teamID *uint) (*MDMAppleBootstrapPackageSummary, error)
+
+	// MDMGetEULABytes returns the contents of the EULA that matches
+	// the given token.
+	//
+	// A token is required as the means of authentication for this resource
+	// since it can be publicly accessed with anyone with a valid token.
+	MDMGetEULABytes(ctx context.Context, token string) (*MDMEULA, error)
+	// MDMGetEULAMetadata returns metadata about the EULA file that can
+	// be used by clients to display information.
+	MDMGetEULAMetadata(ctx context.Context) (*MDMEULA, error)
+	// MDMCreateEULA adds a new EULA file.
+	MDMCreateEULA(ctx context.Context, name string, file io.ReadSeeker, dryRun bool) error
+	// MDMAppleDelete EULA removes an EULA entry.
+	MDMDeleteEULA(ctx context.Context, token string, dryRun bool) error
+
+	// Create or update the MDM Apple Setup Assistant for a team or no team.
+	SetOrUpdateMDMAppleSetupAssistant(ctx context.Context, asst *MDMAppleSetupAssistant) (*MDMAppleSetupAssistant, error)
+	// Get the MDM Apple Setup Assistant for the provided team or no team.
+	GetMDMAppleSetupAssistant(ctx context.Context, teamID *uint) (*MDMAppleSetupAssistant, error)
+	// GetDefaultMDMAppleSetupAssistantProfile returns the default MDM Apple setup assistant profile for automatic setup, and the updated at time of the profile. If not set, it returns the default specified in code.
+	GetDefaultMDMAppleSetupAssistantProfile(ctx context.Context) (profile godep.Profile, updatedAt *time.Time, err error)
+	// Delete the MDM Apple Setup Assistant for the provided team or no team.
+	DeleteMDMAppleSetupAssistant(ctx context.Context, teamID *uint) error
+
+	// HasCustomSetupAssistantConfigurationWebURL checks if the team/global
+	// config has a custom setup assistant defined, and if the JSON content
+	// defines a custom `configuration_web_url`.
+	HasCustomSetupAssistantConfigurationWebURL(ctx context.Context, teamID *uint) (bool, error)
+
+	// UpdateMDMAppleSetup updates the specified MDM Apple setup values for a
+	// specified team or for hosts with no team.
+	UpdateMDMAppleSetup(ctx context.Context, payload MDMAppleSetupPayload) error
+
+	// TriggerMigrateMDMDevice posts a webhook request to the URL configured
+	// for MDM macOS migration.
+	TriggerMigrateMDMDevice(ctx context.Context, host *Host) error
+
+	GetMDMManualEnrollmentProfile(ctx context.Context, personal bool) ([]byte, error)
+
+	// TriggerLinuxDiskEncryptionEscrow queues a LUKS escrow request. It queues nothing and returns a
+	// LinuxEscrowInFlightError while fleetd is handling an earlier one.
+	TriggerLinuxDiskEncryptionEscrow(ctx context.Context, host *Host) error
+
+	// SubmitBitLockerPIN accepts a BitLocker startup PIN the end user typed on their My device page and queues it, encrypted, for the
+	// host's agent to apply. Device-authenticated.
+	SubmitBitLockerPIN(ctx context.Context, host *Host, pin string) error
+
+	// BitLockerPINStateForDevice reports whether this host's fleetd can apply an end-user-chosen BitLocker PIN, and where any
+	// submission stands, so the My device page knows which modal to show and what to poll for.
+	BitLockerPINStateForDevice(ctx context.Context, host *Host) (fleetdCanSetPIN bool, request *HostBitLockerPINRequest, err error)
+
+	// CheckMDMAppleEnrollmentWithMinimumOSVersion checks if the minimum OS version is met for a MDM enrollment
+	CheckMDMAppleEnrollmentWithMinimumOSVersion(ctx context.Context, m *MDMAppleMachineInfo) (*MDMAppleSoftwareUpdateRequired, error)
+
+	// GetOTAProfile gets the OTA (over-the-air) profile for a given team based on the enroll secret provided.
+	// personal indicates whether the end user selected "Personal (BYOD)" on the /enroll page; it is
+	// baked into the POST-back URL so the OTA enrollment handler can set the correct access rights.
+	GetOTAProfile(ctx context.Context, enrollSecret, idpSessionID string, personal bool) ([]byte, error)
+
+	///////////////////////////////////////////////////////////////////////////////
+	// CronSchedulesService
+
+	// TriggerCronSchedule attempts to trigger an ad-hoc run of the named cron schedule.
+	TriggerCronSchedule(ctx context.Context, name string) error
+
+	// ResetAutomation sets the policies and all policies of the listed teams to fire again
+	// for all hosts that are already marked as failing.
+	ResetAutomation(ctx context.Context, teamIDs, policyIDs []uint) error
+
+	///////////////////////////////////////////////////////////////////////////////
+	// Windows MDM
+
+	// ProcessMDMMicrosoftDiscovery handles the Discovery message validation and response
+	ProcessMDMMicrosoftDiscovery(ctx context.Context, req *SoapRequest) (*SoapResponse, error)
+
+	// GetMDMMicrosoftDiscoveryResponse returns a valid DiscoveryResponse message
+	GetMDMMicrosoftDiscoveryResponse(ctx context.Context, upnEmail string) (*DiscoverResponse, error)
+
+	// GetMDMWindowsPolicyResponse returns a valid GetPoliciesResponse message
+	GetMDMWindowsPolicyResponse(ctx context.Context, authToken *HeaderBinarySecurityToken) (*GetPoliciesResponse, error)
+
+	// GetMDMWindowsEnrollResponse returns a valid RequestSecurityTokenResponseCollection message
+	GetMDMWindowsEnrollResponse(ctx context.Context, secTokenMsg *RequestSecurityToken, authToken *HeaderBinarySecurityToken) (*RequestSecurityTokenResponseCollection, error)
+
+	// GetAuthorizedSoapFault authorize the request so SoapFault message can be returned
+	GetAuthorizedSoapFault(ctx context.Context, eType string, origMsg int, errorMsg error) *SoapFault
+
+	// SignMDMMicrosoftClientCSR returns a signed certificate from the client certificate signing request and the
+	// certificate fingerprint. The certificate common name should be passed in the subject parameter.
+	SignMDMMicrosoftClientCSR(ctx context.Context, subject string, csr *x509.CertificateRequest) ([]byte, string, error)
+
+	// GetMDMWindowsManagementResponse returns a valid SyncML response message
+	GetMDMWindowsManagementResponse(ctx context.Context, reqSyncML *SyncML, reqCerts []*x509.Certificate) (*SyncML, error)
+
+	// GetMDMWindowsTOSContent returns TOS content
+	GetMDMWindowsTOSContent(ctx context.Context, redirectUri string, reqID string) (string, error)
+
+	// RunMDMCommand enqueues an MDM command for execution on the given devices.
+	// Note that a deviceID is the same as a host's UUID.
+	RunMDMCommand(ctx context.Context, rawBase64Cmd string, deviceIDs []string) (result *CommandEnqueueResult, err error)
+
+	// GetMDMCommandResults returns the execution results of a command identified by a CommandUUID.
+	GetMDMCommandResults(ctx context.Context, commandUUID string, hostIdentifier string) ([]*MDMCommandResult, error)
+
+	// ListMDMCommands returns MDM commands based on the provided options.
+	ListMDMCommands(ctx context.Context, opts *MDMCommandListOptions) ([]*MDMCommand, *int64, *PaginationMetadata, error)
+
+	// Set or update the disk encryption key for a host.
+	SetOrUpdateDiskEncryptionKey(ctx context.Context, encryptionKey, clientError string) error
+
+	// SetOrUpdateDiskEncryptionProtection records the outcome of the agent's attempt to restore disk encryption
+	// protection on a host that was encrypted but unprotected.
+	SetOrUpdateDiskEncryptionProtection(ctx context.Context, outcome DiskEncryptionProtectionOutcome, clientError string) error
+
+	// GetBitLockerPINForHost hands the agent the startup PIN the end user submitted. It can only succeed once per
+	// submission: the PIN is cleared as it is read.
+	GetBitLockerPINForHost(ctx context.Context) (pin string, requestUUID string, err error)
+
+	// SetBitLockerPINOutcome records whether the agent managed to apply the PIN it collected.
+	SetBitLockerPINOutcome(ctx context.Context, requestUUID string, outcome BitLockerPINRequestStatus, clientError string) error
+
+	// GetMDMWindowsConfigProfile retrieves the specified configuration profile.
+	GetMDMWindowsConfigProfile(ctx context.Context, profileUUID string) (*MDMWindowsConfigProfile, error)
+
+	// DeleteMDMWindowsConfigProfile deletes the specified windows profile.
+	DeleteMDMWindowsConfigProfile(ctx context.Context, profileUUID string) error
+
+	// GetMDMWindowsProfileSummary summarizes the current state of MDM configuration profiles on each host
+	// in the specified team (or, if no team is specified, each host that is not assigned to any team).
+	GetMDMWindowsProfilesSummary(ctx context.Context, teamID *uint) (*MDMProfilesSummary, error)
+
+	// NewMDMWindowsConfigProfile creates a new Windows configuration profile for
+	// the specified team.
+	NewMDMWindowsConfigProfile(ctx context.Context, teamID uint, profileName string, data []byte, labelsInclude []string, labelsMembershipMode MDMLabelsMode, labelsExcludeAny []string) (*MDMWindowsConfigProfile, error)
+
+	// NewMDMUnsupportedConfigProfile is called when a profile with an
+	// unsupported extension is uploaded.
+	NewMDMUnsupportedConfigProfile(ctx context.Context, teamID uint, filename string) error
+
+	// Called when an activation is uploaded alongside a profile that isn't an
+	// Apple declaration. Exists, like the two below, so the error goes through
+	// an authorization check.
+	NewMDMActivationUnsupportedProfile(ctx context.Context, teamID uint) error
+
+	// NewMDMInvalidJSONConfigProfile is called when a JSON profile is uploaded with contents that
+	// cannot be resolved to either Apple DDM or Android format
+	NewMDMInvalidJSONConfigProfile(ctx context.Context, teamID uint, err error) error
+
+	// UpdateMDMConfigProfile updates an existing configuration profile's
+	// contents and/or label targeting in place. Supported for Apple
+	// .mobileconfig profiles, Apple DDM declarations, Windows profiles, and
+	// Android profiles.
+	//
+	// profileName is the uploaded file's name without its extension, empty when
+	// the request carried no file. Unused by Apple .mobileconfig, which is named
+	// by the PayloadDisplayName in its content.
+	UpdateMDMConfigProfile(ctx context.Context, profileUUID string, profileName string, profile []byte, labelsInclude []string, labelsMembershipMode MDMLabelsMode, labelsExcludeAny []string, activation optjson.Slice[byte]) error
+
+	// ListMDMConfigProfiles returns a list of paginated configuration profiles.
+	ListMDMConfigProfiles(ctx context.Context, teamID *uint, opt ListOptions) ([]*MDMConfigProfilePayload, *PaginationMetadata, error)
+
+	// BatchSetMDMProfiles replaces the custom Windows/macOS/Android profiles for a specified
+	// team or for hosts with no team.
+	BatchSetMDMProfiles(
+		ctx context.Context, teamID *uint, teamName *string, profiles []MDMProfileBatchPayload, dryRun bool, skipBulkPending bool,
+		assumeEnabled *bool, noCache bool,
+	) error
+
+	///////////////////////////////////////////////////////////////////////////////
+	// Linux MDM
+
+	// LinuxHostDiskEncryptionStatus returns the current disk encryption status of the specified Linux host
+	// Returns empty status if the host is not a supported Linux host
+	LinuxHostDiskEncryptionStatus(ctx context.Context, host Host) (HostMDMDiskEncryption, error)
+
+	// GetMDMLinuxProfilesSummary summarizes the current status of Linux disk encryption for
+	// the provided team (or hosts without a team if teamId is nil), or returns zeroes if disk
+	// encryption is not enforced on the selected team
+	GetMDMLinuxProfilesSummary(ctx context.Context, teamId *uint) (MDMProfilesSummary, error)
+
+	///////////////////////////////////////////////////////////////////////////////
+	// Android MDM
+
+	// NewMDMAndroidConfigProfile creates a new Android configuration profile
+	NewMDMAndroidConfigProfile(ctx context.Context, teamID uint, profileName string, data []byte, labelsInclude []string, labelsMembershipMode MDMLabelsMode, labelsExcludeAny []string) (*MDMAndroidConfigProfile, error)
+
+	// DeleteMDMAndroidConfigProfile deletes the specified Android profile.
+	DeleteMDMAndroidConfigProfile(ctx context.Context, profileUUID string) error
+
+	// GetMDMAndroidConfigProfile returns the specified Android profile.
+	GetMDMAndroidConfigProfile(ctx context.Context, profileUUID string) (*MDMAndroidConfigProfile, error)
+
+	// GetMDMAndroidProfilesSummary summarizes the current state of MDM configuration profiles on each Android
+	// host in the specified team (or, if no team is specified, each host that is not assigned to any team).
+	GetMDMAndroidProfilesSummary(ctx context.Context, teamID *uint) (*MDMProfilesSummary, error)
+
+	///////////////////////////////////////////////////////////////////////////////
+	// Common MDM
+
+	// GetMDMDiskEncryptionSummary returns the current disk encryption status of all macOS, Windows, and
+	// Linux hosts in the specified team (or, if no team is specified, each host that is not
+	// assigned to any team).
+	GetMDMDiskEncryptionSummary(ctx context.Context, teamID *uint) (*MDMDiskEncryptionSummary, error)
+
+	// ResendHostMDMProfile resends the MDM profile to the host.
+	ResendHostMDMProfile(ctx context.Context, hostID uint, profileUUID string) error
+
+	// ResendHostNameTemplate resets a host's host-name template enforcement so
+	// the cron re-sends the Settings/DeviceName command on its next run. Only
+	// hosts in a "failed" or "verified" state can be resent.
+	ResendHostNameTemplate(ctx context.Context, hostID uint) error
+
+	// ResendDeviceHostMDMProfile resends the MDM profile to the device host that requested it.
+	ResendDeviceHostMDMProfile(ctx context.Context, host *Host, profileUUID string) error
+
+	// BatchResendMDMProfileToHosts resends an MDM profile to the hosts that
+	// satisfy the specified filters.
+	BatchResendMDMProfileToHosts(ctx context.Context, profileUUID string, filters BatchResendMDMProfileFilters) error
+
+	// GetMDMConfigProfileStatus returns the number of hosts for each status of a
+	// single configuration profile.
+	GetMDMConfigProfileStatus(ctx context.Context, profileUUID string) (MDMConfigProfileStatus, error)
+
+	///////////////////////////////////////////////////////////////////////////////
+	// Host Script Execution
+
+	// RunHostScript executes a script on a host and optionally waits for the
+	// result if waitForResult is > 0. If it times out waiting for a result, it
+	// fails with a 504 Gateway Timeout error.
+	RunHostScript(ctx context.Context, request *HostScriptRequestPayload, waitForResult time.Duration) (*HostScriptResult, error)
+
+	// GetScriptIDByName returns the ID of a script matching the provided name and team. If no team
+	// is provided, it will return the ID of the script with the provided name that is not
+	// associated with any team.
+	GetScriptIDByName(ctx context.Context, name string, teamID *uint) (uint, error)
+
+	// GetHostScript returns information about a host script execution.
+	GetHostScript(ctx context.Context, execID string) (*HostScriptResult, error)
+
+	// SaveHostScriptResult saves information about execution of a script on a host.
+	SaveHostScriptResult(ctx context.Context, result *HostScriptResultPayload) error
+
+	// GetScriptResult returns the result of a script run
+	GetScriptResult(ctx context.Context, execID string) (*HostScriptResult, error)
+
+	// GetSelfServiceUninstallScriptResult returns the result of a script run if it's a self-service uninstall for the specified host
+	GetSelfServiceUninstallScriptResult(ctx context.Context, host *Host, execID string) (*HostScriptResult, error)
+
+	// NewScript creates a new (saved) script with its content provided by the
+	// io.Reader r.
+	NewScript(ctx context.Context, teamID *uint, name string, r io.Reader) (*Script, error)
+
+	// UpdateScript updates a saved script with the contents of io.Reader r
+	UpdateScript(ctx context.Context, scriptID uint, r io.Reader) (*Script, error)
+
+	// DeleteScript deletes an existing (saved) script.
+	DeleteScript(ctx context.Context, scriptID uint) error
+
+	// ListScripts returns a list of paginated saved scripts.
+	ListScripts(ctx context.Context, teamID *uint, opt ListOptions) ([]*Script, *PaginationMetadata, error)
+
+	// GetScript returns the script corresponding to the provided id. If the
+	// download is requested, it also returns the script's contents.
+	GetScript(ctx context.Context, scriptID uint, downloadRequested bool) (*Script, []byte, error)
+
+	// GetHostScriptDetails returns a list of scripts that apply to the provided host.
+	GetHostScriptDetails(ctx context.Context, hostID uint, opt ListOptions) ([]*HostScriptDetail, *PaginationMetadata, error)
+
+	// BatchSetScripts replaces the scripts for a specified team or for
+	// hosts with no team.
+	BatchSetScripts(ctx context.Context, maybeTmID *uint, maybeTmName *string, payloads []ScriptPayload, dryRun bool) ([]ScriptResponse, error)
+
+	// BatchScriptExecute runs a script on many hosts. It creates and returns a batch execution ID
+	BatchScriptExecute(ctx context.Context, scriptID uint, hostIDs []uint, filters *map[string]any, notBefore *time.Time) (string, error)
+
+	BatchScriptExecutionSummary(ctx context.Context, batchExecutionID string) (*BatchActivity, error)
+
+	BatchScriptExecutionStatus(ctx context.Context, batchExecutionID string) (*BatchActivity, error)
+
+	BatchScriptExecutionHostResults(ctx context.Context, batchExecutionID string, status BatchScriptExecutionStatus, opt ListOptions) ([]BatchScriptHost, *PaginationMetadata, uint, error)
+
+	BatchScriptExecutionList(ctx context.Context, filter BatchExecutionStatusFilter) ([]BatchActivity, int64, error)
+
+	// BatchScriptCancel cancels a batch script execution
+	BatchScriptCancel(ctx context.Context, batchExecutionID string) error
+
+	// Script-based methods (at least for some platforms, MDM-based for others)
+	LockHost(ctx context.Context, hostID uint, viewPIN bool) (unlockPIN string, err error)
+	UnlockHost(ctx context.Context, hostID uint) (unlockPIN string, err error)
+	WipeHost(ctx context.Context, hostID uint, metadata *MDMWipeMetadata) error
+
+	// ClearPasscode is a method that clears the passcode on a host, primarily mobile devices.
+	// Not script based, only MDM based.
+	ClearPasscode(ctx context.Context, hostID uint) (*CommandEnqueueResult, error)
+
+	// CancelHostMDMCommand cancels a pending Apple MDM command (lock, wipe,
+	// clear passcode, enable lost mode) before the host receives it.
+	CancelHostMDMCommand(ctx context.Context, hostID uint, commandUUID string) error
+
+	// RotateRecoveryLockPassword rotates the recovery lock password for a macOS host.
+	// This is only available for Apple Silicon Macs that are MDM-enrolled and have
+	// an existing recovery lock password.
+	RotateRecoveryLockPassword(ctx context.Context, hostID uint) error
+
+	// GetHostManagedAccountPassword retrieves and decrypts the managed local account
+	// password for the given host ID. Available whenever the row has a stored password
+	// and status is not 'failed' (the row's status may be 'pending' due to a recent view).
+	GetHostManagedAccountPassword(ctx context.Context, hostID uint) (*HostManagedLocalAccountPassword, error)
+
+	// RotateManagedLocalAccountPassword rotates the macOS managed local admin
+	// (`_fleetadmin`) password. Premium-only. When account_uuid is captured the
+	// rotation is enqueued immediately; otherwise it's deferred until the cron
+	// can fulfill it after osquery captures the UUID.
+	RotateManagedLocalAccountPassword(ctx context.Context, hostID uint) error
+
+	///////////////////////////////////////////////////////////////////////////////
+	// Software installers
+
+	UploadSoftwareInstaller(ctx context.Context, payload *UploadSoftwareInstallerPayload) (*SoftwareInstaller, error)
+	UpdateSoftwareInstaller(ctx context.Context, payload *UpdateSoftwareInstallerPayload) (*SoftwareInstaller, error)
+	DeleteSoftwareInstaller(ctx context.Context, titleID uint, teamID *uint, installerID *uint) error
+	GenerateSoftwareInstallerToken(ctx context.Context, alt string, titleID uint, teamID *uint, installerID *uint) (string, error)
+	GetSoftwareInstallerTokenMetadata(ctx context.Context, token string, titleID uint) (*SoftwareInstallerTokenMetadata, error)
+	GetSoftwareInstallerMetadata(ctx context.Context, skipAuthz bool, titleID uint, teamID *uint) (*SoftwareInstaller, error)
+	DownloadSoftwareInstaller(ctx context.Context, skipAuthz bool, alt string, titleID uint,
+		teamID *uint, installerID *uint) (*DownloadSoftwareInstallerPayload, error)
+	OrbitDownloadSoftwareInstaller(ctx context.Context, installerID uint) (*DownloadSoftwareInstallerPayload, error)
+
+	/////////////////////////////////////////////////////////////////////////////////
+	// Software title icons
+
+	GetSoftwareTitleIcon(ctx context.Context, teamID uint, titleID uint) ([]byte, int64, string, error)
+	UploadSoftwareTitleIcon(ctx context.Context, payload *UploadSoftwareTitleIconPayload) (SoftwareTitleIcon, error)
+	DeleteSoftwareTitleIcon(ctx context.Context, teamID uint, titleID uint) error
+
+	/////////////////////////////////////////////////////////////////////////////////
+	// Software categories (used as self-service categories in the UI)
+
+	ListSoftwareCategories(ctx context.Context, teamID *uint) ([]SoftwareCategory, error)
+	ListSelfServiceSoftwareCategoriesForHost(ctx context.Context, host *Host) ([]SoftwareCategory, error)
+	NewSoftwareCategory(ctx context.Context, teamID *uint, name string) (*SoftwareCategory, error)
+	UpdateSoftwareCategory(ctx context.Context, id uint, name string) (*SoftwareCategory, error)
+	DeleteSoftwareCategory(ctx context.Context, id uint) error
+
+	/////////////////////////////////////////////////////////////////////////////////
+	// Organization logo
+
+	// UploadOrgLogo stores a logo image for the given mode and updates the
+	// AppConfig URL fields. OrgLogoModeAll applies the same file to both
+	// light and dark.
+	UploadOrgLogo(ctx context.Context, mode OrgLogoMode, content io.ReadSeeker) error
+	// DeleteOrgLogo removes the stored logo for the given mode and clears
+	// the AppConfig URL fields. OrgLogoModeAll deletes both.
+	DeleteOrgLogo(ctx context.Context, mode OrgLogoMode) error
+	// GetOrgLogo returns the stored logo bytes for mode along with their
+	// content length. Only OrgLogoModeLight and OrgLogoModeDark are valid;
+	// OrgLogoModeAll is rejected.
+	GetOrgLogo(ctx context.Context, mode OrgLogoMode) ([]byte, int64, error)
+
+	////////////////////////////////////////////////////////////////////////////////
+	// Setup Experience
+
+	SetSetupExperienceSoftware(ctx context.Context, platform string, teamID uint, titleIDs []uint) error
+	ListSetupExperienceSoftware(ctx context.Context, platform string, teamID uint, opts ListOptions) ([]SoftwareTitleListResult, int, *PaginationMetadata, error)
+	// GetOrbitSetupExperienceStatus gets the current status of a macOS setup experience for the given host.
+	GetOrbitSetupExperienceStatus(ctx context.Context, orbitNodeKey string, forceRelease bool, resetFailedSetupSteps bool) (*SetupExperienceStatusPayload, error)
+	// GetSetupExperienceScript gets the current setup experience script for the given team.
+	GetSetupExperienceScript(ctx context.Context, teamID *uint, downloadRequested bool) (*Script, []byte, error)
+	// SetSetupExperienceScript sets the setup experience script for a given team, deleting the existing one if it exists
+	// and is different and replacing it with a new one. Effectively an upsert operation which does nothing if the contents
+	// do not change
+	SetSetupExperienceScript(ctx context.Context, teamID *uint, name string, r io.Reader) error
+	// DeleteSetupExperienceScript deletes the setup experience script for the given team.
+	DeleteSetupExperienceScript(ctx context.Context, teamID *uint) error
+	// SetupExperienceNextStep is a callback that processes the
+	// setup experience status results table and enqueues the next
+	// step. It returns true when there is nothing left to do (setup finished)
+	SetupExperienceNextStep(ctx context.Context, host *Host) (bool, error)
+
+	// SetupExperienceInit initializes the "Setup experience" for a device (by queueing items like software installation, etc.).
+	// This is used for the "Setup experience" on non-darwin devices.
+	SetupExperienceInit(ctx context.Context) (*SetupExperienceInitResult, error)
+	// GetDeviceSetupExperienceStatus returns the "Setup experience" status for a "Fleet Desktop" device.
+	GetDeviceSetupExperienceStatus(ctx context.Context) (*DeviceSetupExperienceStatusPayload, error)
+
+	MaybeCancelPendingSetupExperienceSteps(ctx context.Context, host *Host) error
+
+	IsAllSetupExperienceSoftwareRequired(ctx context.Context, host *Host) (bool, error)
+
+	///////////////////////////////////////////////////////////////////////////////
+	// Fleet-maintained apps
+
+	// AddFleetMaintainedApp adds a Fleet-maintained app to the given team.
+	AddFleetMaintainedApp(ctx context.Context, teamID *uint, appID uint, installScript, preInstallQuery, postInstallScript, uninstallScript string, selfService bool, automaticInstall bool, labelsIncludeAny, labelsExcludeAny, labelsIncludeAll []string) (uint, error)
+	// ListFleetMaintainedApps lists Fleet-maintained apps, including associated software title for supplied team ID (if any)
+	ListFleetMaintainedApps(ctx context.Context, teamID *uint, opts MaintainedAppListOptions) ([]MaintainedApp, *PaginationMetadata, error)
+	// GetFleetMaintainedApp returns a Fleet-maintained app by ID, including associated software title for supplied team ID (if any)
+	GetFleetMaintainedApp(ctx context.Context, appID uint, teamID *uint) (*MaintainedApp, error)
+
+	// /////////////////////////////////////////////////////////////////////////////
+	// Maintenance windows
+
+	// CalendarWebhook handles incoming calendar callback requests.
+	CalendarWebhook(ctx context.Context, eventUUID string, channelID string, resourceState string) error
+
+	// /////////////////////////////////////////////////////////////////////////////
+	// Secret variables
+
+	// CreateSecretVariables creates secret variables for scripts and profiles.
+	CreateSecretVariables(ctx context.Context, secretVariables []SecretVariable, dryRun bool) error
+	// CreateSecretVariable creates a secret variable and returns its ID.
+	// Returns an AlreadyExistsError error if there's already a secret variable with the same name.
+	CreateSecretVariable(ctx context.Context, name string, value string) (id uint, err error)
+	// ListSecretVariables returns a list of secret variable identifiers filtered with the pagination options.
+	// Currently only Page and PerPage in opts are supported/used.
+	// Default value fo the other options is MatchQuery="", After="", IncludeMetadata=true, OrderKey="name", OrderDirection=fleet.OrderAscending.
+	// Returns a count of total secret variable identifiers on all (filtered) pages.
+	ListSecretVariables(ctx context.Context, opts ListOptions) (secretVariables []SecretVariableIdentifier, meta *PaginationMetadata, count int, err error)
+	// DeleteSecretVariable deletes a secret variable by ID.
+	// Returns a NotFoundError error if there's no secret variable with such ID.
+	DeleteSecretVariable(ctx context.Context, id uint) error
+
+	ListCustomHostVitals(ctx context.Context, opts ListOptions) (customHostVitals []CustomHostVital, meta *PaginationMetadata, count int, err error)
+	CreateCustomHostVital(ctx context.Context, name string) (*CustomHostVital, error)
+	UpdateCustomHostVital(ctx context.Context, id uint, name string) (*CustomHostVital, error)
+	DeleteCustomHostVital(ctx context.Context, id uint) error
+	SetHostCustomHostVitalValue(ctx context.Context, hostID uint, vitalID uint, value string) error
+	// UpsertCustomHostVitals declaratively reconciles custom host vital definitions (GitOps):
+	// names present are upserted, names absent from customHostVitals are deleted.
+	UpsertCustomHostVitals(ctx context.Context, customHostVitals []CustomHostVital, dryRun bool) error
+
+	// ListAPIEndpoints returns all API endpoints
+	ListAPIEndpoints(ctx context.Context) (endpoints []APIEndpoint, err error)
+
+	// /////////////////////////////////////////////////////////////////////////////
+	// SCIM
+
+	// ScimDetails returns the details of last access to Fleet's SCIM endpoints
+	ScimDetails(ctx context.Context) (ScimDetails, error)
+
+	// /////////////////////////////////////////////////////////////////////////////
+	// Microsoft Conditional Access
+
+	// ConditionalAccessMicrosoftCreateIntegration kicks-off the integration with Entra
+	// and returns the consent URL to redirect the admin to.
+	ConditionalAccessMicrosoftCreateIntegration(ctx context.Context, tenantID string) (adminConsentURL string, err error)
+	// ConditionalAccessMicrosoftGet returns the current (currently unique) integration.
+	ConditionalAccessMicrosoftGet(ctx context.Context) (*ConditionalAccessMicrosoftIntegration, error)
+	// ConditionalAccessMicrosoftConfirm finalizes the integration (marks integration as done).
+	ConditionalAccessMicrosoftConfirm(ctx context.Context) (configurationCompleted bool, setupError string, err error)
+	// ConditionalAccessMicrosoftDelete deletes the integration and deprovisions the tenant on Entra.
+	ConditionalAccessMicrosoftDelete(ctx context.Context) error
+
+	// /////////////////////////////////////////////////////////////////////////////
+	// Okta conditional access
+
+	// ConditionalAccessGetIdPSigningCert returns the Okta IdP signing certificate (public key only)
+	// for administrators to download and configure in Okta.
+	ConditionalAccessGetIdPSigningCert(ctx context.Context) (certPEM []byte, err error)
+	// ConditionalAccessGetIdPAppleProfile returns the Apple MDM configuration profile
+	// (for user scope) to configure Okta conditional access on the host.
+	ConditionalAccessGetIdPAppleProfile(ctx context.Context) (profileData []byte, err error)
+
+	//////////////////////////////////////////////////////////////////////////////
+	// Certificate Authorities
+
+	// ListCertificateAuthorities lists all certificate authorities.
+	ListCertificateAuthorities(ctx context.Context) ([]*CertificateAuthoritySummary, error)
+	// GetCertificateAuthority returns a CertificateAuthority by ID. Secrets are masked
+	GetCertificateAuthority(ctx context.Context, id uint) (*CertificateAuthority, error)
+	// NewCertificateAuthority creates a new certificate authority and returns the created object
+	// with its ID set. Secrets must be provided
+	NewCertificateAuthority(ctx context.Context, p CertificateAuthorityPayload) (*CertificateAuthority, error)
+	// DeleteCertificateAuthority deletes the certificate authority of the given id, returns nil if successful or not found error
+	DeleteCertificateAuthority(ctx context.Context, certificateAuthorityID uint) error
+	// UpdateCertificateAuthority updates the certificate authority of the given id
+	UpdateCertificateAuthority(ctx context.Context, id uint, p CertificateAuthorityUpdatePayload) error
+	RequestCertificate(ctx context.Context, p RequestCertificatePayload) (*string, error)
+
+	// BatchApplyCertificateAuthorities applies the given certificate authorities spec
+	BatchApplyCertificateAuthorities(ctx context.Context, groupedCAs GroupedCertificateAuthorities, opts BatchApplyCertificateAuthoritiesOpts) error
+	// GetGroupedCertificateAuthorities retrieves the grouped certificate authorities
+	GetGroupedCertificateAuthorities(ctx context.Context, includeSecrets bool) (*GroupedCertificateAuthorities, error)
+
+	// UnenrollMDM unenrolls the host from MDM
+	UnenrollMDM(ctx context.Context, hostID uint) error
+
+	///////////////////////////////////////////////////////////////////////////////
+	// Apple Platform SSO (PSSO)
+
+	// PSSONonce issues a fresh single-use nonce for the Mac extension to
+	// embed in subsequent token-request JWTs.
+	PSSONonce(ctx context.Context) (string, error)
+	// PSSORegisterDevice validates the device-key payload POSTed by the Mac
+	// extension and persists the registration.
+	PSSORegisterDevice(ctx context.Context, req PSSODeviceRegistrationRequest) error
+	// PSSOToken handles the per-sign-in protocol message: parses the inbound
+	// signed JWT, dispatches on grant_type (password login) or request_type
+	// (key_request / key_exchange), and returns the JWE response body.
+	PSSOToken(ctx context.Context, jwtBytes []byte) ([]byte, error)
+	// PSSOJWKS returns the JSON web key set that publishes Fleet's PSSO
+	// signing public key.
+	PSSOJWKS(ctx context.Context) ([]byte, error)
+	// PSSOAASA returns the apple-app-site-association JSON used by Apple's
+	// framework to bind the extension's authsrv: entitlement to a Team+Bundle ID.
+	PSSOAASA(ctx context.Context) ([]byte, error)
+
+	//////////////////////////////////////////////////////////////////////////////
+	// Apple MDM Assets
+
+	// ListAppleDDMAssets returns a list of assets used for Apple DDM belonging to the specified team, in their API representation.
+	ListAppleDDMAssets(ctx context.Context, teamID *uint) ([]*DDMAsset, error)
+	// GetAppleDDMAsset returns the asset with the given UUID, in its API representation.
+	GetAppleDDMAsset(ctx context.Context, assetUUID string) (*DDMAsset, error)
+	// DownloadAppleDDMAsset returns the filename and contents of the asset with the given UUID.
+	DownloadAppleDDMAsset(ctx context.Context, assetUUID string) (filename string, data []byte, err error)
+	// CreateAppleDDMAsset creates a new asset used for Apple DDM. It returns the UUID of the created asset.
+	CreateAppleDDMAsset(ctx context.Context, teamID *uint, name string, data []byte) (string, error)
+	// DeleteAppleDDMAsset deletes the asset with the given UUID.
+	DeleteAppleDDMAsset(ctx context.Context, assetUUID string) error
+	// BatchSetAppleDDMAssets sets the complete desired set of Apple DDM assets
+	// for a team (used by GitOps). It upserts the given assets and deletes any
+	// existing assets not in the set.
+	BatchSetAppleDDMAssets(ctx context.Context, teamID *uint, teamName string, assets []MDMAppleDDMAssetBatchPayload, dryRun bool) error
+
+	// ReleaseABDevices releases the specified Apple Business devices.
+	ReleaseABDevices(ctx context.Context, hostIDs []uint) ([]*ABReleaseDeviceResponse, error)
+
+	//////////////////////////////////////////////////////////////////////////////
+	// Microsoft Graph
+
+	// ListMicrosoftGraphCredentials returns the stored Microsoft Graph credentials with their per-tenant sync status.
+	ListMicrosoftGraphCredentials(ctx context.Context) ([]*MicrosoftGraphCredentialMetadata, error)
+	// ApplyMicrosoftGraphCredentials declaratively reconciles the stored Microsoft Graph credentials to the supplied
+	// list, verifying any new or changed credential against Graph before storing it. A tenant absent from the list is deleted.
+	ApplyMicrosoftGraphCredentials(ctx context.Context, creds []MicrosoftGraphCredential, dryRun bool) error
+
+	// SendAPNSPing sends a ping to the specified host via APNS. Only valid for Apple hosts.
+	SendAPNSPing(ctx context.Context, hostID uint) error
+	DeviceSendAPNSPing(ctx context.Context, host *Host) error
+}
+
+type KeyValueStore interface {
+	Set(ctx context.Context, key string, value string, expireTime time.Duration) error
+	Get(ctx context.Context, key string) (*string, error)
+}
+
+type AdvancedKeyValueStore interface {
+	KeyValueStore
+
+	// MGet returns the values for the given keys.
+	// It returns a map of key to value, where the value is nil if the key doesn't exist.
+	// Important to use hashes for the keys to land in the same slot.
+	MGet(ctx context.Context, keys []string) (map[string]*string, error)
+	Delete(ctx context.Context, key string) error
+}
+
+// ClientConfigResult is the outcome of an ETag-aware osquery config request
+// (see OsqueryService.GetClientConfigWithETag).
+type ClientConfigResult struct {
+	// Body is the exact bytes to write to the agent: the canonical config for
+	// an agent that did not opt in (byte-identical to the pre-feature
+	// response), or that config with the validator spliced in under the
+	// "etag" key for one that did. It is nil when NotModified is true.
+	Body []byte
+	// ETag is the validator for the config representation: SHA-256 hex over the
+	// canonical (etag-less) body, or the Redis-stored value on a short-circuit
+	// hit. It is opaque to agents, which echo it verbatim in the "etag" request
+	// field, and the reserved value "ok" can never collide with hex output.
+	//
+	// The endpoint does not read this field — it is carried for tests and
+	// diagnostics; the value agents see is already spliced into Body.
+	ETag string
+	// NotModified reports that the client's etag matched: the response is
+	// the constant body {"etag":"ok"}.
+	NotModified bool
+	// CacheStatus describes, for observability only, how this result was
+	// produced. It is logged as etag_result by the osquery config endpoint.
+	CacheStatus ConfigETagCacheStatus
+	// Mode is the cache mode the request was served under, for observability
+	// only. It is logged as etag_mode by the osquery config endpoint.
+	Mode ConfigETagMode
+}
+
+// ConfigETagMode is the cache mode an osquery config request was served
+// under. Observability only: it never changes the response an agent sees.
+type ConfigETagMode string
+
+const (
+	// ConfigETagModeOff means no store was configured, so the short circuit
+	// could not apply. Distinct from Bypass: the feature is not active at all.
+	ConfigETagModeOff ConfigETagMode = "off"
+	// ConfigETagModeBypass means the feature is active but this request
+	// declined to use it — user-created 2017 packs exist, or the gate state
+	// could not be read. Kept distinct from Off so the etag_mode field can
+	// tell "flag disabled" from "enabled but bypassing fleet-wide"; no
+	// control flow branches on it.
+	ConfigETagModeBypass ConfigETagMode = "bypass"
+	// ConfigETagModeShared uses one record per (scope, platform).
+	ConfigETagModeShared ConfigETagMode = "shared"
+	// ConfigETagModeHost uses one isolated record per host, because
+	// label-scoped reports make the rendered config host-specific.
+	ConfigETagModeHost ConfigETagMode = "host"
+)
+
+// ConfigETagCacheStatus is how an osquery config result was produced.
+// Observability only.
+type ConfigETagCacheStatus string
+
+const (
+	// These two are the only values meaning the SHORT CIRCUIT answered
+	// "unchanged" WITHOUT building the config. Every other value means a
+	// full config build happened.
+	ConfigETagStatusRedisNotModified     ConfigETagCacheStatus = "redis_not_modified"
+	ConfigETagStatusRedisHostNotModified ConfigETagCacheStatus = "redis_host_not_modified"
+
+	// ConfigETagStatusNotModified is the bandwidth-only path: the config was
+	// built, but the agent's validator matched it so the body shrinks to the
+	// constant "unchanged" form.
+	ConfigETagStatusNotModified ConfigETagCacheStatus = "not_modified"
+	// ConfigETagStatusFullMismatch is a full config sent to an agent whose
+	// validator did not match.
+	ConfigETagStatusFullMismatch ConfigETagCacheStatus = "full_mismatch"
+	// ConfigETagStatusFullNoValidator is a full config sent to an agent that
+	// sent no validator, or an empty one.
+	ConfigETagStatusFullNoValidator ConfigETagCacheStatus = "full_no_validator"
+)
+
+// ConfigETagLabelScopes is the cached deployment-wide answer to "which
+// report scopes contain label-scoped scheduled reports". It drives the
+// shared-vs-per-host cache-mode selection of the osquery config ETag short
+// circuit: a host is in per-host mode when the GLOBAL scope has label-scoped
+// reports (global reports are inherited by every host) or when its own team
+// (fleet) does.
+type ConfigETagLabelScopes struct {
+	// Global is true when the global scope has label-scoped scheduled
+	// reports. Global reports are inherited by team hosts, so this puts
+	// EVERY host in per-host mode.
+	Global bool `json:"global"`
+	// TeamIDs are the teams (fleets) whose scope has label-scoped scheduled
+	// reports.
+	TeamIDs []uint `json:"fleet_ids"`
+}
+
+// PerHostMode reports whether a host with the given team (nil = no team)
+// must use per-host ETag records instead of the team-shared record.
+func (s ConfigETagLabelScopes) PerHostMode(teamID *uint) bool {
+	if s.Global {
+		return true
+	}
+	if teamID == nil {
+		return false
+	}
+	return slices.Contains(s.TeamIDs, *teamID)
+}
+
+// Any reports whether any scope has label-scoped scheduled reports.
+func (s ConfigETagLabelScopes) Any() bool {
+	return s.Global || len(s.TeamIDs) > 0
+}
+
+// ErrConfigETagGateLoading is returned by ConfigETagStore gate methods
+// (LegacyPacksPresent, LabelScopes) when another request on this Fleet
+// instance is already loading the missing gate state. It signals NORMAL
+// contention, not a fault: callers must treat the state as unknown for this
+// request (bypass the short circuit, run a full build) WITHOUT waiting and
+// WITHOUT error logging. This is the non-blocking half of the gate loaders'
+// leader election — one database load per container per miss window, and a
+// hung loader can never stall config delivery for other requests.
+var ErrConfigETagGateLoading = errors.New("config etag gate state load in flight")
+
+// ConfigETagStore is the Redis-backed store behind the osquery config ETag
+// short circuit. Two properties callers depend on:
+//
+//   - stored ETags carry the generation current when they were written, so one
+//     config-affecting write invalidates every record at once by bumping it;
+//   - publication is refused while the write fence is armed, so an ETag
+//     computed from stale in-memory cache data can never be persisted.
+//
+// Every method must FAIL OPEN: a Redis error disables the optimization for that
+// request and never fails config delivery. See server/service/redis_config_etag
+// for why each of these is necessary.
+type ConfigETagStore interface {
+	// GetETagIfCurrent returns the stored ETag for (scope, platform) only if its
+	// recorded generation matches the current generation. ok is false on a
+	// missing/expired key or a stale generation.
+	GetETagIfCurrent(ctx context.Context, scope, platform string) (etag string, ok bool, err error)
+	// SetIfNoFence persists the ETag for (scope, platform), stamped with the
+	// current generation — unless the write fence is armed, in which case it
+	// does nothing and returns stored=false. The check-and-set is atomic in
+	// Redis; see the package docs for why this is required for correctness.
+	SetIfNoFence(ctx context.Context, scope, platform, etag string) (stored bool, err error)
+	// Invalidate atomically bumps the deployment generation counter
+	// (invalidating every stored ETag — SHARED and PER-HOST — for reads) and
+	// arms the write fence. It must be called after every successful
+	// config-affecting datastore write.
+	Invalidate(ctx context.Context) error
+
+	// GetHostETagIfCurrent returns the stored PER-HOST ETag for hostID only if its
+	// recorded generation matches the current generation AND its recorded
+	// scope and platform match the authenticated host context — so a team
+	// transfer or platform change is a natural cache miss with no key
+	// cleanup required. Per-host records exist because label-scoped reports
+	// make the rendered config host-specific; a per-host record is never
+	// read by another host, so cross-host isolation is structural.
+	GetHostETagIfCurrent(ctx context.Context, hostID uint, scope, platform string) (etag string, ok bool, err error)
+	// SetHostIfNoFence persists the PER-HOST ETag stamped with the current
+	// generation and a jittered backstop TTL (~50-70m) — unless the
+	// deployment write fence OR the host's publish quarantine is armed, in
+	// which case it does nothing and returns stored=false. The fence covers
+	// stale in-memory config inputs after a config/report mutation; the
+	// quarantine covers stale membership reads immediately after that host's
+	// own label invalidation. The check-and-set is atomic in Redis.
+	SetHostIfNoFence(ctx context.Context, hostID uint, scope, platform, etag string) (stored bool, err error)
+	// InvalidateHost atomically deletes the host's PER-HOST record and arms
+	// its 30-second publish quarantine (one Lua script — a pipeline is not
+	// atomic and would let a straddling build republish stale membership
+	// between the DEL and the quarantine SET). Called conservatively after
+	// every successful persistence of the host's label results — no value
+	// diff required — and from manual membership paths where the affected
+	// host IDs are known.
+	InvalidateHost(ctx context.Context, hostID uint) error
+
+	// LegacyPacksPresent reports whether the deployment has any user-created
+	// 2017 packs — the hard deployment-wide bypass. 2017 pack targeting can
+	// change via label membership drift, which fires no invalidation event,
+	// and per-host records do not help because pack content is also
+	// host-specific in unbounded ways. The result is cached in Redis for a
+	// few minutes; on a cache miss, load is called to compute it (one cheap
+	// DB query). Errors must be treated by callers as "present" (fail closed
+	// for the gate = fail open for config correctness).
+	LegacyPacksPresent(ctx context.Context, load func(ctx context.Context) (bool, error)) (bool, error)
+	// ResetLegacyPacksFlag drops the cached legacy-packs answer so the next
+	// LegacyPacksPresent recomputes it. Called by pack CRUD invalidation
+	// hooks, where the answer may have just changed.
+	ResetLegacyPacksFlag(ctx context.Context) error
+	// LabelScopes returns the cached set of scopes containing label-scoped
+	// scheduled reports (bounded ~5m TTL), loading it via load — one cheap
+	// deployment-level DB query — on a cache miss. It drives shared vs
+	// per-host mode selection. Errors must be treated by callers as
+	// "unknown": bypass the short circuit and run a normal full build —
+	// never guess that a host is eligible for the shared key.
+	LabelScopes(ctx context.Context, load func(ctx context.Context) (ConfigETagLabelScopes, error)) (ConfigETagLabelScopes, error)
+	// ResetLabelScopes drops the cached label-scope answer so the next
+	// LabelScopes recomputes it. Called by query CRUD and label-deletion
+	// invalidation hooks, where the answer may have just changed in either
+	// direction.
+	ResetLabelScopes(ctx context.Context) error
+}
+
+const (
+	// BatchSetSoftwareInstallerStatusProcessing is the value returned for an ongoing BatchSetSoftwareInstallers operation.
+	BatchSetSoftwareInstallersStatusProcessing = "processing"
+	// BatchSetSoftwareInstallerStatusCompleted is the value returned for a completed BatchSetSoftwareInstallers operation.
+	BatchSetSoftwareInstallersStatusCompleted = "completed"
+	// BatchSetSoftwareInstallerStatusFailed is the value returned for a failed BatchSetSoftwareInstallers operation.
+	BatchSetSoftwareInstallersStatusFailed = "failed"
+	// MinOrbitLUKSVersion is the earliest version of Orbit that can escrow LUKS passphrases
+	MinOrbitLUKSVersion = "1.36.0"
+	// LinuxEscrowInFlightWindow is how long a LUKS escrow request blocks re-triggering after fleetd's
+	// last sign of life (hand-off or progress report). It only matters for agents that report nothing.
+	LinuxEscrowInFlightWindow = 5 * time.Minute
+	// LinuxEscrowInFlightMessage is the LinuxEscrowInFlightError message.
+	LinuxEscrowInFlightMessage = "A disk encryption key is already being created for this host."
+	// MFALinkTTL is how long MFA verification links stay active
+	MFALinkTTL = time.Minute * 15
+)

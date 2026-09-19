@@ -1,0 +1,151 @@
+import React, { useCallback, useContext, useState } from "react";
+import { useErrorHandler } from "react-error-boundary";
+import { useQuery } from "react-query";
+import { InjectedRouter, Params } from "react-router/lib/Router";
+
+import Spinner from "components/Spinner";
+import { notify } from "components/ToastNotification";
+import { AppContext } from "context/app";
+import { IConfig } from "interfaces/config";
+import { IApiError } from "interfaces/errors";
+import paths from "router/paths";
+import configAPI from "services/entities/config";
+import deepDifference from "utilities/deep_difference";
+
+import SideNav from "../components/SideNav";
+
+import { DeepPartial } from "./cards/constants";
+import ORG_SETTINGS_NAV_ITEMS from "./OrgSettingsNavItems";
+
+interface IOrgSettingsPageProps {
+  params: Params;
+  router: InjectedRouter; // v3
+}
+
+export const baseClass = "org-settings";
+
+const OrgSettingsPage = ({ params, router }: IOrgSettingsPageProps) => {
+  const { section } = params;
+  const DEFAULT_SETTINGS_SECTION = ORG_SETTINGS_NAV_ITEMS[0];
+
+  const [isUpdatingSettings, setIsUpdatingSettings] = useState(false);
+  const { isFreeTier, isPremiumTier, setConfig, isSandboxMode } = useContext(
+    AppContext
+  );
+
+  if (isSandboxMode) {
+    // redirect to Integrations page in sandbox mode
+    router.push(paths.ADMIN_INTEGRATIONS);
+  }
+  const handlePageError = useErrorHandler();
+
+  const {
+    data: appConfig,
+    isLoading: isLoadingAppConfig,
+    refetch: refetchConfig,
+  } = useQuery<IConfig, Error, IConfig>(["config"], () => configAPI.loadAll(), {
+    select: (data: IConfig) => data,
+    onSuccess: (data) => {
+      setConfig(data);
+    },
+  });
+
+  const onFormSubmit = useCallback(
+    async (formUpdates: DeepPartial<IConfig>) => {
+      if (!appConfig) {
+        return false;
+      }
+
+      setIsUpdatingSettings(true);
+
+      const diff = deepDifference(formUpdates, appConfig);
+      // send all formUpdates.agent_options because diff overrides all agent options
+      diff.agent_options = formUpdates.agent_options;
+
+      try {
+        await configAPI.update(diff);
+        notify.success("Successfully updated settings.");
+        refetchConfig();
+        return true;
+      } catch (response) {
+        const resp = response as undefined | { data: IApiError };
+
+        if (resp?.data.errors[0].reason.includes("could not dial smtp host")) {
+          notify.error("Could not connect to SMTP server. Please try again.", {
+            response,
+          });
+        } else if (resp?.data.errors) {
+          const reason = resp?.data.errors[0].reason;
+          const agentOptionsInvalid =
+            reason.includes("unsupported key provided") ||
+            reason.includes("invalid value type");
+          const isAgentOptionsError =
+            agentOptionsInvalid ||
+            reason.includes("script_execution_timeout' value exceeds limit.");
+          notify.error(
+            <>
+              Couldn&apos;t update{" "}
+              {isAgentOptionsError ? "agent options" : "settings"}: {reason}
+              {agentOptionsInvalid && (
+                <>
+                  <br />
+                  If you&apos;re not using the latest osquery, use the fleetctl
+                  apply --force command to override validation.
+                </>
+              )}
+            </>,
+            { response }
+          );
+        }
+        return false;
+      } finally {
+        setIsUpdatingSettings(false);
+      }
+    },
+    [appConfig, refetchConfig]
+  );
+
+  // filter out non-premium options
+  let navItems = ORG_SETTINGS_NAV_ITEMS;
+  if (!isPremiumTier) {
+    navItems = ORG_SETTINGS_NAV_ITEMS.filter(
+      (item) => item.urlSection !== "fleet-desktop"
+    );
+  }
+
+  const currentFormSection =
+    navItems.find((item) => item.urlSection === section) ??
+    DEFAULT_SETTINGS_SECTION;
+
+  const CurrentCard = currentFormSection.Card;
+
+  if (isFreeTier && section === "fleet-desktop") {
+    handlePageError({ status: 403 });
+    return null;
+  }
+
+  return (
+    <div className={`${baseClass}`}>
+      <SideNav
+        className={`${baseClass}__side-nav`}
+        navItems={navItems}
+        activeItem={currentFormSection.urlSection}
+        CurrentCard={
+          !isLoadingAppConfig && appConfig ? (
+            <CurrentCard
+              appConfig={appConfig}
+              handleSubmit={onFormSubmit}
+              isUpdatingSettings={isUpdatingSettings}
+              isPremiumTier={isPremiumTier}
+              router={router}
+            />
+          ) : (
+            <Spinner />
+          )
+        }
+      />
+    </div>
+  );
+};
+
+export default OrgSettingsPage;

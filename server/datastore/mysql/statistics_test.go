@@ -1,0 +1,1386 @@
+package mysql
+
+import (
+	"context"
+	"database/sql"
+	"encoding/json"
+	"fmt"
+	"testing"
+	"time"
+
+	"github.com/fleetdm/fleet/v4/pkg/optjson"
+	"github.com/fleetdm/fleet/v4/server/config"
+	"github.com/fleetdm/fleet/v4/server/contexts/ctxerr"
+	"github.com/fleetdm/fleet/v4/server/contexts/license"
+	"github.com/fleetdm/fleet/v4/server/fleet"
+	"github.com/fleetdm/fleet/v4/server/ptr"
+	"github.com/fleetdm/fleet/v4/server/test"
+	"github.com/jmoiron/sqlx"
+	"github.com/stretchr/testify/assert"
+	"github.com/stretchr/testify/require"
+)
+
+func TestStatistics(t *testing.T) {
+	ds := CreateMySQLDS(t)
+
+	cases := []struct {
+		name string
+		fn   func(t *testing.T, ds *Datastore)
+	}{
+		{"ShouldSend", testStatisticsShouldSend},
+		{"ConditionalAccessStatistics", testConditionalAccessStatistics},
+		{"FleetMaintainedAppsInUse", testFleetMaintainedAppsInUse},
+		{"PoliciesAutomationEnabledSoftware", testPoliciesAutomationEnabledSoftware},
+		{"GitOpsModeStatistics", testGitOpsModeStatistics},
+		{"FleetMDMEnrolled", testStatisticsFleetMDMEnrolled},
+		{"MDMProfileCounts", testStatisticsMDMProfileCounts},
+		{"ThirdPartyIntegrations", testStatisticsThirdPartyIntegrations},
+	}
+	for _, c := range cases {
+		t.Run(c.name, func(t *testing.T) {
+			defer TruncateTables(t, ds)
+			c.fn(t, ds)
+		})
+	}
+}
+
+func testStatisticsShouldSend(t *testing.T, ds *Datastore) {
+	eh := ctxerr.MockHandler{}
+	// Mock the error handler to always return an error
+	eh.RetrieveImpl = func(flush bool) ([]*ctxerr.StoredError, error) {
+		require.False(t, flush)
+		return []*ctxerr.StoredError{
+			{Count: 10, Chain: json.RawMessage(`[{"stack": ["a","b","c","d"]}]`)},
+		}, nil
+	}
+	ctxb := context.Background()
+	ctx := ctxerr.NewContext(ctxb, eh)
+
+	fleetConfig := config.FleetConfig{Osquery: config.OsqueryConfig{DetailUpdateInterval: 1 * time.Hour}}
+
+	premiumLicense := &fleet.LicenseInfo{Tier: fleet.TierPremium, Organization: "Fleet"}
+	freeLicense := &fleet.LicenseInfo{Tier: fleet.TierFree}
+
+	var builtinLabels int
+	ExecAdhocSQL(t, ds, func(q sqlx.ExtContext) error {
+		return sqlx.GetContext(ctx, q, &builtinLabels, `SELECT COUNT(*) FROM labels`)
+	})
+
+	// First time running with no hosts
+	stats, shouldSend, err := ds.ShouldSendStatistics(license.NewContext(ctx, premiumLicense), time.Millisecond, fleetConfig)
+	require.NoError(t, err)
+	assert.True(t, shouldSend)
+	assert.Equal(t, "premium", stats.LicenseTier)
+	assert.Equal(t, "Fleet", stats.Organization)
+	assert.Equal(t, 0, stats.NumHostsEnrolled)
+	assert.Equal(t, 0, stats.NumHostsABMPending)
+	assert.Equal(t, 0, stats.NumUsers)
+	assert.Equal(t, 0, stats.NumSoftwareVersions)
+	assert.Equal(t, 0, stats.NumHostSoftwares)
+	assert.Equal(t, 0, stats.NumSoftwareTitles)
+	assert.Equal(t, 0, stats.NumHostSoftwareInstalledPaths)
+	assert.Equal(t, 0, stats.NumSoftwareCPEs)
+	assert.Equal(t, 0, stats.NumSoftwareCVEs)
+	assert.Equal(t, 0, stats.NumTeams)
+	assert.Equal(t, 0, stats.NumPolicies)
+	assert.Equal(t, 0, stats.NumQueries)
+	assert.Equal(t, builtinLabels, stats.NumLabels)
+	assert.Equal(t, false, stats.SoftwareInventoryEnabled)
+	assert.Equal(t, true, stats.SystemUsersEnabled)
+	assert.Equal(t, false, stats.VulnDetectionEnabled)
+	assert.Equal(t, false, stats.HostsStatusWebHookEnabled)
+	assert.Equal(t, 0, stats.NumWeeklyActiveUsers)
+	assert.Equal(t, 0, stats.NumWeeklyPolicyViolationDaysActual)
+	assert.Equal(t, 0, stats.NumWeeklyPolicyViolationDaysPossible)
+	assert.Equal(t, `[{"count":10,"loc":["a","b","c"]}]`, string(stats.StoredErrors))
+	assert.Equal(t, []fleet.HostsCountByOsqueryVersion{}, stats.HostsEnrolledByOsqueryVersion) // should be empty slice instead of nil
+	assert.Equal(t, []fleet.HostsCountByOrbitVersion{}, stats.HostsEnrolledByOrbitVersion)     // should be empty slice instead of nil
+	assert.Equal(t, false, stats.MDMMacOsEnabled)
+	assert.Equal(t, false, stats.HostExpiryEnabled)
+	assert.Equal(t, false, stats.MDMWindowsEnabled)
+	assert.Equal(t, false, stats.MDMRecoveryLockPasswordEnabled)
+	assert.Equal(t, false, stats.LiveQueryDisabled)
+	assert.Equal(t, false, stats.AIFeaturesDisabled)
+	assert.Equal(t, false, stats.MaintenanceWindowsEnabled)
+	assert.Equal(t, false, stats.MaintenanceWindowsConfigured)
+	assert.Equal(t, 0, stats.NumHostsFleetDesktopEnabled)
+	assert.False(t, stats.OktaConditionalAccessConfigured)
+	assert.False(t, stats.ConditionalAccessBypassDisabled)
+	assert.False(t, stats.ConditionalAccessEnabled)
+	assert.False(t, stats.EntraConditionalAccessConfigured)
+	assert.False(t, stats.GitOpsModeEnabled)
+	assert.False(t, stats.FleetDesktopSSOEnabled)
+	// Existing-install defaults applied by migration 20260323144117_AddGitOpsExceptionsToAppConfig
+	// (labels + secrets on, software off) and baked into the dumped test schema.
+	assert.Equal(t, []string{"labels", "secrets"}, stats.GitOpsModeExceptions)
+	assert.Equal(t, 0, stats.NumMDMAppleProfiles)
+	assert.Equal(t, 0, stats.NumMDMWindowsProfiles)
+	assert.Equal(t, 0, stats.NumMDMAppleDeclarations)
+	assert.Equal(t, 0, stats.NumMDMAndroidProfiles)
+	assert.Empty(t, stats.ResultLogDestination)
+	assert.Empty(t, stats.StatusLogDestination)
+	assert.Empty(t, stats.AuditLogDestination)
+	assert.False(t, stats.AnyVulnerabilitiesWebhookEnabled)
+	assert.False(t, stats.AnyFailingPoliciesWebhookEnabled)
+	assert.False(t, stats.AnyHostActivitiesWebhookEnabled)
+	assert.False(t, stats.GlobalActivityWebhookEnabled)
+	assert.False(t, stats.TicketDestinationConfigured)
+	assert.False(t, stats.SSOConfiguredFleetUsers)
+	assert.False(t, stats.SSOConfiguredEndUsers)
+	assert.False(t, stats.AccountProvisioningConfigured)
+	assert.False(t, stats.IDPSCIMConfigured)
+	assert.False(t, stats.CertificateAuthorityConfigured)
+	assert.False(t, stats.IDPGoogleWorkspaceConfigured)
+
+	firstIdentifier := stats.AnonymousIdentifier
+
+	err = ds.RecordStatisticsSent(ctx)
+	require.NoError(t, err)
+
+	// Create new host for test
+	h1, err := ds.NewHost(ctx, &fleet.Host{
+		DetailUpdatedAt: time.Now(),
+		LabelUpdatedAt:  time.Now(),
+		PolicyUpdatedAt: time.Now(),
+		SeenTime:        time.Now(),
+		NodeKey:         ptr.String("1"),
+		UUID:            "1",
+		Hostname:        "foo.local",
+		PrimaryIP:       "192.168.1.1",
+		PrimaryMac:      "30-65-EC-6F-C4-58",
+		OsqueryHostID:   ptr.String("M"),
+		OsqueryVersion:  "4.9.0",
+	})
+	require.NoError(t, err)
+
+	// Create host_orbit_info record for test
+	require.NoError(
+		t, ds.SetOrUpdateHostOrbitInfo(
+			ctx, h1.ID, "1.1.0", sql.NullString{String: "1.1.0", Valid: true}, sql.NullBool{Bool: true, Valid: true},
+		),
+	)
+
+	// Create two new users for test
+	u1, err := ds.NewUser(ctx, &fleet.User{
+		Password:                 []byte("foobar"),
+		AdminForcedPasswordReset: false,
+		Email:                    "baz@example.com",
+		SSOEnabled:               false,
+		GlobalRole:               ptr.String(fleet.RoleObserver),
+	})
+	require.NoError(t, err)
+	_, err = ds.NewUser(ctx, &fleet.User{
+		Password:                 []byte("foobar"),
+		AdminForcedPasswordReset: false,
+		Email:                    "qux@example.com",
+		SSOEnabled:               false,
+		GlobalRole:               ptr.String(fleet.RoleObserver),
+	})
+	require.NoError(t, err)
+	// Create a session for user baz, but not qux (so only 1 is active)
+	_, err = ds.NewSession(ctx, u1.ID, 8)
+	require.NoError(t, err)
+
+	// Create new team for test
+	_, err = ds.NewTeam(ctx, &fleet.Team{
+		Name:        "footeam",
+		Description: "team of foo",
+	})
+	require.NoError(t, err)
+
+	// Create new global policy for test
+	_, err = ds.NewGlobalPolicy(ctx, ptr.Uint(1), fleet.PolicyPayload{
+		Name:        "testpolicy",
+		Query:       "select 1;",
+		Description: "test policy desc",
+		Resolution:  "test policy resolution",
+	})
+	require.NoError(t, err)
+
+	// Create new label for test
+	_, err = ds.NewLabel(ctx, &fleet.Label{
+		Name:        "testlabel",
+		Query:       "select 1;",
+		Platform:    "darwin",
+		Description: "test label description",
+	})
+	require.NoError(t, err)
+
+	// Create new app cfg for test
+	cfg, err := ds.NewAppConfig(ctx, &fleet.AppConfig{
+		OrgInfo: fleet.OrgInfo{
+			OrgName:    "Test",
+			OrgLogoURL: "localhost:8080/logo.png",
+		},
+	})
+	require.NoError(t, err)
+
+	// Initialize policy violation days for test
+	pvdJSON, err := json.Marshal(PolicyViolationDays{FailingHostCount: 5, TotalHostCount: 10})
+	require.NoError(t, err)
+	_, err = ds.writer(ctx).ExecContext(ctx, `
+		INSERT INTO
+			aggregated_stats (id, global_stats, type, json_value, created_at, updated_at)
+		VALUES (?, ?, ?, CAST(? AS JSON), ?, ?)
+		ON DUPLICATE KEY UPDATE
+			json_value = VALUES(json_value),
+			updated_at = VALUES(updated_at)
+	`, 0, true, aggregatedStatsTypePolicyViolationsDays, pvdJSON, time.Now().Add(-48*time.Hour), time.Now().Add(-7*24*time.Hour))
+	require.NoError(t, err)
+
+	require.NoError(t, err)
+	cfg.Features.EnableSoftwareInventory = false
+	cfg.Features.EnableHostUsers = false
+	cfg.VulnerabilitySettings.DatabasesPath = ""
+	cfg.WebhookSettings.HostStatusWebhook.Enable = true
+	cfg.MDM.EnabledAndConfigured = true
+	cfg.HostExpirySettings.HostExpiryEnabled = true
+	cfg.MDM.WindowsEnabledAndConfigured = true
+	cfg.ServerSettings.LiveQueryDisabled = true
+	err = ds.SaveAppConfig(ctx, cfg)
+	require.NoError(t, err)
+
+	time.Sleep(1100 * time.Millisecond) // ensure the DB timestamp is not in the same second
+
+	// Running with 1 host
+	stats, shouldSend, err = ds.ShouldSendStatistics(license.NewContext(ctx, premiumLicense), time.Millisecond, fleetConfig)
+	require.NoError(t, err)
+	assert.True(t, shouldSend)
+	assert.NotEmpty(t, stats.AnonymousIdentifier)
+	assert.NotEmpty(t, stats.FleetVersion)
+	assert.Equal(t, "premium", stats.LicenseTier)
+	assert.Equal(t, "Fleet", stats.Organization)
+	assert.Equal(t, 1, stats.NumHostsEnrolled)
+	assert.Equal(t, 0, stats.NumHostsABMPending)
+	assert.Equal(t, 2, stats.NumUsers)
+	assert.Equal(t, 0, stats.NumSoftwareVersions)
+	assert.Equal(t, 0, stats.NumHostSoftwares)
+	assert.Equal(t, 0, stats.NumSoftwareTitles)
+	assert.Equal(t, 0, stats.NumHostSoftwareInstalledPaths)
+	assert.Equal(t, 0, stats.NumSoftwareCPEs)
+	assert.Equal(t, 0, stats.NumSoftwareCVEs)
+	assert.Equal(t, 1, stats.NumTeams)
+	assert.Equal(t, 1, stats.NumPolicies)
+	assert.Equal(t, 0, stats.NumQueries)
+	assert.Equal(t, builtinLabels+1, stats.NumLabels)
+	assert.Equal(t, false, stats.SoftwareInventoryEnabled)
+	assert.Equal(t, false, stats.SystemUsersEnabled)
+	assert.Equal(t, false, stats.VulnDetectionEnabled)
+	assert.Equal(t, true, stats.HostsStatusWebHookEnabled)
+	assert.Equal(t, 1, stats.NumWeeklyActiveUsers)
+	assert.Equal(t, 5, stats.NumWeeklyPolicyViolationDaysActual)
+	assert.Equal(t, 10, stats.NumWeeklyPolicyViolationDaysPossible)
+	assert.Equal(t, `[{"count":10,"loc":["a","b","c"]}]`, string(stats.StoredErrors))
+	assert.Equal(t, []fleet.HostsCountByOsqueryVersion{{OsqueryVersion: "4.9.0", NumHosts: 1}}, stats.HostsEnrolledByOsqueryVersion)
+	assert.Equal(t, []fleet.HostsCountByOrbitVersion{{OrbitVersion: "1.1.0", NumHosts: 1}}, stats.HostsEnrolledByOrbitVersion)
+	assert.Equal(t, false, stats.AIFeaturesDisabled)
+	assert.Equal(t, false, stats.MaintenanceWindowsEnabled)
+	assert.Equal(t, false, stats.MaintenanceWindowsConfigured)
+	assert.Equal(t, 1, stats.NumHostsFleetDesktopEnabled)
+	assert.False(t, stats.OktaConditionalAccessConfigured)
+	assert.False(t, stats.ConditionalAccessBypassDisabled)
+	assert.False(t, stats.ConditionalAccessEnabled)
+	assert.False(t, stats.EntraConditionalAccessConfigured)
+
+	err = ds.RecordStatisticsSent(ctx)
+	require.NoError(t, err)
+
+	// If we try right away, it shouldn't ask to send
+	stats, shouldSend, err = ds.ShouldSendStatistics(license.NewContext(ctx, premiumLicense), fleet.StatisticsFrequency, fleetConfig)
+	require.NoError(t, err)
+	assert.False(t, shouldSend)
+
+	time.Sleep(1100 * time.Millisecond) // ensure the DB timestamp is not in the same second
+
+	// create a few more hosts, with platforms and os versions
+	_, err = ds.NewHost(ctx, &fleet.Host{
+		DetailUpdatedAt: time.Now(),
+		LabelUpdatedAt:  time.Now(),
+		PolicyUpdatedAt: time.Now(),
+		SeenTime:        time.Now(),
+		NodeKey:         ptr.String("2"),
+		UUID:            "2",
+		Hostname:        "foo.local2",
+		PrimaryIP:       "192.168.1.2",
+		PrimaryMac:      "30-65-EC-6F-C4-59",
+		OsqueryHostID:   ptr.String("S"),
+		Platform:        "rhel",
+		OSVersion:       "Fedora 35",
+	})
+	require.NoError(t, err)
+
+	_, err = ds.NewHost(ctx, &fleet.Host{
+		DetailUpdatedAt: time.Now(),
+		LabelUpdatedAt:  time.Now(),
+		PolicyUpdatedAt: time.Now(),
+		SeenTime:        time.Now(),
+		NodeKey:         ptr.String("3"),
+		UUID:            "3",
+		Hostname:        "foo.local3",
+		PrimaryIP:       "192.168.1.3",
+		PrimaryMac:      "40-65-EC-6F-C4-59",
+		OsqueryHostID:   ptr.String("T"),
+		Platform:        "rhel",
+		OSVersion:       "Fedora 35",
+	})
+	require.NoError(t, err)
+
+	_, err = ds.NewHost(ctx, &fleet.Host{
+		DetailUpdatedAt: time.Now(),
+		LabelUpdatedAt:  time.Now(),
+		PolicyUpdatedAt: time.Now(),
+		SeenTime:        time.Now(),
+		NodeKey:         ptr.String("4"),
+		UUID:            "4",
+		Hostname:        "foo.local4",
+		PrimaryIP:       "192.168.1.4",
+		PrimaryMac:      "50-65-EC-6F-C4-59",
+		OsqueryHostID:   ptr.String("U"),
+		Platform:        "macos",
+		OSVersion:       "10.11.12",
+	})
+	require.NoError(t, err)
+
+	_, err = ds.NewHost(ctx, &fleet.Host{
+		DetailUpdatedAt: time.Now(),
+		LabelUpdatedAt:  time.Now(),
+		PolicyUpdatedAt: time.Now(),
+		SeenTime:        time.Now(),
+		NodeKey:         ptr.String("5"),
+		UUID:            "5",
+		Hostname:        "foo.local5",
+		PrimaryIP:       "192.168.1.5",
+		PrimaryMac:      "60-65-EC-6F-C4-59",
+		OsqueryHostID:   ptr.String("V"),
+		Platform:        "rhel",
+		OSVersion:       "Fedora 36",
+	})
+	require.NoError(t, err)
+
+	// Lower the frequency to trigger an "outdated" sent
+	stats, shouldSend, err = ds.ShouldSendStatistics(license.NewContext(ctx, premiumLicense), time.Millisecond, fleetConfig)
+	require.NoError(t, err)
+	assert.True(t, shouldSend)
+	assert.Equal(t, firstIdentifier, stats.AnonymousIdentifier)
+	assert.Equal(t, "premium", stats.LicenseTier)
+	assert.Equal(t, "Fleet", stats.Organization)
+	assert.Equal(t, 5, stats.NumHostsEnrolled)
+	assert.Equal(t, 0, stats.NumHostsABMPending)
+	assert.Equal(t, 2, stats.NumUsers)
+	assert.Equal(t, 0, stats.NumQueries)
+	assert.Equal(t, 0, stats.NumSoftwareVersions)
+	assert.Equal(t, 0, stats.NumHostSoftwares)
+	assert.Equal(t, 0, stats.NumSoftwareTitles)
+	assert.Equal(t, 0, stats.NumHostSoftwareInstalledPaths)
+	assert.Equal(t, 0, stats.NumSoftwareCPEs)
+	assert.Equal(t, 0, stats.NumSoftwareCVEs)
+	assert.Equal(t, 0, stats.NumWeeklyActiveUsers)          // no active user since last stats were sent
+	require.Len(t, stats.HostsEnrolledByOperatingSystem, 3) // empty platform, rhel and macos
+	assert.Equal(t, 5, stats.NumWeeklyPolicyViolationDaysActual)
+	require.ElementsMatch(t, []fleet.HostsCountByOSVersion{
+		{Version: "Fedora 35", NumEnrolled: 2},
+		{Version: "Fedora 36", NumEnrolled: 1},
+	}, stats.HostsEnrolledByOperatingSystem["rhel"])
+	require.ElementsMatch(t, []fleet.HostsCountByOSVersion{
+		{Version: "10.11.12", NumEnrolled: 1},
+	}, stats.HostsEnrolledByOperatingSystem["macos"])
+	require.ElementsMatch(t, []fleet.HostsCountByOSVersion{
+		{Version: "", NumEnrolled: 1},
+	}, stats.HostsEnrolledByOperatingSystem[""])
+	assert.Equal(t, `[{"count":10,"loc":["a","b","c"]}]`, string(stats.StoredErrors))
+	assert.Equal(t, false, stats.AIFeaturesDisabled)
+	assert.Equal(t, false, stats.MaintenanceWindowsEnabled)
+	assert.Equal(t, false, stats.MaintenanceWindowsConfigured)
+	assert.Equal(t, 1, stats.NumHostsFleetDesktopEnabled)
+	assert.False(t, stats.OktaConditionalAccessConfigured)
+	assert.False(t, stats.ConditionalAccessBypassDisabled)
+	assert.False(t, stats.ConditionalAccessEnabled)
+	assert.False(t, stats.EntraConditionalAccessConfigured)
+
+	// Create multiple new sessions for a single user
+	_, err = ds.NewSession(ctx, u1.ID, 8)
+	require.NoError(t, err)
+	_, err = ds.NewSession(ctx, u1.ID, 8)
+	require.NoError(t, err)
+	_, err = ds.NewSession(ctx, u1.ID, 8)
+	require.NoError(t, err)
+
+	// CleanupStatistics resets policy violation days
+	err = ds.CleanupStatistics(ctx)
+	require.NoError(t, err)
+
+	// wait a bit and resend statistics
+	time.Sleep(1100 * time.Millisecond) // ensure the DB timestamp is not in the same second
+
+	stats, shouldSend, err = ds.ShouldSendStatistics(license.NewContext(ctx, premiumLicense), time.Millisecond, fleetConfig)
+	require.NoError(t, err)
+	assert.True(t, shouldSend)
+	assert.Equal(t, stats.AnonymousIdentifier, firstIdentifier)
+	assert.Equal(t, "premium", stats.LicenseTier)
+	assert.Equal(t, "Fleet", stats.Organization)
+	assert.Equal(t, 5, stats.NumHostsEnrolled)
+	assert.Equal(t, 0, stats.NumHostsABMPending)
+	assert.Equal(t, 2, stats.NumUsers)
+	assert.Equal(t, 0, stats.NumQueries)
+	assert.Equal(t, 0, stats.NumSoftwareVersions)
+	assert.Equal(t, 0, stats.NumHostSoftwares)
+	assert.Equal(t, 0, stats.NumSoftwareTitles)
+	assert.Equal(t, 0, stats.NumHostSoftwareInstalledPaths)
+	assert.Equal(t, 0, stats.NumSoftwareCPEs)
+	assert.Equal(t, 0, stats.NumSoftwareCVEs)
+	assert.Equal(t, 1, stats.NumWeeklyActiveUsers)
+	assert.Equal(t, 0, stats.NumWeeklyPolicyViolationDaysActual)
+	assert.Equal(t, 0, stats.NumWeeklyPolicyViolationDaysPossible)
+	assert.Equal(t, `[{"count":10,"loc":["a","b","c"]}]`, string(stats.StoredErrors))
+	assert.Equal(t, false, stats.AIFeaturesDisabled)
+	assert.Equal(t, false, stats.MaintenanceWindowsEnabled)
+	assert.Equal(t, false, stats.MaintenanceWindowsConfigured)
+	assert.Equal(t, 1, stats.NumHostsFleetDesktopEnabled)
+	assert.False(t, stats.OktaConditionalAccessConfigured)
+	assert.False(t, stats.ConditionalAccessBypassDisabled)
+	assert.False(t, stats.ConditionalAccessEnabled)
+	assert.False(t, stats.EntraConditionalAccessConfigured)
+
+	// Add host to test hosts not responding stats
+	_, err = ds.NewHost(ctx, &fleet.Host{
+		DetailUpdatedAt: time.Now().Add(-3 * time.Hour),
+		LabelUpdatedAt:  time.Now(),
+		PolicyUpdatedAt: time.Now(),
+		SeenTime:        time.Now(),
+		NodeKey:         ptr.String("6"),
+		UUID:            "6",
+		Hostname:        "non-responsive.local",
+		PrimaryIP:       "192.168.1.6",
+		PrimaryMac:      "30-65-EC-6F-C4-66",
+		OsqueryHostID:   ptr.String("NR"),
+	})
+	require.NoError(t, err)
+
+	stats, shouldSend, err = ds.ShouldSendStatistics(license.NewContext(ctx, premiumLicense), time.Millisecond, fleetConfig)
+	require.NoError(t, err)
+	assert.True(t, shouldSend)
+	assert.Equal(t, firstIdentifier, stats.AnonymousIdentifier)
+	assert.Equal(t, "premium", stats.LicenseTier)
+	assert.Equal(t, "Fleet", stats.Organization)
+	assert.Equal(t, 6, stats.NumHostsEnrolled)
+	assert.Equal(t, 1, stats.NumHostsNotResponding)
+
+	// trigger again with a free license, organization should be "unknown"
+	time.Sleep(1100 * time.Millisecond) // ensure the DB timestamp is not in the same second
+	stats, shouldSend, err = ds.ShouldSendStatistics(license.NewContext(ctx, freeLicense), time.Millisecond, fleetConfig)
+	require.NoError(t, err)
+	assert.True(t, shouldSend)
+	assert.Equal(t, firstIdentifier, stats.AnonymousIdentifier)
+	assert.Equal(t, "free", stats.LicenseTier)
+	assert.Equal(t, "unknown", stats.Organization)
+
+	fleetConfig.Vulnerabilities = config.VulnerabilitiesConfig{DatabasesPath: "some/path/vulns"}
+	stats, shouldSend, err = ds.ShouldSendStatistics(license.NewContext(ctx, freeLicense), time.Millisecond, fleetConfig)
+	require.NoError(t, err)
+	assert.True(t, shouldSend)
+	assert.True(t, stats.VulnDetectionEnabled)
+
+	// Test conditional access statistics
+	cfg.ConditionalAccess = &fleet.ConditionalAccessSettings{
+		OktaIDPID:                       optjson.SetString("test-idp-id"),
+		OktaAssertionConsumerServiceURL: optjson.SetString("https://example.okta.com/sso/saml"),
+		OktaAudienceURI:                 optjson.SetString("https://example.okta.com"),
+		OktaCertificate:                 optjson.SetString("test-certificate"),
+		BypassDisabled:                  optjson.SetBool(true),
+	}
+	err = ds.SaveAppConfig(ctx, cfg)
+	require.NoError(t, err)
+
+	time.Sleep(1100 * time.Millisecond)
+
+	stats, shouldSend, err = ds.ShouldSendStatistics(license.NewContext(ctx, premiumLicense), time.Millisecond, fleetConfig)
+	require.NoError(t, err)
+	assert.True(t, shouldSend)
+	assert.True(t, stats.OktaConditionalAccessConfigured)
+	assert.True(t, stats.ConditionalAccessBypassDisabled)
+
+	// Update config: bypass enabled (BypassDisabled=false), Okta still configured
+	cfg.ConditionalAccess.BypassDisabled = optjson.SetBool(false)
+	err = ds.SaveAppConfig(ctx, cfg)
+	require.NoError(t, err)
+
+	time.Sleep(1100 * time.Millisecond)
+
+	stats, shouldSend, err = ds.ShouldSendStatistics(license.NewContext(ctx, premiumLicense), time.Millisecond, fleetConfig)
+	require.NoError(t, err)
+	assert.True(t, shouldSend)
+	assert.True(t, stats.OktaConditionalAccessConfigured)
+	assert.False(t, stats.ConditionalAccessBypassDisabled)
+}
+
+func markStatisticsStale(t *testing.T, ctx context.Context, ds *Datastore) {
+	_, err := ds.writer(ctx).ExecContext(ctx,
+		`UPDATE statistics SET created_at = DATE_SUB(NOW(), INTERVAL 2 HOUR), updated_at = DATE_SUB(NOW(), INTERVAL 2 HOUR) LIMIT 1`)
+	require.NoError(t, err)
+}
+
+func testConditionalAccessStatistics(t *testing.T, ds *Datastore) {
+	eh := ctxerr.MockHandler{}
+	eh.RetrieveImpl = func(flush bool) ([]*ctxerr.StoredError, error) {
+		return nil, nil
+	}
+	ctxb := context.Background()
+	ctx := ctxerr.NewContext(ctxb, eh)
+
+	premiumLicense := &fleet.LicenseInfo{Tier: fleet.TierPremium, Organization: "Fleet"}
+	fleetConfig := config.FleetConfig{Osquery: config.OsqueryConfig{DetailUpdateInterval: 1 * time.Hour}}
+
+	// Initial state: nothing configured
+	stats, shouldSend, err := ds.ShouldSendStatistics(license.NewContext(ctx, premiumLicense), time.Millisecond, fleetConfig)
+	require.NoError(t, err)
+	assert.True(t, shouldSend)
+	assert.False(t, stats.ConditionalAccessEnabled)
+	assert.False(t, stats.EntraConditionalAccessConfigured)
+
+	markStatisticsStale(t, ctx, ds)
+
+	// Enable conditional access on appconfig (for "No team")
+	cfg, err := ds.AppConfig(ctx)
+	require.NoError(t, err)
+	cfg.Integrations.ConditionalAccessEnabled = optjson.SetBool(true)
+	err = ds.SaveAppConfig(ctx, cfg)
+	require.NoError(t, err)
+
+	stats, shouldSend, err = ds.ShouldSendStatistics(license.NewContext(ctx, premiumLicense), time.Millisecond, fleetConfig)
+	require.NoError(t, err)
+	assert.True(t, shouldSend)
+	assert.True(t, stats.ConditionalAccessEnabled)
+	assert.False(t, stats.EntraConditionalAccessConfigured)
+
+	markStatisticsStale(t, ctx, ds)
+
+	// Disable on appconfig
+	cfg.Integrations.ConditionalAccessEnabled = optjson.SetBool(false)
+	err = ds.SaveAppConfig(ctx, cfg)
+	require.NoError(t, err)
+
+	stats, shouldSend, err = ds.ShouldSendStatistics(license.NewContext(ctx, premiumLicense), time.Millisecond, fleetConfig)
+	require.NoError(t, err)
+	assert.True(t, shouldSend)
+	assert.False(t, stats.ConditionalAccessEnabled)
+
+	markStatisticsStale(t, ctx, ds)
+
+	// Enable conditional access on a team
+	team, err := ds.NewTeam(ctx, &fleet.Team{
+		Name:        "ca-team",
+		Description: "team with conditional access",
+	})
+	require.NoError(t, err)
+	team.Config.Integrations.ConditionalAccessEnabled = optjson.SetBool(true)
+	_, err = ds.SaveTeam(ctx, team)
+	require.NoError(t, err)
+
+	stats, shouldSend, err = ds.ShouldSendStatistics(license.NewContext(ctx, premiumLicense), time.Millisecond, fleetConfig)
+	require.NoError(t, err)
+	assert.True(t, shouldSend)
+	assert.True(t, stats.ConditionalAccessEnabled)
+
+	markStatisticsStale(t, ctx, ds)
+
+	// Disable on team
+	team.Config.Integrations.ConditionalAccessEnabled = optjson.SetBool(false)
+	_, err = ds.SaveTeam(ctx, team)
+	require.NoError(t, err)
+
+	stats, shouldSend, err = ds.ShouldSendStatistics(license.NewContext(ctx, premiumLicense), time.Millisecond, fleetConfig)
+	require.NoError(t, err)
+	assert.True(t, shouldSend)
+	assert.False(t, stats.ConditionalAccessEnabled)
+
+	markStatisticsStale(t, ctx, ds)
+
+	// Test Entra conditional access: create the integration but without setup done
+	err = ds.ConditionalAccessMicrosoftCreateIntegration(ctx, "test-tenant", "test-secret")
+	require.NoError(t, err)
+
+	stats, shouldSend, err = ds.ShouldSendStatistics(license.NewContext(ctx, premiumLicense), time.Millisecond, fleetConfig)
+	require.NoError(t, err)
+	assert.True(t, shouldSend)
+	assert.False(t, stats.EntraConditionalAccessConfigured) // setup not done yet
+
+	markStatisticsStale(t, ctx, ds)
+
+	// Mark setup done
+	err = ds.ConditionalAccessMicrosoftMarkSetupDone(ctx)
+	require.NoError(t, err)
+
+	stats, shouldSend, err = ds.ShouldSendStatistics(license.NewContext(ctx, premiumLicense), time.Millisecond, fleetConfig)
+	require.NoError(t, err)
+	assert.True(t, shouldSend)
+	assert.True(t, stats.EntraConditionalAccessConfigured)
+
+	markStatisticsStale(t, ctx, ds)
+
+	// On Fleet Free (e.g. after a license downgrade/expiry) the leftover
+	// integration row must not be reported as configured.
+	freeLicense := &fleet.LicenseInfo{Tier: fleet.TierFree}
+	stats, shouldSend, err = ds.ShouldSendStatistics(license.NewContext(ctx, freeLicense), time.Millisecond, fleetConfig)
+	require.NoError(t, err)
+	assert.True(t, shouldSend)
+	assert.False(t, stats.EntraConditionalAccessConfigured)
+}
+
+func testFleetMaintainedAppsInUse(t *testing.T, ds *Datastore) {
+	ctx := context.Background()
+
+	fmaUsage := func(name string, patchPolicy, softwareAutomation bool) fleet.FleetMaintainedAppUsage {
+		return fleet.FleetMaintainedAppUsage{Name: name, PatchPolicy: patchPolicy, SoftwareAutomation: softwareAutomation}
+	}
+
+	expectMaintainedApps := func(mac, win []fleet.FleetMaintainedAppUsage) {
+		t.Helper()
+		gotMac, gotWin, err := fleetMaintainedAppsInUseDB(ctx, ds.reader(ctx))
+		require.NoError(t, err)
+		require.Equal(t, mac, gotMac)
+		require.Equal(t, win, gotWin)
+	}
+
+	noApps := []fleet.FleetMaintainedAppUsage{}
+	macNoPolicies := []fleet.FleetMaintainedAppUsage{fmaUsage("slack/darwin", false, false), fmaUsage("zoom/darwin", false, false)}
+	macWithPatchPolicies := []fleet.FleetMaintainedAppUsage{fmaUsage("slack/darwin", true, true), fmaUsage("zoom/darwin", true, false)}
+	winNoPolicies := []fleet.FleetMaintainedAppUsage{fmaUsage("microsoft-teams/windows", false, false), fmaUsage("zoom/windows", false, false)}
+
+	// No fleet-maintained apps - should return empty slices (not nil)
+	macOSApps, windowsApps, err := fleetMaintainedAppsInUseDB(ctx, ds.reader(ctx))
+	require.NoError(t, err)
+	assert.NotNil(t, macOSApps)
+	assert.NotNil(t, windowsApps)
+	assert.Empty(t, macOSApps)
+	assert.Empty(t, windowsApps)
+
+	appDarwin1, err := ds.UpsertMaintainedApp(ctx, &fleet.MaintainedApp{
+		Name:             "Zoom",
+		Slug:             "zoom/darwin",
+		Platform:         "darwin",
+		UniqueIdentifier: "us.zoom.xos",
+	})
+	require.NoError(t, err)
+	appDarwin2, err := ds.UpsertMaintainedApp(ctx, &fleet.MaintainedApp{
+		Name:             "Slack",
+		Slug:             "slack/darwin",
+		Platform:         "darwin",
+		UniqueIdentifier: "com.tinyspeck.slackmacgap",
+	})
+	require.NoError(t, err)
+	appWindows1, err := ds.UpsertMaintainedApp(ctx, &fleet.MaintainedApp{
+		Name:             "Microsoft Teams",
+		Slug:             "microsoft-teams/windows",
+		Platform:         "windows",
+		UniqueIdentifier: "msteams",
+	})
+	require.NoError(t, err)
+	appWindows2, err := ds.UpsertMaintainedApp(ctx, &fleet.MaintainedApp{
+		Name:             "Zoom",
+		Slug:             "zoom/windows",
+		Platform:         "windows",
+		UniqueIdentifier: "zoom-windows",
+	})
+	require.NoError(t, err)
+	appLinux, err := ds.UpsertMaintainedApp(ctx, &fleet.MaintainedApp{
+		Name:             "Linux App",
+		Slug:             "linux-app/linux",
+		Platform:         "linux",
+		UniqueIdentifier: "linux.app",
+	})
+	require.NoError(t, err)
+
+	// Apps exist but no software installers - should still return empty
+	expectMaintainedApps(noApps, noApps)
+
+	// Create script content (required for software installers)
+	var installScriptID, uninstallScriptID int64
+	ExecAdhocSQL(t, ds, func(q sqlx.ExtContext) error {
+		result, err := q.ExecContext(ctx, `INSERT INTO script_contents (md5_checksum, contents) VALUES (UNHEX(?), ?)`,
+			"d41d8cd98f00b204e9800998ecf8427e", "echo 'install'")
+		if err != nil {
+			return err
+		}
+		installScriptID, _ = result.LastInsertId()
+		return nil
+	})
+	ExecAdhocSQL(t, ds, func(q sqlx.ExtContext) error {
+		result, err := q.ExecContext(ctx, `INSERT INTO script_contents (md5_checksum, contents) VALUES (UNHEX(?), ?)`,
+			"e10adc3949ba59abbe56e057f20f883e", "echo 'uninstall'")
+		if err != nil {
+			return err
+		}
+		uninstallScriptID, _ = result.LastInsertId()
+		return nil
+	})
+
+	// Create software installers that reference fleet-maintained apps
+	ExecAdhocSQL(t, ds, func(q sqlx.ExtContext) error {
+		_, err := q.ExecContext(ctx, `
+			INSERT INTO software_installers (
+				team_id, global_or_team_id, filename, version, platform,
+				install_script_content_id, uninstall_script_content_id,
+				storage_id, package_ids, fleet_maintained_app_id, patch_query
+			) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+		`, nil, 0, "zoom.pkg", "1.0", "darwin", installScriptID, uninstallScriptID, "storage1", "[]", appDarwin1.ID, "")
+		return err
+	})
+	ExecAdhocSQL(t, ds, func(q sqlx.ExtContext) error {
+		_, err := q.ExecContext(ctx, `
+			INSERT INTO software_installers (
+				team_id, global_or_team_id, filename, version, platform,
+				install_script_content_id, uninstall_script_content_id,
+				storage_id, package_ids, fleet_maintained_app_id, patch_query
+			) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+		`, nil, 0, "slack.pkg", "1.0", "darwin", installScriptID, uninstallScriptID, "storage2", "[]", appDarwin2.ID, "")
+		return err
+	})
+	ExecAdhocSQL(t, ds, func(q sqlx.ExtContext) error {
+		_, err := q.ExecContext(ctx, `
+			INSERT INTO software_installers (
+				team_id, global_or_team_id, filename, version, platform,
+				install_script_content_id, uninstall_script_content_id,
+				storage_id, package_ids, fleet_maintained_app_id, patch_query
+			) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+		`, nil, 0, "teams.exe", "1.0", "windows", installScriptID, uninstallScriptID, "storage3", "[]", appWindows1.ID, "")
+		return err
+	})
+	ExecAdhocSQL(t, ds, func(q sqlx.ExtContext) error {
+		_, err := q.ExecContext(ctx, `
+			INSERT INTO software_installers (
+				team_id, global_or_team_id, filename, version, platform,
+				install_script_content_id, uninstall_script_content_id,
+				storage_id, package_ids, fleet_maintained_app_id, patch_query
+			) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+		`, nil, 0, "zoom.exe", "1.0", "windows", installScriptID, uninstallScriptID, "storage4", "[]", appWindows2.ID, "")
+		return err
+	})
+	ExecAdhocSQL(t, ds, func(q sqlx.ExtContext) error {
+		_, err := q.ExecContext(ctx, `
+			INSERT INTO software_installers (
+				team_id, global_or_team_id, filename, version, platform,
+				install_script_content_id, uninstall_script_content_id,
+				storage_id, package_ids, fleet_maintained_app_id, patch_query
+			) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+		`, nil, 0, "linux.deb", "1.0", "linux", installScriptID, uninstallScriptID, "storage5", "[]", appLinux.ID, "")
+		return err
+	})
+
+	// Apps with installers - should return correct apps grouped by platform
+	expectMaintainedApps(macNoPolicies, winNoPolicies)
+
+	// Create duplicate installers for same app
+	ExecAdhocSQL(t, ds, func(q sqlx.ExtContext) error {
+		_, err := q.ExecContext(ctx, `
+			INSERT INTO software_installers (
+				team_id, global_or_team_id, filename, version, platform,
+				install_script_content_id, uninstall_script_content_id,
+				storage_id, package_ids, fleet_maintained_app_id, patch_query
+			) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+		`, nil, 0, "zoom-v2.pkg", "2.0", "darwin", installScriptID, uninstallScriptID, "storage6", "[]", appDarwin1.ID, "")
+		return err
+	})
+	expectMaintainedApps(macNoPolicies, winNoPolicies)
+
+	// Create an installer with NULL fleet_maintained_app_id (should be ignored)
+	ExecAdhocSQL(t, ds, func(q sqlx.ExtContext) error {
+		_, err := q.ExecContext(ctx, `
+			INSERT INTO software_installers (
+				team_id, global_or_team_id, filename, version, platform,
+				install_script_content_id, uninstall_script_content_id,
+				storage_id, package_ids, fleet_maintained_app_id, patch_query
+			) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+		`, nil, 0, "custom.pkg", "1.0", "darwin", installScriptID, uninstallScriptID, "storage7", "[]", nil, "")
+		return err
+	})
+
+	// Should return the same results (NULL fleet_maintained_app_id is filtered out)
+	expectMaintainedApps(macNoPolicies, winNoPolicies)
+
+	// Give the darwin apps software titles so patch policies can point at them. Both zoom
+	// installers (the 1.0 and the cached 2.0) share one title, as real FMA versions do.
+	var zoomTitleID, slackTitleID, slackInstallerID uint
+	ExecAdhocSQL(t, ds, func(q sqlx.ExtContext) error {
+		res, err := q.ExecContext(ctx, `INSERT INTO software_titles (name, source, bundle_identifier) VALUES ('Zoom', 'apps', 'us.zoom.xos')`)
+		if err != nil {
+			return err
+		}
+		id, _ := res.LastInsertId()
+		zoomTitleID = uint(id) //nolint:gosec // test fixture
+
+		res, err = q.ExecContext(ctx, `INSERT INTO software_titles (name, source, bundle_identifier) VALUES ('Slack', 'apps', 'com.tinyspeck.slackmacgap')`)
+		if err != nil {
+			return err
+		}
+		id, _ = res.LastInsertId()
+		slackTitleID = uint(id) //nolint:gosec // test fixture
+
+		if _, err := q.ExecContext(ctx, `UPDATE software_installers SET title_id = ? WHERE fleet_maintained_app_id = ?`, zoomTitleID, appDarwin1.ID); err != nil {
+			return err
+		}
+		if _, err := q.ExecContext(ctx, `UPDATE software_installers SET title_id = ? WHERE fleet_maintained_app_id = ?`, slackTitleID, appDarwin2.ID); err != nil {
+			return err
+		}
+		return sqlx.GetContext(ctx, q, &slackInstallerID, `SELECT id FROM software_installers WHERE fleet_maintained_app_id = ?`, appDarwin2.ID)
+	})
+
+	// A dynamic policy that installs the app is not a patch policy, and must leave both
+	// flags alone. Asserted before any patch policy exists, so the per-slug OR can't mask it.
+	ExecAdhocSQL(t, ds, func(q sqlx.ExtContext) error {
+		_, err := q.ExecContext(ctx, `
+			INSERT INTO policies (name, query, description, checksum, team_id, software_installer_id)
+			VALUES ('install slack', 'SELECT 1', '', UNHEX(MD5('install slack')), ?, ?)`, fleet.PolicyNoTeamID, slackInstallerID)
+		return err
+	})
+
+	expectMaintainedApps(macNoPolicies, winNoPolicies)
+
+	// A patch policy with no software automation, and one with a software automation.
+	ExecAdhocSQL(t, ds, func(q sqlx.ExtContext) error {
+		_, err := q.ExecContext(ctx, `
+			INSERT INTO policies (name, query, description, checksum, type, team_id, patch_software_title_id)
+			VALUES ('patch zoom', 'SELECT 1', '', UNHEX(MD5('patch zoom')), 'patch', ?, ?)`, fleet.PolicyNoTeamID, zoomTitleID)
+		return err
+	})
+	ExecAdhocSQL(t, ds, func(q sqlx.ExtContext) error {
+		_, err := q.ExecContext(ctx, `
+			INSERT INTO policies (name, query, description, checksum, type, team_id, patch_software_title_id, software_installer_id)
+			VALUES ('patch slack', 'SELECT 1', '', UNHEX(MD5('patch slack')), 'patch', ?, ?, ?)`, fleet.PolicyNoTeamID, slackTitleID, slackInstallerID)
+		return err
+	})
+
+	expectMaintainedApps(macWithPatchPolicies, winNoPolicies)
+
+	// The same app installed on another team, with no patch policy of its own. The slug must
+	// still appear exactly once, with the booleans OR'd across teams -- this is what the
+	// GROUP BY buys us, and what plain DISTINCT would get wrong.
+	tm, err := ds.NewTeam(ctx, &fleet.Team{Name: "fma stats team"})
+	require.NoError(t, err)
+	ExecAdhocSQL(t, ds, func(q sqlx.ExtContext) error {
+		_, err := q.ExecContext(ctx, `
+			INSERT INTO software_installers (
+				team_id, global_or_team_id, title_id, filename, version, platform,
+				install_script_content_id, uninstall_script_content_id,
+				storage_id, package_ids, fleet_maintained_app_id, patch_query
+			) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+		`, tm.ID, tm.ID, zoomTitleID, "zoom.pkg", "1.0", "darwin", installScriptID, uninstallScriptID, "storage8", "[]", appDarwin1.ID, "")
+		return err
+	})
+
+	expectMaintainedApps(macWithPatchPolicies, winNoPolicies)
+
+	// A patch policy scoped to a team must not mark a different team's installer. Use
+	// microsoft-teams, which has no patch policy of its own -- asserting this against an app
+	// that already reports true would be masked by the per-slug OR.
+	var teamsTitleID uint
+	ExecAdhocSQL(t, ds, func(q sqlx.ExtContext) error {
+		res, err := q.ExecContext(ctx, `INSERT INTO software_titles (name, source, bundle_identifier) VALUES ('Microsoft Teams', 'programs', 'msteams.exe')`)
+		if err != nil {
+			return err
+		}
+		id, _ := res.LastInsertId()
+		teamsTitleID = uint(id) //nolint:gosec // test fixture
+		_, err = q.ExecContext(ctx, `UPDATE software_installers SET title_id = ? WHERE fleet_maintained_app_id = ?`, teamsTitleID, appWindows1.ID)
+		return err
+	})
+	// microsoft-teams is installed on "no team" only; scope the patch policy to the team.
+	ExecAdhocSQL(t, ds, func(q sqlx.ExtContext) error {
+		_, err := q.ExecContext(ctx, `
+			INSERT INTO policies (name, query, description, checksum, type, team_id, patch_software_title_id)
+			VALUES ('patch teams', 'SELECT 1', '', UNHEX(MD5('patch teams')), 'patch', ?, ?)`, tm.ID, teamsTitleID)
+		return err
+	})
+	expectMaintainedApps(macWithPatchPolicies, winNoPolicies)
+}
+
+func testPoliciesAutomationEnabledSoftware(t *testing.T, ds *Datastore) {
+	ctx := context.Background()
+
+	count, err := amountPoliciesAutomationEnabledSoftwareDB(ctx, ds.reader(ctx))
+	require.NoError(t, err)
+	assert.Equal(t, 0, count)
+
+	// Set up an installer and a VPP app so the automation columns can be populated.
+	var installScriptID, uninstallScriptID int64
+	ExecAdhocSQL(t, ds, func(q sqlx.ExtContext) error {
+		res, err := q.ExecContext(ctx, `INSERT INTO script_contents (md5_checksum, contents) VALUES (UNHEX(?), ?)`,
+			"d41d8cd98f00b204e9800998ecf8427e", "echo 'install'")
+		if err != nil {
+			return err
+		}
+		installScriptID, _ = res.LastInsertId()
+		res, err = q.ExecContext(ctx, `INSERT INTO script_contents (md5_checksum, contents) VALUES (UNHEX(?), ?)`,
+			"e10adc3949ba59abbe56e057f20f883e", "echo 'uninstall'")
+		if err != nil {
+			return err
+		}
+		uninstallScriptID, _ = res.LastInsertId()
+		return nil
+	})
+
+	var installerID, titleID uint
+	ExecAdhocSQL(t, ds, func(q sqlx.ExtContext) error {
+		res, err := q.ExecContext(ctx, `INSERT INTO software_titles (name, source, bundle_identifier) VALUES ('Ruby', 'apps', 'org.ruby.lang')`)
+		if err != nil {
+			return err
+		}
+		id, _ := res.LastInsertId()
+		titleID = uint(id) //nolint:gosec // test fixture
+
+		res, err = q.ExecContext(ctx, `
+			INSERT INTO software_installers (
+				team_id, global_or_team_id, title_id, filename, version, platform,
+				install_script_content_id, uninstall_script_content_id,
+				storage_id, package_ids, patch_query
+			) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+		`, nil, 0, titleID, "ruby.pkg", "1.0", "darwin", installScriptID, uninstallScriptID, "storage-ruby", "[]", "")
+		if err != nil {
+			return err
+		}
+		id, _ = res.LastInsertId()
+		installerID = uint(id) //nolint:gosec // test fixture
+		return nil
+	})
+
+	var vppAppsTeamsID uint
+	ExecAdhocSQL(t, ds, func(q sqlx.ExtContext) error {
+		if _, err := q.ExecContext(ctx, `INSERT INTO vpp_apps (adam_id, platform, name) VALUES ('12345', 'darwin', 'Numbers')`); err != nil {
+			return err
+		}
+		res, err := q.ExecContext(ctx, `INSERT INTO vpp_apps_teams (adam_id, platform, global_or_team_id) VALUES ('12345', 'darwin', 0)`)
+		if err != nil {
+			return err
+		}
+		id, _ := res.LastInsertId()
+		vppAppsTeamsID = uint(id) //nolint:gosec // test fixture
+		return nil
+	})
+
+	insertPolicy := func(name, columns, values string, args ...any) {
+		t.Helper()
+		ExecAdhocSQL(t, ds, func(q sqlx.ExtContext) error {
+			_, err := q.ExecContext(ctx, fmt.Sprintf(`
+				INSERT INTO policies (name, query, description, checksum%s)
+				VALUES (?, 'SELECT 1', '', UNHEX(MD5(?))%s)`, columns, values),
+				append([]any{name, name}, args...)...)
+			return err
+		})
+	}
+
+	// A dynamic policy with no automation columns set is not a software automation.
+	insertPolicy("plain", "", "")
+	count, err = amountPoliciesAutomationEnabledSoftwareDB(ctx, ds.reader(ctx))
+	require.NoError(t, err)
+	assert.Equal(t, 0, count)
+
+	// A dynamic policy that installs a package counts.
+	insertPolicy("install ruby", ", software_installer_id", ", ?", installerID)
+	count, err = amountPoliciesAutomationEnabledSoftwareDB(ctx, ds.reader(ctx))
+	require.NoError(t, err)
+	assert.Equal(t, 1, count)
+
+	// So does one that installs a VPP app.
+	insertPolicy("install vpp", ", vpp_apps_teams_id", ", ?", vppAppsTeamsID)
+	count, err = amountPoliciesAutomationEnabledSoftwareDB(ctx, ds.reader(ctx))
+	require.NoError(t, err)
+	assert.Equal(t, 2, count)
+
+	// A patch policy with no install automation does not count: automation_type=software no
+	// longer matches on p.type, automation_type=patch covers those instead.
+	insertPolicy("patch ruby", ", type, patch_software_title_id", ", 'patch', ?", titleID)
+	count, err = amountPoliciesAutomationEnabledSoftwareDB(ctx, ds.reader(ctx))
+	require.NoError(t, err)
+	assert.Equal(t, 2, count)
+
+	// A patch policy that also installs a package does count.
+	var pythonTitleID uint
+	ExecAdhocSQL(t, ds, func(q sqlx.ExtContext) error {
+		res, err := q.ExecContext(ctx, `INSERT INTO software_titles (name, source, bundle_identifier) VALUES ('Python', 'apps', 'org.python.lang')`)
+		if err != nil {
+			return err
+		}
+		id, _ := res.LastInsertId()
+		pythonTitleID = uint(id) //nolint:gosec // test fixture
+		return nil
+	})
+	insertPolicy("patch python", ", type, patch_software_title_id, software_installer_id", ", 'patch', ?, ?", pythonTitleID, installerID)
+	count, err = amountPoliciesAutomationEnabledSoftwareDB(ctx, ds.reader(ctx))
+	require.NoError(t, err)
+	assert.Equal(t, 3, count)
+
+	// Script and calendar automations are separate filters and must not count.
+	var scriptID uint
+	ExecAdhocSQL(t, ds, func(q sqlx.ExtContext) error {
+		res, err := q.ExecContext(ctx, `INSERT INTO scripts (name, global_or_team_id, script_content_id) VALUES ('run.sh', 0, ?)`, installScriptID)
+		if err != nil {
+			return err
+		}
+		id, _ := res.LastInsertId()
+		scriptID = uint(id) //nolint:gosec // test fixture
+		return nil
+	})
+	insertPolicy("run script", ", script_id", ", ?", scriptID)
+	insertPolicy("calendar", ", calendar_events_enabled", ", 1")
+	count, err = amountPoliciesAutomationEnabledSoftwareDB(ctx, ds.reader(ctx))
+	require.NoError(t, err)
+	assert.Equal(t, 3, count)
+}
+
+func testGitOpsModeStatistics(t *testing.T, ds *Datastore) {
+	eh := ctxerr.MockHandler{}
+	eh.RetrieveImpl = func(flush bool) ([]*ctxerr.StoredError, error) {
+		return nil, nil
+	}
+	ctx := ctxerr.NewContext(context.Background(), eh)
+
+	premiumLicense := &fleet.LicenseInfo{Tier: fleet.TierPremium, Organization: "Fleet"}
+	fleetConfig := config.FleetConfig{Osquery: config.OsqueryConfig{DetailUpdateInterval: 1 * time.Hour}}
+
+	// Create a new app config so ApplyDefaults runs (new-install defaults: only "secrets" exception).
+	_, err := ds.NewAppConfig(ctx, &fleet.AppConfig{
+		OrgInfo: fleet.OrgInfo{OrgName: "Test", OrgLogoURL: "localhost:8080/logo.png"},
+	})
+	require.NoError(t, err)
+
+	// Default state (new install): GitOps mode disabled, only "secrets" is a default exception.
+	stats, shouldSend, err := ds.ShouldSendStatistics(license.NewContext(ctx, premiumLicense), time.Millisecond, fleetConfig)
+	require.NoError(t, err)
+	assert.True(t, shouldSend)
+	assert.False(t, stats.GitOpsModeEnabled)
+	assert.Equal(t, []string{"secrets"}, stats.GitOpsModeExceptions)
+
+	markStatisticsStale(t, ctx, ds)
+
+	// Enable GitOps mode and add labels + software exceptions.
+	cfg, err := ds.AppConfig(ctx)
+	require.NoError(t, err)
+	cfg.GitOpsConfig.GitopsModeEnabled = true
+	cfg.GitOpsConfig.RepositoryURL = "https://github.com/example/fleet-config"
+	cfg.GitOpsConfig.Exceptions.Labels = true
+	cfg.GitOpsConfig.Exceptions.Software = true
+	cfg.GitOpsConfig.Exceptions.Secrets = true
+	require.NoError(t, ds.SaveAppConfig(ctx, cfg))
+
+	stats, shouldSend, err = ds.ShouldSendStatistics(license.NewContext(ctx, premiumLicense), time.Millisecond, fleetConfig)
+	require.NoError(t, err)
+	assert.True(t, shouldSend)
+	assert.True(t, stats.GitOpsModeEnabled)
+	assert.Equal(t, []string{"labels", "software", "secrets"}, stats.GitOpsModeExceptions)
+
+	markStatisticsStale(t, ctx, ds)
+
+	// Disable GitOps mode but keep exceptions configured — exceptions are persisted independently.
+	cfg, err = ds.AppConfig(ctx)
+	require.NoError(t, err)
+	cfg.GitOpsConfig.GitopsModeEnabled = false
+	require.NoError(t, ds.SaveAppConfig(ctx, cfg))
+
+	stats, shouldSend, err = ds.ShouldSendStatistics(license.NewContext(ctx, premiumLicense), time.Millisecond, fleetConfig)
+	require.NoError(t, err)
+	assert.True(t, shouldSend)
+	assert.False(t, stats.GitOpsModeEnabled)
+	assert.Equal(t, []string{"labels", "software", "secrets"}, stats.GitOpsModeExceptions)
+
+	markStatisticsStale(t, ctx, ds)
+
+	// Clear all exceptions: should serialize as empty slice, not nil.
+	cfg, err = ds.AppConfig(ctx)
+	require.NoError(t, err)
+	cfg.GitOpsConfig.Exceptions.Labels = false
+	cfg.GitOpsConfig.Exceptions.Software = false
+	cfg.GitOpsConfig.Exceptions.Secrets = false
+	cfg.FleetDesktop.SSOEnabled = true
+	require.NoError(t, ds.SaveAppConfig(ctx, cfg))
+
+	stats, shouldSend, err = ds.ShouldSendStatistics(license.NewContext(ctx, premiumLicense), time.Millisecond, fleetConfig)
+	require.NoError(t, err)
+	assert.True(t, shouldSend)
+	assert.False(t, stats.GitOpsModeEnabled)
+	assert.Equal(t, []string{}, stats.GitOpsModeExceptions)
+	assert.True(t, stats.FleetDesktopSSOEnabled)
+}
+
+func testStatisticsFleetMDMEnrolled(t *testing.T, ds *Datastore) {
+	ctx := t.Context()
+
+	// With no hosts, both counts are zero (not null/missing).
+	macOS, windows, err := numHostsFleetMDMEnrolledDB(ctx, ds.reader(ctx))
+	require.NoError(t, err)
+	assert.Zero(t, macOS)
+	assert.Zero(t, windows)
+
+	// Each host exercises one branch of the query; only enrolled, non-server, Fleet-MDM darwin/windows hosts are counted.
+	cases := []struct {
+		name             string
+		platform         string
+		isServer         bool
+		enrolled         bool
+		installedFromDep bool
+		mdmName          string // "" means no MDM data at all
+	}{
+		{"macOS Fleet MDM", "darwin", false, true, false, fleet.WellKnownMDMFleet},        // counted (macOS)
+		{"windows Fleet MDM", "windows", false, true, false, fleet.WellKnownMDMFleet},     // counted (Windows)
+		{"macOS third-party MDM", "darwin", false, true, false, fleet.WellKnownMDMIntune}, // excluded: not Fleet
+		// ABM pending: DEP-assigned (installed_from_dep=1) but not yet enrolled (enrolled=0).
+		{"macOS ABM pending", "darwin", false, false, true, fleet.WellKnownMDMFleet},   // excluded: not enrolled
+		{"windows server host", "windows", true, true, false, fleet.WellKnownMDMFleet}, // excluded: is_server
+		{"iOS Fleet MDM", "ios", false, true, false, fleet.WellKnownMDMFleet},          // excluded: not macOS/Windows
+		{"macOS no MDM", "darwin", false, false, false, ""},                            // excluded: no MDM data
+	}
+	for i, c := range cases {
+		key := fmt.Sprintf("mdm-stats-%d", i)
+		h := test.NewHost(t, ds, key, "", key, key, time.Now(), test.WithPlatform(c.platform))
+		if c.mdmName != "" {
+			require.NoError(t, ds.SetOrUpdateMDMData(ctx, h.ID, c.isServer, c.enrolled, "https://fleet.example.com", c.installedFromDep, c.mdmName, "", false), c.name)
+		}
+	}
+
+	// The counts flow through the full ShouldSendStatistics payload: 1 macOS and 1 Windows Fleet-MDM host.
+	eh := ctxerr.MockHandler{}
+	eh.RetrieveImpl = func(flush bool) ([]*ctxerr.StoredError, error) { return nil, nil }
+	statsCtx := ctxerr.NewContext(ctx, eh)
+	premiumLicense := &fleet.LicenseInfo{Tier: fleet.TierPremium, Organization: "Fleet"}
+	fleetConfig := config.FleetConfig{Osquery: config.OsqueryConfig{DetailUpdateInterval: 1 * time.Hour}}
+	stats, shouldSend, err := ds.ShouldSendStatistics(license.NewContext(statsCtx, premiumLicense), time.Millisecond, fleetConfig)
+	require.NoError(t, err)
+	assert.True(t, shouldSend)
+	assert.Equal(t, 1, stats.NumHostsFleetMDMEnrolledMacOS)
+	assert.Equal(t, 1, stats.NumHostsFleetMDMEnrolledWindows)
+}
+
+func testStatisticsMDMProfileCounts(t *testing.T, ds *Datastore) {
+	eh := ctxerr.MockHandler{}
+	eh.RetrieveImpl = func(flush bool) ([]*ctxerr.StoredError, error) {
+		return nil, nil
+	}
+	ctx := ctxerr.NewContext(context.Background(), eh)
+
+	premiumLicense := &fleet.LicenseInfo{Tier: fleet.TierPremium, Organization: "Fleet"}
+	fleetConfig := config.FleetConfig{Osquery: config.OsqueryConfig{DetailUpdateInterval: 1 * time.Hour}}
+
+	// Initial state: all profile counts should be zero.
+	stats, shouldSend, err := ds.ShouldSendStatistics(license.NewContext(ctx, premiumLicense), time.Millisecond, fleetConfig)
+	require.NoError(t, err)
+	assert.True(t, shouldSend)
+	assert.Equal(t, 0, stats.NumMDMAppleProfiles)
+	assert.Equal(t, 0, stats.NumMDMWindowsProfiles)
+	assert.Equal(t, 0, stats.NumMDMAppleDeclarations)
+	assert.Equal(t, 0, stats.NumMDMAndroidProfiles)
+	assert.Empty(t, stats.ResultLogDestination)
+	assert.Empty(t, stats.StatusLogDestination)
+	assert.Empty(t, stats.AuditLogDestination)
+	assert.False(t, stats.AnyVulnerabilitiesWebhookEnabled)
+	assert.False(t, stats.AnyFailingPoliciesWebhookEnabled)
+	assert.False(t, stats.AnyHostActivitiesWebhookEnabled)
+	assert.False(t, stats.GlobalActivityWebhookEnabled)
+	assert.False(t, stats.TicketDestinationConfigured)
+	assert.False(t, stats.SSOConfiguredFleetUsers)
+	assert.False(t, stats.SSOConfiguredEndUsers)
+	assert.False(t, stats.AccountProvisioningConfigured)
+	assert.False(t, stats.IDPSCIMConfigured)
+	assert.False(t, stats.CertificateAuthorityConfigured)
+	assert.False(t, stats.IDPGoogleWorkspaceConfigured)
+
+	markStatisticsStale(t, ctx, ds)
+
+	// Insert Apple configuration profiles.
+	ExecAdhocSQL(t, ds, func(q sqlx.ExtContext) error {
+		for i := 1; i <= 3; i++ {
+			_, err := q.ExecContext(ctx,
+				`INSERT INTO mdm_apple_configuration_profiles (team_id, identifier, name, mobileconfig, checksum, profile_uuid)
+				 VALUES (0, ?, ?, '<plist></plist>', '', ?)`,
+				fmt.Sprintf("com.test.profile%d", i),
+				fmt.Sprintf("Test Profile %d", i),
+				fmt.Sprintf("a%d", i),
+			)
+			if err != nil {
+				return err
+			}
+		}
+		return nil
+	})
+
+	// Insert Windows configuration profiles.
+	ExecAdhocSQL(t, ds, func(q sqlx.ExtContext) error {
+		for i := 1; i <= 2; i++ {
+			_, err := q.ExecContext(ctx,
+				`INSERT INTO mdm_windows_configuration_profiles (team_id, name, syncml, profile_uuid)
+				 VALUES (0, ?, '<Replace></Replace>', ?)`,
+				fmt.Sprintf("Win Profile %d", i),
+				fmt.Sprintf("w%d", i),
+			)
+			if err != nil {
+				return err
+			}
+		}
+		return nil
+	})
+
+	// Insert Apple declarations.
+	ExecAdhocSQL(t, ds, func(q sqlx.ExtContext) error {
+		for i := 1; i <= 4; i++ {
+			_, err := q.ExecContext(ctx,
+				`INSERT INTO mdm_apple_declarations (team_id, identifier, name, raw_json, declaration_uuid)
+				 VALUES (0, ?, ?, '{}', ?)`,
+				fmt.Sprintf("com.test.decl%d", i),
+				fmt.Sprintf("Test Decl %d", i),
+				fmt.Sprintf("d%d", i),
+			)
+			if err != nil {
+				return err
+			}
+		}
+		return nil
+	})
+
+	// Insert Android configuration profiles.
+	ExecAdhocSQL(t, ds, func(q sqlx.ExtContext) error {
+		_, err := q.ExecContext(ctx,
+			`INSERT INTO mdm_android_configuration_profiles (team_id, name, raw_json, profile_uuid)
+			 VALUES (0, 'Android Profile 1', '{}', 'n1')`,
+		)
+		return err
+	})
+
+	// Verify the counts match what was inserted.
+	stats, shouldSend, err = ds.ShouldSendStatistics(license.NewContext(ctx, premiumLicense), time.Millisecond, fleetConfig)
+	require.NoError(t, err)
+	assert.True(t, shouldSend)
+	assert.Equal(t, 3, stats.NumMDMAppleProfiles)
+	assert.Equal(t, 2, stats.NumMDMWindowsProfiles)
+	assert.Equal(t, 4, stats.NumMDMAppleDeclarations)
+	assert.Equal(t, 1, stats.NumMDMAndroidProfiles)
+}
+
+func testStatisticsThirdPartyIntegrations(t *testing.T, ds *Datastore) {
+	eh := ctxerr.MockHandler{}
+	eh.RetrieveImpl = func(flush bool) ([]*ctxerr.StoredError, error) {
+		return nil, nil
+	}
+	ctx := ctxerr.NewContext(t.Context(), eh)
+
+	premiumLicense := &fleet.LicenseInfo{Tier: fleet.TierPremium, Organization: "Fleet"}
+	fleetConfig := config.FleetConfig{Osquery: config.OsqueryConfig{DetailUpdateInterval: 1 * time.Hour}}
+
+	_, err := ds.NewAppConfig(ctx, &fleet.AppConfig{
+		OrgInfo: fleet.OrgInfo{OrgName: "Test", OrgLogoURLDarkMode: "localhost:8080/logo.png"},
+	})
+	require.NoError(t, err)
+
+	stats, shouldSend, err := ds.ShouldSendStatistics(license.NewContext(ctx, premiumLicense), time.Millisecond, fleetConfig)
+	require.NoError(t, err)
+	assert.True(t, shouldSend)
+	assert.Empty(t, stats.ResultLogDestination)
+	assert.Empty(t, stats.StatusLogDestination)
+	assert.Empty(t, stats.AuditLogDestination)
+	assert.False(t, stats.AnyVulnerabilitiesWebhookEnabled)
+	assert.False(t, stats.AnyFailingPoliciesWebhookEnabled)
+	assert.False(t, stats.AnyHostActivitiesWebhookEnabled)
+	assert.False(t, stats.GlobalActivityWebhookEnabled)
+	assert.False(t, stats.TicketDestinationConfigured)
+	assert.False(t, stats.SSOConfiguredFleetUsers)
+	assert.False(t, stats.SSOConfiguredEndUsers)
+	assert.False(t, stats.AccountProvisioningConfigured)
+	assert.False(t, stats.IDPSCIMConfigured)
+	assert.False(t, stats.CertificateAuthorityConfigured)
+	assert.False(t, stats.IDPGoogleWorkspaceConfigured)
+
+	markStatisticsStale(t, ctx, ds)
+
+	// Log destinations come from the server config, not the app config.
+	fleetConfig.Osquery.ResultLogPlugin = "firehose"
+	fleetConfig.Osquery.StatusLogPlugin = "kinesis"
+	fleetConfig.Activity.AuditLogPlugin = "pubsub"
+
+	cfg, err := ds.AppConfig(ctx)
+	require.NoError(t, err)
+	cfg.WebhookSettings.VulnerabilitiesWebhook.Enable = true
+	cfg.WebhookSettings.ActivitiesWebhook.Enable = true
+	cfg.Integrations.Jira = []*fleet.JiraIntegration{{URL: "https://jira.example.com", Username: "user", ProjectKey: "PROJ"}}
+	cfg.Integrations.GoogleWorkspace = []*fleet.GoogleWorkspaceIntegration{{
+		Domain: "example.com",
+		ApiKey: fleet.GoogleCalendarApiKey{Values: map[string]string{"client_email": "svc@example.com"}},
+	}}
+	cfg.SSOSettings = &fleet.SSOSettings{EnableSSO: true}
+	cfg.MDM.EndUserAuthentication.SSOProviderSettings = fleet.SSOProviderSettings{
+		EntityID:    "fleet",
+		MetadataURL: "https://idp.example.com/metadata",
+	}
+	cfg.MDM.AppleAccountProvisioning.OAuthIdPTokenURL = optjson.SetString("https://idp.example.com/oauth2/v1/token")
+	cfg.MDM.AppleAccountProvisioning.OAuthIdPClientID = optjson.SetString("client-id")
+	require.NoError(t, ds.SaveAppConfig(ctx, cfg))
+
+	require.NoError(t, ds.UpdateScimLastRequest(ctx, &fleet.ScimLastRequest{Status: "success"}))
+
+	_, err = ds.NewCertificateAuthority(ctx, &fleet.CertificateAuthority{
+		Type: string(fleet.CATypeHydrant),
+		Name: new("Hydrant CA"),
+		URL:  new("https://hydrant.example.com"),
+	})
+	require.NoError(t, err)
+
+	stats, shouldSend, err = ds.ShouldSendStatistics(license.NewContext(ctx, premiumLicense), time.Millisecond, fleetConfig)
+	require.NoError(t, err)
+	assert.True(t, shouldSend)
+	assert.Equal(t, "firehose", stats.ResultLogDestination)
+	assert.Equal(t, "kinesis", stats.StatusLogDestination)
+	assert.Equal(t, "pubsub", stats.AuditLogDestination)
+	assert.True(t, stats.AnyVulnerabilitiesWebhookEnabled)
+	assert.True(t, stats.GlobalActivityWebhookEnabled)
+	assert.True(t, stats.TicketDestinationConfigured)
+	assert.True(t, stats.SSOConfiguredFleetUsers)
+	assert.True(t, stats.SSOConfiguredEndUsers)
+	assert.True(t, stats.AccountProvisioningConfigured)
+	assert.True(t, stats.IDPSCIMConfigured)
+	assert.True(t, stats.CertificateAuthorityConfigured)
+	assert.True(t, stats.IDPGoogleWorkspaceConfigured)
+	// Neither the global config nor any fleet enables these yet.
+	assert.False(t, stats.AnyFailingPoliciesWebhookEnabled)
+	assert.False(t, stats.AnyHostActivitiesWebhookEnabled)
+
+	markStatisticsStale(t, ctx, ds)
+
+	// A fleet-level webhook is enough to flip the "any" flags.
+	team, err := ds.NewTeam(ctx, &fleet.Team{
+		Name: "webhooks",
+		Config: fleet.TeamConfig{
+			WebhookSettings: fleet.TeamWebhookSettings{
+				FailingPoliciesWebhook: fleet.FailingPoliciesWebhookSettings{Enable: true, DestinationURL: "https://example.com/fp"},
+				HostActivitiesWebhook:  &fleet.HostActivitiesWebhookSettings{Enable: true, DestinationURL: "https://example.com/ha"},
+			},
+		},
+	})
+	require.NoError(t, err)
+
+	stats, shouldSend, err = ds.ShouldSendStatistics(license.NewContext(ctx, premiumLicense), time.Millisecond, fleetConfig)
+	require.NoError(t, err)
+	assert.True(t, shouldSend)
+	assert.True(t, stats.AnyFailingPoliciesWebhookEnabled)
+	assert.True(t, stats.AnyHostActivitiesWebhookEnabled)
+
+	markStatisticsStale(t, ctx, ds)
+
+	// "No team" webhooks are stored separately from the teams table, so they get their own check.
+	require.NoError(t, ds.DeleteTeam(ctx, team.ID))
+
+	stats, shouldSend, err = ds.ShouldSendStatistics(license.NewContext(ctx, premiumLicense), time.Millisecond, fleetConfig)
+	require.NoError(t, err)
+	assert.True(t, shouldSend)
+	require.False(t, stats.AnyFailingPoliciesWebhookEnabled)
+	require.False(t, stats.AnyHostActivitiesWebhookEnabled)
+
+	markStatisticsStale(t, ctx, ds)
+
+	require.NoError(t, ds.SaveDefaultTeamConfig(ctx, &fleet.TeamConfig{
+		WebhookSettings: fleet.TeamWebhookSettings{
+			FailingPoliciesWebhook: fleet.FailingPoliciesWebhookSettings{Enable: true, DestinationURL: "https://example.com/fp"},
+			HostActivitiesWebhook:  &fleet.HostActivitiesWebhookSettings{Enable: true, DestinationURL: "https://example.com/ha"},
+		},
+	}))
+
+	stats, shouldSend, err = ds.ShouldSendStatistics(license.NewContext(ctx, premiumLicense), time.Millisecond, fleetConfig)
+	require.NoError(t, err)
+	assert.True(t, shouldSend)
+	assert.True(t, stats.AnyFailingPoliciesWebhookEnabled)
+	assert.True(t, stats.AnyHostActivitiesWebhookEnabled)
+}

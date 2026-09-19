@@ -1,0 +1,56 @@
+.software-page {
+  @include vertical-page-layout;
+
+  &__header-wrap {
+    display: flex;
+    flex-direction: column;
+    gap: $pad-large;
+  }
+
+  &__header {
+    @include normalize-team-header;
+
+    .button-wrap {
+      display: flex;
+      justify-content: flex-end;
+      min-width: 266px;
+    }
+  }
+
+  &__header {
+    display: flex;
+    align-items: center;
+
+    .form-field {
+      margin-bottom: 0;
+    }
+  }
+
+  &__action-buttons {
+    display: flex;
+    align-items: center;
+    gap: $gap-action-elements;
+  }
+
+  &__text {
+    margin-right: $pad-large;
+  }
+
+  &__title {
+    font-size: $large;
+  }
+
+  &__wrapper {
+    .page-description {
+      margin-bottom: px-to-rem(30);
+      max-width: 75%;
+
+      @media (min-width: $break-md) {
+        max-width: none;
+      }
+    }
+    .tab-nav {
+      margin-bottom: $pad-xxlarge;
+    }
+  }
+}

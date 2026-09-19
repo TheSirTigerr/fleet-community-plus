@@ -1,0 +1,187 @@
+name: Team1
+team_settings:
+  secrets:
+    - secret: "SampleSecret123"
+    - secret: "ABC"
+  webhook_settings:
+    failing_policies_webhook:
+      enable_failing_policies_webhook: true
+      destination_url: https://example.tines.com/webhook
+      policy_ids: [1, 2, 3, 4, 5, 6, 7, 8, 9]
+  features:
+    enable_host_users: true
+    enable_software_inventory: true
+  host_expiry_settings:
+    host_expiry_enabled: true
+    host_expiry_window: 30
+agent_options:
+  command_line_flags:
+    distributed_denylist_duration: 0
+  config:
+    decorators:
+      load:
+        - SELECT uuid AS host_uuid FROM system_info;
+        - SELECT hostname AS hostname FROM system_info;
+    options:
+      disable_distributed: false
+      distributed_interval: 10
+      distributed_plugin: tls
+      distributed_tls_max_attempts: 3
+      logger_tls_endpoint: /api/v1/osquery/log
+      pack_delimiter: /
+controls:
+  macos_settings:
+    custom_settings:
+      - path: ./lib/macos-password.mobileconfig
+  windows_settings:
+    custom_settings:
+      - path: ./lib/windows-screenlock.xml
+  scripts:
+    - path: ./lib/collect-fleetd-logs.sh
+  enable_disk_encryption: true
+  enable_recovery_lock_password: true
+  windows_require_bitlocker_pin: true
+  macos_setup:
+    bootstrap_package: null
+    enable_end_user_authentication: false
+    macos_setup_assistant: null
+  macos_updates:
+    deadline: null
+    minimum_version: null
+  ios_updates:
+    deadline: null
+    minimum_version: null
+  ipados_updates:
+    deadline: null
+    minimum_version: null
+  windows_updates:
+    deadline_days: null
+    grace_period_days: null
+  macos_migration:
+    enable: false
+    mode: ""
+    webhook_url: ""
+  windows_enabled_and_configured: true
+  windows_migration_enabled: false
+  enable_turn_on_windows_mdm_manually: false
+  windows_entra_tenant_ids: []
+  windows_entra_client_ids: []
+  apple_require_hardware_attestation: false
+  only_allow_apple_business_enrollment: false
+labels:
+  - name: a
+    description: A cool global label
+    query: SELECT 1 FROM osquery_info
+    label_membership_type: dynamic
+queries:
+  - name: Scheduled query stats
+    description: Collect osquery performance stats directly from osquery
+    query: SELECT *,
+      (SELECT value from osquery_flags where name = 'pack_delimiter') AS delimiter
+      FROM osquery_schedule;
+    interval: 0
+    platform: darwin,linux,windows
+    min_osquery_version: all
+    observer_can_run: false
+    automations_enabled: false
+    logging: snapshot
+  - name: orbit_info
+    query: SELECT * from orbit_info;
+    interval: 0
+    platform: darwin,linux,windows
+    min_osquery_version: all
+    observer_can_run: false
+    automations_enabled: true
+    logging: snapshot
+  - name: osquery_info
+    query: SELECT * from osquery_info;
+    interval: 604800 # 1 week
+    platform: darwin,linux,windows,chrome
+    min_osquery_version: all
+    observer_can_run: false
+    automations_enabled: true
+    logging: snapshot
+policies:
+  - name: 😊 Failing policy
+    platform: linux
+    description: This policy should always fail.
+    resolution: There is no resolution for this policy.
+    query: SELECT 1 FROM osquery_info WHERE start_time < 0;
+  - name: Passing policy
+    platform: linux,windows,darwin,chrome
+    description: This policy should always pass.
+    resolution: There is no resolution for this policy.
+    query: SELECT 1;
+  - name: No root logins (macOS, Linux)
+    platform: linux,darwin
+    query: SELECT 1 WHERE NOT EXISTS (SELECT * FROM last
+      WHERE username = "root"
+      AND time > (( SELECT unix_time FROM time ) - 3600 ))
+    critical: true
+  - name: 🔥 Failing policy
+    platform: linux
+    description: This policy should always fail.
+    resolution: There is no resolution for this policy.
+    query: SELECT 1 FROM osquery_info WHERE start_time < 0;
+  - name: 😊😊 Failing policy
+    platform: linux
+    description: This policy should always fail.
+    resolution: There is no resolution for this policy.
+    query: SELECT 1 FROM osquery_info WHERE start_time < 0;
+  - name: Microsoft Teams on macOS installed and up to date
+    platform: darwin
+    query: SELECT 1 FROM apps WHERE name = 'Microsoft Teams.app' AND version_compare(bundle_short_version, '24193.1707.3028.4282') >= 0;
+    install_software:
+      package_path: ./microsoft-teams.pkg.software.yml
+  - name: Slack on macOS is installed
+    platform: darwin
+    query: SELECT 1 FROM apps WHERE name = 'Slack.app';
+    install_software:
+      app_store_id: "123456"
+  - name: Script run policy
+    platform: linux
+    description: This should run a script on failure
+    query: SELECT * from osquery_info;
+    run_script:
+      path: ./lib/collect-fleetd-logs.sh
+  - name: 🔥 Failing policy with script
+    platform: linux
+    description: This policy should always fail.
+    resolution: There is no resolution for this policy.
+    query: SELECT 1 FROM osquery_info WHERE start_time < 0;
+    run_script:
+      path: ./lib/collect-fleetd-logs.sh
+software:
+  app_store_apps:
+    - app_store_id: "123456"
+  packages:
+    - path: ./microsoft-teams.pkg.software.yml
+      labels_include_any:
+        - a
+      categories:
+        - Communication
+        - Productivity
+    - url: https://ftp.mozilla.org/pub/firefox/releases/129.0.2/mac/en-US/Firefox%20129.0.2.pkg
+      self_service: true
+      labels_exclude_any:
+        - a
+  fleet_maintained_apps:
+    - slug: slack/darwin
+      version: "4.47.65"
+      self_service: true
+      categories:
+        - Productivity
+        - Communication
+    - slug: box-drive/windows
+      install_script:
+        path: ./lib/install.sh
+      uninstall_script:
+        path: ./lib/uninstall-box.sh
+      post_install_script:
+        path: ./lib/post-install.sh
+      pre_install_query:
+        path: ./lib/preinstall-query.yml
+      self_service: true
+      categories:
+        - Productivity
+        - Developer tools

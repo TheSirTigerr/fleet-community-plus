@@ -1,0 +1,237 @@
+# Fleetctl
+
+Fleetctl (pronounced "Fleet control") is a command line interface (CLI) tool for managing Fleet from the command line. Fleetctl enables a GitOps workflow with Fleet.
+
+Fleetctl also provides a quick way to work with all the data exposed by Fleet without having to use the Fleet UI or work directly with the Fleet API.
+
+<div purpose="embedded-content">
+   <iframe src="https://www.youtube.com/embed/ERbknt6w8eg" allowfullscreen></iframe>
+</div>
+
+## Installing fleetctl
+
+The easiest way to install or update fleetctl is from the [fleetdm.com/download page](https://fleetdm.com/download).
+
+You can also manually download the fleetctl binary from [GitHub](https://github.com/fleetdm/fleet/releases). Double-click the `tar.gz` or `zip` file to extract the binary. To run fleetctl commands, use the binary's path (`/path/to/fleetctl`). For convenience, copy or move the binary to a directory in your `$PATH` (ex: `/usr/local/bin`). This allows you to execute fleetctl without specifying its location.
+
+<!--
+
+The easiest way to install fleetctl is with this macOS and Linux script:
+
+```bash
+curl -sSL https://fleetdm.com/resources/install-fleetctl.sh | bash
+```
+
+For Windows, use this script:
+
+```powershell
+for /f "tokens=1,* delims=:" %a in ('curl -s https://api.github.com/repos/fleetdm/fleet/releases/latest ^| findstr "browser_download_url" ^| findstr "_windows_amd64.zip"') do (curl -kOL %b) && if not exist "%USERPROFILE%\.fleetctl" mkdir "%USERPROFILE%\.fleetctl" && for /f "delims=" %a in ('dir /b fleetctl_*_windows_amd64.zip') do tar -xf "%a" --strip-components=1 -C "%USERPROFILE%\.fleetctl" && del "%a"
+```
+
+Run this script again to update fleetctl if you've installed it this way.
+
+Alternatively, you can install and manage [fleetctl using npm](https://www.npmjs.com/package/fleetctl).
+
+Download and install [Node.js](https://nodejs.org/en).
+
+Install fleetctl with npm (included in Node.js).
+
+```sh
+npm install -g fleetctl
+```
+
+If you see an error such as `Please try running this command again as root/Administrator` or `Permission denied`, run this command instead: `sudo npm install -g fleetctl`.
+
+```sh
+sudo npm install -g fleetctl
+```
+
+-->
+
+
+### Upgrading fleetctl
+
+To upgrade fleetctl, install it again from the [fleetdm.com/download page](https://fleetdm.com/download) or [GitHub](https://github.com/fleetdm/fleet/releases). Match the version of fleetctl to the version of your Fleet server.
+
+If you installed fleetctl with npm, upgrade it with `npm update -g fleetctl`. The new binary is downloaded the next time you run a `fleetctl` command.
+
+## Usage
+
+To see the available commands you can run:
+
+```sh
+> fleetctl --help
+```
+
+Each command has a help menu with additional information. To pull up the help menu, run `fleetctl <command> --help`, replacing `<command>` with the command you're looking up:
+
+```sh
+> fleetctl setup --help
+```
+
+## Authentication
+
+This section walks you through authentication, assuming you already have a running Fleet instance. To learn how to set up new Fleet instance, check out the [Deploy](https://fleetdm.com/docs/deploy/introduction) section or [Building Fleet locally](https://github.com/fleetdm/fleet/blob/main/docs/Contributing/getting-started/building-fleet.md) docs. 
+
+### Login
+
+To log in to your Fleet instance, run the following commands:
+
+1. Set the Fleet instance address (your Fleet server’s URL)
+
+```sh
+> fleetctl config set --address 'https://fleet.example.com'
+[+] Set the address config key to "https://fleet.example.com" in the "default" context
+```
+
+2. Log in with your credentials
+
+```sh
+> fleetctl login
+Log in using the standard Fleet credentials.
+Email: mike@arpaia.co
+Password:
+[+] Fleet login successful and context configured!
+```
+
+Once your local context is configured, you can use fleetctl normally.
+
+#### Users with single sign-on (SSO) or email two-factor authentication (2FA)
+
+Users that log into Fleet with SSO or email 2FA can't log in with `fleetctl login`. Instead, the best practice is to retrieve their API token from the UI and manually set it in their fleetctl configuration (instead of logging in via `fleetctl login`).
+
+**Fleet UI:**
+1. Go to the **My account** page (https://fleet.example.com/profile)
+2. Select the **Get API token** button to bring up a modal with the API token.
+3. Set the API token in the `~/.fleet/config` file. 
+
+```yaml
+contexts:
+  default:
+    address: https://fleet.corp.example.com
+    email: example@example.com
+    token: your_token_here
+```
+4. Now you're ready to run `fleetctl` commands!
+
+> The token can also be set with `fleetctl config set --token`, but this may leak the token into a user's shell history.
+
+### Using fleetctl with an API-only user
+
+When running automated workflows using the Fleet API, we recommend using an API-only user's API key rather than a regular user's API key. A regular user's API key expires frequently for security purposes, requiring routine updates. Meanwhile, an API-only user's key does not expire.   
+
+An API-only user does not have access to the Fleet UI. Instead, it's only purpose is to interact with the API programmatically or from fleetctl.
+
+#### Create API-only user
+
+To create an API-only user, navigate to **Settings > Users > Create user** and select the **API-only** option. 
+
+You can optionally restrict the user to a specific list of API endpoints, which narrows access without expanding permissions beyond the user's role (for example, a team admin granted access to the [Update configuration](https://fleetdm.com/docs/rest-api/rest-api#update-configuration) endpoint will still receive a `403` response, because that endpoint is restricted to global admins).
+
+You can also create an API-only user with `fleetctl`. First, log in to fleetctl as an admin (see [authentication](#authentication) above for details), then run:
+
+```sh
+fleetctl user create --name 'API User' --api-only
+```
+
+`--email` and `--password` are optional when creating an API-only user. If omitted, Fleet generates an email derived from the creator's address; the user authenticates via API token only.
+
+After running the command, you'll receive an API token:
+
+```sh
+Successfully created new user!
+
+When you're ready to view the API token, press any key (will not be shown again):
+The API token for your new user is: <TOKEN>
+```
+
+> If you need to retrieve this user's token again in the future, you can do so via the [log in API](https://fleetdm.com/docs/rest-api/rest-api#log-in).
+
+#### Permissions
+
+An API-only user can be given the same permissions as a regular user. The default access level is **Observer**. You can specify what level of access the new user should have using the `--global-role` flag:
+
+```sh
+fleetctl user create --name 'API User' --api-only --global-role 'admin'
+```
+
+With Fleet Premium, use the `--fleet <fleet_id>:<role>` to create an API-only user that only has access to a specific fleet:
+
+```sh
+fleetctl user create --name 'API User' --api-only --fleet 4:gitops
+```
+
+#### Changing permissions
+
+To change the role of a current user, log into the Fleet UI as an admin and navigate to Settings > Users.
+> Suggestion: Create a new user to disable/enable a user's access to the UI (converting a regular user to an API-only user or vice versa).
+
+### Switching users
+
+To use fleetctl with your regular user account but occasionally use your API-only user for specific cases, you can set up your fleetctl config with a new `context` to hold the credentials of your API-only user:
+
+```sh
+fleetctl config set --address 'https://dogfood.fleetdm.com' --context api
+[+] Context "api" not found, creating it with default values
+[+] Set the address config key to "https://dogfood.fleetdm.com" in the "api" context
+```
+
+From there on, you can use  the `--context api` flag whenever you need to use the API-only user's identity, rather than logging in and out to switch accounts:
+
+```sh
+fleetctl login --context 'admin'
+Log in using the admin Fleet credentials.
+Email: admin@example.com
+Password:
+[+] Fleet login successful and context configured!
+```
+
+Running a command with no context will use the default profile.
+
+## Advanced
+
+### Debugging Fleet
+
+Fleetctl provides debugging capabilities about the running Fleet server via the `debug` command. To see a complete list of all the options, run:
+
+```sh
+fleetctl debug --help
+```
+
+To generate a full debugging archive, run:
+
+```sh
+fleetctl debug archive
+```
+
+This will generate a `tar.gz` file with:
+
+- `prof` archives that can be inspected via `go tools pprof <archive_name_here>`.
+- A file containing a set of all the errors that happened in the server during the interval of time defined by the [logging_error_retention_period](https://fleetdm.com/docs/deploying/configuration#logging-error-retention-period) configuration.
+- Files containing database-specific information.
+
+### Deprecation warnings
+
+In the v4.82.0 version of `fleetctl`, several commands and options (like `fleetctl get queries`) were deprecated in favor of newer names (like `fleetctl get reports`). Starting in v4.83.0, you will begin to see warnings whenever deprecated command or option names are used. You can enable these warnings in v4.82.0 to get a head start on updating your files. To do so, either set the `FLEET_ENABLE_LOG_TOPICS` environment variable to `deprecated-field-names`, or use the `--enable_log_topics=deprecated-field-names` option in your commands.  For example:
+
+```
+> FLEET_ENABLE_LOG_TOPICS=deprecated-field-names fleetctl get queries
+```
+
+```
+> export FLEET_ENABLE_LOG_TOPICS=deprecated-field-names 
+> fleetctl get queries
+```
+
+```
+> fleetctl get queries --enable_log_topics=deprecated-field-names
+```
+
+Once the warnings become enabled by default (in v4.83.0), you can use the `FLEET_DISABLE_LOG_TOPICS` environment variable or `--enable_log_topics` command-line option to disable them.
+
+<meta name="category" value="guides">
+<meta name="authorGitHubUsername" value="noahtalerman">
+<meta name="authorFullName" value="Noah Talerman">
+<meta name="publishedOn" value="2024-07-04">
+<meta name="articleTitle" value="Fleetctl">
+<meta name="description" value="Read about fleetctl, a CLI tool for managing Fleet and osquery configurations, running queries, generating Fleet's agent (fleetd), and more.">

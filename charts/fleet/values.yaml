@@ -1,0 +1,364 @@
+## Section: Kubernetes
+# All settings related to how Fleet is deployed in Kubernetes
+hostName: fleet.localhost
+replicas: 3 # The number of Fleet instances to deploy
+revisionHistoryLimit: 10 # Number of old ReplicaSets for Fleet deployment to retain for rollback (set to 0 for unlimited)
+imageRepository: fleetdm/fleet
+imageTag: v4.91.1 # Version of Fleet to deploy
+# imagePullPolicy is optional. If unset, Kubernetes defaults to IfNotPresent
+# for tagged images and Always for the :latest tag. Valid values: Always,
+# IfNotPresent, Never.
+# imagePullPolicy: IfNotPresent
+# imagePullSecrets is optional.
+# imagePullSecrets:
+#   - name: docker
+#   - name: internal
+podAnnotations: {} # Additional annotations to add to the Fleet pod
+serviceAnnotations: {} # Additional annotations to add to the Fleet service
+serviceAccountAnnotations: {} # Additional annotations to add to the Fleet service account
+resources:
+  limits:
+    cpu: 1 # 1 CPU Core
+    memory: 4Gi
+  requests:
+    cpu: 0.1 # 0.1 CPU Core
+    memory: 50Mi
+
+# Node labels for pod assignment
+# ref: https://kubernetes.io/docs/user-guide/node-selection/
+nodeSelector: {}
+
+# Tolerations for pod assignment
+# ref: https://kubernetes.io/docs/concepts/configuration/taint-and-toleration/
+tolerations: []
+
+# Configurable affinity for pod assignment
+affinity:
+  podAntiAffinity:
+    preferredDuringSchedulingIgnoredDuringExecution:
+      - podAffinityTerm:
+          labelSelector:
+            matchExpressions:
+              - key: app
+                operator: In
+                values:
+                  - fleet
+          topologyKey: kubernetes.io/hostname
+        weight: 100
+
+ingress:
+  enabled: false
+  className: ""
+  annotations:
+    {}
+    # kubernetes.io/tls-acme: "true"
+    # nginx.ingress.kubernetes.io/proxy-body-size: 10m
+    # kubernetes.io/ingress.class: nginx
+    # cert-manager.io/cluster-issuer: letsencrypt
+  hosts:
+    - host: chart-example.local
+      paths:
+        - path: /
+          pathType: ImplementationSpecific
+  tls: []
+  #  - secretName: chart-example-tls
+  #    hosts:
+  #      - chart-example.local
+
+## Section: Fleet
+# All of the settings relating to configuring the Fleet server
+fleet:
+  # Will also be the targetPort for the service
+  listenPort: 8080
+  # servicePort is optional.  Use if the service port needs to differ from the listenPort above.
+  # servicePort: 9080
+  # Name of the Secret resource storing S3 bucket and optionally TLS secrets
+  secretName: fleet
+  # Whether or not to run `fleet db prepare` to run SQL migrations before starting Fleet
+  autoApplySQLMigrations: true
+  # Add extra annotations to the migration Job
+  migrationJobAnnotations:
+  tls:
+    enabled: true
+    # Set to true if you need a separate secret for just TLS data.
+    # Useful with cert-manager and similar deployments.
+    uniqueTLSSecret: false
+    secretName: fleet-tls
+    compatibility: modern
+    certSecretKey: server.cert
+    keySecretKey: server.key
+  auth:
+    bcryptCost: 12
+    saltKeySize: 24
+  app:
+    tokenKeySize: 24
+    inviteTokenValidityPeriod: 120h # 5 days
+  session:
+    keySize: 64
+    duration: 2160h # 90 days
+  logging:
+    debug: false
+    json: false
+    disableBanner: false
+  mdm:
+    windows:
+      wstepIdentityCertKey: ""
+      wstepIdentityKeyKey: ""
+  carving:
+    s3:
+      bucketName: ""
+      prefix: ""
+      accessKeyID: ""
+      secretKey: s3-bucket
+      region: ""
+      endpointURL: ""
+      forceS3PathStyle: false
+      gcsIAMAuth: false
+      stsAssumeRoleARN: ""
+  softwareInstallers:
+    s3:
+      bucketName: ""
+      prefix: ""
+      accessKeyID: ""
+      secretKey: software-installers
+      region: ""
+      endpointURL: ""
+      forceS3PathStyle: false
+      gcsIAMAuth: false
+      stsAssumeRoleARN: ""
+  license:
+    secretName: ""
+    licenseKey: license-key
+  extraVolumes: []
+  extraVolumeMounts: []
+  # Currently only passes readOnlyRootFilesystem, runAsNonRoot, runAsUser, runAsGroup
+  securityContext:
+    readOnlyRootFilesystem: true
+    runAsNonRoot: true
+    runAsUser: 3333
+    runAsGroup: 3333
+  # Add additional CA's to the Fleet container truststore
+  # To add CA's, set enabled: true
+  # Supports adding CA's from Config maps and Secrets
+  # configMaps:
+  #   - name: fleet-ca-config
+  #   - name: ca-config-map-2
+  #   - name: ca-config-map-3
+  #   - name: ca-config-map-N
+  # secrets:
+  #   - name: fleet-ca-secret
+  #   - name: ca-secret-2
+  #   - name: ca-secret-3
+  #   - name: ca-secret-N
+  additionalCAs:
+    enabled: false
+    configMaps:
+    # - name: fleet-ca-config
+    secrets:
+    # - name: fleet-ca-secret
+
+# Whether to make fleet vulnerability processing run in a dedicated container
+# if you set dedicated=false, you need to increase the main resources section
+# to 4Gi or the fleet container will be OOMKilled when vulnerability processing
+# tries to run.
+vulnProcessing:
+  dedicated: false
+  schedule: "0 * * * *"
+  resources:
+    limits:
+      cpu: 1 # 1GHz
+      memory: 4Gi
+    requests:
+      cpu: 0.1 # 100Mhz
+      memory: 50Mi
+
+## Section: osquery
+# All of the settings related to osquery's interactions with the Fleet server
+osquery:
+  # Name of the secret resource containing optional secrets for AWS credentials
+  secretName: osquery
+  nodeKeySize: 24
+  labelUpdateInterval: 30m
+  detailUpdateInterval: 30m
+
+  # To change where Fleet store the logs sent from osquery, set the values below
+  logging:
+    statusPlugin: filesystem
+    resultPlugin: filesystem
+
+    # To congigure the filesystem logger, change the values below
+    filesystem:
+      statusLogFile: osquery_status # will be placed in the /logs volume
+      resultLogFile: osquery_result # will be placed in the /logs volume
+      enableRotation: false
+      enableCompression: false
+      volumeSize: 20Gi # the maximum size of the volume
+
+    # To configure the AWS Firehose logger, change the values below
+    firehose:
+      region: ""
+      accessKeyID: ""
+      secretKey: firehose
+      stsAssumeRoleARN: ""
+      statusStream: ""
+      resultStream: ""
+
+    # To configure the AWS Kinesis logger, change the values below
+    kinesis:
+      region: ""
+      accessKeyID: ""
+      secretKey: kinesis
+      stsAssumeRoleARN: ""
+      statusStream: ""
+      resultStream: ""
+
+    # To configure the AWS Lambda logger, change the values below
+    lambda:
+      region: ""
+      accessKeyID: ""
+      secretKey: lambda
+      stsAssumeRoleARN: ""
+      statusFunction: ""
+      resultFunction: ""
+
+    # To configure the GCP PubSub logger, change the values below
+    pubsub:
+      project: ""
+      statusTopic: ""
+      resultTopic: ""
+
+## Section: database
+# All of the connection settings for MySQL
+database:
+  # Name of the Secret resource containing MySQL password and TLS secrets
+  secretName: mysql
+  address: 127.0.0.1:3306
+  database: fleet
+  username: fleet
+  passwordKey: mysql-password
+  maxOpenConns: 50
+  maxIdleConns: 50
+  connMaxLifetime: 0
+  tls:
+    enabled: false
+    ## Commented options below are optional.  Uncomment to use.
+    # caCertKey: ca.cert
+    ## Client certificates require both the certKey and keyKey
+    # certKey: client.cert
+    # keyKey: client.key
+    config: ""
+    serverName: ""
+
+## Section: database_read_replica:
+# All of the connection settings for MySQL read replica
+# Commented options are optional. Uncomment to use.
+# database_read_replica:
+#  # Name of the Secret resource containing MySQL password and TLS secrets
+#  address: 127.0.0.1:3306
+#  database: fleet
+#  username: fleet-ro
+#  ## Password configuration. Pick whether you'd like to load from secret or from an accessible mount path.
+#  ## Added from Secret
+#  secretName: mysql-ro
+#  passwordKey: mysql-ro-password
+#  ## Added from Mount Path
+#  passwordPath: /path/to/password
+#  maxOpenConns: 50
+#  maxIdleConns: 50
+#  connMaxLifetime: 0
+#  tls:
+#    enabled: false
+#    ## Commented options below are optional.  Uncomment to use.
+#    # caCertKey: ca.cert
+#    ## Client certificates require both the certKey and keyKey
+#    # certKey: client.cert
+#    # keyKey: client.key
+#    config: ""
+#    serverName: ""
+
+## Section: cache
+# All of the connection settings for Redis
+cache:
+  address: 127.0.0.1:6379
+  database: "0"
+  usePassword: false
+  secretName: redis
+  passwordKey: redis-password
+
+## Section: GKE
+# Settings that make running on Google Kubernetes Engine easier
+gke:
+  # The CloudSQL Proxy runs as a container in the Fleet Pod that proxies connections to a Cloud SQL instance
+  cloudSQL:
+    enableProxy: false
+    imageRepository: gcr.io/cloudsql-docker/gce-proxy
+    imageTag: 1.17-alpine
+    verbose: true
+    instanceName: ""
+  # The GKE Ingress requires a few changes that other ingress controllers don't
+  ingress:
+    useManagedCertificate: false
+    useGKEIngress: false
+    # 0 to allow the nodeport to be automatically selected, otherwise allowed range (30000-32767)
+    nodePort: 0
+  # Workload Identity allows the K8s service account to assume the IAM permissions of a GCP service account
+  workloadIdentityEmail: ""
+
+## Section: Environment Variables
+# All of the environment variables that can be set for Fleet
+environments:
+  # MDM Settings
+  # The following environment variable is required if you are using
+  # Fleet's macOS MDM features.  In a production environment, it is recommended that
+  # you store this private key in a secret and use envsFrom to reference the secret below.
+  # Leave this as an empty string (the default) when providing the key via
+  # envsFrom below -- entries left empty here are omitted from the rendered
+  # env list, so there won't be a duplicate/conflicting entry for the same
+  # name.
+  # For more information, check out the docs: https://fleetdm.com/docs/configuration/fleet-server-configuration#server-private-key
+  FLEET_SERVER_PRIVATE_KEY: ""
+
+## Section: Environment Variables from Secrets/CMs
+# envsFrom:
+# - name: MY_ENV_NAME_1
+#   valueFrom:
+#     configMapKeyRef:
+#       name: cm-name
+#       key: cm-key-name
+# - name: MY_ENV_NAME_2
+#   valueFrom:
+#     secretKeyRef:
+#       name: secret-name
+#       key: secret-key-name
+
+## Section: MySQL subchart
+## Set mysql.enabled=true to deploy a dev/test MySQL instance.
+## For production, use an external MySQL and leave this disabled.
+## When enabled, also point Fleet to the subchart service and secret:
+##   database.address: <release-name>-mysql:3306
+##   database.secretName: <release-name>-mysql
+mysql:
+  enabled: false
+  auth:
+    rootPassword: ""
+    username: fleet
+    password: ""
+    database: fleet
+
+## Section: Redis/Valkey subchart
+## Set redis.enabled=true to deploy a dev/test Valkey (Redis-compatible) instance.
+## For production, use an external Redis/Valkey and leave this disabled.
+## NOTE: The condition key is "redis.enabled" for backwards compatibility,
+## but the sub-chart is now Valkey (https://valkey.io).
+## When enabled, also point Fleet to the subchart service:
+##   cache.address: <release-name>-valkey:6379
+## If valkey.auth.enabled=true, also set cache.usePassword/cache.secretName/
+## cache.passwordKey to match your Valkey secret configuration.
+redis:
+  enabled: false
+
+valkey:
+  replica:
+    enabled: false
+  auth:
+    enabled: false

@@ -1,0 +1,33 @@
+name: mdm_bridge
+platforms:
+  - windows
+description: Allows querying MDM enrolled devices using "get" commands. Currently, only supports commands that target the device scope. Head to the [Windows configuration profiles (CSPs) documentation](https://learn.microsoft.com/en-us/windows/client-management/mdm/policy-configuration-service-provider) to verify that the setting support the device scope.
+examples: |-
+  Identify Macs that are DEP capable but have not been enrolled to MDM.
+
+  ```
+  SELECT raw_mdm_command_output FROM mdm_bridge WHERE mdm_command_input = '<SyncBody><Get><CmdID>1</CmdID><Item><Target><LocURI>./Device/Vendor/MSFT/Policy/Result/System/AllowTelemetry</LocURI></Target></Item></Get></SyncBody>';
+  ```
+columns:
+  - name: enrollment_status
+    type: text
+    required: false
+    description: Contains the enrollment status of the device, possible values are "device_enrolled" and "device_unenrolled".
+  - name: enrolled_user
+    type: text
+    required: false
+    description: Contains the enrollment URI of the device.
+  - name: mdm_command_input
+    type: text
+    required: false
+    description: The "get" command to execute on the device. If empty, no command is executed and the "enrollment_status" and "enrolled_user" columns are returned.
+  - name: mdm_command_output
+    type: text
+    required: false
+    description: Value of the "Results" field of the MDM command output.
+  - name: raw_mdm_command_output
+    type: text
+    required: false
+    description: The full raw output of the MDM command execution.
+notes: This table is not a core osquery table. It is included as part of Fleet's agent ([fleetd](https://fleetdm.com/docs/get-started/anatomy#fleetd)). This table does not work on Windows Server
+evented: false

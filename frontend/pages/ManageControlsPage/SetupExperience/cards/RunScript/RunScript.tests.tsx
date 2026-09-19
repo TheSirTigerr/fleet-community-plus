@@ -1,0 +1,130 @@
+import { screen, waitFor } from "@testing-library/react";
+import React from "react";
+
+import { createMockMdmConfig } from "__mocks__/configMock";
+import { createGetConfigHandler } from "test/handlers/config-handlers";
+import {
+  createSetupExperienceScriptHandler,
+  errorNoSetupExperienceScriptHandler,
+} from "test/handlers/setup-experience-handlers";
+import { createGetTeamHandler } from "test/handlers/team-handlers";
+import mockServer from "test/mock-server";
+import { createCustomRenderer, createMockRouter } from "test/test-utils";
+
+import RunScript from "./RunScript";
+
+describe("RunScript", () => {
+  it("should render the page description on the empty state when MDM isn't configured", async () => {
+    mockServer.use(errorNoSetupExperienceScriptHandler);
+    mockServer.use(
+      createGetConfigHandler({
+        mdm: createMockMdmConfig({ enabled_and_configured: false }),
+      })
+    );
+    mockServer.use(createGetTeamHandler({}));
+    const render = createCustomRenderer({
+      withBackendMock: true,
+    });
+
+    render(<RunScript router={createMockRouter()} currentTeamId={1} />);
+
+    expect(
+      await screen.findByText(/Turn on MDM and automatic enrollment/i)
+    ).toBeInTheDocument();
+    expect(
+      screen.getByText(/Upload a script to run on macOS hosts/)
+    ).toBeVisible();
+  });
+
+  it("should render the 'Turn on MDM and automatic enrollment' message when MDM isn't configured", async () => {
+    mockServer.use(errorNoSetupExperienceScriptHandler);
+    mockServer.use(
+      createGetConfigHandler({
+        mdm: createMockMdmConfig({ enabled_and_configured: false }),
+      })
+    );
+    mockServer.use(createGetTeamHandler({}));
+    const render = createCustomRenderer({
+      withBackendMock: true,
+    });
+
+    render(<RunScript router={createMockRouter()} currentTeamId={1} />);
+    // Spinner has a 250ms anti-flash delay; the mocked request resolves
+    // before that, so the spinner intentionally never renders here.
+    expect(
+      screen.queryByText(/Turn on MDM and automatic enrollment/i)
+    ).not.toBeInTheDocument();
+    expect(
+      await screen.findByText(/Turn on MDM and automatic enrollment/i)
+    ).toBeInTheDocument();
+  });
+
+  it("should render the 'Turn on MDM and automatic enrollment' message when MDM is configured but not ABM", async () => {
+    mockServer.use(errorNoSetupExperienceScriptHandler);
+    mockServer.use(
+      createGetConfigHandler({
+        mdm: createMockMdmConfig({
+          enabled_and_configured: true,
+          apple_bm_enabled_and_configured: false,
+        }),
+      })
+    );
+    mockServer.use(createGetTeamHandler({}));
+    const render = createCustomRenderer({
+      withBackendMock: true,
+    });
+
+    render(<RunScript router={createMockRouter()} currentTeamId={1} />);
+
+    // Spinner has a 250ms anti-flash delay; the mocked request resolves
+    // before that, so the spinner intentionally never renders here.
+    expect(
+      screen.queryByText(/Turn on MDM and automatic enrollment/i)
+    ).not.toBeInTheDocument();
+    expect(
+      await screen.findByText(/Turn on MDM and automatic enrollment/i)
+    ).toBeInTheDocument();
+  });
+
+  it("should render the script uploader when no script has been uploaded", async () => {
+    mockServer.use(errorNoSetupExperienceScriptHandler);
+    mockServer.use(createGetConfigHandler());
+    mockServer.use(createGetTeamHandler({}));
+    const render = createCustomRenderer({
+      withBackendMock: true,
+    });
+
+    render(<RunScript router={createMockRouter()} currentTeamId={1} />);
+    // Spinner has a 250ms anti-flash delay; the mocked request resolves
+    // before that, so the spinner intentionally never renders here.
+    expect(screen.queryByLabelText("Upload")).not.toBeInTheDocument();
+    await waitFor(async () => {
+      expect(screen.queryByTestId("spinner")).not.toBeInTheDocument();
+    });
+    expect(await screen.findByRole("button", { name: "Upload" })).toBeVisible();
+  });
+
+  it("should render the uploaded script uploader when a script has been uploaded", async () => {
+    mockServer.use(createSetupExperienceScriptHandler());
+    mockServer.use(createGetConfigHandler());
+    mockServer.use(createGetTeamHandler({}));
+    const render = createCustomRenderer({
+      withBackendMock: true,
+    });
+
+    render(<RunScript router={createMockRouter()} currentTeamId={1} />);
+
+    // Spinner has a 250ms anti-flash delay; the mocked request resolves
+    // before that, so the spinner intentionally never renders here.
+    expect(
+      screen.queryByText("Script will run during setup:")
+    ).not.toBeInTheDocument();
+    await waitFor(async () => {
+      expect(screen.queryByTestId("spinner")).not.toBeInTheDocument();
+    });
+    expect(
+      await screen.findByText("Script will run during setup:")
+    ).toBeVisible();
+    expect(await screen.findByText("Test Script.sh")).toBeVisible();
+  });
+});

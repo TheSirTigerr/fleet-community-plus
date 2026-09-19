@@ -1,0 +1,119 @@
+/* eslint-disable @typescript-eslint/explicit-module-boundary-types */
+
+import { IOperatingSystemVersion } from "interfaces/operating_system";
+import { Platform } from "interfaces/platform";
+import sendRequest from "services";
+import endpoints from "utilities/endpoints";
+import { buildQueryStringFromParams } from "utilities/url";
+
+// TODO: add platforms to this constant as new ones are supported
+export const OS_VERSIONS_API_SUPPORTED_PLATFORMS = [
+  "darwin",
+  "windows",
+  "linux",
+  "chrome",
+  "ios",
+  "ipados",
+  "android",
+];
+
+export interface IGetOSVersionsQueryParams {
+  platform?: Platform | "";
+  teamId?: number;
+  os_name?: string;
+  os_version?: string;
+  order_key?: string;
+  order_direction?: string;
+  page?: number;
+  per_page?: number;
+  max_vulnerabilities?: number;
+  query?: string; // filters the platform column
+}
+
+export interface IGetOSVersionsQueryKey extends IGetOSVersionsQueryParams {
+  scope: string;
+}
+
+export interface IOSVersionsResponse {
+  count: number;
+  counts_updated_at: string;
+  os_versions: IOperatingSystemVersion[];
+  meta: {
+    has_next_results: boolean;
+    has_previous_results: boolean;
+  };
+}
+interface IGetOsVersionOptions {
+  os_version_id: number;
+  teamId?: number;
+  max_vulnerabilities?: number;
+}
+
+export interface IGetOsVersionQueryKey extends IGetOsVersionOptions {
+  scope: "osVersionDetails";
+}
+
+export interface IOSVersionResponse {
+  counts_updated_at?: string;
+  os_version: IOperatingSystemVersion;
+}
+
+type IGetOSVersionsRequestQueryParams = Record<
+  string,
+  string | number | undefined
+>;
+
+export const getOSVersions = ({
+  platform,
+  teamId,
+  os_name,
+  os_version,
+  order_key,
+  order_direction,
+  page,
+  per_page,
+  max_vulnerabilities = 0,
+  query = "",
+}: IGetOSVersionsQueryParams = {}): Promise<IOSVersionsResponse> => {
+  const { OS_VERSIONS } = endpoints;
+  let path = OS_VERSIONS;
+
+  const params: IGetOSVersionsRequestQueryParams = {
+    platform,
+    fleet_id: teamId,
+    os_name,
+    os_version,
+    order_key,
+    order_direction,
+    page,
+    per_page,
+    max_vulnerabilities,
+    query,
+  };
+
+  const queryString = buildQueryStringFromParams(params);
+
+  if (queryString) path += `?${queryString}`;
+
+  return sendRequest("GET", path);
+};
+
+const getOSVersion = ({
+  os_version_id,
+  teamId,
+  max_vulnerabilities,
+}: IGetOsVersionOptions): Promise<IOSVersionResponse> => {
+  const endpoint = endpoints.OS_VERSION(os_version_id);
+  const queryString = buildQueryStringFromParams({
+    fleet_id: teamId,
+    max_vulnerabilities,
+  });
+  const path = queryString ? `${endpoint}?${queryString}` : endpoint;
+
+  return sendRequest("GET", path);
+};
+
+export default {
+  getOSVersions,
+  getOSVersion,
+};

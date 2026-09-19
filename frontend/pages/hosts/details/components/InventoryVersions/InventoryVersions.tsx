@@ -1,0 +1,171 @@
+import React from "react";
+
+import Card from "components/Card";
+import DataSet from "components/DataSet";
+import TooltipWrapper from "components/TooltipWrapper";
+import TruncatedTextList from "components/TruncatedTextList";
+import {
+  SoftwareExtensionFor,
+  formatSoftwareType,
+  INSTALLABLE_SOURCE_PLATFORM_CONVERSION,
+  IHostSoftware,
+  ISoftwareInstallVersion,
+  SoftwareSource,
+} from "interfaces/software";
+import { DEFAULT_EMPTY_CELL_VALUE } from "utilities/constants";
+import { dateAgo } from "utilities/date_format";
+
+const baseClass = "inventory-versions";
+
+interface IInventoryVersionProps {
+  version: ISoftwareInstallVersion;
+  source: SoftwareSource;
+  extension_for?: SoftwareExtensionFor;
+  bundleIdentifier?: string;
+}
+
+const InventoryVersion = ({
+  version,
+  source,
+  bundleIdentifier,
+  extension_for,
+}: IInventoryVersionProps) => {
+  const {
+    vulnerabilities,
+    installed_paths: installedPaths,
+    signature_information: signatureInformation,
+  } = version;
+
+  const lastOpenedTitle =
+    INSTALLABLE_SOURCE_PLATFORM_CONVERSION[source] === "linux" ? (
+      <TooltipWrapper tipContent="The last time the package was opened by the end user or accessed by any process on the host.">
+        Last opened
+      </TooltipWrapper>
+    ) : (
+      "Last opened"
+    );
+
+  return (
+    <Card
+      className={`${baseClass}__version`}
+      color="grey"
+      borderRadiusSize="medium"
+    >
+      <div className={`${baseClass}__row`}>
+        <DataSet
+          title="Version"
+          value={version.version || DEFAULT_EMPTY_CELL_VALUE}
+          textOnly
+        />
+        <DataSet
+          title="Type"
+          value={formatSoftwareType({ source, extension_for })}
+          textOnly
+        />
+        {bundleIdentifier && (
+          <DataSet
+            title="Bundle identifier"
+            value={bundleIdentifier}
+            textOnly
+          />
+        )}
+        {version.last_opened_at !== undefined && (
+          <DataSet
+            title={lastOpenedTitle}
+            value={
+              version.last_opened_at !== ""
+                ? dateAgo(version.last_opened_at)
+                : "Never"
+            }
+            textOnly
+          />
+        )}
+        {vulnerabilities && vulnerabilities.length !== 0 && (
+          <DataSet
+            className={`${baseClass}__vulnerabilities`}
+            title="Vulnerabilities"
+            value={<TruncatedTextList items={vulnerabilities} />}
+          />
+        )}
+      </div>
+      {!!installedPaths?.length &&
+        installedPaths.map((path) => {
+          // Find the signature info for this path
+          const sigInfo = signatureInformation?.find(
+            (info) => info.installed_path === path
+          );
+
+          return (
+            <div className={`${baseClass}__sig-info`}>
+              <DataSet orientation="horizontal" title="Path" value={path} />
+              {sigInfo?.hash_sha256 && (
+                <DataSet
+                  orientation="horizontal"
+                  title="Hash"
+                  value={sigInfo.hash_sha256}
+                />
+              )}
+            </div>
+          );
+        })}
+    </Card>
+  );
+};
+
+interface IInventoryVersionsProps {
+  hostSoftware: IHostSoftware;
+  showLabel?: boolean;
+}
+const InventoryVersions = ({
+  hostSoftware,
+  showLabel = true,
+}: IInventoryVersionsProps) => {
+  const installedVersions = hostSoftware.installed_versions;
+
+  if (!installedVersions || installedVersions.length === 0) {
+    return (
+      <div className={baseClass}>
+        <Card
+          className={`${baseClass}__version-details`}
+          color="grey"
+          borderRadiusSize="medium"
+        >
+          <div className={`${baseClass}__row`}>
+            <DataSet
+              title="Type"
+              value={formatSoftwareType({
+                source: hostSoftware.source,
+                extension_for: hostSoftware.extension_for,
+              })}
+            />
+          </div>
+        </Card>
+      </div>
+    );
+  }
+
+  return (
+    <div className={baseClass}>
+      {showLabel && (
+        <div className={`${baseClass}__label`}>
+          Current version{installedVersions.length > 1 && "s"}:
+        </div>
+      )}
+      <div className={`${baseClass}__versions`}>
+        {installedVersions.map((installedVersion) => {
+          return (
+            <InventoryVersion
+              key={installedVersion.version}
+              version={installedVersion}
+              source={hostSoftware.source}
+              bundleIdentifier={hostSoftware.bundle_identifier}
+              extension_for={hostSoftware.extension_for}
+            />
+          );
+        })}
+      </div>
+    </div>
+  );
+};
+
+export default InventoryVersions;

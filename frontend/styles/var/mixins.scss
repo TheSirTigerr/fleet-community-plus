@@ -1,0 +1,545 @@
+$min-width: $break-xs;
+$medium-width: 1024px;
+$desktop-width: 1200px;
+$max-width: 2560px;
+
+@mixin breakpoint($size: desktop) {
+  @if ($size == tablet) {
+    @media (max-width: $medium-width) {
+      @content;
+    }
+  } @else if ($size == ltdesktop) {
+    @media (max-width: ($desktop-width - 1)) {
+      @content;
+    }
+  } @else if ($size == desktop) {
+    @media (min-width: ($medium-width + 1)) {
+      @content;
+    }
+  } @else if ($size == smalldesk) {
+    @media (max-width: 1185px) {
+      @content;
+    }
+  } @else {
+    @content;
+  }
+}
+
+// Apply to the outer header row that contains TeamsHeader + action buttons,
+// NOT to .fleet-dropdown-wrapper itself — the wrapper needs its own
+// `display: inline-block` so FleetsDropdown's absolutely-positioned menu
+// anchors under the button.
+@mixin normalize-team-header {
+  display: flex;
+  align-items: center;
+  height: 38px;
+  justify-content: space-between;
+}
+
+//  Used to keep the settings description sticky under the main nav and sub nav.
+// TODO: figure out how to calculate these values with variables. Will be tedious to change otherwise
+@mixin sticky-settings-description {
+  position: sticky;
+  // this is the current spacing needed to keep the description looking correct under the sub nav when scrolling.
+  top: 104px;
+  z-index: 2;
+  background-color: $core-fleet-white;
+  margin: 0;
+  padding: $pad-xxlarge 0 54px 0;
+}
+
+// Used to create a list item with the item data (name, created at, etc...) on
+// the left and the item actions (download, delete, etc...) on the right.
+@mixin list-item {
+  display: flex;
+  justify-content: space-between;
+  align-items: center;
+
+  &__list-item-data {
+    display: flex;
+    align-items: center;
+  }
+
+  &__list-item-info {
+    margin-left: $pad-medium;
+    display: flex;
+    flex-direction: column;
+  }
+
+  &__list-item-name {
+    font-size: $x-small;
+    font-weight: $bold;
+  }
+
+  &__list-item-uploaded {
+    font-size: $xx-small;
+  }
+
+  &__list-item-actions {
+    display: flex;
+    justify-content: flex-end;
+  }
+
+  &__list-item-button {
+    width: 40px;
+    height: 40px;
+  }
+
+  &__list-item-button:not(:last-child) {
+    margin-right: $pad-medium;
+  }
+}
+
+// used to share styles across the manual enroll mdm modal and the auto enroll mdm modal.
+@mixin enroll-mdm-modal {
+  &__description {
+    margin: $pad-large 0;
+  }
+
+  &__download-button {
+    margin-top: 12px;
+  }
+
+  ol {
+    padding-left: 0;
+  }
+
+  li {
+    margin-bottom: $pad-large;
+    list-style-position: inside;
+  }
+}
+
+@mixin disabled($allow-pointer-events: false) {
+  opacity: 0.5;
+  filter: grayscale(0.5);
+  cursor: default;
+
+  @if $allow-pointer-events {
+    pointer-events: auto; // Allows text selection/scroll in disabled state
+  } @else {
+    pointer-events: none;
+  }
+
+  // Must override
+  &:hover,
+  &:focus {
+    cursor: default;
+  }
+}
+
+@mixin disabled-checkbox {
+  background-color: $ui-fleet-black-25;
+  border-color: $ui-fleet-black-25;
+  pointer-events: none;
+  cursor: default;
+}
+
+@mixin grey-text {
+  color: $ui-fleet-black-50;
+}
+
+@mixin help-text {
+  font-size: $xx-small;
+  font-weight: $regular;
+  @include grey-text;
+
+  .custom-link,
+  button {
+    font-size: inherit;
+  }
+}
+
+@mixin form-label {
+  font-size: $x-small;
+  font-weight: $bold;
+  color: $core-fleet-black;
+}
+
+@mixin link {
+  color: $ui-fleet-black-75;
+  font-weight: $bold;
+  font-size: $x-small;
+  text-decoration: none;
+
+  &:hover:not(.button--default) {
+    color: $core-fleet-black;
+  }
+
+  &:focus-visible {
+    color: $core-fleet-black;
+    outline-color: $core-focused-outline;
+    outline-offset: 1px;
+    outline-style: solid;
+    outline-width: 1px;
+    border-radius: 4px;
+    text-decoration: none;
+  }
+}
+
+@mixin cell-with-link {
+  display: inline-flex;
+  align-items: center;
+  justify-content: space-between;
+  width: 100%;
+}
+
+@mixin ellipse-text($max-width: auto) {
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+  max-width: $max-width;
+}
+
+@mixin color-contrasted-sections {
+  .section {
+    display: flex;
+    flex-direction: column;
+    background-color: $core-fleet-white;
+    border-radius: 16px;
+    border: 1px solid $ui-fleet-black-10;
+    padding: $pad-xxlarge;
+    box-shadow: 0px 3px 0px rgba(226, 228, 234, 0.4);
+  }
+}
+
+@mixin tooltip-text {
+  width: max-content;
+  max-width: 280px;
+  padding: 6px;
+  color: $static-white;
+  background-color: $tooltip-bg;
+  font-weight: $regular;
+  font-size: $xx-small;
+  border-radius: 4px;
+  box-sizing: border-box;
+  z-index: 100;
+  line-height: 1.375;
+  white-space: initial;
+  text-align: left;
+
+  // Hyphenated words will still break at hyphens first
+  //  while non-hyphenated strings will break only when necessary
+  overflow-wrap: break-word; // Preferred property for modern browsers
+  word-wrap: break-word; // Fallback for older browsers e.g. IE
+  word-break: break-word; // Ensures words break when necessary
+
+  p {
+    margin: 0;
+  }
+}
+
+@mixin flex-column-32px-gap {
+  display: flex;
+  flex-direction: column;
+  gap: px-to-rem(32);
+}
+
+@mixin flex-column-24px-gap {
+  display: flex;
+  flex-direction: column;
+  gap: $gap-page-component;
+}
+
+@mixin flex-column-16px-gap {
+  display: flex;
+  flex-direction: column;
+  gap: $pad-medium;
+}
+
+@mixin flex-column-8px-gap {
+  display: flex;
+  flex-direction: column;
+  gap: $pad-small;
+}
+
+@mixin flex-column-4px-gap {
+  display: flex;
+  flex-direction: column;
+  gap: $pad-xsmall;
+}
+
+@mixin vertical-form-layout {
+  @include flex-column-24px-gap;
+}
+
+@mixin vertical-page-layout {
+  @include flex-column-24px-gap;
+}
+
+// Separate in case there's any card level styling we need
+@mixin vertical-card-layout {
+  @include flex-column-24px-gap;
+}
+
+// Separate in case there's any modal level styling we need
+@mixin vertical-modal-layout {
+  @include flex-column-24px-gap;
+}
+
+// Separate in case there's any tab level styling we need
+@mixin vertical-page-tab-panel-layout {
+  @include flex-column-24px-gap;
+}
+
+@mixin vertical-data-set-layout {
+  @include flex-column-16px-gap;
+}
+
+// Row above a list/table body carrying a left-aligned description or heading
+// and an optional right-aligned action button (e.g. "Add profile"). Used by
+// every ManageControlsPage tab-panel that renders a list under a tab.
+@mixin tab-header {
+  display: flex;
+  justify-content: space-between;
+  align-items: flex-start;
+  gap: $pad-medium;
+}
+
+@mixin button-dropdown {
+  .form-field {
+    margin: 0;
+  }
+
+  .Select {
+    position: relative;
+    border: 0;
+    height: auto;
+
+    &.is-focused,
+    &:hover {
+      border: 0;
+    }
+
+    &.is-focused:not(.is-open) {
+      .Select-control {
+        background-color: initial;
+      }
+    }
+
+    .Select-control {
+      display: flex;
+      background-color: initial;
+      height: auto;
+      justify-content: space-between;
+      border: 0;
+      cursor: pointer;
+
+      &:hover {
+        box-shadow: none;
+      }
+
+      &:hover .Select-placeholder {
+        color: $core-vibrant-blue;
+      }
+
+      .Select-placeholder {
+        font-size: 14px;
+        line-height: normal;
+        padding-left: 0;
+        margin-top: 1px;
+      }
+
+      .Select-input {
+        height: auto;
+
+        // When tabbing
+        &:focus-visible {
+          outline: 2px solid $core-fleet-black;
+          outline-offset: 1px;
+          border-radius: 4px;
+        }
+      }
+
+      .Select-arrow-zone {
+        display: flex;
+      }
+    }
+
+    .Select-placeholder {
+      display: flex;
+      align-items: center;
+    }
+
+    .Select-menu-outer {
+      margin-top: $pad-xsmall;
+      box-shadow: 0 2px 6px rgba(0, 0, 0, 0.1);
+      border-radius: $border-radius;
+      z-index: 6;
+      overflow: hidden;
+      border: 0;
+      width: 188px;
+      left: unset;
+      top: unset;
+      max-height: none;
+      padding: $pad-small;
+      position: absolute;
+
+      .Select-menu {
+        max-height: none;
+      }
+    }
+
+    .Select-arrow {
+      transition: transform 0.25s ease;
+    }
+
+    &:not(.is-open) {
+      .Select-control:hover .Select-arrow {
+        content: url("../assets/images/icon-chevron-blue-16x16@2x.png");
+      }
+    }
+
+    &.is-open {
+      .Select-control .Select-placeholder {
+        color: $core-vibrant-blue;
+      }
+
+      .Select-arrow {
+        transform: rotate(180deg);
+      }
+    }
+  }
+}
+
+@mixin tooltip5-arrow-styles {
+  // arrow styles directly from react-tooltip-5 css
+  .react-tooltip-arrow {
+    width: 8px;
+    height: 8px;
+  }
+  [class*="react-tooltip__place-top"] > .styles-module_arrow__K0L3T {
+    transform: rotate(45deg);
+  }
+  [class*="react-tooltip__place-right"] > .styles-module_arrow__K0L3T {
+    transform: rotate(135deg);
+  }
+  [class*="react-tooltip__place-bottom"] > .styles-module_arrow__K0L3T {
+    transform: rotate(225deg);
+  }
+  [class*="react-tooltip__place-left"] > .styles-module_arrow__K0L3T {
+    transform: rotate(315deg);
+  }
+}
+
+@mixin side-nav-list {
+  position: -webkit-sticky;
+  position: sticky;
+  // this is the spacing needed to make the sticky form nav position correctly when scrolling
+  // TODO: find a way to calculate these sticky positions this and use variables.
+  //  will be tedious to update otherwise.
+  top: 217px;
+  width: clamp(200px, 25vw, 260px);
+  padding: 0 clamp(48px, 6.25vw, 64px) 0 0;
+  list-style: none;
+  font-size: $x-small;
+  display: flex;
+  flex-direction: column;
+  gap: $pad-small;
+  margin: 0;
+}
+
+@mixin side-nav-item {
+  white-space: nowrap;
+  height: 32px;
+  border-radius: 4px;
+
+  a,
+  span.link-with-context // Disabled side nav item
+  {
+    display: flex;
+    align-items: center;
+    height: 100%;
+    padding: 0 16px;
+    color: $ui-fleet-black-75;
+    font-weight: $regular;
+    text-decoration: none;
+    border-bottom: none;
+  }
+
+  a {
+    cursor: pointer;
+    &:hover {
+      color: $ui-fleet-black-75-over;
+    }
+    // TooltipTruncatedText's inner element sets `cursor: default`; inherit so
+    // the whole nav-item label reads as clickable.
+    .component__tooltip-wrapper__element {
+      cursor: inherit;
+    }
+  }
+
+  &:has(a):hover {
+    background-color: $ui-fleet-black-5;
+  }
+
+  &--active {
+    background-color: $ui-fleet-black-5;
+    a {
+      font-weight: $bold;
+      color: $core-fleet-black;
+      * > .__react_component_tooltip {
+        font-weight: initial;
+      }
+    }
+  }
+}
+
+@mixin tab-empty-state {
+  display: flex;
+  flex-direction: column;
+  align-items: center;
+  border: 1px solid $ui-fleet-black-10;
+  border-radius: $pad-xsmall;
+  padding: $pad-xxlarge;
+  gap: $pad-large;
+  font-size: $small;
+  p {
+    margin: 0;
+    @include help-text;
+  }
+}
+
+@mixin gradient-background {
+  background-image: linear-gradient(
+    180deg,
+    $gradient-background 0%,
+    $core-fleet-white 100%
+  );
+  background-size: 100% 150px; // Must do this or gradient can be different heights on different pages
+  background-repeat: no-repeat;
+  background-color: $core-fleet-white; // area below gradient — transitionable
+}
+
+// Shared styling for a search input rendered inside a dropdown menu (icon on
+// the left, 36px tall, Fleet-black-10 border). Used by FleetsDropdown,
+// CategoryFilter, and ActivityTypeDropdown.
+// TODO: extend Fleet's SearchField / InputFieldWithIcon to cover this
+// pattern — out of scope for the FleetsDropdown rework.
+@mixin menu-search-input {
+  width: 100%;
+  height: 36px;
+  box-sizing: border-box;
+  padding: 9.5px 12px 9.5px 36px;
+  line-height: $line-height;
+  font-family: "Inter", sans-serif;
+  font-size: $x-small;
+  color: $core-fleet-black;
+  background-color: $core-fleet-white;
+  border: solid 1px $ui-fleet-black-10;
+  border-radius: $border-radius;
+
+  &::placeholder {
+    color: $ui-fleet-black-50;
+  }
+
+  &:hover,
+  &:focus {
+    outline: none;
+    border-color: $ui-fleet-black-75;
+
+    + .icon svg path {
+      fill: $ui-fleet-black-75;
+    }
+  }
+}

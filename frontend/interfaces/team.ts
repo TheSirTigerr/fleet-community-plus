@@ -1,0 +1,179 @@
+import PropTypes from "prop-types";
+
+import {
+  IAppleDeviceUpdates,
+  IConfigFeatures,
+  IWebhookSettings,
+} from "./config";
+import enrollSecretInterface, { IEnrollSecret } from "./enroll_secret";
+import { ITeamIntegrations } from "./integration";
+import { EndUserLocalAccountType, ITokenFleet, ITokenTeam } from "./mdm";
+import { UserRole } from "./user";
+
+export default PropTypes.shape({
+  id: PropTypes.number.isRequired,
+  created_at: PropTypes.string,
+  name: PropTypes.string.isRequired,
+  description: PropTypes.string,
+  agent_options: PropTypes.object, // eslint-disable-line react/forbid-prop-types
+  role: PropTypes.any, // eslint-disable-line react/forbid-prop-types
+  // role value is included when the team is in the context of a user
+  user_count: PropTypes.number,
+  host_count: PropTypes.number,
+  secrets: PropTypes.arrayOf(enrollSecretInterface),
+});
+
+/**
+ * The id, name, description, and host count for a team entity
+ */
+export interface ITeamSummary {
+  id: number;
+  name: string;
+  description?: string;
+  host_count?: number;
+}
+
+/**
+ * The shape of a team entity excluding integrations and webhook settings
+ */
+export interface ITeam extends ITeamSummary {
+  uuid?: string;
+  display_text?: string;
+  count?: number;
+  created_at?: string;
+  features?: IConfigFeatures;
+  agent_options?: Record<string, unknown>;
+  user_count?: number;
+  host_count?: number;
+  secrets?: IEnrollSecret[];
+  role?: UserRole; // role value is included when the team is in the context of a user
+  mdm?: {
+    /** @deprecated Virtual key: true only when all per-platform disk
+    encryption settings (`apple_settings`, `windows_settings`,
+    `linux_settings`) are enabled. Read the per-platform fields instead. */
+    enable_disk_encryption: boolean;
+    enable_recovery_lock_password: boolean;
+    name_template?: string;
+    /** @deprecated Use `windows_settings.require_bitlocker_pin`. */
+    windows_require_bitlocker_pin: boolean;
+    macos_updates: IAppleDeviceUpdates;
+    ios_updates: IAppleDeviceUpdates;
+    ipados_updates: IAppleDeviceUpdates;
+    apple_settings: {
+      configuration_profiles: null; // TODO: types?
+      enable_disk_encryption: boolean;
+      enable_escrow_disk_encryption_key?: boolean;
+    };
+    setup_experience: {
+      macos_bootstrap_package: string | null;
+      enable_end_user_authentication: boolean;
+      apple_setup_assistant: string | null;
+      apple_enable_release_device_manually: boolean | null;
+      macos_manual_agent_install: boolean | null;
+      require_all_software_macos: boolean | null;
+      require_all_software_windows: boolean | null;
+      lock_end_user_info: boolean | null;
+      enable_create_local_admin_account?: boolean;
+      end_user_local_account_type?: EndUserLocalAccountType;
+    };
+    macos_setup?: {
+      enable_managed_local_account?: boolean;
+    };
+    windows_settings?: {
+      enable_disk_encryption?: boolean;
+      require_bitlocker_pin?: boolean;
+      enable_managed_local_account?: boolean;
+    };
+    linux_settings?: {
+      enable_escrow_disk_encryption_key?: boolean;
+    };
+    windows_updates: {
+      deadline_days: number | null;
+      grace_period_days: number | null;
+    };
+  };
+  host_expiry_settings?: {
+    host_expiry_enabled: boolean;
+    host_expiry_window: number; // days
+  };
+}
+
+/**
+ * The webhook settings of a team
+ */
+export type ITeamWebhookSettings = Pick<
+  IWebhookSettings,
+  | "vulnerabilities_webhook"
+  | "failing_policies_webhook"
+  | "host_status_webhook"
+  | "host_activities_webhook"
+>;
+
+/**
+ * The integrations and webhook settings of a team
+ */
+export interface ITeamAutomationsConfig {
+  webhook_settings: ITeamWebhookSettings;
+  integrations: ITeamIntegrations;
+}
+
+/**
+ * The shape of a team entity including integrations and webhook settings
+ */
+export type ITeamConfig = ITeam & ITeamAutomationsConfig;
+
+/**
+ * The shape of a new user to add to a team
+ */
+export interface INewTeamUser {
+  id: number;
+  role: UserRole;
+}
+
+/**
+ * The shape of the body expected from the API when adding new users to teams
+ */
+export interface INewTeamUsersFormData {
+  users: INewTeamUser[];
+}
+export interface IRemoveTeamUserFormData {
+  users: { id?: number }[];
+}
+interface INewTeamSecret {
+  team_id: number;
+  secret: string;
+  created_at?: string;
+}
+export interface INewTeamSecretFormData {
+  secrets: INewTeamSecret[];
+}
+export interface IRemoveTeamSecretFormData {
+  secrets: { secret: string }[];
+}
+
+export const API_ALL_TEAMS_ID = undefined;
+export const APP_CONTEXT_ALL_TEAMS_ID = -1;
+export const APP_CONTEXT_ALL_TEAMS_SUMMARY: ITeamSummary = {
+  id: APP_CONTEXT_ALL_TEAMS_ID,
+  name: "All fleets",
+} as const;
+
+export const API_NO_TEAM_ID = 0;
+export const APP_CONTEXT_NO_TEAM_ID = 0;
+export const APP_CONTEXT_NO_TEAM_SUMMARY: ITeamSummary = {
+  id: APP_CONTEXT_NO_TEAM_ID,
+  name: "Unassigned",
+} as const;
+
+export const isAnyTeamSelected = (currentTeamId?: number) =>
+  currentTeamId !== undefined && currentTeamId > APP_CONTEXT_NO_TEAM_ID;
+
+export const getTeamDisplayName = (team: ITokenTeam) =>
+  team.team_id === APP_CONTEXT_NO_TEAM_ID
+    ? APP_CONTEXT_NO_TEAM_SUMMARY.name
+    : team.name;
+
+export const getFleetDisplayName = (fleet: ITokenFleet) =>
+  fleet.fleet_id === APP_CONTEXT_NO_TEAM_ID
+    ? APP_CONTEXT_NO_TEAM_SUMMARY.name
+    : fleet.name;

@@ -1,0 +1,604 @@
+import { isEmpty } from "lodash";
+import React, { useMemo, useRef, useState } from "react";
+import { useQuery } from "react-query";
+import { InjectedRouter } from "react-router";
+
+import { SoftwareInstallDetailsModal } from "components/ActivityDetails/InstallDetails/SoftwareInstallDetailsModal/SoftwareInstallDetailsModal";
+import SoftwareIpaInstallDetailsModal from "components/ActivityDetails/InstallDetails/SoftwareIpaInstallDetailsModal";
+import SoftwareScriptDetailsModal from "components/ActivityDetails/InstallDetails/SoftwareScriptDetailsModal/SoftwareScriptDetailsModal";
+import SoftwareUninstallDetailsModal, {
+  ISWUninstallDetailsParentState,
+} from "components/ActivityDetails/InstallDetails/SoftwareUninstallDetailsModal/SoftwareUninstallDetailsModal";
+import VppInstallDetailsModal from "components/ActivityDetails/InstallDetails/VppInstallDetailsModal";
+import { IShowActivityDetailsData } from "components/ActivityItem/ActivityItem";
+import DataError from "components/DataError";
+import EmptyState from "components/EmptyState";
+import IconStatusMessage from "components/IconStatusMessage";
+import FailedEnrollmentProfileModal, {
+  IFailedEnrollmentProfileModalProps,
+} from "components/modals/FailedEnrollmentProfileModal";
+import ShowQueryModal from "components/modals/ShowQueryModal";
+import Pagination from "components/Pagination";
+import Spinner from "components/Spinner";
+import {
+  ActivityType,
+  IActivityDetails,
+  IActivityDetailsWithActor,
+} from "interfaces/activity";
+import { PerformanceImpactIndicator } from "interfaces/schedulable_query";
+import {
+  resolveUninstallStatus,
+  SoftwareInstallUninstallStatus,
+  SCRIPT_PACKAGE_SOURCES,
+} from "interfaces/software";
+import MdmCommandDetailsModal, {
+  getIconName,
+  getVerbForCommandStatus,
+} from "pages/hosts/components/CommandDetailsModal";
+import { getDisplayedSoftwareName } from "pages/SoftwarePage/helpers";
+import paths from "router/paths";
+import activitiesAPI, {
+  IActivitiesResponse,
+} from "services/entities/activities";
+import {
+  formatMdmCommandNameForActivityItem,
+  getMdmCommandDisplayName,
+} from "utilities/activityHelpers";
+import { timeAgo } from "utilities/date_format";
+import { getPerformanceImpactDescription } from "utilities/helpers";
+
+import ActivityAutomationDetailsModal from "./components/ActivityAutomationDetailsModal";
+import ActivityFeedFilters from "./components/ActivityFeedFilters";
+import AppStoreDetailsModal from "./components/AppStoreDetailsModal/AppStoreDetailsModal";
+import SoftwareDetailsModal from "./components/LibrarySoftwareDetailsModal";
+import RunScriptDetailsModal from "./components/RunScriptDetailsModal/RunScriptDetailsModal";
+import GlobalActivityItem from "./GlobalActivityItem";
+
+const baseClass = "activity-feed";
+interface IActvityCardProps {
+  setShowActivityFeedTitle: (showActivityFeedTitle: boolean) => void;
+  setRefetchActivities: (refetch: () => void) => void;
+  isPremiumTier: boolean;
+  router: InjectedRouter;
+}
+
+const DEFAULT_PAGE_SIZE = 8;
+
+const generateDateFilter = (dateFilter: string) => {
+  const startDate = new Date();
+  const endDate = new Date();
+
+  switch (dateFilter) {
+    case "all":
+      return {
+        startDate: "",
+        endDate: "",
+      };
+    case "today":
+      startDate.setHours(0, 0, 0, 0);
+      endDate.setHours(23, 59, 59, 999);
+      break;
+    case "yesterday":
+      startDate.setDate(startDate.getDate() - 1);
+      startDate.setHours(0, 0, 0, 0);
+      endDate.setDate(endDate.getDate() - 1);
+      endDate.setHours(23, 59, 59, 999);
+      break;
+    case "7d":
+      startDate.setDate(startDate.getDate() - 7);
+      break;
+    case "30d":
+      startDate.setDate(startDate.getDate() - 30);
+      break;
+    case "3m":
+      startDate.setMonth(startDate.getMonth() - 3);
+      break;
+    case "12m":
+      startDate.setMonth(startDate.getMonth() - 12);
+      break;
+    default:
+      break;
+  }
+
+  return {
+    startDate: startDate.toISOString(),
+    endDate: endDate.toISOString(),
+  }; // We convert to seconds since epoch as that is what the backend expects
+};
+
+const ActivityFeed = ({
+  setShowActivityFeedTitle,
+  setRefetchActivities,
+  isPremiumTier,
+  router,
+}: IActvityCardProps): JSX.Element => {
+  const [pageIndex, setPageIndex] = useState(0);
+  const [showShowQueryModal, setShowShowQueryModal] = useState(false);
+  const [showScriptDetailsModal, setShowScriptDetailsModal] = useState(false);
+  const [
+    packageInstallDetails,
+    setPackageInstallDetails,
+  ] = useState<IActivityDetails | null>(null); // Also includes Android Play Store installs
+  const [
+    scriptPackageDetails,
+    setScriptPackageDetails,
+  ] = useState<IActivityDetails | null>(null);
+  const [
+    ipaPackageInstallDetails,
+    setIpaPackageInstallDetails,
+  ] = useState<IActivityDetailsWithActor | null>(null);
+  const [
+    packageUninstallDetails,
+    setPackageUninstallDetails,
+  ] = useState<ISWUninstallDetailsParentState | null>(null);
+  const [
+    vppInstallDetails,
+    setVppInstallDetails,
+  ] = useState<IActivityDetailsWithActor | null>(null);
+  const [
+    activityAutomationDetails,
+    setActivityAutomationDetails,
+  ] = useState<IActivityDetails | null>(null);
+  const [
+    softwareDetails,
+    setSoftwareDetails,
+  ] = useState<IActivityDetails | null>(null);
+  const [
+    appStoreDetails,
+    setAppStoreDetails,
+  ] = useState<IActivityDetails | null>(null);
+  const [
+    enrollmentProfileFailedDetails,
+    setEnrollmentProfileFailedDetails,
+  ] = useState<Omit<IFailedEnrollmentProfileModalProps, "onDone"> | null>(null);
+  const [mdmCommandActivityDetails, setMdmCommandActivityDetails] = useState<{
+    host_uuid?: string;
+    command_uuid: string;
+    actor_full_name?: string;
+    host_display_name?: string;
+    request_type?: string;
+  } | null>(null);
+
+  const [searchQuery, setSearchQuery] = useState("");
+  const [createdAtDirection, setCreatedAtDirection] = useState("desc");
+  const [dateFilter, setDateFilter] = useState("all");
+  const [typeFilter, setTypeFilter] = useState<string[]>([""]);
+
+  const queryShown = useRef("");
+  const queryImpact = useRef<PerformanceImpactIndicator | undefined>(undefined);
+  const scriptExecutionId = useRef("");
+
+  const { startDate, endDate } = useMemo(() => generateDateFilter(dateFilter), [
+    dateFilter,
+  ]);
+
+  const {
+    data: activitiesData,
+    error: errorActivities,
+    isFetching: isFetchingActivities,
+    refetch,
+  } = useQuery<
+    IActivitiesResponse,
+    Error,
+    IActivitiesResponse,
+    Array<{
+      scope: string;
+      pageIndex: number;
+      perPage: number;
+      query?: string;
+      orderDirection?: string;
+      startDate?: string;
+      endDate?: string;
+      typeFilter?: string[];
+    }>
+  >(
+    [
+      {
+        scope: "activities",
+        pageIndex,
+        perPage: DEFAULT_PAGE_SIZE,
+        query: searchQuery,
+        orderDirection: createdAtDirection,
+        startDate,
+        endDate,
+        typeFilter,
+      },
+    ],
+    ({
+      queryKey: [
+        {
+          pageIndex: page,
+          perPage,
+          query,
+          orderDirection,
+          startDate: queryStartDate,
+          endDate: queryEndDate,
+          typeFilter: queryTypeFilter,
+        },
+      ],
+    }) => {
+      return activitiesAPI.loadNext(
+        page,
+        perPage,
+        query,
+        orderDirection,
+        queryStartDate,
+        queryEndDate,
+        queryTypeFilter
+      );
+    },
+    {
+      keepPreviousData: true,
+      staleTime: 5000,
+      onSuccess: () => {
+        setShowActivityFeedTitle(true);
+      },
+      onError: () => {
+        setShowActivityFeedTitle(true);
+      },
+    }
+  );
+
+  setRefetchActivities(refetch);
+
+  const onLoadPrevious = () => {
+    setPageIndex(pageIndex - 1);
+  };
+
+  const onLoadNext = () => {
+    setPageIndex(pageIndex + 1);
+  };
+
+  const handleDetailsClick = ({
+    type,
+    details,
+    actor_full_name,
+    fleet_initiated,
+  }: IShowActivityDetailsData) => {
+    switch (type) {
+      case ActivityType.LiveQuery:
+        queryShown.current = details?.query_sql ?? "";
+        queryImpact.current = details?.stats
+          ? getPerformanceImpactDescription(details.stats)
+          : undefined;
+        setShowShowQueryModal(true);
+        break;
+      case ActivityType.RanScript:
+        scriptExecutionId.current = details?.script_execution_id ?? "";
+        setShowScriptDetailsModal(true);
+        break;
+      case ActivityType.InstalledSoftware:
+        if (SCRIPT_PACKAGE_SOURCES.includes(details?.source || "")) {
+          setScriptPackageDetails({ ...details });
+        } else {
+          details?.command_uuid
+            ? setIpaPackageInstallDetails({
+                ...details,
+                actor_full_name,
+                fleet_initiated,
+              })
+            : setPackageInstallDetails({ ...details });
+        }
+        break;
+      case ActivityType.UninstalledSoftware:
+        setPackageUninstallDetails({
+          ...details,
+          softwareName: getDisplayedSoftwareName(
+            details?.software_title,
+            details?.software_display_name
+          ),
+          uninstallStatus: resolveUninstallStatus(details?.status),
+          scriptExecutionId: details?.script_execution_id || "",
+          hostDisplayName: details?.host_display_name,
+        });
+        break;
+      case ActivityType.InstalledAppStoreApp:
+        // Apple VPP + Android installs. Envelope actor fields ride along so
+        // the modal can render the actor-driven failure copy per Figma.
+        setVppInstallDetails({ ...details, actor_full_name, fleet_initiated });
+        break;
+      case ActivityType.EnabledActivityAutomations:
+      case ActivityType.EditedActivityAutomations:
+        setActivityAutomationDetails({ ...details });
+        break;
+      case ActivityType.AddedSoftware:
+      case ActivityType.EditedSoftware:
+      case ActivityType.DeletedSoftware:
+        setSoftwareDetails({ ...details });
+        break;
+      case ActivityType.AddedAppStoreApp:
+      case ActivityType.EditedAppStoreApp:
+      case ActivityType.DeletedAppStoreApp:
+        setAppStoreDetails({ ...details });
+        break;
+      case ActivityType.RanScriptBatch:
+      case ActivityType.CanceledScriptBatch:
+        router.push(
+          paths.CONTROLS_SCRIPTS_BATCH_DETAILS(
+            details?.batch_execution_id || ""
+          )
+        );
+        break;
+      case ActivityType.FailedEnrollmentProfileRenewal:
+        setEnrollmentProfileFailedDetails({
+          command: {
+            command_uuid: details?.command_uuid || "",
+          },
+        });
+        break;
+      case ActivityType.RanCustomMdmCommand: {
+        if (!details?.command_uuid) {
+          break;
+        }
+        setMdmCommandActivityDetails({
+          command_uuid: details.command_uuid,
+          host_uuid: details?.host_uuid,
+          actor_full_name,
+          host_display_name: details?.host_display_name,
+          request_type: details?.request_type,
+        });
+        break;
+      }
+      default:
+        break;
+    }
+  };
+
+  const renderError = () => {
+    return <DataError verticalPaddingSize="pad-large" />;
+  };
+
+  const renderNoActivities = () => {
+    return (
+      <EmptyState
+        variant="list"
+        header="No activities match the current criteria"
+        info="Try editing a report, updating your policies, or running a live report."
+      />
+    );
+  };
+
+  // Renders opaque information as activity feed is loading
+  const opacity = isFetchingActivities ? { opacity: 0.4 } : { opacity: 1 };
+
+  const activities = activitiesData?.activities;
+  const meta = activitiesData?.meta;
+
+  return (
+    <div className={baseClass}>
+      <ActivityFeedFilters
+        searchQuery={searchQuery}
+        typeFilter={typeFilter}
+        dateFilter={dateFilter}
+        createdAtDirection={createdAtDirection}
+        setSearchQuery={setSearchQuery}
+        setTypeFilter={setTypeFilter}
+        setDateFilter={setDateFilter}
+        setCreatedAtDirection={setCreatedAtDirection}
+        setPageIndex={setPageIndex}
+      />
+      {errorActivities && renderError()}
+      {!errorActivities && !isFetchingActivities && isEmpty(activities) ? (
+        renderNoActivities()
+      ) : (
+        <>
+          {isFetchingActivities && (
+            <div className="spinner">
+              <Spinner />
+            </div>
+          )}
+          <div style={opacity}>
+            {activities?.map((activity) => (
+              <GlobalActivityItem
+                activity={activity}
+                isPremiumTier={isPremiumTier}
+                onDetailsClick={handleDetailsClick}
+                key={activity.id}
+              />
+            ))}
+          </div>
+        </>
+      )}
+      {!errorActivities &&
+        (!isEmpty(activities) || (isEmpty(activities) && pageIndex > 0)) && (
+          <Pagination
+            disablePrev={isFetchingActivities || !meta?.has_previous_results}
+            disableNext={isFetchingActivities || !meta?.has_next_results}
+            hidePagination={
+              !isFetchingActivities &&
+              !meta?.has_previous_results &&
+              !meta?.has_next_results
+            }
+            onPrevPage={onLoadPrevious}
+            onNextPage={onLoadNext}
+          />
+        )}
+      {showShowQueryModal && (
+        <ShowQueryModal
+          query={queryShown.current}
+          impact={queryImpact.current}
+          onCancel={() => setShowShowQueryModal(false)}
+        />
+      )}
+      {showScriptDetailsModal && (
+        <RunScriptDetailsModal
+          scriptExecutionId={scriptExecutionId.current}
+          onCancel={() => setShowScriptDetailsModal(false)}
+        />
+      )}
+      {packageInstallDetails && (
+        <SoftwareInstallDetailsModal
+          details={packageInstallDetails}
+          onCancel={() => setPackageInstallDetails(null)}
+        />
+      )}
+      {scriptPackageDetails && (
+        <SoftwareScriptDetailsModal
+          details={scriptPackageDetails}
+          onCancel={() => setScriptPackageDetails(null)}
+        />
+      )}
+      {ipaPackageInstallDetails && (
+        <SoftwareIpaInstallDetailsModal
+          details={{
+            appName: getDisplayedSoftwareName(
+              ipaPackageInstallDetails.software_title,
+              ipaPackageInstallDetails.software_display_name
+            ),
+            fleetInstallStatus: (ipaPackageInstallDetails.status ||
+              "pending_install") as SoftwareInstallUninstallStatus,
+            hostDisplayName: ipaPackageInstallDetails.host_display_name || "",
+            commandUuid: ipaPackageInstallDetails.command_uuid || "",
+            failureReason: ipaPackageInstallDetails.failure_reason,
+            actorFullName: ipaPackageInstallDetails.actor_full_name,
+            fleetInitiated: ipaPackageInstallDetails.fleet_initiated,
+            selfService: ipaPackageInstallDetails.self_service,
+          }}
+          onCancel={() => setIpaPackageInstallDetails(null)}
+        />
+      )}
+      {packageUninstallDetails && (
+        <SoftwareUninstallDetailsModal
+          {...packageUninstallDetails}
+          hostDisplayName={packageUninstallDetails.hostDisplayName || ""}
+          onCancel={() => setPackageUninstallDetails(null)}
+        />
+      )}
+      {vppInstallDetails && (
+        <VppInstallDetailsModal
+          details={{
+            appName: getDisplayedSoftwareName(
+              vppInstallDetails.software_title,
+              vppInstallDetails.software_display_name
+            ),
+            fleetInstallStatus: (vppInstallDetails.status ||
+              "pending_install") as SoftwareInstallUninstallStatus,
+            hostDisplayName: vppInstallDetails.host_display_name || "",
+            commandUuid: vppInstallDetails.command_uuid || "",
+            platform: vppInstallDetails.host_platform,
+            failureReason: vppInstallDetails.failure_reason,
+            actorFullName: vppInstallDetails.actor_full_name,
+            fleetInitiated: vppInstallDetails.fleet_initiated,
+            selfService: vppInstallDetails.self_service,
+          }}
+          onCancel={() => setVppInstallDetails(null)}
+        />
+      )}
+      {activityAutomationDetails && (
+        <ActivityAutomationDetailsModal
+          details={activityAutomationDetails}
+          onCancel={() => setActivityAutomationDetails(null)}
+        />
+      )}
+      {softwareDetails && (
+        <SoftwareDetailsModal
+          details={softwareDetails}
+          onCancel={() => setSoftwareDetails(null)}
+        />
+      )}
+      {appStoreDetails && (
+        <AppStoreDetailsModal
+          details={appStoreDetails}
+          onCancel={() => setAppStoreDetails(null)}
+        />
+      )}
+      {enrollmentProfileFailedDetails && (
+        <FailedEnrollmentProfileModal
+          command={enrollmentProfileFailedDetails.command}
+          onDone={() => setEnrollmentProfileFailedDetails(null)}
+        />
+      )}
+      {!!mdmCommandActivityDetails && (
+        <MdmCommandDetailsModal
+          command={mdmCommandActivityDetails}
+          contentBody={(cls, result) => {
+            const isDeleted = result.status === "Deleted";
+            const isPending = getIconName(result.status) === "pending-outline";
+            const cmdDisplayName = getMdmCommandDisplayName(
+              isDeleted
+                ? mdmCommandActivityDetails.request_type
+                : result.request_type
+            );
+            const timeAgoText = result.updated_at
+              ? ` (${timeAgo(new Date(result.updated_at), {
+                  addSuffix: true,
+                })})`
+              : "";
+
+            if (isDeleted) {
+              // no result -- likely the host was wiped and re-enrolled since.
+              // Use the activity's own details, captured at click-time,
+              // instead of the (empty) fetched result. Both fields are
+              // optional on that captured state, so guard against a leading
+              // "ran ..." with no actor and a bare "on ." with no hostname.
+              const {
+                actor_full_name: actorText,
+                host_display_name: hostText,
+              } = mdmCommandActivityDetails;
+              return (
+                <>
+                  <IconStatusMessage
+                    className={`${cls}__status-message`}
+                    iconName="info-outline"
+                    message={
+                      <span>
+                        {actorText && <b>{actorText}</b>}
+                        {actorText ? " ran " : "Ran "}
+                        {formatMdmCommandNameForActivityItem(
+                          mdmCommandActivityDetails.request_type
+                        )}
+                        {" on "}
+                        {hostText ? <b>{hostText}</b> : "this host"}
+                        {"."}
+                      </span>
+                    }
+                  />
+                  <div>This command has been deleted.</div>
+                </>
+              );
+            }
+
+            return (
+              <IconStatusMessage
+                className={`${cls}__status-message`}
+                iconName={getIconName(result.status)}
+                message={
+                  isPending ? (
+                    <span>
+                      {cmdDisplayName ? (
+                        <>
+                          {"The "}
+                          <b>{cmdDisplayName}</b>
+                          {" custom MDM command"}
+                        </>
+                      ) : (
+                        "A custom MDM command"
+                      )}
+                      {" is pending on "}
+                      <b>{result.hostname}</b>
+                      {`${timeAgoText}.`}
+                    </span>
+                  ) : (
+                    <span>
+                      {mdmCommandActivityDetails.actor_full_name && (
+                        <b>{mdmCommandActivityDetails.actor_full_name}</b>
+                      )}
+                      {` ${getVerbForCommandStatus(result.status)} `}
+                      {formatMdmCommandNameForActivityItem(result.request_type)}
+                      {" on "}
+                      <b>{result.hostname}</b>
+                      {"."}
+                    </span>
+                  )
+                }
+              />
+            );
+          }}
+          onDone={() => setMdmCommandActivityDetails(null)}
+        />
+      )}
+    </div>
+  );
+};
+
+export default ActivityFeed;

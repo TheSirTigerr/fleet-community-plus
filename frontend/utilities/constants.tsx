@@ -1,0 +1,541 @@
+import React from "react";
+
+import { ICampaign } from "interfaces/campaign";
+import { IDropdownOption } from "interfaces/dropdownOption";
+import { IHost } from "interfaces/host";
+import { MdmEnrollmentStatus } from "interfaces/mdm";
+import { DisplayPlatform, Platform } from "interfaces/platform";
+import { ISchedulableQuery } from "interfaces/schedulable_query";
+import URL_PREFIX from "router/url_prefix";
+
+const { origin } = global.window.location;
+export const BASE_URL = `${origin}${URL_PREFIX}/api`;
+
+export const UNCHANGED_PASSWORD_API_RESPONSE = "********";
+
+export enum PolicyResponse {
+  PASSING = "passing",
+  FAILING = "failing",
+}
+
+export const DEFAULT_GRAVATAR_LINK =
+  "https://fleetdm.com/images/permanent/icon-avatar-default-gray-transparent-64x64@2x.png";
+
+export const DEFAULT_GRAVATAR_LINK_DARK =
+  "https://fleetdm.com/images/permanent/icon-avatar-default-dark-24x24%402x.png";
+
+export const DEFAULT_GRAVATAR_LINK_FALLBACK =
+  "/assets/images/icon-avatar-default-gray-transparent-64x64@2x.png";
+
+export const DEFAULT_GRAVATAR_LINK_DARK_FALLBACK =
+  "/assets/images/icon-avatar-default-dark-24x24%402x.png";
+
+export const ACTIVITY_EXPIRY_WINDOW_DROPDOWN_OPTIONS: IDropdownOption[] = [
+  { value: 30, label: "30 days" },
+  { value: 60, label: "60 days" },
+  { value: 90, label: "90 days" },
+];
+
+export const FREQUENCY_DROPDOWN_OPTIONS: IDropdownOption[] = [
+  { value: 0, label: "Never" },
+  { value: 300, label: "Every 5 minutes" },
+  { value: 600, label: "Every 10 minutes" },
+  { value: 900, label: "Every 15 minutes" },
+  { value: 1800, label: "Every 30 minutes" },
+  { value: 3600, label: "Every hour" },
+  { value: 21600, label: "Every 6 hours" },
+  { value: 43200, label: "Every 12 hours" },
+  { value: 86400, label: "Every day" },
+  { value: 604800, label: "Every week" },
+];
+export const HOST_STATUS_WEBHOOK_HOST_PERCENTAGE_DROPDOWN_OPTIONS: IDropdownOption[] = [
+  { label: "1%", value: 1 },
+  { label: "5%", value: 5 },
+  { label: "10%", value: 10 },
+  { label: "25%", value: 25 },
+];
+
+export const HOST_STATUS_WEBHOOK_WINDOW_DROPDOWN_OPTIONS: IDropdownOption[] = [
+  { label: "1 day", value: 1 },
+  { label: "3 days", value: 3 },
+  { label: "7 days", value: 7 },
+  { label: "14 days", value: 14 },
+];
+
+export const GITHUB_NEW_ISSUE_LINK =
+  "https://github.com/fleetdm/fleet/issues/new?assignees=&labels=bug%2C%3Areproduce&template=bug-report.md";
+
+/** website links */
+export const FLEET_WEBSITE_URL = "https://fleetdm.com";
+export const TRANSPARENCY_LINK = `${FLEET_WEBSITE_URL}/better`;
+export const SUPPORT_LINK = `${FLEET_WEBSITE_URL}/support`;
+export const CONTACT_FLEET_LINK = `${FLEET_WEBSITE_URL}/contact`;
+export const LEARN_MORE_ABOUT_BASE_LINK = `${FLEET_WEBSITE_URL}/learn-more-about`;
+export const FLEET_GUIDES_BASE_LINK = `${FLEET_WEBSITE_URL}/guides`;
+export const ANDROID_PLAY_STORE_URL =
+  "https://play.google.com/store/apps/details";
+
+/**  July 28, 2016 is the date of the initial commit to fleet/fleet. */
+export const INITIAL_FLEET_DATE = "2016-07-28T00:00:00Z";
+
+export const LOGGING_TYPE_OPTIONS = [
+  { label: "Snapshot", value: "snapshot" },
+  { label: "Differential", value: "differential" },
+  {
+    label: "Differential (ignore removals)",
+    value: "differential_ignore_removals",
+  },
+];
+
+export const MAX_OSQUERY_SCHEDULED_QUERY_INTERVAL = 604800;
+
+// Max character length for most user-supplied free-text fields (name, title,
+// description) — matches the varchar(255) column shared across policies,
+// reports, teams (fleets), labels, software categories, custom variables,
+// certificate authorities, etc. Use on any `InputField` bound to such a
+// column: `inputOptions={{ maxLength: MAX_ENTITY_CHAR_LENGTH }}`.
+export const MAX_ENTITY_CHAR_LENGTH = 255;
+
+export const MIN_OSQUERY_VERSION_OPTIONS = [
+  { label: "All", value: "" },
+  { label: "5.23.1 +", value: "5.23.1" },
+  { label: "5.23.0 +", value: "5.23.0" },
+  { label: "5.22.1 +", value: "5.22.1" },
+  { label: "5.21.0 +", value: "5.21.0" },
+  { label: "5.20.0 +", value: "5.20.0" },
+  { label: "5.19.0 +", value: "5.19.0" },
+  { label: "5.18.1 +", value: "5.18.1" },
+  { label: "5.18.0 +", value: "5.18.0" },
+  { label: "5.17.0 +", value: "5.17.0" },
+  { label: "5.16.0 +", value: "5.16.0" },
+  { label: "5.15.0 +", value: "5.15.0" },
+  { label: "5.14.1 +", value: "5.14.1" },
+  { label: "5.13.1 +", value: "5.13.1" },
+  { label: "5.12.2 +", value: "5.12.2" },
+  { label: "5.12.1 +", value: "5.12.1" },
+  { label: "5.11.0 +", value: "5.11.0" },
+  { label: "5.10.2 +", value: "5.10.2" },
+  { label: "5.9.1 +", value: "5.9.1" },
+  { label: "5.8.2 +", value: "5.8.2" },
+  { label: "5.8.1 +", value: "5.8.1" },
+  { label: "5.7.0 +", value: "5.7.0" },
+  { label: "5.6.0 +", value: "5.6.0" },
+  { label: "5.5.1 +", value: "5.5.1" },
+  { label: "5.4.0 +", value: "5.4.0" },
+  { label: "5.3.0 +", value: "5.3.0" },
+  { label: "5.2.3 +", value: "5.2.3" },
+  { label: "5.2.2 +", value: "5.2.2" },
+  { label: "5.2.1 +", value: "5.2.1" },
+  { label: "5.2.0 +", value: "5.2.0" },
+  { label: "5.1.0 +", value: "5.1.0" },
+  { label: "5.0.1 +", value: "5.0.1" },
+  { label: "5.0.0 +", value: "5.0.0" },
+  { label: "4.9.0 +", value: "4.9.0" },
+  { label: "4.8.0 +", value: "4.8.0" },
+  { label: "4.7.0 +", value: "4.7.0" },
+  { label: "4.6.0 +", value: "4.6.0" },
+  { label: "4.5.1 +", value: "4.5.1" },
+  { label: "4.5.0 +", value: "4.5.0" },
+  { label: "4.4.0 +", value: "4.4.0" },
+  { label: "4.3.0 +", value: "4.3.0" },
+  { label: "4.2.0 +", value: "4.2.0" },
+  { label: "4.1.2 +", value: "4.1.2" },
+  { label: "4.1.1 +", value: "4.1.1" },
+  { label: "4.1.0 +", value: "4.1.0" },
+  { label: "4.0.2 +", value: "4.0.2" },
+  { label: "4.0.1 +", value: "4.0.1" },
+  { label: "4.0.0 +", value: "4.0.0" },
+  { label: "3.4.0 +", value: "3.4.0" },
+  { label: "3.3.2 +", value: "3.3.2" },
+  { label: "3.3.1 +", value: "3.3.1" },
+  { label: "3.2.6 +", value: "3.2.6" },
+  { label: "2.2.1 +", value: "2.2.1" },
+  { label: "2.2.0 +", value: "2.2.0" },
+  { label: "2.1.2 +", value: "2.1.2" },
+  { label: "2.1.1 +", value: "2.1.1" },
+  { label: "2.0.0 +", value: "2.0.0" },
+  { label: "1.8.2 +", value: "1.8.2" },
+  { label: "1.8.1 +", value: "1.8.1" },
+];
+
+export const LIVE_POLICY_STEPS = {
+  1: "EDITOR",
+  2: "TARGETS",
+  3: "RUN",
+};
+
+export const LIVE_QUERY_STEPS = {
+  1: "TARGETS",
+  2: "RUN",
+};
+
+export const DEFAULT_QUERY: ISchedulableQuery = {
+  description: "",
+  name: "",
+  query: "SELECT * FROM osquery_info;",
+  id: 0,
+  interval: 0,
+  observer_can_run: false,
+  discard_data: false,
+  platform: "",
+  min_osquery_version: "",
+  automations_enabled: false,
+  logging: "snapshot",
+  author_name: "",
+  updated_at: "",
+  created_at: "",
+  saved: false,
+  author_id: 0,
+  packs: [],
+  team_id: 0,
+  author_email: "",
+  stats: {},
+  editingExistingQuery: false,
+};
+
+export const DEFAULT_CAMPAIGN = {
+  created_at: "",
+
+  totals: {
+    count: 0,
+    missing_in_action: 0,
+    offline: 0,
+    online: 0,
+  },
+
+  errors: [],
+  hosts: [],
+  uiHostCounts: {
+    total: 0,
+    successful: 0,
+    failed: 0,
+  },
+  queryResults: [],
+
+  status: "",
+  serverHostCounts: {
+    countOfHostsWithResults: 0,
+    countOfHostsWithNoResults: 0,
+  },
+
+  id: 0,
+  query_id: 0,
+  updated_at: "",
+  user_id: 0,
+} as ICampaign;
+
+export const DEFAULT_CAMPAIGN_STATE = {
+  observerShowSql: false,
+  queryIsRunning: false,
+  queryPosition: {},
+  queryResultsToggle: null,
+  runQueryMilliseconds: 0,
+  selectRelatedHostTarget: false,
+  targetsCount: 0,
+  targetsError: null,
+  campaign: { ...DEFAULT_CAMPAIGN },
+};
+
+const PLATFORM_LABEL_NAMES_FROM_API = [
+  "All Hosts",
+  "All Linux",
+  "CentOS Linux",
+  "macOS",
+  "MS Windows",
+  "Red Hat Linux",
+  "Ubuntu Linux",
+  "chrome",
+  "iOS",
+  "iPadOS",
+  "Android",
+] as const;
+
+export type PlatformLabelNameFromAPI = typeof PLATFORM_LABEL_NAMES_FROM_API[number];
+
+export const isPlatformLabelNameFromAPI = (
+  s: string
+): s is PlatformLabelNameFromAPI => {
+  return PLATFORM_LABEL_NAMES_FROM_API.includes(s as PlatformLabelNameFromAPI);
+};
+
+export const PLATFORM_DISPLAY_NAMES: Record<string, DisplayPlatform> = {
+  darwin: "macOS",
+  macOS: "macOS",
+  windows: "Windows",
+  Windows: "Windows",
+  linux: "Linux",
+  Linux: "Linux",
+  chrome: "ChromeOS",
+  ChromeOS: "ChromeOS",
+  ios: "iOS",
+  ipados: "iPadOS",
+  android: "Android",
+  Android: "Android",
+} as const;
+
+// as returned by the TARGETS API; based on display_text
+export const PLATFORM_LABEL_DISPLAY_NAMES: Record<
+  PlatformLabelNameFromAPI,
+  string
+> = {
+  "All Hosts": "All hosts",
+  "All Linux": "Linux",
+  "CentOS Linux": "CentOS Linux",
+  macOS: "macOS",
+  "MS Windows": "Windows",
+  "Red Hat Linux": "Red Hat Linux",
+  "Ubuntu Linux": "Ubuntu Linux",
+  chrome: "ChromeOS",
+  iOS: "iOS",
+  iPadOS: "iPadOS",
+  Android: "Android",
+} as const;
+
+export const PLATFORM_LABEL_DISPLAY_TYPES: Record<
+  PlatformLabelNameFromAPI,
+  string
+> = {
+  "All Hosts": "all",
+  "All Linux": "platform",
+  "CentOS Linux": "platform",
+  macOS: "platform",
+  "MS Windows": "platform",
+  "Red Hat Linux": "platform",
+  "Ubuntu Linux": "platform",
+  chrome: "platform",
+  iOS: "platform",
+  iPadOS: "platform",
+  Android: "platform",
+} as const;
+
+// For some builtin labels, display different strings than what API returns
+export const LABEL_DISPLAY_MAP: Partial<
+  Record<PlatformLabelNameFromAPI, string>
+> = {
+  "All Hosts": "All hosts",
+  "All Linux": "Linux",
+  chrome: "ChromeOS",
+  "MS Windows": "Windows",
+};
+
+export const PLATFORM_TYPE_ICONS = {
+  "All Linux": "linux",
+  macOS: "darwin",
+  "MS Windows": "windows",
+  chrome: "chrome",
+  iOS: "iOS",
+  iPadOS: "iPadOS",
+  Android: "android",
+} as const;
+
+export const hasPlatformTypeIcon = (
+  s: string
+): s is Extract<PlatformLabelNameFromAPI, keyof typeof PLATFORM_TYPE_ICONS> => {
+  return !!PLATFORM_TYPE_ICONS[s as keyof typeof PLATFORM_TYPE_ICONS];
+};
+
+export type PlatformLabelOptions = DisplayPlatform | "All";
+
+export type PlatformValueOptions = Platform | "all";
+
+/** Scheduled queries do not support ChromeOS, iOS, iPadOS, or Android */
+export const SCHEDULE_PLATFORM_DROPDOWN_OPTIONS = [
+  { label: "All", value: "" }, // API empty string runs on all platforms
+  { label: "macOS", value: "darwin" },
+  { label: "Windows", value: "windows" },
+  { label: "Linux", value: "linux" },
+] as const;
+
+export const HOSTS_SEARCH_BOX_PLACEHOLDER =
+  "Search name, user email, hostname, UUID, serial number, or IP address";
+
+export const HOSTS_SEARCH_BOX_TOOLTIP = (
+  <>
+    Search hosts by name, user email, hostname,
+    <br />
+    UUID, serial number, or IP address.
+  </>
+);
+
+export const VULNERABILITIES_SEARCH_BOX_TOOLTIP = (
+  <>
+    To search for an exact CVE, surround the string
+    <br />
+    in double quotes (e.g. &quot;CVE-2024-1234&quot;).
+  </>
+);
+
+// Keys from API
+export const MDM_STATUS_TOOLTIP: Record<
+  MdmEnrollmentStatus,
+  React.ReactNode
+> = {
+  "On (automatic)": (
+    <span>
+      MDM was turned on automatically (Apple ADE, Windows Autopilot, or
+      fully-managed Android). IT admins can block end users from turning MDM
+      off.
+    </span>
+  ),
+  "On (manual)": (
+    <span>
+      Enrolled with a manual enrollment profile as a company-owned device. IT
+      admins can wipe this device and enforce all MDM restrictions.
+    </span>
+  ),
+  "On (manual - personal)": (
+    <span>
+      Enrolled with a manual enrollment profile as a personal (BYOD) device. IT
+      admins cannot wipe this device or lock the end user out.
+    </span>
+  ),
+  "On (company-owned)": null,
+  Off: undefined, // no tooltip specified
+  Pending: (
+    <span>
+      Hosts pending automatic enrollment in Apple Business (AB) or Windows
+      Autopilot.
+    </span>
+  ),
+};
+
+/** Used where a single host's platform is known, e.g. the host details MDM status modal. */
+export const MDM_STATUS_PENDING_TOOLTIP_BY_PLATFORM = {
+  windows: (
+    <span>
+      Hosts added to Windows Autopilot. These will automatically enroll to Fleet
+      and turn on MDM when they&apos;re unboxed.
+    </span>
+  ),
+  apple: (
+    <span>
+      Hosts ordered via Apple Business (AB). These will automatically enroll to
+      Fleet and turn on MDM when they&apos;re unboxed.
+    </span>
+  ),
+};
+
+export const BATTERY_TOOLTIP: Record<string, string | React.ReactNode> = {
+  Normal: (
+    <span>
+      Current maximum capacity is at least
+      <br />
+      80% of its designed capacity and the
+      <br />
+      cycle count is below 1000.
+    </span>
+  ),
+  "Service recommended": (
+    <span>
+      Current maximum capacity has fallen
+      <br />
+      below 80% of its designed capacity
+      <br />
+      or the cycle count has reached 1000.
+    </span>
+  ),
+};
+
+export const PRIMO_TOOLTIP = "Fleets are disabled while using Primo";
+
+/** Must pass agent options config as empty object */
+export const EMPTY_AGENT_OPTIONS = {
+  config: {},
+};
+
+export const DEFAULT_EMPTY_CELL_VALUE = "---";
+
+export const DOCUMENT_TITLE_SUFFIX = "Fleet";
+
+export const HOST_SUMMARY_DATA: (keyof IHost)[] = [
+  "id",
+  "status",
+  "issues",
+  "platform",
+  "detail_updated_at",
+  "policy_updated_at",
+  "team_name",
+  "display_name", // Not rendered on my device page
+  "maintenance_window", // Not rendered on my device page
+  "os_version",
+  "mdm",
+  "last_mdm_checked_in_at",
+];
+
+export const HOST_VITALS_DATA = [
+  "seen_time",
+  "uptime",
+  "last_enrolled_at",
+  "hardware_model",
+  "hardware_marketing_name",
+  "hardware_serial",
+  "primary_ip",
+  "public_ip",
+  "geolocation",
+  "batteries",
+  "detail_updated_at",
+  "last_restarted_at",
+  "platform",
+  "uuid",
+  "gigs_disk_space_available",
+  "percent_disk_space_available",
+  "gigs_total_disk_space",
+  "gigs_all_disk_space",
+  "disk_encryption_enabled",
+  "osquery_version",
+  "orbit_version",
+  "fleet_desktop_version",
+  "memory",
+  "cpu_type",
+  "os_version",
+  "timezone",
+  "mdm_enrollment_hardware_attested",
+  "primary_mac",
+  // Android-only vitals. Absent for every other platform, so they're simply
+  // dropped by the pick rather than needing a platform check here.
+  "adb_enabled",
+  "passcode_protected",
+  "play_protect_enabled",
+  "encryption_type",
+  "manufacturer",
+  "security_update_version",
+  "device_kernel_version",
+  "bootloader_version",
+  "system_update_status",
+  "security_posture",
+  "imei",
+  "meid",
+  "api_level",
+  "telephony_infos",
+];
+
+export const HOST_OSQUERY_DATA = [
+  "config_tls_refresh",
+  "logger_tls_period",
+  "distributed_interval",
+];
+
+export const DEFAULT_USE_QUERY_OPTIONS = {
+  refetchOnWindowFocus: false,
+  retry: (failureCount: number, error: unknown) => {
+    const err = error as any;
+    let isBadRequestErr = false;
+    if (err.status !== undefined) {
+      isBadRequestErr = err.status >= 400 && err.status < 500;
+    }
+    return failureCount < 4 && !isBadRequestErr;
+  },
+};
+
+export const INVALID_PLATFORMS_REASON =
+  "query payload verification: query's platform must be a comma-separated list of 'darwin', 'linux', 'windows', and/or 'chrome' in a single string";
+
+export const INVALID_PLATFORMS_FLASH_MESSAGE =
+  "Couldn't save report. Please update platforms and try again.";
+
+export const DATE_FNS_FORMAT_STRINGS = {
+  dateAtTime: "E, MMM d 'at' p",
+  hoursAndMinutes: "HH:mm",
+};
+
+export const MAX_SCRIPT_BATCH_TARGETS = 5000;

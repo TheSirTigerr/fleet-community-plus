@@ -1,0 +1,111 @@
+package zenity
+
+import (
+	"bytes"
+	"errors"
+	"fmt"
+
+	"github.com/fleetdm/fleet/v4/orbit/pkg/dialog"
+	"github.com/fleetdm/fleet/v4/orbit/pkg/execuser"
+	"github.com/fleetdm/fleet/v4/orbit/pkg/user"
+	"github.com/rs/zerolog/log"
+)
+
+const zenityProcessName = "zenity"
+
+type Zenity struct {
+	// cmdWithOutput can be set in tests to mock execution of the dialog.
+	cmdWithOutput func(args ...string) ([]byte, int, error)
+}
+
+// New creates a new Zenity dialog instance for zenity v4 on Linux.
+// Zenity implements the Dialog interface.
+func New() *Zenity {
+	return &Zenity{
+		cmdWithOutput: execCmdWithOutput,
+	}
+}
+
+// ShowEntry displays an dialog that accepts end user input. It returns the entered
+// text or errors ErrCanceled, ErrTimeout, or ErrUnknown.
+func (z *Zenity) ShowEntry(opts dialog.EntryOptions) ([]byte, error) {
+	args := []string{"--entry"}
+	if opts.Title != "" {
+		args = append(args, fmt.Sprintf("--title=%s", opts.Title))
+	}
+	if opts.Text != "" {
+		args = append(args, fmt.Sprintf("--text=%s", opts.Text))
+	}
+	if opts.HideText {
+		args = append(args, "--hide-text")
+	}
+	if opts.TimeOut > 0 {
+		args = append(args, fmt.Sprintf("--timeout=%d", int(opts.TimeOut.Seconds())))
+	}
+
+	output, statusCode, err := z.cmdWithOutput(args...)
+	if err != nil {
+		switch statusCode {
+		case 1:
+			return nil, dialog.ErrCanceled
+		case 5:
+			return nil, dialog.ErrTimeout
+		default:
+			return nil, errors.Join(dialog.ErrUnknown, err)
+		}
+	}
+
+	return output, nil
+}
+
+// ShowInfo displays an information dialog. It returns errors ErrTimeout or ErrUnknown.
+func (z *Zenity) ShowInfo(opts dialog.InfoOptions) error {
+	args := []string{"--info"}
+	if opts.Title != "" {
+		args = append(args, fmt.Sprintf("--title=%s", opts.Title))
+	}
+	if opts.Text != "" {
+		args = append(args, fmt.Sprintf("--text=%s", opts.Text))
+	}
+	if opts.TimeOut > 0 {
+		args = append(args, fmt.Sprintf("--timeout=%d", int(opts.TimeOut.Seconds())))
+	}
+
+	_, statusCode, err := z.cmdWithOutput(args...)
+	if err != nil {
+		switch statusCode {
+		case 5:
+			return dialog.ErrTimeout
+		default:
+			return errors.Join(dialog.ErrUnknown, err)
+		}
+	}
+
+	return nil
+}
+
+func execCmdWithOutput(args ...string) ([]byte, int, error) {
+	var opts []execuser.Option
+	for _, arg := range args {
+		opts = append(opts, execuser.WithArg(arg, "")) // Using empty value for positional args
+	}
+
+	// Retrieve and set active GUI user.
+	loggedInUser, err := user.UserLoggedInViaGui()
+	if err != nil {
+		return nil, 0, fmt.Errorf("user logged in via GUI: %w", err)
+	}
+	if loggedInUser == nil || *loggedInUser == "" {
+		return nil, 0, errors.New("no GUI user found")
+	}
+	log.Debug().Msgf("found GUI user: %s, attempting zenity", *loggedInUser)
+	opts = append(opts, execuser.WithUser(*loggedInUser))
+
+	// Execute zenity.
+	output, exitCode, err := execuser.RunWithOutput(zenityProcessName, opts...)
+
+	// Trim the newline from zenity output
+	output = bytes.TrimSuffix(output, []byte("\n"))
+
+	return output, exitCode, err
+}

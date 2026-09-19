@@ -1,0 +1,11 @@
+.software-version-details-page {
+  @include vertical-page-layout;
+
+  h2 {
+    font-size: $small;
+  }
+
+  &__vulnerabilities-section {
+    @include vertical-card-layout;
+  }
+}

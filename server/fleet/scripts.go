@@ -1,0 +1,981 @@
+package fleet
+
+import (
+	"bufio"
+	"errors"
+	"fmt"
+	"path/filepath"
+	"regexp"
+	"strings"
+	"time"
+	"unicode/utf8"
+
+	"github.com/fleetdm/fleet/v4/pkg/optjson"
+	"github.com/fleetdm/fleet/v4/pkg/scripts"
+	"github.com/fleetdm/fleet/v4/server/mdm/android"
+)
+
+// Script represents a saved script that can be executed on a host.
+type Script struct {
+	ID     uint   `json:"id" db:"id"`
+	TeamID *uint  `json:"team_id" renameto:"fleet_id" db:"team_id"`
+	Name   string `json:"name" db:"name"`
+	// ScriptContents is not returned in payloads nor is it returned
+	// from reading from the database, it is only used as payload to
+	// create the script. This is so that we minimize the number of
+	// times this potentially large field is transferred.
+	ScriptContents string    `json:"-"`
+	CreatedAt      time.Time `json:"created_at" db:"created_at"`
+	// UpdatedAt serves as the "uploaded at" timestamp, since it is updated each
+	// time the script record gets updated.
+	UpdatedAt time.Time `json:"updated_at" db:"updated_at"`
+	// ScriptContentID is the ID of the script contents, which are stored separately from the Script.
+	ScriptContentID uint `json:"-" db:"script_content_id"`
+}
+
+func (s Script) AuthzType() string {
+	return "script"
+}
+
+func (s *Script) ValidateNewScript() error {
+	if s.Name == "" {
+		return errors.New("The file name must not be empty.")
+	}
+
+	ext := strings.ToLower(filepath.Ext(s.Name))
+	switch ext {
+	case ".sh", ".ps1", ".py":
+		// ok
+	default:
+		return errors.New("File type not supported. Only .sh, .py, and .ps1 file types are allowed.")
+	}
+
+	// validate the script contents as if it were already a saved script
+	if err := ValidateHostScriptContents(s.ScriptContents, true); err != nil {
+		return err
+	}
+
+	kind, directExecute, err := shebangInfo(s.ScriptContents)
+	if err != nil {
+		return err
+	}
+	switch ext {
+	case ".sh":
+		// allow no shebang (defaults to /bin/sh), or a supported shell shebang.
+		if directExecute && kind != shebangShell {
+			return errors.New(`Shell scripts must use a shell shebang (for example, "#!/bin/sh") or no shebang. For Python, use a ".py" script.`)
+		}
+	case ".py":
+		// python scripts must be directly executable (via a python shebang).
+		if !directExecute || kind != shebangPython {
+			return errors.New(`Python scripts must start with a python shebang (for example, "#!/usr/bin/env python3").`)
+		}
+	case ".ps1":
+		// PowerShell scripts are executed via powershell.exe, shebangs are not supported.
+		if directExecute {
+			return errors.New(`PowerShell scripts must not start with a shebang ("#!").`)
+		}
+	}
+
+	return nil
+}
+
+// HostScriptDetail represents the details of a script that applies to a specific host.
+type HostScriptDetail struct {
+	// HostID is the ID of the host.
+	HostID uint `json:"-"`
+	// ScriptID is the ID of the script.
+	ScriptID uint `json:"script_id"`
+	// Name is the name of the script.
+	Name string `json:"name"`
+	// LastExecution is the most recent execution of the script on the host. It is nil if the script
+	// has never executed on the host.
+	LastExecution *HostScriptExecution `json:"last_execution"`
+}
+
+// NewHostScriptDetail creates a new HostScriptDetail and sets its LastExecution field based on the
+// provided details.
+func NewHostScriptDetail(hostID, scriptID uint, name string, executionID *string, executedAt *time.Time, exitCode *int64, hsrID *uint) *HostScriptDetail {
+	hs := HostScriptDetail{
+		HostID:   hostID,
+		ScriptID: scriptID,
+		Name:     name,
+	}
+	hs.setLastExecution(executionID, executedAt, exitCode, hsrID)
+	return &hs
+}
+
+// HostScriptExecution represents a single execution of a script on a host.
+type HostScriptExecution struct {
+	// HostID is the ID of the host.
+	HostID uint `json:"-"`
+	// ScriptID is the ID of the script.
+	ScriptID uint `json:"-"`
+	// HSRID is the unique row identifier of the host_script_results table for this execution.
+	HSRID uint `json:"-"`
+	// ExecutionID is a unique identifier for a single execution of the script.
+	ExecutionID string `json:"execution_id"`
+	// ExecutedAt represents the time that the script was executed on the host. It should correspond to
+	// the created_at field of the host_script_results table for the associated HSRID.
+	ExecutedAt time.Time `json:"executed_at"`
+	// Status is the status of the script execution. It is one of "pending", "ran", or "error". It
+	// is derived from the exit_code field of the host_script_results table for the associated HSRID.
+	Status string `json:"status"`
+}
+
+// SetLastExecution updates the LastExecution field of the HostScriptDetail if the provided details
+// are more recent than the current LastExecution. It returns true if the LastExecution was updated.
+func (hs *HostScriptDetail) setLastExecution(executionID *string, executedAt *time.Time, exitCode *int64, hsrID *uint) bool {
+	if executionID == nil || executedAt == nil {
+		// no new execution, nothing to do
+		return false
+	}
+
+	newHSE := &HostScriptExecution{
+		ExecutionID: *executionID,
+		ExecutedAt:  *executedAt,
+	}
+	if hsrID != nil {
+		newHSE.HSRID = *hsrID
+	}
+	switch {
+	case exitCode == nil:
+		newHSE.Status = "pending"
+	case *exitCode == 0:
+		newHSE.Status = "ran"
+	default:
+		newHSE.Status = "error"
+	}
+
+	if hs.LastExecution == nil {
+		// no previous execution, use the new one
+		hs.LastExecution = newHSE
+		return true
+	}
+	if newHSE.ExecutedAt.After(hs.LastExecution.ExecutedAt) {
+		// new execution is more recent, use it
+		hs.LastExecution = newHSE
+		return true
+	}
+	if newHSE.ExecutedAt == hs.LastExecution.ExecutedAt && newHSE.HSRID > hs.LastExecution.HSRID {
+		// same execution time, but new execution has a higher ID, use it
+		hs.LastExecution = newHSE
+		return true
+	}
+
+	return false
+}
+
+type HostScriptRequestPayload struct {
+	HostID          uint   `json:"host_id"`
+	ScriptID        *uint  `json:"script_id"`
+	PolicyID        *uint  `json:"policy_id"`
+	ScriptContents  string `json:"script_contents"`
+	ScriptContentID uint   `json:"-"`
+	ScriptName      string `json:"script_name"`
+	TeamID          uint   `json:"team_id,omitempty" renameto:"fleet_id"`
+	// UserID is filled automatically from the context's user (the authenticated
+	// user that made the API request).
+	UserID *uint `json:"-"`
+	// SyncRequest is filled automatically based on the endpoint used to create
+	// the execution request (synchronous or asynchronous).
+	SyncRequest bool `json:"-"`
+	// SetupExperienceScriptID is the ID of the setup experience script related to this request
+	// payload, if such a script exists.
+	SetupExperienceScriptID *uint `json:"-"`
+	// DeferActivation enqueues the upcoming activity without activating it;
+	// the activity stays invisible to the host until the fleet-initiated
+	// release cron activates it within the configured per-minute budget. Set
+	// by policy-automation paths when activity.fleet_initiated_release_per_minute > 0.
+	DeferActivation bool `json:"-"`
+}
+
+// IsFleetInitiated returns true if the script execution is initiated by Fleet
+// (via a policy automation) rather than by a person.
+func (r HostScriptRequestPayload) IsFleetInitiated() bool {
+	return r.PolicyID != nil
+}
+
+// Priority returns the priority to assign to this activity in the upcoming
+// activities queue. Setup experience outranks everything; user-initiated
+// scripts outrank Fleet-initiated ones so they are never queued behind
+// deferred policy-automation activities.
+func (r HostScriptRequestPayload) Priority() int {
+	switch {
+	case r.SetupExperienceScriptID != nil:
+		return SetupExperienceActivityPriority
+	case !r.IsFleetInitiated():
+		return UserInitiatedActivityPriority
+	default:
+		return 0
+	}
+}
+
+func (r HostScriptRequestPayload) ValidateParams(waitForResult time.Duration) error {
+	if r.ScriptContents == "" && r.ScriptID == nil && r.ScriptName == "" {
+		return NewInvalidArgumentError("script", `One of 'script_id', 'script_contents', or 'script_name' is required.`)
+	}
+
+	if r.ScriptID != nil {
+		switch {
+		case r.ScriptContents != "":
+			return NewInvalidArgumentError("script_id", `Only one of 'script_id' or 'script_contents' is allowed.`)
+		case r.ScriptName != "":
+			return NewInvalidArgumentError("script_id", `Only one of 'script_id' or 'script_name' is allowed.`)
+		case r.TeamID > 0:
+			return NewInvalidArgumentError("script_id", `Only one of 'script_id' or 'team_id' is allowed.`)
+		}
+	}
+	if r.ScriptContents != "" {
+		switch {
+		case r.ScriptName != "":
+			return NewInvalidArgumentError("script_contents", `Only one of 'script_contents' or 'script_name' is allowed.`)
+		case r.TeamID > 0:
+			return NewInvalidArgumentError("script_contents", `"Only one of 'script_contents' or 'team_id' is allowed.`)
+		}
+	}
+
+	return nil
+}
+
+type HostScriptResultPayload struct {
+	HostID      uint   `json:"host_id"`
+	ExecutionID string `json:"execution_id"`
+	Output      string `json:"output"`
+	Runtime     int    `json:"runtime"`
+	ExitCode    int    `json:"exit_code"`
+	Timeout     int    `json:"timeout"`
+}
+
+// HostScriptResult represents a script result that was requested to execute on
+// a specific host. If no result was received yet for a script, the ExitCode
+// field is null and the output is empty.
+type HostScriptResult struct {
+	// ID is the unique row identifier of the host script result.
+	ID uint `json:"-" db:"id"`
+	// HostID is the host on which the script was executed.
+	HostID uint `json:"host_id" db:"host_id"`
+	// ExecutionID is a unique identifier for a single execution of the script.
+	ExecutionID string `json:"execution_id" db:"execution_id"`
+	// BatchExecutionID is an identifier that links this execution to a larger batch job
+	BatchExecutionID *string `json:"batch_execution_id" db:"batch_execution_id"`
+	// ScriptContents is the content of the script to execute.
+	ScriptContents string `json:"script_contents" db:"script_contents"`
+	// Output is the combined stdout/stderr output of the script. It is empty
+	// if no result was received yet.
+	Output string `json:"output" db:"output"`
+	// Runtime is the running time of the script in seconds, rounded.
+	Runtime int `json:"runtime" db:"runtime"`
+	// ExitCode is null if script execution result was never received from the
+	// host. It is -1 if it was received but the script did not terminate
+	// normally (same as how Go handles this: https://pkg.go.dev/os#ProcessState.ExitCode)
+	ExitCode *int64 `json:"exit_code" db:"exit_code"`
+	// Timeout is the maximum time in seconds that the script was allowed to run
+	// at the time of execution.
+	Timeout *int `json:"timeout" db:"timeout"`
+	// CreatedAt is the creation timestamp of the script execution request. It is
+	// not returned as part of the payloads, but is used to determine if the script
+	// is too old to still expect a response from the host.
+	CreatedAt time.Time `json:"-" db:"created_at"`
+	// ScriptID is the id of the saved script to execute, or nil if this was an
+	// anonymous script execution.
+	ScriptID *uint `json:"script_id" db:"script_id"`
+	// PolicyID is the id of the policy that triggered the script execution, or
+	// nil if the execution was not triggered by a policy failure
+	PolicyID *uint `json:"policy_id" db:"policy_id"`
+	// UserID is the id of the user that requested execution. It is not part of
+	// the rendered JSON as it is only returned by the
+	// /hosts/:id/activities/upcoming endpoint which doesn't use this struct as
+	// return type.
+	UserID *uint `json:"-" db:"user_id"`
+	// SyncRequest is used to determine when creating the script ran activity if
+	// the request was synchronous or asynchronous. It is otherwise not returned
+	// as part of any API endpoint.
+	SyncRequest bool `json:"-" db:"sync_request"`
+
+	// TeamID is only used for authorization, it must be set to the team id of
+	// the host when checking authorization and is otherwise not set.
+	TeamID *uint `json:"team_id" renameto:"fleet_id" db:"-"` // TODO: should we omit this from the json result?
+
+	// Message is the UserMessage associated with a response from an execution.
+	// It may be set by the endpoint and included in the resulting JSON but it is
+	// not otherwise part of the host_script_results table.
+	Message string `json:"message" db:"-"`
+
+	// Hostname can be set by the endpoint as extra information to make available
+	// when generating the UserMessage associated with a response from an
+	// execution. It is otherwise not part of the host_script_results table and
+	// not returned as part of the resulting JSON.
+	Hostname string `json:"-" db:"-"`
+
+	// HostDeletedAt indicates if the results are associated with a deleted host.
+	// This supports the soft-delete feature for script results so that the
+	// results can still be returned to see activity details after the host got
+	// deleted.
+	HostDeletedAt *time.Time `json:"-" db:"host_deleted_at"`
+
+	// SetupExperienceScriptID is the ID of the setup experience script, if this script execution
+	// was part of setup experience.
+	SetupExperienceScriptID *uint `json:"-" db:"setup_experience_script_id"`
+
+	// Canceled indicates if that script execution request was canceled by a
+	// user.
+	Canceled bool `json:"-" db:"canceled"`
+
+	// AttemptNumber tracks which retry attempt this is for policy automation executions.
+	// nil = not triggered by a policy failure
+	// 1,2,3 attempt, 3 being max retries
+	AttemptNumber *int `json:"attempt_number,omitempty" db:"attempt_number"`
+}
+
+func (hsr HostScriptResult) AuthzType() string {
+	return "host_script_result"
+}
+
+type BatchScriptHost struct {
+	// ID is the host on which the script was executed.
+	ID             uint   `json:"id" db:"id"`
+	ComputerName   string `json:"-" db:"computer_name"`
+	HostName       string `json:"-" db:"hostname"`
+	HardwareModel  string `json:"-" db:"hardware_model"`
+	HardwareSerial string `json:"-" db:"hardware_serial"`
+	// Display name is the host's display name.
+	DisplayName string `json:"display_name" db:"display_name"`
+	// ExecutionID is a unique identifier for a single execution of the script.
+	ScriptExecutionID string `json:"script_execution_id" db:"execution_id"`
+	// Output is the combined stdout/stderr output of the script. It is empty
+	// if no result was received yet.
+	ScriptOutput string `json:"script_output_preview,omitempty" db:"output"`
+	// Executed at is the time the script was executed on the host (if at all).
+	ScriptExecutedAt *time.Time `json:"script_executed_at,omitempty" db:"updated_at"`
+	// Status is the status of the host's batch script run.
+	Status BatchScriptExecutionStatus `json:"script_status" db:"status"`
+}
+
+// UserMessage returns the user-friendly message to associate with the current
+// state of the HostScriptResult. This is returned as part of the API endpoints
+// for running a script synchronously (so that fleetctl can display it) and to
+// get the script results for an execution ID (e.g. when looking at the details
+// screen of a script execution activity in the website).
+func (hsr HostScriptResult) UserMessage(hostTimeout bool, hostTimeoutValue *int) string {
+	if hostTimeout {
+		return RunScriptHostTimeoutErrMsg
+	}
+
+	if hsr.ExitCode == nil {
+		if hsr.HostTimeout(scripts.MaxServerWaitTime) {
+			return RunScriptHostTimeoutErrMsg
+		}
+
+		if !hsr.SyncRequest {
+			return RunScriptAsyncScriptEnqueuedMsg
+		}
+
+		return RunScriptAlreadyRunningErrMsg
+	}
+
+	switch *hsr.ExitCode {
+	case ExitCodeScriptTimeout:
+		return HostScriptTimeoutMessage(hostTimeoutValue)
+	case ExitCodeScriptsDisabled:
+		return RunScriptDisabledErrMsg
+	case ExitCodeFleetVarResolutionFailed:
+		return RunScriptFleetVarsFailedErrMsg
+	default:
+		return ""
+	}
+}
+
+// Sentinel exit codes for script results (host_script_results.exit_code) and
+// software install results (host_software_installs.install_script_exit_code).
+// They are assigned by fleetd or the Fleet server, never by the script
+// itself, and share a single namespace so a value can't mean different things
+// on the two surfaces; each comment notes where the code applies. A real
+// process can exit with a status that collides with these values; that
+// ambiguity is accepted.
+const (
+	// ExitCodeScriptTimeout is reported when a process did not exit cleanly:
+	// either it never started (e.g. exec failed) or it was stopped before
+	// finishing (e.g. fleetd killed it at the execution timeout). Go reports
+	// -1 in both cases, so the two cannot be distinguished from the exit code
+	// alone. For script results, this renders the timeout message; for
+	// software installs, it renders the "couldn't run the install script"
+	// message.
+	ExitCodeScriptTimeout = -1
+	// ExitCodeScriptsDisabled is reported by fleetd when a script or software
+	// install can't run because scripts are disabled on the host.
+	ExitCodeScriptsDisabled = -2
+	// ExitCodeInstallerDownloadFailed is reported by fleetd when it failed to
+	// download the installer. Software install results only.
+	ExitCodeInstallerDownloadFailed = -3
+	// ExitCodeInstallerNotFound is reported by fleetd when it has been unable
+	// to fetch installer details from the server for longer than the retry
+	// window (e.g. because the installer was deleted/replaced while a
+	// setup-experience install was in flight). Software install results only.
+	ExitCodeInstallerNotFound = -4
+	// ExitCodeFleetVarResolutionFailed is recorded by the server when it
+	// can't resolve one or more Fleet variables in a script or in a software
+	// installer's scripts for the target host; the result's output holds the
+	// reasons.
+	ExitCodeFleetVarResolutionFailed = -5
+)
+
+func HostScriptTimeoutMessage(seconds *int) string {
+	var timeout int
+	if seconds == nil || *seconds == 0 {
+		timeout = int(scripts.MaxHostExecutionTime.Seconds())
+	} else {
+		timeout = *seconds
+	}
+	return fmt.Sprintf("Timeout. Fleet stopped the script after %d seconds to protect host performance.", timeout)
+}
+
+func (hsr HostScriptResult) HostTimeout(waitForResultTime time.Duration) bool {
+	return hsr.SyncRequest && hsr.ExitCode == nil && time.Now().After(hsr.CreatedAt.Add(waitForResultTime))
+}
+
+const (
+	SavedScriptMaxRuneLen   = 500000
+	UnsavedScriptMaxRuneLen = 10000
+)
+
+// anchored, so that it matches to the end of the line
+var (
+	scriptHashbangValidation       = regexp.MustCompile(`^#!\s*(:?/usr)?/bin/(ba|z)?sh(?:\s*|\s+.*)$`)
+	ErrUnsupportedInterpreter      = errors.New(`Interpreter not supported. Supported interpreters are "#!/bin/sh", "#!/bin/bash", "#!/bin/zsh", "#!/usr/bin/env python3", or an absolute path to "python" / "python3".`)
+	ErrUnsupportedShellInterpreter = errors.New(`Interpreter not supported. Shell scripts must run in "#!/bin/sh", "#!/bin/bash", or "#!/bin/zsh."`)
+)
+
+type ShebangKind int
+
+const (
+	ShebangNone ShebangKind = iota
+	ShebangShell
+	ShebangPython
+)
+
+// shebangKind is kept for internal use to maintain backwards compatibility
+type shebangKind = ShebangKind
+
+const (
+	shebangNone   = ShebangNone
+	shebangShell  = ShebangShell
+	shebangPython = ShebangPython
+)
+
+// ShebangInfo inspects the script contents and returns whether it should be
+// executed directly (via the kernel's shebang support), and what kind of
+// interpreter it declares.
+//
+// Note: for backwards compatibility, scripts without a shebang are allowed and
+// will be executed using /bin/sh.
+func ShebangInfo(contents string) (kind ShebangKind, directExecute bool, err error) {
+	return shebangInfo(contents)
+}
+
+// shebangInfo inspects the script contents and returns whether it should be
+// executed directly (via the kernel's shebang support), and what kind of
+// interpreter it declares.
+//
+// Note: for backwards compatibility, scripts without a shebang are allowed and
+// will be executed using /bin/sh.
+func shebangInfo(contents string) (kind shebangKind, directExecute bool, err error) {
+	if !strings.HasPrefix(contents, "#!") {
+		return shebangNone, false, nil
+	}
+
+	// read the first line in a portable way
+	sc := bufio.NewScanner(strings.NewReader(contents))
+	if !sc.Scan() {
+		return shebangNone, false, ErrUnsupportedInterpreter
+	}
+	line := strings.TrimSpace(sc.Text())
+	if !strings.HasPrefix(line, "#!") {
+		// should not happen given the prefix check, but be defensive
+		return shebangNone, false, nil
+	}
+
+	// tokenize the shebang: "#! <interpreter> [args...]"
+	rest := strings.TrimSpace(strings.TrimPrefix(line, "#!"))
+	fields := strings.Fields(rest)
+	if len(fields) == 0 {
+		return shebangNone, false, ErrUnsupportedInterpreter
+	}
+
+	interp := fields[0]
+	base := filepath.Base(interp)
+
+	// Support env-based shebangs like "#!/usr/bin/env python3"
+	if base == "env" {
+		// Require env to be in /bin or /usr/bin (common, predictable locations)
+		if !strings.HasPrefix(interp, "/bin/") && !strings.HasPrefix(interp, "/usr/bin/") {
+			return shebangNone, false, ErrUnsupportedInterpreter
+		}
+
+		// Skip env options (e.g. -S, -i) until we find the command.
+		i := 1
+		for i < len(fields) && strings.HasPrefix(fields[i], "-") {
+			i++
+		}
+		if i >= len(fields) {
+			return shebangNone, false, ErrUnsupportedInterpreter
+		}
+		cmd := fields[i]
+		switch {
+		case cmd == "sh" || cmd == "bash" || cmd == "zsh":
+			return shebangShell, true, nil
+		case cmd == "python" || cmd == "python3" || strings.HasPrefix(cmd, "python3."):
+			return shebangPython, true, nil
+		default:
+			return shebangNone, false, ErrUnsupportedInterpreter
+		}
+	}
+
+	// For direct interpreter paths, require an absolute path. For shell scripts,
+	// we keep the historical restriction to /bin or /usr/bin. For Python, allow
+	// any absolute path (e.g. /usr/local/bin/python3, /opt/homebrew/bin/python3).
+	if !strings.HasPrefix(interp, "/") {
+		return shebangNone, false, ErrUnsupportedInterpreter
+	}
+
+	switch {
+	case base == "sh" || base == "bash" || base == "zsh":
+		if !strings.HasPrefix(interp, "/bin/") && !strings.HasPrefix(interp, "/usr/bin/") {
+			return shebangNone, false, ErrUnsupportedInterpreter
+		}
+		return shebangShell, true, nil
+	case base == "python" || base == "python3" || strings.HasPrefix(base, "python3."):
+		return shebangPython, true, nil
+	default:
+		// preserve backwards-compatibility with prior behavior for shell scripts
+		// that relied on the regex validator (primarily for /usr/bin/(ba|z)?sh).
+		if scriptHashbangValidation.MatchString(line) {
+			return shebangShell, true, nil
+		}
+		return shebangNone, false, ErrUnsupportedInterpreter
+	}
+}
+
+// ValidateShebang validates if we support a script, and whether we
+// can execute it directly, or need to pass it to a shell interpreter.
+func ValidateShebang(s string) (directExecute bool, err error) {
+	_, directExecute, err = shebangInfo(s)
+	return directExecute, err
+}
+
+func ValidateHostScriptContents(s string, isSavedScript bool) error {
+	if s == "" {
+		return errors.New("Script contents must not be empty.")
+	}
+
+	maxLen := SavedScriptMaxRuneLen
+	maxLenErrMsg := RunScriptSavedMaxLenErrMsg
+	if !isSavedScript {
+		maxLen = UnsavedScriptMaxRuneLen
+		maxLenErrMsg = RunScripUnsavedMaxLenErrMsg
+	}
+
+	// look for the script length in bytes first, as rune counting a huge string
+	// can be expensive.
+	if len(s) > utf8.UTFMax*maxLen {
+		return errors.New(maxLenErrMsg)
+	}
+
+	// now that we know that the script is at most 4*maxScriptRuneLen bytes long,
+	// we can safely count the runes for a precise check.
+	if utf8.RuneCountInString(s) > maxLen {
+		return errors.New(maxLenErrMsg)
+	}
+
+	// script must be a "text file", but that's not so simple to validate, so we
+	// assume that if it is valid utf8 encoding, it is a text file (binary files
+	// will often have invalid utf8 byte sequences).
+	if !utf8.ValidString(s) {
+		return errors.New("Wrong data format. Only plain text allowed.")
+	}
+
+	if _, err := ValidateShebang(s); err != nil {
+		return err
+	}
+
+	return nil
+}
+
+// ValidateSoftwareInstallerScript validates the content of a software installer
+// script (install, post-install, or uninstall). Unlike ValidateHostScriptContents,
+// empty scripts are valid (meaning "no script"). The platform parameter determines
+// whether shebang validation is applied (only for "darwin" and "linux"; skipped
+// for "windows" since those use PowerShell).
+func ValidateSoftwareInstallerScript(s, platform string) error {
+	// Empty scripts are valid — they mean "no script provided".
+	if s == "" {
+		return nil
+	}
+
+	// Size check: use the saved-script limit (500,000 runes).
+	if len(s) > utf8.UTFMax*SavedScriptMaxRuneLen {
+		return errors.New(RunScriptSavedMaxLenErrMsg)
+	}
+	if utf8.RuneCountInString(s) > SavedScriptMaxRuneLen {
+		return errors.New(RunScriptSavedMaxLenErrMsg)
+	}
+
+	// Binary check: must be valid UTF-8.
+	if !utf8.ValidString(s) {
+		return errors.New("Wrong data format. Only plain text allowed.")
+	}
+
+	// Shebang/interpreter check: only for darwin and linux (shell scripts).
+	// Windows uses PowerShell, which doesn't use shebangs.
+	if platform != "windows" {
+		kind, _, err := ShebangInfo(s)
+		if err != nil {
+			// Return a shell-specific error message for software installer scripts,
+			// since they only support shell interpreters (not python).
+			return ErrUnsupportedShellInterpreter
+		}
+		// Software installer scripts must use a shell interpreter (or no shebang,
+		// which defaults to /bin/sh). Python shebangs are not supported here.
+		if kind == ShebangPython {
+			return ErrUnsupportedShellInterpreter
+		}
+	}
+
+	return nil
+}
+
+type ScriptPayload struct {
+	Name           string `json:"name"`
+	ScriptContents []byte `json:"script_contents"`
+}
+
+type SoftwareInstallerPayload struct {
+	// URL is the download URL for the installer. For script packages specified via
+	// the path field, this uses "script://filename" to pass the filename; in that
+	// case InstallScript contains the script content directly.
+	URL             string `json:"url"`
+	PreInstallQuery string `json:"pre_install_query"` //nolint:apiparamcheck // SQL precondition for install
+	// InstallScript is the script to run after downloading the installer. For script
+	// packages via "script://" URL, this contains the package content itself.
+	InstallScript     string `json:"install_script"`
+	UninstallScript   string `json:"uninstall_script"`
+	PostInstallScript string `json:"post_install_script"`
+	SelfService       bool   `json:"self_service"`
+	FleetMaintained   bool   `json:"-"`
+	// set from whether this request spelled out a script, not from the API
+	InstallScriptEdited   bool   `json:"-"`
+	UninstallScriptEdited bool   `json:"-"`
+	Filename              string `json:"-"`
+	InstallDuringSetup    *bool  `json:"install_during_setup"` // if nil, do not change saved value, otherwise set it
+	// SetupExperiencePlatforms carries non-native cross-platform setup
+	// experience selections. Nil means "no change"; an empty slice clears
+	// all cross-platform selections for this installer.
+	SetupExperiencePlatforms *[]string `json:"setup_experience_platforms,omitempty"`
+	LabelsIncludeAny         []string  `json:"labels_include_any"`
+	LabelsExcludeAny         []string  `json:"labels_exclude_any"`
+	LabelsIncludeAll         []string  `json:"labels_include_all"`
+	// ValidatedLabels is a struct that contains the validated labels for the
+	// software installer. It is nil if the labels have not been validated.
+	ValidatedLabels *LabelIdentsWithScope
+	SHA256          string                `json:"sha256"`
+	Categories      optjson.Slice[string] `json:"categories,omitzero"`
+	DisplayName     string                `json:"display_name"`
+	// This is to support FMAs
+	Slug            *string        `json:"slug"`
+	MaintainedApp   *MaintainedApp `json:"-"`
+	RollbackVersion string         `json:"fleet_maintained_app_version"`
+
+	IconPath string `json:"-"`
+	IconHash string `json:"-"`
+	// AlwaysDownload disables conditional HTTP downloads using ETag headers.
+	AlwaysDownload bool `json:"always_download"`
+	// Configuration is the managed app configuration as raw XML bytes (iOS / iPadOS in-house apps only).
+	Configuration []byte `json:"configuration,omitempty"`
+}
+
+type HostLockWipeStatus struct {
+	// HostFleetPlatform is the fleet-normalized platform of the host, i.e. the
+	// result of host.FleetPlatform().
+	HostFleetPlatform string
+
+	// macOS hosts use an MDM command to lock
+	LockMDMCommand       *MDMCommand
+	LockMDMCommandResult *MDMCommandResult
+
+	// windows and linux hosts use a script to lock
+	LockScript *HostScriptResult
+
+	// macOS hosts must manually unlock using a secret PIN, which is stored here
+	// when the lock request is sent.
+	UnlockPIN string
+	// macOS records the timestamp of the unlock request in the "unlock_ref",
+	// which is then stored here.
+	UnlockRequestedAt time.Time
+	// iOS/iPadOS hosts use an MDM command to unlock
+	UnlockMDMCommand       *MDMCommand
+	UnlockMDMCommandResult *MDMCommandResult
+	// windows and linux hosts use a script to unlock
+	UnlockScript *HostScriptResult
+
+	// macOS and Windows use MDM commands for Wipe
+	WipeMDMCommand       *MDMCommand
+	WipeMDMCommandResult *MDMCommandResult
+
+	// Linux uses a script for Wipe
+	WipeScript *HostScriptResult
+
+	// Android tracks Clear passcode (RESET_PASSWORD) as a pending state via mdm_android_commands.
+	// Apple's ClearPasscode lives in nano_commands and is not surfaced as a device-level pending
+	// state, so these fields are Android-only today.
+	ClearPasscodeMDMCommand       *MDMCommand
+	ClearPasscodeMDMCommandResult *MDMCommandResult
+
+	LocationPending bool
+}
+
+// ScriptResponse is the response type used when applying scripts by batch.
+type ScriptResponse struct {
+	// TeamID is the id of the team.
+	// A value of nil means it is scoped to hosts that are assigned to "No team".
+	TeamID *uint `json:"team_id" renameto:"fleet_id" db:"team_id"`
+	// ID is the id of the script
+	ID uint `json:"id" db:"id"`
+	// Name is the name of the script
+	Name string `json:"name" db:"name"`
+}
+
+type DeviceStatus string
+
+const (
+	DeviceStatusWiped    DeviceStatus = "wiped"
+	DeviceStatusLocked   DeviceStatus = "locked"
+	DeviceStatusUnlocked DeviceStatus = "unlocked"
+)
+
+func (s HostLockWipeStatus) DeviceStatus() DeviceStatus {
+	switch {
+	case s.IsWiped():
+		return DeviceStatusWiped
+	case s.IsLocked():
+		return DeviceStatusLocked
+	default:
+		return DeviceStatusUnlocked
+	}
+}
+
+type PendingDeviceAction string
+
+const (
+	PendingActionLock          PendingDeviceAction = "lock"
+	PendingActionUnlock        PendingDeviceAction = "unlock"
+	PendingActionWipe          PendingDeviceAction = "wipe"
+	PendingActionClearPasscode PendingDeviceAction = "clear_passcode"
+	PendingActionLocation      PendingDeviceAction = "location"
+	PendingActionNone          PendingDeviceAction = ""
+)
+
+func (s HostLockWipeStatus) PendingAction() PendingDeviceAction {
+	switch {
+	case s.LocationPending:
+		return PendingActionLocation
+	case s.IsPendingLock():
+		return PendingActionLock
+	case s.IsPendingUnlock():
+		return PendingActionUnlock
+	case s.IsPendingWipe():
+		return PendingActionWipe
+	case s.IsPendingClearPasscode():
+		return PendingActionClearPasscode
+	default:
+		return PendingActionNone
+	}
+}
+
+func (s *HostLockWipeStatus) IsPendingLock() bool {
+	if s.HostFleetPlatform == "darwin" || s.HostFleetPlatform == "ios" || s.HostFleetPlatform == "ipados" || s.HostFleetPlatform == "android" {
+		// pending lock if an MDM command is queued but no result received yet
+		return s.LockMDMCommand != nil && s.LockMDMCommandResult == nil
+	}
+	// pending lock if script execution request is queued but no result yet and not canceled
+	return s.LockScript != nil && s.LockScript.ExitCode == nil && !s.LockScript.Canceled
+}
+
+func (s HostLockWipeStatus) IsPendingUnlock() bool {
+	if s.HostFleetPlatform == "darwin" {
+		// MacOS does not have a concept of pending unlock.
+		return false
+	}
+	if s.HostFleetPlatform == "ios" || s.HostFleetPlatform == "ipados" {
+		// pending unlock if an MDM command is queued but no result received yet
+		// since for mobile apple devices we use lost mode.
+		return s.UnlockMDMCommand != nil && s.UnlockMDMCommandResult == nil
+	}
+
+	// pending unlock if script execution request is queued but no result yet and not canceled
+	return s.UnlockScript != nil && s.UnlockScript.ExitCode == nil && !s.UnlockScript.Canceled
+}
+
+func (s HostLockWipeStatus) IsPendingWipe() bool {
+	if s.HostFleetPlatform == "linux" {
+		// pending wipe if script execution request is queued but no result yet and not canceled
+		return s.WipeScript != nil && s.WipeScript.ExitCode == nil && !s.WipeScript.Canceled
+	}
+	// pending wipe if an MDM command is queued but no result received yet (Apple, Windows, Android)
+	return s.WipeMDMCommand != nil && s.WipeMDMCommandResult == nil
+}
+
+// IsPendingClearPasscode reports whether a Clear Passcode is in flight.
+// Support for Apple coming in #46286
+func (s HostLockWipeStatus) IsPendingClearPasscode() bool {
+	if s.HostFleetPlatform != "android" {
+		return false
+	}
+	return s.ClearPasscodeMDMCommand != nil && s.ClearPasscodeMDMCommandResult == nil
+}
+
+func (s HostLockWipeStatus) IsLocked() bool {
+	// this state is regardless of pending unlock/wipe (it reports whether the
+	// host is locked *now*).
+
+	if s.HostFleetPlatform == "darwin" {
+		// locked if an MDM command was sent and succeeded
+		return s.LockMDMCommand != nil && s.LockMDMCommandResult != nil &&
+			s.LockMDMCommandResult.Status == MDMAppleStatusAcknowledged
+	}
+
+	if s.HostFleetPlatform == "ios" || s.HostFleetPlatform == "ipados" {
+		return s.LockMDMCommand != nil && s.LockMDMCommandResult != nil &&
+			s.LockMDMCommandResult.Status == MDMAppleStatusAcknowledged && !s.LocationPending
+	}
+
+	if s.HostFleetPlatform == "android" {
+		// Android device unlock happens locally via the user's PIN; AMAPI does not deliver a "device unlocked" notification, and Fleet
+		// has no UNLOCK command.
+		return false
+	}
+
+	// locked if a script was sent and succeeded
+	return s.LockScript != nil && s.LockScript.ExitCode != nil &&
+		*s.LockScript.ExitCode == 0
+}
+
+func (s HostLockWipeStatus) IsUnlocked() bool {
+	// this state is regardless of pending lock/unlock/wipe (it reports whether
+	// the host is unlocked *now*).
+	return !s.IsLocked() && !s.IsWiped()
+}
+
+func (s HostLockWipeStatus) IsWiped() bool {
+	switch s.HostFleetPlatform {
+	case "linux":
+		// wiped if script was sent and succeeded
+		return s.WipeScript != nil && s.WipeScript.ExitCode != nil &&
+			*s.WipeScript.ExitCode == 0
+	case "windows":
+		// wiped if an MDM command was sent and succeeded
+		return s.WipeMDMCommand != nil && s.WipeMDMCommandResult != nil &&
+			strings.HasPrefix(s.WipeMDMCommandResult.Status, "2")
+	case "darwin", "ios", "ipados":
+		// wiped if an MDM command was sent and succeeded
+		return s.WipeMDMCommand != nil && s.WipeMDMCommandResult != nil &&
+			s.WipeMDMCommandResult.Status == MDMAppleStatusAcknowledged
+	case "android":
+		// wiped if Pub/Sub COMMAND notification reported an Android-side ack.
+		return s.WipeMDMCommand != nil && s.WipeMDMCommandResult != nil &&
+			s.WipeMDMCommandResult.Status == string(android.MDMAndroidCommandStatusAcknowledged)
+	default:
+		return false
+	}
+}
+
+var (
+	BatchExecuteIncompatiblePlatform = "incompatible-platform"
+	BatchExecuteIncompatibleFleetd   = "incompatible-fleetd"
+	BatchExecuteInvalidHost          = "invalid-host"
+	BatchExecuteIncompatibleTeam     = "incompatible-team"
+)
+
+type BatchExecutionStatusFilter struct {
+	ScriptID *uint   `json:"script_id,omitempty"`
+	TeamID   *uint   `json:"team_id,omitempty" renameto:"fleet_id"` // if nil, it is scoped to hosts that are assigned to "No team"
+	Status   *string `json:"status,omitempty"`                      // e.g. "pending", "ran", "errored", "canceled", "incompatible-platform", "incompatible-fleetd"
+	// ExecutionID is the unique identifier for a single execution of the script.
+	ExecutionID *string `json:"execution_id,omitempty"`
+	// Limit is the maximum number of results to return.
+	// If not set, it defaults to 100.
+	Limit *uint `json:"limit,omitempty"`
+	// Offset is the number of results to skip before returning results.
+	// If not set, it defaults to 0.
+	Offset *uint `json:"offset,omitempty"`
+}
+
+type BatchExecutionHost struct {
+	HostID          uint    `json:"host_id" db:"host_id"`
+	HostDisplayName string  `json:"host_display_name" db:"hostname"`
+	ExecutionID     *string `json:"execution_id,omitempty" db:"execution_id"`
+	Error           *string `json:"error,omitempty" db:"error"`
+}
+
+type BatchActivity struct {
+	ID               uint                          `json:"id" db:"id"`
+	BatchExecutionID string                        `json:"batch_execution_id" db:"execution_id"`
+	UserID           *uint                         `json:"user_id" db:"user_id"`
+	JobID            *uint                         `json:"-" db:"job_id"`
+	ActivityType     BatchExecutionActivityType    `json:"-" db:"activity_type"`
+	ScriptID         *uint                         `json:"script_id" db:"script_id"`
+	ScriptName       string                        `json:"script_name" db:"script_name"`
+	TeamID           *uint                         `json:"team_id" renameto:"fleet_id" db:"team_id"`
+	CreatedAt        time.Time                     `json:"created_at" db:"created_at"`
+	UpdatedAt        time.Time                     `json:"updated_at" db:"updated_at"`
+	NotBefore        *time.Time                    `json:"not_before,omitempty" db:"not_before"`
+	StartedAt        *time.Time                    `json:"started_at,omitempty" db:"started_at"`
+	FinishedAt       *time.Time                    `json:"finished_at,omitempty" db:"finished_at"`
+	Canceled         bool                          `json:"canceled" db:"canceled"`
+	Status           ScheduledBatchExecutionStatus `json:"status" db:"status"`
+	NumTargeted      *uint                         `json:"targeted_host_count" db:"num_targeted"`
+	NumPending       *uint                         `json:"pending_host_count" db:"num_pending"`
+	NumRan           *uint                         `json:"ran_host_count" db:"num_ran"`
+	NumErrored       *uint                         `json:"errored_host_count" db:"num_errored"`
+	NumCanceled      *uint                         `json:"canceled_host_count" db:"num_canceled"`
+	NumIncompatible  *uint                         `json:"incompatible_host_count" db:"num_incompatible"`
+}
+
+type BatchActivityHostResult struct {
+	ID               uint    `db:"id"`
+	BatchExecutionID string  `db:"batch_execution_id"`
+	HostID           uint    `db:"host_id"`
+	HostExecutionID  *string `db:"host_execution_id"`
+	Error            *string `db:"error"`
+}
+
+type BatchActivityScriptJobArgs struct {
+	ExecutionID string `json:"execution_id"`
+}
+
+type ScheduledBatchExecutionStatus string
+
+var (
+	ScheduledBatchExecutionStarted   ScheduledBatchExecutionStatus = "started"
+	ScheduledBatchExecutionScheduled ScheduledBatchExecutionStatus = "scheduled"
+	ScheduledBatchExecutionFinished  ScheduledBatchExecutionStatus = "finished"
+)
+
+type BatchExecutionActivityType string
+
+var BatchExecutionActivityScript BatchExecutionActivityType = "script"
+
+const BatchActivityScriptsJobName = "batch_scripts"
+
+// ValidateScriptPlatform returns whether a script can run on a host based on its host.Platform
+func ValidateScriptPlatform(scriptName, platform string) bool {
+	switch filepath.Ext(scriptName) {
+	case ".sh":
+		return IsUnixLike(platform)
+	case ".py":
+		return IsUnixLike(platform)
+	case ".ps1":
+		return platform == "windows"
+	default:
+		return false
+	}
+}

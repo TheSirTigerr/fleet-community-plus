@@ -1,0 +1,66 @@
+.account-side-panel {
+  @include vertical-card-layout;
+  $gap-data-sets: $pad-medium;
+
+  &__change-avatar {
+    display: flex;
+    flex-direction: column;
+    gap: $pad-small;
+    align-items: center;
+  }
+
+  &__avatar {
+    margin: 0 auto;
+  }
+
+  &__button {
+    width: 100%;
+  }
+
+  &__password-info {
+    display: flex;
+    flex-direction: column;
+    gap: $pad-small;
+    width: 100%;
+  }
+
+  &__last-updated {
+    @include help-text;
+  }
+
+  &__confirm-update {
+    margin-bottom: $pad-medium;
+  }
+
+  &__secret-label {
+    font-size: $x-small;
+    font-weight: $bold;
+    margin: 0 0 $pad-xsmall;
+  }
+
+  &.button-wrap {
+    justify-content: flex-end;
+  }
+
+  &__theme-picker {
+    display: flex;
+    flex-direction: column;
+    gap: $pad-small;
+  }
+
+  &__theme-picker-label {
+    font-size: $x-small;
+    font-weight: $bold;
+  }
+
+  &__version {
+    font-size: $xx-small;
+    text-align: center;
+    display: block;
+  }
+
+  &__privacy-policy {
+    text-align: center;
+    display: block;
+  }
+}

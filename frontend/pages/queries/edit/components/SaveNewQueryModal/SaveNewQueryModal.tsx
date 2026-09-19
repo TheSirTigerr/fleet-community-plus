@@ -1,0 +1,397 @@
+import { size } from "lodash";
+import React, { useState, useEffect, useContext, useMemo } from "react";
+import { useQuery } from "react-query";
+
+import Button from "components/buttons/Button";
+import RevealButton from "components/buttons/RevealButton";
+import CustomLink from "components/CustomLink";
+import Checkbox from "components/forms/fields/Checkbox";
+// @ts-ignore
+import Dropdown from "components/forms/fields/Dropdown";
+import InputField from "components/forms/fields/InputField";
+import Slider from "components/forms/fields/Slider";
+import Icon from "components/Icon";
+import LogDestinationIndicator from "components/LogDestinationIndicator";
+import Modal from "components/Modal";
+import { DropdownTargetLabelSelector } from "components/TargetLabelSelector";
+import {
+  getCustomTargetOptions,
+  LabelScope,
+} from "components/TargetLabelSelector/labelScopes";
+import TooltipWrapper from "components/TooltipWrapper";
+import { AppContext } from "context/app";
+import useDeepEffect from "hooks/useDeepEffect";
+import { IPlatformSelector } from "hooks/usePlatformSelector";
+import { CommaSeparatedPlatformString } from "interfaces/platform";
+import {
+  ICreateQueryFormData,
+  ISchedulableQuery,
+  QueryLoggingOption,
+} from "interfaces/schedulable_query";
+import labelsAPI, {
+  getCustomLabels,
+  ILabelsSummaryResponse,
+} from "services/entities/labels";
+import {
+  FREQUENCY_DROPDOWN_OPTIONS,
+  LOGGING_TYPE_OPTIONS,
+  MIN_OSQUERY_VERSION_OPTIONS,
+  DEFAULT_USE_QUERY_OPTIONS,
+  MAX_ENTITY_CHAR_LENGTH,
+} from "utilities/constants";
+
+import DiscardDataOption from "../DiscardDataOption";
+
+const baseClass = "save-query-modal";
+
+export interface ISaveNewQueryModalProps {
+  queryValue: string;
+  apiTeamIdForQuery?: number; // query will be global if omitted
+  isLoading: boolean;
+  saveQuery: (formData: ICreateQueryFormData) => void;
+  toggleSaveNewQueryModal: () => void;
+  backendValidators: { [key: string]: string };
+  existingQuery?: ISchedulableQuery;
+  queryReportsDisabled?: boolean;
+  platformSelector: IPlatformSelector;
+}
+
+const validateQueryName = (name: string) => {
+  const errors: { [key: string]: string } = {};
+
+  if (!name) {
+    errors.name = "Report name must be present";
+  }
+
+  const valid = !size(errors);
+  return { valid, errors };
+};
+
+const SaveNewQueryModal = ({
+  queryValue,
+  apiTeamIdForQuery,
+  isLoading,
+  saveQuery,
+  toggleSaveNewQueryModal,
+  backendValidators,
+  existingQuery,
+  queryReportsDisabled,
+  platformSelector,
+}: ISaveNewQueryModalProps): JSX.Element => {
+  const { config, isPremiumTier, currentTeam } = useContext(AppContext);
+
+  const [name, setName] = useState("");
+  const [description, setDescription] = useState("");
+  const [selectedFrequency, setSelectedFrequency] = useState(
+    existingQuery?.interval ?? 3600
+  );
+  const [
+    selectedMinOsqueryVersionOptions,
+    setSelectedMinOsqueryVersionOptions,
+  ] = useState(existingQuery?.min_osquery_version ?? "");
+  const [
+    selectedLoggingType,
+    setSelectedLoggingType,
+  ] = useState<QueryLoggingOption>(existingQuery?.logging ?? "snapshot");
+  const [observerCanRun, setObserverCanRun] = useState(false);
+  const [automationsEnabled, setAutomationsEnabled] = useState(false);
+  const [selectedTargetType, setSelectedTargetType] = useState("All hosts");
+  const [selectedCustomTarget, setSelectedCustomTarget] = useState<LabelScope>(
+    "labelsIncludeAny"
+  );
+  const [selectedLabels, setSelectedLabels] = useState({});
+  const [discardData, setDiscardData] = useState(false);
+  const customTargetOptions = useMemo(
+    () => getCustomTargetOptions({ entity: "report", isPremiumTier }),
+    [isPremiumTier]
+  );
+  const [errors, setErrors] = useState<{ [key: string]: string }>(
+    backendValidators
+  );
+  const [showAdvancedOptions, setShowAdvancedOptions] = useState(false);
+
+  const {
+    data: { labels } = { labels: [] },
+    isFetching: isFetchingLabels,
+  } = useQuery<ILabelsSummaryResponse, Error>(
+    ["custom_labels"],
+    () => labelsAPI.summary(currentTeam?.id, true),
+    {
+      ...DEFAULT_USE_QUERY_OPTIONS,
+      // Wait for the current team to load from context before pulling labels, otherwise on a page load
+      // directly on the page this gets called with currentTeam not set, then again
+      // with the correct team value. If we don't trigger on currentTeam changes we'll just start with a
+      // null team ID here and never populate with the correct team unless we navigate from another page
+      // where team context is already set prior to navigation.
+      enabled: isPremiumTier && !!currentTeam,
+      staleTime: 10000,
+      select: (res) => ({ labels: getCustomLabels(res.labels) }),
+    }
+  );
+
+  const onSelectLabel = ({
+    name: labelName,
+    value,
+  }: {
+    name: string;
+    value: boolean;
+  }) => {
+    setSelectedLabels({
+      ...selectedLabels,
+      [labelName]: value,
+    });
+  };
+
+  const toggleAdvancedOptions = () => {
+    setShowAdvancedOptions(!showAdvancedOptions);
+  };
+
+  useDeepEffect(() => {
+    if (name) {
+      setErrors({});
+    }
+  }, [name]);
+
+  useEffect(() => {
+    setErrors(backendValidators);
+  }, [backendValidators]);
+
+  // Disable saving if "Custom" targeting is selected, but no labels are selected.
+  const canSave =
+    platformSelector.isAnyPlatformSelected &&
+    (selectedTargetType === "All hosts" ||
+      Object.entries(selectedLabels).some(([, value]) => {
+        return value;
+      }));
+
+  const onClickSaveQuery = (evt: React.MouseEvent<HTMLFormElement>) => {
+    evt.preventDefault();
+
+    const trimmedName = name.trim();
+
+    const { valid, errors: newErrors } = validateQueryName(trimmedName);
+    setErrors({
+      ...errors,
+      ...newErrors,
+    });
+    setName(trimmedName);
+
+    const newPlatformString = platformSelector
+      .getSelectedPlatforms()
+      .join(",") as CommaSeparatedPlatformString;
+
+    if (valid) {
+      const customLabelNames =
+        isPremiumTier && selectedTargetType === "Custom"
+          ? Object.entries(selectedLabels)
+              .filter(([, selected]) => selected)
+              .map(([labelName]) => labelName)
+          : [];
+      const labelsForScope = (scope: LabelScope) => {
+        if (!isPremiumTier) {
+          return undefined;
+        }
+        return selectedCustomTarget === scope ? customLabelNames : [];
+      };
+      const labelsIncludeAny = labelsForScope("labelsIncludeAny");
+      const labelsIncludeAll = labelsForScope("labelsIncludeAll");
+
+      saveQuery({
+        // from modal fields
+        name: trimmedName,
+        description,
+        interval: selectedFrequency,
+        observer_can_run: observerCanRun,
+        automations_enabled: automationsEnabled,
+        discard_data: discardData,
+        platform: newPlatformString,
+        min_osquery_version: selectedMinOsqueryVersionOptions,
+        logging: selectedLoggingType,
+        // from previous New query page
+        query: queryValue,
+        // from doubly previous ManageQueriesPage
+        fleet_id: apiTeamIdForQuery,
+        labels_include_any: labelsIncludeAny,
+        labels_include_all: labelsIncludeAll,
+      });
+    }
+  };
+
+  return (
+    <Modal title="Save report" onExit={toggleSaveNewQueryModal}>
+      <form
+        onSubmit={onClickSaveQuery}
+        className={baseClass}
+        autoComplete="off"
+      >
+        <InputField
+          name="name"
+          onChange={(value: string) => setName(value)}
+          onBlur={() => {
+            setName(name.trim());
+          }}
+          value={name}
+          error={errors.name}
+          inputClassName={`${baseClass}__name`}
+          label="Name"
+          autofocus
+          inputOptions={{ maxLength: MAX_ENTITY_CHAR_LENGTH }}
+        />
+        <InputField
+          name="description"
+          onChange={(value: string) => setDescription(value)}
+          value={description}
+          inputClassName={`${baseClass}__description`}
+          label="Description"
+          type="textarea"
+          helpText="What information does your report reveal? (optional)"
+        />
+        <Dropdown
+          searchable={false}
+          options={FREQUENCY_DROPDOWN_OPTIONS}
+          onChange={(value: number) => {
+            setSelectedFrequency(value);
+          }}
+          placeholder="Every hour"
+          value={selectedFrequency}
+          label="Interval"
+          wrapperClassName={`${baseClass}__form-field form-field--frequency`}
+          helpText={
+            <>
+              Hosts report at fixed times (e.g., on the hour for a 1-hour
+              interval).{" "}
+              <CustomLink
+                url="https://fleetdm.com/guides/reports#schedule-a-report"
+                text="Learn more"
+                newTab
+              />
+            </>
+          }
+        />
+        <Checkbox
+          name="observerCanRun"
+          onChange={setObserverCanRun}
+          value={observerCanRun}
+          wrapperClassName="observer-can-run-wrapper"
+          helpText="Users with the Observer role will be able to run this report as a live report."
+        >
+          Observers can run
+        </Checkbox>
+        <Slider
+          onChange={() => setAutomationsEnabled(!automationsEnabled)}
+          value={automationsEnabled}
+          activeText={
+            <>
+              Automations on
+              {selectedFrequency === 0 && (
+                <TooltipWrapper
+                  tipContent={
+                    <>
+                      Automations and reporting will be paused for this report
+                      until an interval is set.
+                    </>
+                  }
+                  position="right"
+                  tipOffset={9}
+                  showArrow
+                  underline={false}
+                >
+                  <Icon name="warning" />
+                </TooltipWrapper>
+              )}
+            </>
+          }
+          inactiveText="Automations off"
+          helpText={
+            <>
+              Historical results will {!automationsEnabled ? "not " : ""}be sent
+              to your log destination:{" "}
+              <b>
+                <LogDestinationIndicator
+                  logDestination={config?.logging.result.plugin || ""}
+                  filesystemDestination={
+                    config?.logging.result.config?.result_log_file
+                  }
+                  webhookDestination={config?.logging.result.config?.result_url}
+                  excludeTooltip
+                />
+              </b>
+              .
+            </>
+          }
+        />
+        {platformSelector.render()}
+        {isPremiumTier && (
+          <DropdownTargetLabelSelector
+            selectedTargetType={selectedTargetType}
+            selectedCustomTarget={selectedCustomTarget}
+            customTargetOptions={customTargetOptions}
+            onSelectCustomTarget={(val) =>
+              setSelectedCustomTarget(val as LabelScope)
+            }
+            selectedLabels={selectedLabels}
+            className={`${baseClass}__target`}
+            onSelectTargetType={setSelectedTargetType}
+            onSelectLabel={onSelectLabel}
+            labels={labels || []}
+            suppressTitle
+          />
+        )}
+        <RevealButton
+          isShowing={showAdvancedOptions}
+          className="advanced-options-toggle"
+          hideText="Advanced options"
+          showText="Advanced options"
+          caretPosition="after"
+          onClick={toggleAdvancedOptions}
+        />
+        {showAdvancedOptions && (
+          <>
+            <Dropdown
+              options={MIN_OSQUERY_VERSION_OPTIONS}
+              onChange={setSelectedMinOsqueryVersionOptions}
+              placeholder="Select"
+              value={selectedMinOsqueryVersionOptions}
+              label="Minimum osquery version"
+              wrapperClassName={`${baseClass}__form-field ${baseClass}__form-field--osquer-vers`}
+            />
+            <Dropdown
+              options={LOGGING_TYPE_OPTIONS}
+              onChange={setSelectedLoggingType}
+              placeholder="Select"
+              value={selectedLoggingType}
+              label="Logging"
+              wrapperClassName={`${baseClass}__form-field ${baseClass}__form-field--logging`}
+            />
+            {queryReportsDisabled !== undefined && (
+              <DiscardDataOption
+                {...{
+                  queryReportsDisabled,
+                  selectedLoggingType,
+                  discardData,
+                  setDiscardData,
+                  breakHelpText: true,
+                }}
+              />
+            )}
+          </>
+        )}
+        <div className="modal-cta-wrap">
+          <Button
+            type="submit"
+            className="save-query-loading"
+            isLoading={isLoading || isFetchingLabels}
+            disabled={!canSave}
+          >
+            Save
+          </Button>
+          <Button onClick={toggleSaveNewQueryModal} variant="secondary">
+            Cancel
+          </Button>
+        </div>
+      </form>
+    </Modal>
+  );
+};
+
+export default SaveNewQueryModal;

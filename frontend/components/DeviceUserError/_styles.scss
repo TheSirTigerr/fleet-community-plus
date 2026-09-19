@@ -1,0 +1,53 @@
+.device-user-error {
+  display: flex;
+  flex-direction: column;
+  align-items: center;
+
+  &__mobile-view {
+    align-self: center;
+    vertical-align: middle;
+    justify-content: center; /* vertical centering */
+    min-height: 100vh; /* full viewport height */
+  }
+
+  &__inner {
+    display: flex;
+    flex-direction: row;
+    margin: $pad-xxxlarge 0;
+  }
+
+  &__content {
+    display: flex;
+    flex-direction: column;
+    gap: $pad-large;
+    max-width: 333px;
+    padding: $pad-small;
+  }
+  &__header {
+    display: block;
+    gap: $pad-large;
+    color: $core-fleet-black;
+    font-weight: $bold;
+    font-size: $x-small;
+    text-align: center;
+
+    .icon {
+      vertical-align: sub;
+      margin-right: $pad-small;
+      position: relative;
+      bottom: 1px;
+    }
+  }
+  &__description {
+    display: block;
+    color: $core-fleet-black;
+    font-weight: normal;
+    font-size: $x-small;
+    text-align: center;
+    line-height: $line-height;
+  }
+  &__action {
+    display: flex;
+    justify-content: center;
+  }
+}

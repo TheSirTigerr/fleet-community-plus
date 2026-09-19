@@ -1,0 +1,62 @@
+import React from "react";
+import { InjectedRouter } from "react-router";
+import { CellProps, Column } from "react-table";
+
+import HeaderCell from "components/TableContainer/DataTable/HeaderCell";
+import InstallerActionCell from "components/TableContainer/DataTable/InstallerActionCell";
+import SoftwareNameCell from "components/TableContainer/DataTable/SoftwareNameCell";
+import { IHeaderProps, IStringCellProps } from "interfaces/datatable_config";
+import { ICombinedFMA } from "interfaces/software";
+
+type IFleetMaintainedAppsTableConfig = Column<ICombinedFMA>;
+type ITableStringCellProps = IStringCellProps<ICombinedFMA>;
+type ITableHeaderProps = IHeaderProps<ICombinedFMA>;
+
+// eslint-disable-next-line import/prefer-default-export
+export const generateTableConfig = (
+  router: InjectedRouter,
+  teamId: number
+): IFleetMaintainedAppsTableConfig[] => {
+  return [
+    {
+      Header: (cellProps: ITableHeaderProps) => (
+        <HeaderCell value="Name" isSortedDesc={cellProps.column.isSortedDesc} />
+      ),
+      accessor: "name",
+      Cell: (cellProps: ITableStringCellProps) => {
+        const { name } = cellProps.row.original;
+
+        return <SoftwareNameCell name={name} />;
+      },
+      sortType: "caseInsensitive",
+    },
+    {
+      Header: "macOS",
+      accessor: "macos",
+      Cell: (cellProps: CellProps<ICombinedFMA>) => {
+        const { macos } = cellProps.row.original;
+
+        return (
+          <InstallerActionCell teamId={teamId} value={macos} router={router} />
+        );
+      },
+      disableSortBy: true,
+    },
+    {
+      Header: "Windows",
+      accessor: "windows",
+      Cell: (cellProps: CellProps<ICombinedFMA>) => {
+        const { windows } = cellProps.row.original;
+
+        return (
+          <InstallerActionCell
+            teamId={teamId}
+            value={windows}
+            router={router}
+          />
+        );
+      },
+      disableSortBy: true,
+    },
+  ];
+};

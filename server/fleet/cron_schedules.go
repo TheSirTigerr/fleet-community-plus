@@ -1,0 +1,272 @@
+package fleet
+
+import (
+	"context"
+	"encoding/json"
+	"fmt"
+	"net/http"
+	"sort"
+	"strings"
+	"time"
+)
+
+type CronScheduleName string
+
+// List of recognized cron schedule names.
+const (
+	CronAppleMDMDEPProfileAssigner   CronScheduleName = "apple_mdm_dep_profile_assigner"
+	CronCleanupsThenAggregation      CronScheduleName = "cleanups_then_aggregation"
+	CronFrequentCleanups             CronScheduleName = "frequent_cleanups"
+	CronUsageStatistics              CronScheduleName = "usage_statistics"
+	CronVulnerabilities              CronScheduleName = "vulnerabilities"
+	CronAutomations                  CronScheduleName = "automations"
+	CronWorkerIntegrations           CronScheduleName = "integrations"
+	CronActivitiesStreaming          CronScheduleName = "activities_streaming"
+	CronMDMAppleProfileManager       CronScheduleName = "mdm_apple_profile_manager"
+	CronMDMWindowsProfileManager     CronScheduleName = "mdm_windows_profile_manager"
+	CronMDMAndroidProfileManager     CronScheduleName = "mdm_android_profile_manager"
+	CronMDMAndroidDeviceReconciler   CronScheduleName = "mdm_android_device_reconciler"
+	CronMicrosoftAutopilotSync       CronScheduleName = "microsoft_autopilot_sync"
+	CronAppleMDMIPhoneIPadRefetcher  CronScheduleName = "apple_mdm_iphone_ipad_refetcher"
+	CronAppleMDMAPNsPusher           CronScheduleName = "apple_mdm_apns_pusher"
+	CronCalendar                     CronScheduleName = "calendar"
+	CronGoogleWorkspaceSync          CronScheduleName = "google_workspace_sync"
+	CronUninstallSoftwareMigration   CronScheduleName = "uninstall_software_migration"
+	CronUpgradeCodeSoftwareMigration CronScheduleName = "upgrade_code_software_migration"
+	CronMaintainedApps               CronScheduleName = "maintained_apps"
+	// CronWindowsMaintainedAppTitles merges Windows software titles whose reported
+	// name embeds the version onto the title owned by the Fleet-maintained app's
+	// installer.
+	CronWindowsMaintainedAppTitles CronScheduleName = "windows_maintained_app_titles"
+	// CronMaintainedAppsAutoUpdate advances each Fleet-maintained app's active
+	// installer to the newest cached version its pin state allows. Premium only;
+	// runs every 1h.
+	CronMaintainedAppsAutoUpdate CronScheduleName = "maintained_apps_auto_update"
+	// CronRefreshVPPAppVersions updates the versions of VPP apps in Fleet to the latest value. Runs
+	// every 1h.
+	CronRefreshVPPAppVersions         CronScheduleName = "refresh_vpp_app_versions"
+	CronAppleMDMIPhoneIPadReviver     CronScheduleName = "apple_mdm_iphone_ipad_reviver"
+	CronUpcomingActivitiesMaintenance CronScheduleName = "upcoming_activities_maintenance"
+	// CronFleetInitiatedActivitiesRelease activates deferred fleet-initiated
+	// upcoming activities (policy-automation installs/scripts) within the
+	// activity.fleet_initiated_release_per_minute budget. Runs every 1 minute.
+	CronFleetInitiatedActivitiesRelease CronScheduleName = "fleet_initiated_activities_release"
+	CronHostVitalsLabelMembership       CronScheduleName = "host_vitals_label_membership"
+	CronBatchActivityCompletionChecker  CronScheduleName = "batch_activity_completion_checker"
+	CronScheduledBatchActivities        CronScheduleName = "scheduled_batch_activities"
+	// CronEnableAndroidAppReportsOnDefaultPolicy enables applications reports on the default Android MDM policy (profile).
+	// This job only runs once after upgrading to v4.76.0.
+	CronEnableAndroidAppReportsOnDefaultPolicy CronScheduleName = "enable_android_app_reports_on_default_policy"
+	// CronMigrateToPerHostPolicy moves all Android hosts that are on the default MDM policy to a dedicated
+	// policy per host. This job only runs once after upgrading to v4.77.0.
+	CronMigrateToPerHostPolicy CronScheduleName = "migrate_to_per_host_policy"
+	// CronQueryResultsCleanup deletes excess query result rows that exceed the maximum allowed per query.
+	// Runs every 1 minute.
+	CronQueryResultsCleanup CronScheduleName = "query_results_cleanup"
+	// CronSendRecoveryLockCommands sends SetRecoveryLock MDM commands to macOS devices.
+	// Runs every 5 minutes.
+	CronSendRecoveryLockCommands CronScheduleName = "send_recovery_lock_commands"
+	// CronSendManagedLocalAccountRotationCommands rotates managed local account passwords.
+	// Runs every 5 minutes; picks up rows whose auto_rotate_at has elapsed (set by view or
+	// by a manual rotation that was deferred because the account UUID wasn't yet known).
+	CronSendManagedLocalAccountRotationCommands CronScheduleName = "send_managed_local_account_rotation_commands"
+	CronAppleMDMWorker                          CronScheduleName = "apple_mdm_worker"
+	CronChartDataCollection                     CronScheduleName = "chart_data_collection" // Used by chart bounded context
+	CronCleanupExpiredADUEChallenges            CronScheduleName = "cleanup_expired_adue_challenges"
+	CronAppleMDMOSUpdatesSchedule               CronScheduleName = "apple_mdm_os_updates"
+	// CronMDMAndroidCommandReconciler polls AMAPI for the outcome of Android MDM commands whose Pub/Sub
+	// COMMAND notification never arrived, so they don't stay pending forever. Runs every 24h.
+	CronMDMAndroidCommandReconciler CronScheduleName = "mdm_android_command_reconciler"
+	// CronAppleMDMAPNsSweep walks enabled Apple MDM enrollments in daily laps
+	// and re-pushes any that have been silent for more than a day, so offline
+	// devices always have a stored push waiting at APNs.
+	CronAppleMDMAPNsSweep CronScheduleName = "apple_mdm_apns_sweep"
+)
+
+type CronSchedulesService interface {
+	// TriggerCronSchedule attempts to trigger an ad-hoc run of the named cron schedule.
+	TriggerCronSchedule(ctx context.Context, name string) error
+}
+
+func NewCronSchedules() *CronSchedules {
+	return &CronSchedules{Schedules: make(map[string]CronSchedule)}
+}
+
+type CronSchedule interface {
+	Trigger(ctx context.Context) (*CronStats, bool, error)
+	Name() string
+	Start()
+}
+
+type CronSchedules struct {
+	Schedules map[string]CronSchedule
+}
+
+// AuthzType implements authz.AuthzTyper.
+func (cs *CronSchedules) AuthzType() string {
+	return "cron_schedules"
+}
+
+type NewCronScheduleFunc func() (CronSchedule, error)
+
+// StartCronSchedules starts a new cron schedule and registers it with the cron schedules struct.
+func (cs *CronSchedules) StartCronSchedule(fn NewCronScheduleFunc) error {
+	sched, err := fn()
+	if err != nil {
+		return err
+	}
+	sched.Start()
+	cs.Schedules[sched.Name()] = sched
+	return nil
+}
+
+// TriggerCronSchedule attempts to trigger an ad-hoc run of the named cron schedule.
+func (cs *CronSchedules) TriggerCronSchedule(ctx context.Context, name string) error {
+	sched, ok := cs.Schedules[name]
+	if !ok {
+		return triggerNotFoundError{name: name, msg: cs.formatSupportedTriggerNames()}
+	}
+	stats, _, err := sched.Trigger(ctx)
+	switch {
+	case err != nil:
+		return err
+	case stats != nil:
+		return triggerConflictError{name: name, stats: stats}
+	default:
+		return nil
+	}
+}
+
+// ScheduleNames returns a list of the names of all cron schedules registered with the service.
+func (cs *CronSchedules) ScheduleNames() []string {
+	var res []string
+	for _, sched := range cs.Schedules {
+		res = append(res, sched.Name())
+	}
+	sort.Strings(res)
+	return res
+}
+
+func (cs *CronSchedules) formatSupportedTriggerNames() string {
+	names := cs.ScheduleNames()
+	switch len(names) {
+	case 0:
+		return "no supported triggers"
+	case 1:
+		return fmt.Sprintf("supported trigger name is %s", names[0])
+	default:
+		return fmt.Sprintf("supported trigger names are %s, and %s", strings.Join(names[:len(names)-1], ", "), names[len(names)-1])
+	}
+}
+
+type triggerConflictError struct {
+	name  string
+	stats *CronStats
+}
+
+func (e triggerConflictError) Error() string {
+	msg := "conflicts with current status of "
+	if e.name != "" {
+		msg += fmt.Sprintf("%s ", e.name)
+	}
+	msg += "schedule"
+	if e.stats != nil {
+		msg += fmt.Sprintf(": %s run started %v ago", e.stats.StatsType, time.Since(e.stats.CreatedAt).Round(time.Millisecond))
+	}
+	return msg
+}
+
+func (e triggerConflictError) IsConflict() bool {
+	return true
+}
+
+func (e triggerConflictError) IsClientError() bool {
+	return true
+}
+
+func (e triggerConflictError) StatusCode() int {
+	return http.StatusConflict
+}
+
+type triggerNotFoundError struct {
+	name string
+	msg  string
+}
+
+func (e triggerNotFoundError) Error() string {
+	return fmt.Sprintf("invalid name; %s", e.msg)
+}
+
+func (e triggerNotFoundError) IsNotFound() bool {
+	return true
+}
+
+func (e triggerNotFoundError) IsClientError() bool {
+	return true
+}
+
+func (e triggerNotFoundError) StatusCode() int {
+	return http.StatusNotFound
+}
+
+type CronScheduleErrors map[string]error
+
+func (cse CronScheduleErrors) MarshalJSON() ([]byte, error) {
+	// Create a temporary map for JSON serialization
+	stringMap := make(map[string]string)
+	for key, err := range cse {
+		if err != nil {
+			stringMap[key] = err.Error()
+		} else {
+			stringMap[key] = ""
+		}
+	}
+	// Serialize the temporary map to JSON
+	return json.Marshal(stringMap)
+}
+
+// CronStats represents statistics recorded in connection with a named set of jobs (sometimes
+// referred to as a "cron" or "schedule"). Each record represents a separate "run" of the named job set.
+type CronStats struct {
+	ID int `db:"id"`
+	// StatsType denotes whether the stats are associated with a run of jobs that was "triggered"
+	// (i.e. run on an ad-hoc basis) or "scheduled" (i.e. run on a regularly scheduled interval).
+	StatsType CronStatsType `db:"stats_type"`
+	// Name is the name of the set of jobs (i.e. the schedule name).
+	Name string `db:"name"`
+	// Instance is the unique id of the Fleet instance that performed the run of jobs represented by
+	// the stats.
+	Instance string `db:"instance"`
+	// CreatedAt is the time the stats record was created. It is assumed to be the start of the run.
+	CreatedAt time.Time `db:"created_at"`
+	// UpdatedAt is the time the stats record was last updated. For a "completed" run, this assumed
+	// to be the end of the run.
+	UpdatedAt time.Time `db:"updated_at"`
+	// Status is the current status of the run. Recognized statuses are "pending", "completed", and
+	// "expired".
+	Status CronStatsStatus `db:"status"`
+	// Errors is a JSON string containing any errors encountered during the run.
+	Errors string `db:"errors"`
+}
+
+// CronStatsType is one of two recognized types of cron stats (i.e. "scheduled" or "triggered")
+type CronStatsType string
+
+// List of recognized cron stats types.
+const (
+	CronStatsTypeScheduled CronStatsType = "scheduled"
+	CronStatsTypeTriggered CronStatsType = "triggered"
+)
+
+// CronStatsStatus is one of the recognized statuses of cron stats
+type CronStatsStatus string
+
+// List of recognized cron stats statuses.
+const (
+	CronStatsStatusPending   CronStatsStatus = "pending"
+	CronStatsStatusExpired   CronStatsStatus = "expired"
+	CronStatsStatusCompleted CronStatsStatus = "completed"
+	CronStatsStatusCanceled  CronStatsStatus = "canceled"
+	// CronStatsStatusQueued indicates a trigger request waiting for a remote server to pick up.
+	CronStatsStatusQueued CronStatsStatus = "queued"
+)

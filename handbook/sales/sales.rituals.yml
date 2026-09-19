@@ -1,0 +1,7 @@
+# https://github.com/fleetdm/fleet/pull/13084
+- task: "Review Salesforce opportunities"
+  startedOn: "2024-12-02"
+  frequency: "Weekly"
+  description: "https://fleetdm.com/handbook/sales#review-salesforce-opportunities"
+  moreInfoUrl: "https://fleetdm.com/handbook/sales#review-salesforce-opportunities"
+  dri: "chazmac6"

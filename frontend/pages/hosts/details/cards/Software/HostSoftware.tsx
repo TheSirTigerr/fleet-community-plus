@@ -1,0 +1,417 @@
+import { AxiosError } from "axios";
+import React, { useCallback, useContext, useMemo, useState } from "react";
+import { useQuery } from "react-query";
+import { InjectedRouter } from "react-router";
+
+import CardHeader from "components/CardHeader";
+import DataError from "components/DataError";
+import DeviceUserError from "components/DeviceUserError";
+import Spinner from "components/Spinner";
+import { AppContext } from "context/app";
+import { MdmEnrollmentStatus } from "interfaces/mdm";
+import {
+  HostPlatform,
+  isAndroid,
+  isIPadOrIPhone,
+  isMacOS,
+} from "interfaces/platform";
+import { IHostSoftware, ISoftware } from "interfaces/software";
+import SoftwareFiltersModal from "pages/SoftwarePage/components/modals/SoftwareFiltersModal";
+import {
+  buildSoftwareVulnFiltersQueryParams,
+  getSoftwareVulnFiltersFromQueryParams,
+  ISoftwareVulnFiltersParams,
+} from "pages/SoftwarePage/SoftwareInventory/SoftwareInventoryTable/helpers";
+import deviceAPI, {
+  IDeviceSoftwareQueryKey,
+  IGetDeviceSoftwareResponse,
+} from "services/entities/device_user";
+import hostAPI, {
+  IGetHostSoftwareResponse,
+  IHostSoftwareQueryKey,
+} from "services/entities/hosts";
+import { DEFAULT_USE_QUERY_OPTIONS } from "utilities/constants";
+import { getNextLocationPath } from "utilities/helpers";
+import { convertParamsToSnakeCase } from "utilities/url";
+
+import { generateSoftwareTableHeaders as generateDeviceSoftwareTableConfig } from "./DeviceSoftwareTableConfig";
+import { getSoftwareSubheader } from "./helpers";
+import HostSoftwareTable from "./HostSoftwareTable";
+import { generateSoftwareTableHeaders as generateHostSoftwareTableConfig } from "./HostSoftwareTableConfig";
+
+const baseClass = "host-software-section";
+
+export interface ITableSoftware extends Omit<ISoftware, "vulnerabilities"> {
+  vulnerabilities: string[]; // for client-side search purposes, we only want an array of cve strings
+}
+
+interface HostSoftwareQueryParams
+  extends ReturnType<typeof parseHostSoftwareQueryParams> {
+  include_available_for_install?: boolean;
+}
+
+interface IHostSoftwareProps {
+  /** This is the host id or the device token */
+  id: number | string;
+  platform: HostPlatform;
+  softwareUpdatedAt?: string;
+  router: InjectedRouter;
+  queryParams: HostSoftwareQueryParams;
+  pathname: string;
+  hostTeamId: number;
+  onShowInventoryVersions: (software: IHostSoftware) => void;
+  isSoftwareEnabled?: boolean;
+  isMyDevicePage?: boolean;
+  /**
+   * Premium status for the My device page. The device page is token-authenticated
+   * and has no app session, so `isPremiumTier` is not available from the app
+   * context there and must be passed in explicitly from the device's license info.
+   * Ignored on the host details page, which reads premium status from the app context.
+   */
+  isPremiumTier?: boolean;
+  /** Used to show custom Software card header */
+  hostMdmEnrollmentStatus?: MdmEnrollmentStatus | null;
+}
+
+const DEFAULT_SEARCH_QUERY = "";
+const DEFAULT_SORT_DIRECTION = "asc";
+const DEFAULT_SORT_HEADER = "name";
+const DEFAULT_PAGE = 0;
+const DEFAULT_PAGE_SIZE = 20;
+
+export const parseHostSoftwareQueryParams = (queryParams: {
+  page?: string;
+  query?: string;
+  order_key?: string;
+  order_direction?: "asc" | "desc";
+  vulnerable?: string;
+  exploit?: string;
+  min_cvss_score?: string;
+  max_cvss_score?: string;
+  self_service?: string;
+  category_id?: string;
+  fleet_id?: string;
+  macos_applications?: string;
+}) => {
+  const searchQuery = queryParams?.query ?? DEFAULT_SEARCH_QUERY;
+  const sortHeader = queryParams?.order_key ?? DEFAULT_SORT_HEADER;
+  const sortDirection = queryParams?.order_direction ?? DEFAULT_SORT_DIRECTION;
+  const page = queryParams?.page
+    ? parseInt(queryParams.page, 10)
+    : DEFAULT_PAGE;
+  const pageSize = DEFAULT_PAGE_SIZE;
+  const softwareVulnFilters = getSoftwareVulnFiltersFromQueryParams(
+    queryParams
+  );
+  const categoryId = queryParams?.category_id
+    ? parseInt(queryParams.category_id, 10)
+    : undefined;
+  const selfService = queryParams?.self_service === "true";
+  const teamId = queryParams?.fleet_id
+    ? parseInt(queryParams.fleet_id, 10)
+    : undefined;
+  // Tri-state: true/false when explicitly set in the URL, otherwise undefined so
+  // the platform-specific default can be applied where the platform is known.
+  let macosApplications: boolean | undefined;
+  if (queryParams?.macos_applications === "true") {
+    macosApplications = true;
+  } else if (queryParams?.macos_applications === "false") {
+    macosApplications = false;
+  }
+
+  return {
+    page,
+    query: searchQuery,
+    order_key: sortHeader,
+    order_direction: sortDirection,
+    per_page: pageSize,
+    vulnerable: softwareVulnFilters.vulnerable,
+    min_cvss_score: softwareVulnFilters.minCvssScore,
+    max_cvss_score: softwareVulnFilters.maxCvssScore,
+    self_service: selfService,
+    exploit: softwareVulnFilters.exploit,
+    available_for_install: false, // always false for host software
+    category_id: categoryId,
+    fleet_id: teamId,
+    macos_applications: macosApplications,
+  };
+};
+
+const HostSoftware = ({
+  id,
+  platform,
+  softwareUpdatedAt,
+  router,
+  queryParams,
+  pathname,
+  hostTeamId = 0,
+  onShowInventoryVersions,
+  isSoftwareEnabled = false,
+  isMyDevicePage = false,
+  isPremiumTier: isPremiumTierProp,
+  hostMdmEnrollmentStatus = null,
+}: IHostSoftwareProps) => {
+  const { isPremiumTier: isPremiumTierFromContext } = useContext(AppContext);
+  // The My device page is token-authenticated and has no app session/context, so
+  // its premium status is provided explicitly by the caller. Everywhere else we
+  // read it from the app context.
+  const isPremiumTier = isMyDevicePage
+    ? isPremiumTierProp
+    : isPremiumTierFromContext;
+
+  // The /Applications filter only applies to macOS hosts, and defaults to ON
+  // (only top-level applications) when the host is macOS and no explicit value
+  // is set in the URL. It is left undefined for other platforms, so the param
+  // is neither sent to the API nor appended to the URL on pagination.
+  const macosApplicationsFilter = isMacOS(platform)
+    ? queryParams.macos_applications ?? true
+    : undefined;
+
+  const isUnsupported = isIPadOrIPhone(platform) && queryParams.vulnerable; // no Android software and no vulnerable software for iOS
+
+  const [showSoftwareFiltersModal, setShowSoftwareFiltersModal] = useState(
+    false
+  );
+
+  const {
+    data: hostSoftwareRes,
+    isLoading: hostSoftwareLoading,
+    isError: hostSoftwareError,
+    isFetching: hostSoftwareFetching,
+  } = useQuery<
+    IGetHostSoftwareResponse,
+    AxiosError,
+    IGetHostSoftwareResponse,
+    IHostSoftwareQueryKey[]
+  >(
+    [
+      {
+        scope: "host_software",
+        id: id as number,
+        softwareUpdatedAt,
+        ...queryParams,
+        macos_applications: macosApplicationsFilter,
+      },
+    ],
+    ({ queryKey }) => {
+      return hostAPI.getHostSoftware(queryKey[0]);
+    },
+    {
+      ...DEFAULT_USE_QUERY_OPTIONS,
+      enabled: isSoftwareEnabled && !isMyDevicePage && !isUnsupported,
+      keepPreviousData: true,
+      staleTime: 7000,
+    }
+  );
+
+  const {
+    data: deviceSoftwareRes,
+    isLoading: deviceSoftwareLoading,
+    isError: deviceSoftwareError,
+    isFetching: deviceSoftwareFetching,
+  } = useQuery<
+    IGetDeviceSoftwareResponse,
+    AxiosError,
+    IGetDeviceSoftwareResponse,
+    IDeviceSoftwareQueryKey[]
+  >(
+    [
+      {
+        scope: "device_software",
+        id: id as string,
+        softwareUpdatedAt,
+        ...queryParams,
+        macos_applications: macosApplicationsFilter,
+      },
+    ],
+    ({ queryKey }) => deviceAPI.getDeviceSoftware(queryKey[0]),
+    {
+      ...DEFAULT_USE_QUERY_OPTIONS,
+      enabled: isSoftwareEnabled && isMyDevicePage, // if disabled, we'll always show a generic "No software detected" message. No My Device Page for iPad/iPhone
+      keepPreviousData: true,
+      staleTime: 7000,
+    }
+  );
+
+  const toggleSoftwareFiltersModal = useCallback(() => {
+    setShowSoftwareFiltersModal(!showSoftwareFiltersModal);
+  }, [setShowSoftwareFiltersModal, showSoftwareFiltersModal]);
+
+  /**  Compares vuln filters to current vuln query params */
+  const determineVulnFilterChange = useCallback(
+    (vulnFilters: ISoftwareVulnFiltersParams) => {
+      const changedEntry = Object.entries(vulnFilters).find(([key, val]) => {
+        switch (key) {
+          case "vulnerable":
+          case "exploit": {
+            // Normalize values: undefined → false, then compare
+            const current = queryParams[key] ?? false;
+            const incoming = val ?? false;
+            return incoming !== current;
+          }
+          case "minCvssScore":
+            return val !== queryParams.min_cvss_score;
+          case "maxCvssScore":
+            return val !== queryParams.max_cvss_score;
+          default:
+            return false;
+        }
+      });
+      return changedEntry?.[0] ?? "";
+    },
+    [queryParams]
+  );
+
+  const onApplyVulnFilters = (vulnFilters: ISoftwareVulnFiltersParams) => {
+    const newQueryParams = {
+      query: queryParams.query,
+      orderDirection: queryParams.order_direction,
+      orderKey: queryParams.order_key,
+      perPage: queryParams.per_page,
+      page: 0, // resets page index
+      fleet_id: queryParams.fleet_id,
+      // Preserve an explicit macOS /Applications filter selection across vuln
+      // filter changes. Left undefined when not set so the platform default
+      // continues to apply.
+      macos_applications: queryParams.macos_applications,
+      ...buildSoftwareVulnFiltersQueryParams(vulnFilters),
+    };
+
+    // We want to determine which query param has changed in order to
+    // reset the page index to 0 if any other param has changed.
+    const changedParam = determineVulnFilterChange(vulnFilters);
+
+    // Update the route only if a change is detected
+    if (changedParam) {
+      router.replace(
+        getNextLocationPath({
+          pathPrefix: location.pathname,
+          routeTemplate: "",
+          queryParams: convertParamsToSnakeCase(newQueryParams),
+        })
+      );
+    }
+
+    toggleSoftwareFiltersModal();
+  };
+
+  const tableConfig = useMemo(() => {
+    return isMyDevicePage
+      ? generateDeviceSoftwareTableConfig()
+      : generateHostSoftwareTableConfig({
+          router,
+          teamId: hostTeamId,
+          onShowInventoryVersions,
+        });
+  }, [isMyDevicePage, router, hostTeamId, onShowInventoryVersions]);
+
+  const isLoading = isMyDevicePage
+    ? deviceSoftwareLoading
+    : hostSoftwareLoading;
+
+  const isError = isMyDevicePage ? deviceSoftwareError : hostSoftwareError;
+
+  const data = isMyDevicePage ? deviceSoftwareRes : hostSoftwareRes;
+
+  const renderHostSoftware = () => {
+    if (isLoading) {
+      return <Spinner />;
+    }
+    // will never be the case - to handle `platform` typing discrepancy with DeviceUserPage
+    if (!platform) {
+      return null;
+    }
+    return (
+      <>
+        {isError &&
+          (isMyDevicePage ? (
+            <DeviceUserError />
+          ) : (
+            <DataError verticalPaddingSize="pad-xxxlarge" />
+          ))}
+        {!isError && (
+          <HostSoftwareTable
+            isLoading={
+              isMyDevicePage ? deviceSoftwareFetching : hostSoftwareFetching
+            }
+            data={data}
+            platform={platform}
+            router={router}
+            tableConfig={tableConfig}
+            sortHeader={queryParams.order_key}
+            sortDirection={queryParams.order_direction}
+            searchQuery={queryParams.query}
+            page={queryParams.page}
+            pagePath={pathname}
+            vulnFilters={getSoftwareVulnFiltersFromQueryParams({
+              vulnerable: queryParams.vulnerable,
+              exploit: queryParams.exploit,
+              min_cvss_score: queryParams.min_cvss_score,
+              max_cvss_score: queryParams.max_cvss_score,
+            })}
+            teamId={queryParams.fleet_id}
+            macosApplicationsFilter={macosApplicationsFilter}
+            onAddFiltersClick={toggleSoftwareFiltersModal}
+            // for my device software details modal toggling
+            isMyDevicePage={isMyDevicePage}
+            onShowInventoryVersions={onShowInventoryVersions}
+          />
+        )}
+        {showSoftwareFiltersModal && (
+          <SoftwareFiltersModal
+            onExit={toggleSoftwareFiltersModal}
+            onSubmit={onApplyVulnFilters}
+            vulnFilters={getSoftwareVulnFiltersFromQueryParams({
+              vulnerable: queryParams.vulnerable,
+              exploit: queryParams.exploit,
+              min_cvss_score: queryParams.min_cvss_score,
+              max_cvss_score: queryParams.max_cvss_score,
+            })}
+            isPremiumTier={isPremiumTier || false}
+          />
+        )}
+      </>
+    );
+  };
+
+  if (isMyDevicePage) {
+    return (
+      <div className={baseClass}>
+        <CardHeader
+          header="Software"
+          subheader={
+            // Fleet Free does not have card subheader
+            isPremiumTier
+              ? getSoftwareSubheader({
+                  platform,
+                  isMyDevicePage: true,
+                  hostMdmEnrollmentStatus,
+                })
+              : undefined
+          }
+        />
+        {renderHostSoftware()}
+      </div>
+    );
+  }
+
+  return (
+    <div className={baseClass}>
+      {/* Fleet Free and Android both do not have card subheader */}
+      {!isAndroid(platform) && isPremiumTier && (
+        <CardHeader
+          subheader={getSoftwareSubheader({
+            platform,
+            isMyDevicePage: false,
+            hostMdmEnrollmentStatus,
+          })}
+        />
+      )}
+      {renderHostSoftware()}
+    </div>
+  );
+};
+
+// TODO - name this consistently, it is confusing. This same component is called `SoftwareInventoryCard` one place,
+// `SoftwareCard` another, and `HostSoftware` here.
+export default React.memo(HostSoftware);

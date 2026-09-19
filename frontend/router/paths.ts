@@ -1,0 +1,245 @@
+import {
+  DiskEncryptionSettingsPlatform,
+  SetupExperiencePlatform,
+} from "interfaces/platform";
+
+import URL_PREFIX from "./url_prefix";
+
+const INTEGRATIONS_PREFIX = `${URL_PREFIX}/settings/integrations`;
+
+// Note: changes to paths.ts should change page_titles.ts respectively
+export default {
+  ROOT: `${URL_PREFIX}/`,
+
+  // Controls pages
+  CONTROLS: `${URL_PREFIX}/controls`,
+  CONTROLS_OS_UPDATES: `${URL_PREFIX}/controls/os-updates`,
+  CONTROLS_OS_SETTINGS: `${URL_PREFIX}/controls/os-settings`,
+  CONTROLS_CUSTOM_SETTINGS: `${URL_PREFIX}/controls/os-settings/configuration-profiles`,
+  CONTROLS_ASSETS: `${URL_PREFIX}/controls/os-settings/assets`,
+  CONTROLS_CERTIFICATES: `${URL_PREFIX}/controls/os-settings/certificates`,
+  CONTROLS_DISK_ENCRYPTION: `${URL_PREFIX}/controls/os-settings/disk-encryption`,
+  CONTROLS_DISK_ENCRYPTION_PLATFORM: (
+    platform: DiskEncryptionSettingsPlatform
+  ) => `${URL_PREFIX}/controls/os-settings/disk-encryption/${platform}`,
+  CONTROLS_PASSWORDS: `${URL_PREFIX}/controls/os-settings/passwords`,
+  CONTROLS_HOST_NAME_TEMPLATE: `${URL_PREFIX}/controls/os-settings/host-name-template`,
+  CONTROLS_SETUP_EXPERIENCE: `${URL_PREFIX}/controls/setup-experience`,
+  CONTROLS_USERS: `${URL_PREFIX}/controls/setup-experience/users`,
+  CONTROLS_BOOTSTRAP_PACKAGE: `${URL_PREFIX}/controls/setup-experience/bootstrap-package`,
+  CONTROLS_SETUP_ASSISTANT: `${URL_PREFIX}/controls/setup-experience/setup-assistant`,
+  CONTROLS_INSTALL_SOFTWARE: (platform: SetupExperiencePlatform) =>
+    `${URL_PREFIX}/controls/setup-experience/install-software/${platform}`,
+  CONTROLS_RUN_SCRIPT: `${URL_PREFIX}/controls/setup-experience/run-script`,
+  CONTROLS_SCRIPTS: `${URL_PREFIX}/controls/scripts`,
+  CONTROLS_SCRIPTS_LIBRARY: `${URL_PREFIX}/controls/scripts/library`,
+  CONTROLS_SCRIPTS_BATCH_PROGRESS: `${URL_PREFIX}/controls/scripts/progress`,
+  CONTROLS_SCRIPTS_BATCH_DETAILS: (batchExecutionId: string) =>
+    `${URL_PREFIX}/controls/scripts/progress/${batchExecutionId}`,
+  CONTROLS_VARIABLES: `${URL_PREFIX}/controls/variables`,
+  CONTROLS_VARIABLES_GLOBAL_VARIABLES: `${URL_PREFIX}/controls/variables/global-variables`,
+  CONTROLS_VARIABLES_CUSTOM_HOST_VITALS: `${URL_PREFIX}/controls/variables/custom-host-vitals`,
+
+  // Dashboard pages
+  DASHBOARD: `${URL_PREFIX}/dashboard`,
+  DASHBOARD_LINUX: `${URL_PREFIX}/dashboard/linux`,
+  DASHBOARD_MAC: `${URL_PREFIX}/dashboard/mac`,
+  DASHBOARD_WINDOWS: `${URL_PREFIX}/dashboard/windows`,
+  DASHBOARD_CHROME: `${URL_PREFIX}/dashboard/chrome`,
+  DASHBOARD_IOS: `${URL_PREFIX}/dashboard/ios`,
+  DASHBOARD_IPADOS: `${URL_PREFIX}/dashboard/ipados`,
+  DASHBOARD_ANDROID: `${URL_PREFIX}/dashboard/android`,
+
+  /**
+   * Admin pages
+   */
+
+  ADMIN_SETTINGS: `${URL_PREFIX}/settings`,
+  ADMIN_USERS: `${URL_PREFIX}/settings/users`,
+  ADMIN_USERS_NEW_HUMAN: `${URL_PREFIX}/settings/users/new/human`,
+  ADMIN_USERS_NEW_API: `${URL_PREFIX}/settings/users/new/api`,
+  ADMIN_USERS_EDIT: (userId: number) =>
+    `${URL_PREFIX}/settings/users/${userId}/edit`,
+
+  // Integrations pages
+
+  ADMIN_INTEGRATIONS: INTEGRATIONS_PREFIX,
+  ADMIN_INTEGRATIONS_TICKET_DESTINATIONS: `${INTEGRATIONS_PREFIX}/ticket-destinations`,
+  ADMIN_INTEGRATIONS_MDM: `${INTEGRATIONS_PREFIX}/mdm`,
+  ADMIN_INTEGRATIONS_MDM_APPLE: `${INTEGRATIONS_PREFIX}/mdm/apple`,
+  ADMIN_INTEGRATIONS_MDM_WINDOWS: `${INTEGRATIONS_PREFIX}/mdm/windows`,
+  ADMIN_INTEGRATIONS_MDM_ANDROID: `${INTEGRATIONS_PREFIX}/mdm/android`,
+  ADMIN_INTEGRATIONS_APPLE_BUSINESS_MANAGER: `${INTEGRATIONS_PREFIX}/mdm/ab`,
+  ADMIN_INTEGRATIONS_AUTOMATIC_ENROLLMENT_WINDOWS: `${INTEGRATIONS_PREFIX}/automatic-enrollment/windows`,
+  ADMIN_INTEGRATIONS_MICROSOFT_GRAPH: `${INTEGRATIONS_PREFIX}/mdm/microsoft-graph`,
+  ADMIN_INTEGRATIONS_SCEP: `${INTEGRATIONS_PREFIX}/mdm/scep`,
+  ADMIN_INTEGRATIONS_CALENDARS: `${INTEGRATIONS_PREFIX}/calendars`,
+  ADMIN_INTEGRATIONS_CHANGE_MANAGEMENT: `${INTEGRATIONS_PREFIX}/change-management`,
+  ADMIN_INTEGRATIONS_CONDITIONAL_ACCESS: `${INTEGRATIONS_PREFIX}/conditional-access`,
+  ADMIN_INTEGRATIONS_CERTIFICATE_AUTHORITIES: `${INTEGRATIONS_PREFIX}/certificate-authorities`,
+  ADMIN_INTEGRATIONS_IDENTITY_PROVIDER: `${INTEGRATIONS_PREFIX}/identity-provider`,
+  ADMIN_INTEGRATIONS_VPP: `${INTEGRATIONS_PREFIX}/mdm/vpp`,
+  ADMIN_INTEGRATIONS_VPP_SETUP: `${INTEGRATIONS_PREFIX}/vpp/setup`,
+  ADMIN_INTEGRATIONS_SSO: `${INTEGRATIONS_PREFIX}/sso`,
+  ADMIN_INTEGRATIONS_SSO_FLEET_USERS: `${INTEGRATIONS_PREFIX}/sso/fleet-users`,
+  ADMIN_INTEGRATIONS_SSO_END_USERS: `${INTEGRATIONS_PREFIX}/sso/end-users`,
+  ADMIN_INTEGRATIONS_FPSSO: `${INTEGRATIONS_PREFIX}/account-provisioning`,
+  ADMIN_INTEGRATIONS_HOST_STATUS_WEBHOOK: `${INTEGRATIONS_PREFIX}/host-status-webhook`,
+
+  ADMIN_FLEETS: `${URL_PREFIX}/settings/fleets`,
+  ADMIN_ORGANIZATION: `${URL_PREFIX}/settings/organization`,
+  ADMIN_ORGANIZATION_INFO: `${URL_PREFIX}/settings/organization/info`,
+  ADMIN_ORGANIZATION_WEBADDRESS: `${URL_PREFIX}/settings/organization/webaddress`,
+  ADMIN_ORGANIZATION_SMTP: `${URL_PREFIX}/settings/organization/smtp`,
+  ADMIN_ORGANIZATION_AGENTS: `${URL_PREFIX}/settings/organization/agents`,
+  ADMIN_ORGANIZATION_STATISTICS: `${URL_PREFIX}/settings/organization/statistics`,
+  ADMIN_ORGANIZATION_ADVANCED: `${URL_PREFIX}/settings/organization/advanced`,
+  ADMIN_ORGANIZATION_FLEET_DESKTOP: `${URL_PREFIX}/settings/organization/fleet-desktop`,
+
+  // Software pages
+  SOFTWARE: `${URL_PREFIX}/software`,
+  SOFTWARE_INVENTORY: `${URL_PREFIX}/software/inventory`,
+  SOFTWARE_OS: `${URL_PREFIX}/software/os`,
+  SOFTWARE_VERSIONS: `${URL_PREFIX}/software/versions`,
+  SOFTWARE_LIBRARY: `${URL_PREFIX}/software/library`,
+  SOFTWARE_LIBRARY_CATEGORIES: `${URL_PREFIX}/software/library/categories`,
+  SOFTWARE_TITLE_DETAILS: (id: string): string => {
+    return `${URL_PREFIX}/software/titles/${id}`;
+  },
+  SOFTWARE_VERSION_DETAILS: (id: string): string => {
+    return `${URL_PREFIX}/software/versions/${id}`;
+  },
+  SOFTWARE_OS_DETAILS: (id: number): string => {
+    return `${URL_PREFIX}/software/os/${id}`;
+  },
+  SOFTWARE_VULNERABILITIES: `${URL_PREFIX}/software/vulnerabilities`,
+  SOFTWARE_VULNERABILITY_DETAILS: (cve: string): string => {
+    return `${URL_PREFIX}/software/vulnerabilities/${cve}`;
+  },
+  SOFTWARE_ADD_FLEET_MAINTAINED: `${URL_PREFIX}/software/add/fleet-maintained`,
+  SOFTWARE_FLEET_MAINTAINED_DETAILS: (id: number) =>
+    `${URL_PREFIX}/software/add/fleet-maintained/${id}`,
+  SOFTWARE_ADD_PACKAGE: `${URL_PREFIX}/software/add/package`,
+  SOFTWARE_ADD_APP_STORE: `${URL_PREFIX}/software/add/app-store`,
+
+  // Label pages
+  MANAGE_LABELS: `${URL_PREFIX}/labels/manage`,
+  NEW_LABEL: `${URL_PREFIX}/labels/new`,
+  // deprecated - now handled by `/new` route
+  LABEL_NEW_DYNAMIC: `${URL_PREFIX}/labels/new/dynamic`,
+  // deprecated - now handled by `/new` route
+  LABEL_NEW_MANUAL: `${URL_PREFIX}/labels/new/manual`,
+
+  LABEL_EDIT: (labelId: number) => `${URL_PREFIX}/labels/${labelId}`,
+
+  EDIT_PACK: (packId: number): string => {
+    return `${URL_PREFIX}/packs/${packId}/edit`;
+  },
+  PACK: (packId: number): string => `${URL_PREFIX}/packs/${packId}`,
+  EDIT_LABEL: (labelId: number): string => `${URL_PREFIX}/labels/${labelId}`,
+  EDIT_REPORT: (queryId: number): string =>
+    `${URL_PREFIX}/reports/${queryId}/edit`,
+  LIVE_REPORT: (queryId: number | null): string =>
+    `${URL_PREFIX}/reports/${queryId || "new"}/live`,
+  REPORT_DETAILS: (queryId: number): string =>
+    `${URL_PREFIX}/reports/${queryId}`,
+  POLICY_DETAILS: (policyId: number): string =>
+    `${URL_PREFIX}/policies/${policyId}`,
+  EDIT_POLICY: (policyId: number): string =>
+    `${URL_PREFIX}/policies/${policyId}/edit`,
+  LIVE_POLICY: (policyId: number | null): string =>
+    `${URL_PREFIX}/policies/${policyId || "new"}/live`,
+  FORGOT_PASSWORD: `${URL_PREFIX}/login/forgot`,
+  MFA: `${URL_PREFIX}/login/mfa`,
+  NO_ACCESS: `${URL_PREFIX}/login/denied`,
+  API_ONLY_USER: `${URL_PREFIX}/apionlyuser`,
+
+  // error pages
+  FLEET_403: `${URL_PREFIX}/403`,
+  FLEET_404: `${URL_PREFIX}/404`,
+  FLEET_500: `${URL_PREFIX}/500`,
+
+  LOGIN: `${URL_PREFIX}/login`,
+  LOGOUT: `${URL_PREFIX}/logout`,
+  MANAGE_HOSTS: `${URL_PREFIX}/hosts/manage`,
+  MANAGE_HOSTS_LABEL: (labelId: number | string): string => {
+    return `${URL_PREFIX}/hosts/manage/labels/${labelId}`;
+  },
+  HOST_DETAILS: (id: number, teamId?: number): string => {
+    if (typeof teamId === "number") {
+      return `${URL_PREFIX}/hosts/${id}/details?fleet_id=${teamId}`;
+    }
+    return `${URL_PREFIX}/hosts/${id}/details`;
+  },
+  HOST_SCRIPTS: (id: number): string => {
+    return `${URL_PREFIX}/hosts/${id}/scripts`;
+  },
+  HOST_CONTROLS: (id: number): string => {
+    return `${URL_PREFIX}/hosts/${id}/controls`;
+  },
+  HOST_SOFTWARE: (id: number): string => {
+    return `${URL_PREFIX}/hosts/${id}/software`;
+  },
+  HOST_INVENTORY: (id: number): string => {
+    return `${URL_PREFIX}/hosts/${id}/software/inventory`;
+  },
+  HOST_LIBRARY: (id: number): string => {
+    return `${URL_PREFIX}/hosts/${id}/software/library`;
+  },
+  HOST_REPORTS: (id: number): string => {
+    return `${URL_PREFIX}/hosts/${id}/reports`;
+  },
+  HOST_POLICIES: (id: number): string => {
+    return `${URL_PREFIX}/hosts/${id}/policies`;
+  },
+  HOST_REPORT_RESULTS: (hostId: number, queryId: number): string =>
+    `${URL_PREFIX}/hosts/${hostId}/reports/${queryId}`,
+  DEVICE_USER_DETAILS: (deviceAuthToken: string): string => {
+    return `${URL_PREFIX}/device/${deviceAuthToken}`;
+  },
+  DEVICE_USER_DETAILS_SELF_SERVICE: (deviceAuthToken: string): string => {
+    return `${URL_PREFIX}/device/${deviceAuthToken}/self-service`;
+  },
+  DEVICE_USER_DETAILS_CONTROLS: (deviceAuthToken: string): string => {
+    return `${URL_PREFIX}/device/${deviceAuthToken}/controls`;
+  },
+  DEVICE_USER_DETAILS_SOFTWARE: (deviceAuthToken: string): string => {
+    return `${URL_PREFIX}/device/${deviceAuthToken}/software`;
+  },
+  DEVICE_USER_DETAILS_POLICIES: (deviceAuthToken: string): string => {
+    return `${URL_PREFIX}/device/${deviceAuthToken}/policies`;
+  },
+  DEVICE_TRANSPARENCY: (deviceAuthToken: string): string => {
+    return `${URL_PREFIX}/api/v1/fleet/device/${deviceAuthToken}/transparency`;
+  },
+
+  FLEET_DETAILS_USERS: (teamId?: number): string => {
+    if (teamId !== undefined && teamId > 0) {
+      return `${URL_PREFIX}/settings/fleets/users?fleet_id=${teamId}`;
+    }
+    return `${URL_PREFIX}/settings/fleets`;
+  },
+  FLEET_DETAILS_OPTIONS: (teamId?: number): string => {
+    if (teamId !== undefined && teamId > 0) {
+      return `${URL_PREFIX}/settings/fleets/options?fleet_id=${teamId}`;
+    }
+    return `${URL_PREFIX}/settings/fleets`;
+  },
+  FLEET_DETAILS_SETTINGS: (teamId?: number) => {
+    if (teamId !== undefined && teamId > 0) {
+      return `${URL_PREFIX}/settings/fleets/settings?fleet_id=${teamId}`;
+    }
+    return `${URL_PREFIX}/settings/fleets`;
+  },
+  MANAGE_PACKS: `${URL_PREFIX}/packs/manage`,
+  NEW_PACK: `${URL_PREFIX}/packs/new`,
+  MANAGE_REPORTS: `${URL_PREFIX}/reports/manage`,
+  MANAGE_SCHEDULE: `${URL_PREFIX}/schedule/manage`,
+  MANAGE_POLICIES: `${URL_PREFIX}/policies/manage`,
+  NEW_POLICY: `${URL_PREFIX}/policies/new`,
+  NEW_REPORT: `${URL_PREFIX}/reports/new`,
+  RESET_PASSWORD: `${URL_PREFIX}/login/reset`,
+  SETUP: `${URL_PREFIX}/setup`,
+  ACCOUNT: `${URL_PREFIX}/account`,
+  URL_PREFIX,
+};

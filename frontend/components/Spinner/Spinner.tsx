@@ -1,0 +1,86 @@
+import classnames from "classnames";
+import React, { useEffect, useState } from "react";
+
+type Size = "x-small" | "small" | "medium";
+type PaddingSize = "small" | "medium";
+
+interface ISpinnerProps {
+  small?: boolean;
+  button?: boolean;
+  white?: boolean;
+  /** The size of the spinner. defaults: `"medium"` */
+  size?: Size;
+  /** The size of the spinner padding. `"medium"` 120px (default), `"small"` 60px */
+  verticalPadding?: PaddingSize;
+  /** Center the spinner in its parent. defaults: `true` */
+  centered?: boolean;
+  className?: string;
+  variant?: "mobile";
+  /**
+   * Delay in ms before the spinner becomes visible. If the spinner unmounts
+   * before the delay elapses, it never renders — avoiding a flash when the
+   * underlying load finishes quickly. Defaults to `250`. Pass `0` to show
+   * immediately (e.g. when a spinner represents ongoing work rather than a
+   * load, like pending install/uninstall states).
+   */
+  delay?: number;
+}
+
+const Spinner = ({
+  small,
+  button,
+  white,
+  size = "medium",
+  verticalPadding = "medium",
+  centered = true,
+  className,
+  variant = undefined,
+  delay = 250,
+}: ISpinnerProps): JSX.Element | null => {
+  const [visible, setVisible] = useState(delay === 0);
+
+  useEffect(() => {
+    if (delay === 0) return undefined;
+    const id = setTimeout(() => setVisible(true), delay);
+    return () => clearTimeout(id);
+  }, [delay]);
+
+  if (!visible) return null;
+
+  const classOptions = classnames(`loading-spinner`, className, size, {
+    small,
+    button,
+    white,
+    centered,
+    "small-padding": verticalPadding === "small",
+    "mobile-view": variant === "mobile",
+  });
+  return (
+    <div className={classOptions} data-testid="spinner">
+      <div className="loader">
+        <svg className="circular" viewBox="25 25 50 50">
+          <circle
+            className="background"
+            cx="50"
+            cy="50"
+            r="20"
+            fill="none"
+            strokeWidth="6"
+            strokeMiterlimit="10"
+          />
+          <circle
+            className="path"
+            cx="50"
+            cy="50"
+            r="20"
+            fill="none"
+            strokeWidth="6"
+            strokeMiterlimit="10"
+          />
+        </svg>
+      </div>
+    </div>
+  );
+};
+
+export default Spinner;

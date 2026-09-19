@@ -1,0 +1,85 @@
+.integrations-management {
+  &__description {
+    p {
+      margin: 0;
+    }
+  }
+
+  .no-integrations {
+    @include vertical-card-layout;
+
+    ul {
+      margin: 0;
+      padding: 0;
+      color: $core-fleet-black;
+      list-style: none;
+
+      li {
+        &::before {
+          content: "•";
+          color: $core-vibrant-blue;
+          margin-right: $pad-medium;
+        }
+      }
+    }
+
+    &__inner {
+      display: flex;
+      flex-direction: row;
+
+      h1 {
+        font-size: $small;
+        font-weight: $bold;
+        margin-bottom: $pad-medium;
+      }
+
+      img {
+        width: 176px;
+        margin-right: $pad-xlarge;
+      }
+
+      p {
+        color: $core-fleet-black;
+        font-weight: $regular;
+        font-size: $x-small;
+        margin: 0;
+        margin-bottom: $pad-large;
+      }
+
+      .no-filter-results {
+        display: flex;
+        flex-direction: column;
+        width: 350px;
+      }
+    }
+
+    &__inner-text {
+      width: 350px;
+    }
+  }
+
+  .type__header {
+    width: 12px;
+  }
+
+  .type__cell {
+    .logo-cell {
+      display: block;
+      text-align: center;
+    }
+
+    .zendesk-icon {
+      width: 16px;
+    }
+
+    .jira-icon {
+      width: 24px;
+    }
+  }
+
+  .empty-table__container {
+    h3 {
+      margin-bottom: px-to-rem(10);
+    }
+  }
+}

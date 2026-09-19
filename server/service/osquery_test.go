@@ -1,0 +1,6933 @@
+package service
+
+import (
+	"bytes"
+	"context"
+	"crypto/sha256"
+	"database/sql"
+	"encoding/hex"
+	"encoding/json"
+	"errors"
+	"fmt"
+	"io"
+	"log/slog"
+	"maps"
+	"net"
+	"net/http"
+	"net/http/httptest"
+	"os"
+	"reflect"
+	"slices"
+	"sort"
+	"strings"
+	"sync"
+	"testing"
+	"time"
+
+	"github.com/WatchBeam/clock"
+	"github.com/fleetdm/fleet/v4/ee/pkg/hostidentity/types"
+	"github.com/fleetdm/fleet/v4/pkg/optjson"
+	activity_api "github.com/fleetdm/fleet/v4/server/activity/api"
+	"github.com/fleetdm/fleet/v4/server/agentws"
+	"github.com/fleetdm/fleet/v4/server/authz"
+	"github.com/fleetdm/fleet/v4/server/config"
+	hostctx "github.com/fleetdm/fleet/v4/server/contexts/host"
+	fleetLogging "github.com/fleetdm/fleet/v4/server/contexts/logging"
+	"github.com/fleetdm/fleet/v4/server/contexts/viewer"
+	"github.com/fleetdm/fleet/v4/server/datastore/mysqlredis"
+	"github.com/fleetdm/fleet/v4/server/datastore/redis/redistest"
+	"github.com/fleetdm/fleet/v4/server/fleet"
+	"github.com/fleetdm/fleet/v4/server/live_query/live_query_mock"
+	"github.com/fleetdm/fleet/v4/server/mock"
+	mockresult "github.com/fleetdm/fleet/v4/server/mock/mockresult"
+	"github.com/fleetdm/fleet/v4/server/ptr"
+	"github.com/fleetdm/fleet/v4/server/pubsub"
+	"github.com/fleetdm/fleet/v4/server/service/async"
+	"github.com/fleetdm/fleet/v4/server/service/osquery_utils"
+	"github.com/fleetdm/fleet/v4/server/service/redis_policy_set"
+	kithttp "github.com/go-kit/kit/transport/http"
+	"github.com/stretchr/testify/assert"
+	"github.com/stretchr/testify/require"
+)
+
+// queriesByNameFromQueryByName adapts a per-name QueryByName stub into the batch
+// QueriesByName that the result path now uses, so existing tests keep their
+// per-name stub logic. A stub that returns an error for a name (not found) leaves
+// it absent from the map, matching the real batch behavior.
+func queriesByNameFromQueryByName(
+	fn func(ctx context.Context, teamID *uint, name string) (*fleet.Query, error),
+) func(ctx context.Context, names []fleet.TeamScopedQueryName) (map[string]*fleet.Query, error) {
+	return func(ctx context.Context, names []fleet.TeamScopedQueryName) (map[string]*fleet.Query, error) {
+		out := make(map[string]*fleet.Query, len(names))
+		for _, n := range names {
+			q, err := fn(ctx, n.TeamID, n.Name)
+			if err != nil {
+				continue
+			}
+			out[n.Key()] = q
+		}
+		return out, nil
+	}
+}
+
+// setUpBatchResultLogsTest wires the minimum for SubmitResultLogs to reach
+// preProcessOsqueryResults, returning the unwrapped *Service and the store.
+func setUpBatchResultLogsTest(t *testing.T) (*Service, context.Context, *mock.Store) {
+	ds := new(mock.Store)
+	svc, ctx := newTestService(t, ds, nil, nil)
+	ds.AppConfigFunc = func(ctx context.Context) (*fleet.AppConfig, error) {
+		return &fleet.AppConfig{}, nil
+	}
+	ds.QueriesPerHostFunc = func(ctx context.Context, hostID uint, teamID *uint) ([]uint, error) {
+		return nil, nil
+	}
+	ds.OverwriteQueryResultRowsFunc = func(ctx context.Context, rows []*fleet.ScheduledQueryResultRow, maxQueryReportRows int) (int, error) {
+		return len(rows), nil
+	}
+	serv := ((svc.(validationMiddleware)).Service).(*Service)
+	serv.osqueryLogWriter = &OsqueryLogger{Result: &testJSONLogger{}}
+	ctx = hostctx.NewContext(ctx, &fleet.Host{ID: 1})
+	return serv, ctx, ds
+}
+
+func globalResults(n int) []json.RawMessage {
+	results := make([]json.RawMessage, 0, n)
+	for i := range n {
+		results = append(results, json.RawMessage(fmt.Sprintf(
+			`{"snapshot":[{"a":"b"}],"action":"snapshot","name":"pack/Global/q%d","hostIdentifier":"h","calendarTime":"Tue Jan 10 20:08:51 2017 UTC","unixTime":1484078931}`, i)))
+	}
+	return results
+}
+
+// TestSubmitResultLogsBatchesQueryLookups pins the DoS fix: a submission with
+// many distinct query names must resolve in a single batched lookup, and must
+// never fall back to a per-name QueryByName (left nil so a regression panics).
+func TestSubmitResultLogsBatchesQueryLookups(t *testing.T) {
+	serv, ctx, ds := setUpBatchResultLogsTest(t)
+
+	var batchCalls int
+	ds.QueriesByNameFunc = func(ctx context.Context, names []fleet.TeamScopedQueryName) (map[string]*fleet.Query, error) {
+		batchCalls++
+		return map[string]*fleet.Query{}, nil
+	}
+
+	require.NoError(t, serv.SubmitResultLogs(ctx, globalResults(50)))
+	require.Equal(t, 1, batchCalls, "50 distinct names must resolve in a single batched lookup")
+	require.False(t, ds.QueryByNameFuncInvoked, "batched result path must not fall back to per-name QueryByName")
+}
+
+// TestSubmitResultLogsBatchLookupError verifies a batch-lookup failure is
+// swallowed (results pass through unmodified) rather than crashing or erroring.
+func TestSubmitResultLogsBatchLookupError(t *testing.T) {
+	serv, ctx, ds := setUpBatchResultLogsTest(t)
+	ds.QueriesByNameFunc = func(ctx context.Context, names []fleet.TeamScopedQueryName) (map[string]*fleet.Query, error) {
+		return nil, errors.New("db unavailable")
+	}
+	require.NoError(t, serv.SubmitResultLogs(ctx, globalResults(5)))
+}
+
+// TestSubmitResultLogsCapsDistinctNames verifies the per-submission distinct-name
+// cap bounds how many names reach the datastore.
+func TestSubmitResultLogsCapsDistinctNames(t *testing.T) {
+	defer func(orig int) { maxDistinctQueryNamesPerSubmission = orig }(maxDistinctQueryNamesPerSubmission)
+	maxDistinctQueryNamesPerSubmission = 10
+
+	serv, ctx, ds := setUpBatchResultLogsTest(t)
+	var maxSeen int
+	ds.QueriesByNameFunc = func(ctx context.Context, names []fleet.TeamScopedQueryName) (map[string]*fleet.Query, error) {
+		maxSeen = len(names)
+		return map[string]*fleet.Query{}, nil
+	}
+
+	require.NoError(t, serv.SubmitResultLogs(ctx, globalResults(100)))
+	require.LessOrEqual(t, maxSeen, 10, "distinct names passed to the datastore must be capped")
+}
+
+// TestSubmitResultLogsCappedNamesDoNotBypassScheduleCheck pins the cap to failing
+// closed. A name left unresolved by the cap must not be treated like one Fleet
+// doesn't know: those pass through to the log destination without a schedule
+// check, so inheriting that would let a host fill the cap with junk names and
+// launder a forged result for a query it was never scheduled to run.
+func TestSubmitResultLogsCappedNamesDoNotBypassScheduleCheck(t *testing.T) {
+	defer func(o int) { maxDistinctQueryNamesPerSubmission = o }(maxDistinctQueryNamesPerSubmission)
+	maxDistinctQueryNamesPerSubmission = 2
+
+	// forged names a real Fleet query; the host below is scheduled for nothing.
+	const forged = `{"snapshot":[{"forged":"true"}],"action":"snapshot","name":"pack/Global/report_query","hostIdentifier":"h","unixTime":1484078931}`
+
+	run := func(t *testing.T, fillCap bool) int {
+		ds := new(mock.Store)
+		svc, ctx := newTestService(t, ds, nil, nil)
+		ds.AppConfigFunc = func(ctx context.Context) (*fleet.AppConfig, error) { return &fleet.AppConfig{}, nil }
+		ds.QueriesByNameFunc = func(ctx context.Context, names []fleet.TeamScopedQueryName) (map[string]*fleet.Query, error) {
+			out := make(map[string]*fleet.Query, len(names))
+			for _, n := range names {
+				out[n.Key()] = &fleet.Query{ID: 42, Name: n.Name, Logging: fleet.LoggingSnapshot, AutomationsEnabled: true}
+			}
+			return out, nil
+		}
+		ds.QueriesPerHostFunc = func(ctx context.Context, hostID uint, teamID *uint) ([]uint, error) { return nil, nil }
+		ds.OverwriteQueryResultRowsFunc = func(ctx context.Context, rows []*fleet.ScheduledQueryResultRow, m int) (int, error) {
+			return len(rows), nil
+		}
+		logDest := &testJSONLogger{}
+		serv := ((svc.(validationMiddleware)).Service).(*Service)
+		serv.osqueryLogWriter = &OsqueryLogger{Result: logDest}
+		ctx = hostctx.NewContext(ctx, &fleet.Host{ID: 1})
+
+		var results []json.RawMessage
+		if fillCap {
+			results = append(results, globalResults(maxDistinctQueryNamesPerSubmission)...)
+		}
+		results = append(results, json.RawMessage(forged))
+		require.NoError(t, serv.SubmitResultLogs(ctx, results))
+		return len(logDest.logs)
+	}
+
+	require.Equal(t, 0, run(t, false), "unscheduled query must be dropped when under the cap")
+	require.Equal(t, 0, run(t, true), "filling the cap must not let an unscheduled query through")
+}
+
+// TestSubmitResultLogsCapWarningOnlyWhenNamesDropped pins the cap's warning to
+// names actually left unresolved: a submission landing exactly on the cap uses
+// every slot without breaching it and must not report one.
+func TestSubmitResultLogsCapWarningOnlyWhenNamesDropped(t *testing.T) {
+	defer func(orig int) { maxDistinctQueryNamesPerSubmission = orig }(maxDistinctQueryNamesPerSubmission)
+	maxDistinctQueryNamesPerSubmission = 10
+
+	for _, tc := range []struct {
+		name        string
+		distinct    int
+		wantWarning bool
+	}{
+		{"under the cap", 9, false},
+		{"exactly at the cap", 10, false},
+		{"over the cap", 11, true},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			buf := new(bytes.Buffer)
+			serv, ctx, ds := setUpBatchResultLogsTest(t)
+			serv.logger = slog.New(slog.NewJSONHandler(buf, nil))
+
+			var seen int
+			ds.QueriesByNameFunc = func(ctx context.Context, names []fleet.TeamScopedQueryName) (map[string]*fleet.Query, error) {
+				seen = len(names)
+				return map[string]*fleet.Query{}, nil
+			}
+
+			require.NoError(t, serv.SubmitResultLogs(ctx, globalResults(tc.distinct)))
+			require.Equal(t, min(tc.distinct, 10), seen)
+			require.Equal(t, tc.wantWarning, strings.Contains(buf.String(), "distinct query name cap"),
+				"warning presence should track names actually dropped; log was: %s", buf.String())
+		})
+	}
+}
+
+func TestGetClientConfig(t *testing.T) {
+	ds := new(mock.Store)
+
+	ds.TeamAgentOptionsFunc = func(ctx context.Context, teamID uint) (*json.RawMessage, error) {
+		return nil, nil
+	}
+	ds.ListPacksForHostFunc = func(ctx context.Context, hid uint) ([]*fleet.Pack, error) {
+		return []*fleet.Pack{}, nil
+	}
+	ds.ListScheduledQueriesInPackFunc = func(ctx context.Context, pid uint) (fleet.ScheduledQueryList, error) {
+		tru := true
+		fals := false
+		fortytwo := uint(42)
+		switch pid {
+		case 1:
+			return []*fleet.ScheduledQuery{
+				{Name: "time", Query: "select * from time", Interval: 30, Removed: &fals},
+			}, nil
+		case 4:
+			return []*fleet.ScheduledQuery{
+				{Name: "foobar", Query: "select 3", Interval: 20, Shard: &fortytwo},
+				{Name: "froobing", Query: "select 'guacamole'", Interval: 60, Snapshot: &tru},
+			}, nil
+		default:
+			return []*fleet.ScheduledQuery{}, nil
+		}
+	}
+	ds.ListScheduledQueriesForAgentsFunc = func(ctx context.Context, teamID *uint, hostID *uint, queryReportsDisabled bool) ([]*fleet.Query, error) {
+		if teamID == nil {
+			return nil, nil
+		}
+		return []*fleet.Query{
+			{
+				Query:             "SELECT 1 FROM table_1",
+				Name:              "Some strings carry more weight than others",
+				Interval:          10,
+				Platform:          "linux",
+				MinOsqueryVersion: "5.12.2",
+				Logging:           "snapshot",
+				TeamID:            ptr.Uint(1),
+			},
+			{
+				Query:    "SELECT 1 FROM table_2",
+				Name:     "You shall not pass",
+				Interval: 20,
+				Platform: "macos",
+				Logging:  "differential",
+				TeamID:   ptr.Uint(1),
+			},
+		}, nil
+	}
+	ds.AppConfigFunc = func(ctx context.Context) (*fleet.AppConfig, error) {
+		return &fleet.AppConfig{AgentOptions: ptr.RawMessage(json.RawMessage(`{"config":{"options":{"baz":"bar"}}}`))}, nil
+	}
+	ds.UpdateHostFunc = func(ctx context.Context, host *fleet.Host) error {
+		return nil
+	}
+	ds.HostLiteFunc = func(ctx context.Context, id uint) (*fleet.Host, error) {
+		if id != 1 && id != 2 {
+			return nil, errors.New("not found")
+		}
+		return &fleet.Host{ID: id}, nil
+	}
+
+	svc, ctx := newTestService(t, ds, nil, nil)
+
+	ctx1 := hostctx.NewContext(ctx, &fleet.Host{ID: 1})
+	ctx2 := hostctx.NewContext(ctx, &fleet.Host{ID: 2})
+	ctx3 := hostctx.NewContext(ctx, &fleet.Host{ID: 1, TeamID: ptr.Uint(1)})
+
+	expectedOptions := map[string]interface{}{
+		"baz": "bar",
+	}
+
+	expectedConfig := map[string]interface{}{
+		"options": expectedOptions,
+	}
+
+	// No packs loaded yet
+	conf, err := svc.GetClientConfig(ctx1)
+	require.NoError(t, err)
+	assert.Equal(t, expectedConfig, conf)
+
+	conf, err = svc.GetClientConfig(ctx2)
+	require.NoError(t, err)
+	assert.Equal(t, expectedConfig, conf)
+
+	// Now add packs
+	ds.ListPacksForHostFunc = func(ctx context.Context, hid uint) ([]*fleet.Pack, error) {
+		switch hid {
+		case 1:
+			return []*fleet.Pack{
+				{ID: 1, Name: "pack_by_label"},
+				{ID: 4, Name: "pack_by_other_label"},
+			}, nil
+
+		case 2:
+			return []*fleet.Pack{
+				{ID: 1, Name: "pack_by_label"},
+			}, nil
+		}
+		return []*fleet.Pack{}, nil
+	}
+
+	conf, err = svc.GetClientConfig(ctx1)
+	require.NoError(t, err)
+	assert.Equal(t, expectedOptions, conf["options"])
+	assert.JSONEq(t, `{
+		"pack_by_other_label": {
+			"queries": {
+				"foobar":{"query":"select 3","interval":20,"shard":42},
+				"froobing":{"query":"select 'guacamole'","interval":60,"snapshot":true}
+			}
+		},
+		"pack_by_label": {
+			"queries":{
+				"time":{"query":"select * from time","interval":30,"removed":false}
+			}
+		}
+	}`,
+		string(conf["packs"].(json.RawMessage)),
+	)
+
+	conf, err = svc.GetClientConfig(ctx2)
+	require.NoError(t, err)
+	assert.Equal(t, expectedOptions, conf["options"])
+	assert.JSONEq(t, `{
+		"pack_by_label": {
+			"queries":{
+				"time":{"query":"select * from time","interval":30,"removed":false}
+			}
+		}
+	}`,
+		string(conf["packs"].(json.RawMessage)),
+	)
+
+	// Check scheduled queries are loaded properly
+	conf, err = svc.GetClientConfig(ctx3)
+	require.NoError(t, err)
+	assert.JSONEq(t, `{
+		"pack_by_label": {
+			"queries":{
+				"time":{"query":"select * from time","interval":30,"removed":false}
+			}
+		},
+		"pack_by_other_label": {
+			"queries": {
+				"foobar":{"query":"select 3","interval":20,"shard":42},
+				"froobing":{"query":"select 'guacamole'","interval":60,"snapshot":true}
+			}
+		},
+		"team-1": {
+			"queries": {
+				"Some strings carry more weight than others": {
+					"query": "SELECT 1 FROM table_1",
+					"interval": 10,
+					"platform": "linux",
+					"version": "5.12.2",
+					"snapshot": true
+				},
+				"You shall not pass": {
+					"query": "SELECT 1 FROM table_2",
+					"interval": 20,
+					"platform": "macos",
+					"removed": true,
+					"version": ""
+				}
+			}
+		}
+	}`,
+		string(conf["packs"].(json.RawMessage)),
+	)
+}
+
+// TestGetClientConfigNullConfig is a regression test for a panic
+// ("assignment to entry in nil map") that occurred when a host's agent options
+// had a null "config" and the host also had packs/scheduled queries. See
+// https://github.com/fleetdm/fleet/issues/47388.
+func TestGetClientConfigNullConfig(t *testing.T) {
+	ds := new(mock.Store)
+
+	ds.TeamAgentOptionsFunc = func(ctx context.Context, teamID uint) (*json.RawMessage, error) {
+		return nil, nil
+	}
+	ds.ListPacksForHostFunc = func(ctx context.Context, hid uint) ([]*fleet.Pack, error) {
+		return []*fleet.Pack{{ID: 1, Name: "pack_by_label"}}, nil
+	}
+	ds.ListScheduledQueriesInPackFunc = func(ctx context.Context, pid uint) (fleet.ScheduledQueryList, error) {
+		return []*fleet.ScheduledQuery{
+			{Name: "time", Query: "select * from time", Interval: 30, Removed: new(false)},
+		}, nil
+	}
+	ds.ListScheduledQueriesForAgentsFunc = func(ctx context.Context, teamID *uint, hostID *uint, queryReportsDisabled bool) ([]*fleet.Query, error) {
+		return nil, nil
+	}
+	// Global agent options with a null config. This unmarshals into a nil map,
+	// which previously caused a panic once packs were added to the config.
+	ds.AppConfigFunc = func(ctx context.Context) (*fleet.AppConfig, error) {
+		return &fleet.AppConfig{AgentOptions: new(json.RawMessage(`{"config":null}`))}, nil
+	}
+	ds.UpdateHostFunc = func(ctx context.Context, host *fleet.Host) error {
+		return nil
+	}
+
+	svc, ctx := newTestService(t, ds, nil, nil)
+	ctx = hostctx.NewContext(ctx, &fleet.Host{ID: 1})
+
+	conf, err := svc.GetClientConfig(ctx)
+	require.NoError(t, err)
+	assert.JSONEq(t, `{
+		"pack_by_label": {
+			"queries":{
+				"time":{"query":"select * from time","interval":30,"removed":false}
+			}
+		}
+	}`,
+		string(conf["packs"].(json.RawMessage)),
+	)
+}
+
+func TestGetClientConfigStripsDistributedPluginWhenWebSocketTransportEnabled(t *testing.T) {
+	setup := func(t *testing.T, wsEnabled bool) (fleet.Service, context.Context) {
+		ds := new(mock.Store)
+		ds.ListPacksForHostFunc = func(ctx context.Context, hid uint) ([]*fleet.Pack, error) {
+			return nil, nil
+		}
+		ds.ListScheduledQueriesForAgentsFunc = func(ctx context.Context, teamID *uint, hostID *uint, queryReportsDisabled bool) ([]*fleet.Query, error) {
+			return nil, nil
+		}
+		// Fleet's default agent options include distributed_plugin: tls, which
+		// osquery applies at runtime, overriding the fleetd-managed command line.
+		ds.AppConfigFunc = func(ctx context.Context) (*fleet.AppConfig, error) {
+			return &fleet.AppConfig{
+				AgentOptions: new(json.RawMessage(`{"config":{"options":{"distributed_plugin":"tls","distributed_interval":10,"pack_delimiter":"/"}}}`)),
+			}, nil
+		}
+		ds.UpdateHostFunc = func(ctx context.Context, host *fleet.Host) error {
+			return nil
+		}
+		ds.UpdateHostOsqueryIntervalsFunc = func(ctx context.Context, hostID uint, intervals fleet.HostOsqueryIntervals) error {
+			return nil
+		}
+
+		cfg := config.TestConfig()
+		cfg.WebSocket.TransportEnabled = wsEnabled
+		svc, ctx := newTestServiceWithConfig(t, ds, cfg, nil, nil)
+		ctx = hostctx.NewContext(ctx, &fleet.Host{ID: 1})
+		return svc, ctx
+	}
+
+	t.Run("enabled strips distributed_plugin", func(t *testing.T) {
+		svc, ctx := setup(t, true)
+		conf, err := svc.GetClientConfig(ctx)
+		require.NoError(t, err)
+		opts, ok := conf["options"].(map[string]any)
+		require.True(t, ok)
+		assert.NotContains(t, opts, "distributed_plugin")
+		// Unrelated options are preserved.
+		assert.InDelta(t, 10, opts["distributed_interval"], 0)
+		assert.Equal(t, "/", opts["pack_delimiter"])
+	})
+
+	t.Run("disabled preserves distributed_plugin", func(t *testing.T) {
+		svc, ctx := setup(t, false)
+		conf, err := svc.GetClientConfig(ctx)
+		require.NoError(t, err)
+		opts, ok := conf["options"].(map[string]any)
+		require.True(t, ok)
+		assert.Equal(t, "tls", opts["distributed_plugin"])
+	})
+}
+
+func TestRecordDistributedReadStats(t *testing.T) {
+	hub := agentws.NewHub(slog.New(slog.DiscardHandler), time.Minute, 30*time.Second)
+	var innerCalls int
+	wrapped := recordDistributedReadStats(hub, func(ctx context.Context, request any, svc fleet.Service) (fleet.Errorer, error) {
+		innerCalls++
+		return getDistributedQueriesResponse{}, nil
+	})
+
+	newCtx := func(path string) context.Context {
+		ctx := hostctx.NewContext(t.Context(), &fleet.Host{ID: 9})
+		return context.WithValue(ctx, kithttp.ContextKeyRequestPath, path)
+	}
+
+	_, err := wrapped(newCtx("/api/osquery/distributed/read"), nil, nil)
+	require.NoError(t, err)
+	_, err = wrapped(newCtx("/api/v1/osquery/distributed/read"), nil, nil)
+	require.NoError(t, err)
+	// Missing host in ctx: counts nothing, still calls through.
+	_, err = wrapped(context.WithValue(t.Context(), kithttp.ContextKeyRequestPath, "/api/osquery/distributed/read"), nil, nil)
+	require.NoError(t, err)
+
+	assert.Equal(t, 3, innerCalls)
+	stats := hub.ReadStats()
+	require.Len(t, stats, 1)
+	assert.Equal(t, agentws.ReadStats{HostID: 9, OrbitReads: 1, LegacyReads: 1}, stats[0])
+}
+
+func TestAgentOptionsForHost(t *testing.T) {
+	ds := new(mock.Store)
+	svc, ctx := newTestService(t, ds, nil, nil)
+
+	teamID := uint(1)
+	ds.AppConfigFunc = func(ctx context.Context) (*fleet.AppConfig, error) {
+		return &fleet.AppConfig{
+			AgentOptions: ptr.RawMessage(json.RawMessage(`{"config":{"baz":"bar"},"overrides":{"platforms":{"darwin":{"foo":"override2"}}}}`)),
+		}, nil
+	}
+	ds.TeamAgentOptionsFunc = func(ctx context.Context, id uint) (*json.RawMessage, error) {
+		return ptr.RawMessage(json.RawMessage(`{"config":{"foo":"bar"},"overrides":{"platforms":{"darwin":{"foo":"override"}}}}`)), nil
+	}
+
+	host := &fleet.Host{
+		TeamID:   &teamID,
+		Platform: "darwin",
+	}
+
+	opt, err := svc.AgentOptionsForHost(ctx, host.TeamID, host.Platform)
+	require.NoError(t, err)
+	assert.JSONEq(t, `{"foo":"override"}`, string(opt))
+
+	host.Platform = "windows"
+	opt, err = svc.AgentOptionsForHost(ctx, host.TeamID, host.Platform)
+	require.NoError(t, err)
+	assert.JSONEq(t, `{"foo":"bar"}`, string(opt))
+
+	// Should take gobal option with no team
+	host.TeamID = nil
+	opt, err = svc.AgentOptionsForHost(ctx, host.TeamID, host.Platform)
+	require.NoError(t, err)
+	assert.JSONEq(t, `{"baz":"bar"}`, string(opt))
+
+	host.Platform = "darwin"
+	opt, err = svc.AgentOptionsForHost(ctx, host.TeamID, host.Platform)
+	require.NoError(t, err)
+	assert.JSONEq(t, `{"foo":"override2"}`, string(opt))
+}
+
+var allDetailQueries = osquery_utils.GetDetailQueries(context.Background(), config.FleetConfig{Vulnerabilities: config.VulnerabilitiesConfig{DisableWinOSVulnerabilities: true}}, nil, &fleet.Features{
+	EnableHostUsers:         true,
+	EnableSoftwareInventory: true,
+}, osquery_utils.Integrations{}, nil)
+
+func expectedDetailQueriesForPlatform(platform string) map[string]osquery_utils.DetailQuery {
+	queries := make(map[string]osquery_utils.DetailQuery)
+	for k, v := range allDetailQueries {
+		if v.RunsForPlatform(platform) {
+			queries[k] = v
+		}
+	}
+	return queries
+}
+
+func TestEnrollOsquery(t *testing.T) {
+	ds := new(mock.Store)
+	ds.VerifyEnrollSecretFunc = func(ctx context.Context, secret string) (*fleet.EnrollSecret, error) {
+		switch secret {
+		case "valid_secret":
+			return &fleet.EnrollSecret{Secret: "valid_secret", TeamID: ptr.Uint(3)}, nil
+		default:
+			return nil, errors.New("not found")
+		}
+	}
+	ds.EnrollOsqueryFunc = func(ctx context.Context, opts ...fleet.DatastoreEnrollOsqueryOption) (*fleet.Host, error) {
+		enrollConfig := &fleet.DatastoreEnrollOsqueryConfig{}
+		for _, opt := range opts {
+			opt(enrollConfig)
+		}
+		assert.Equal(t, ptr.Uint(3), enrollConfig.TeamID)
+		return &fleet.Host{
+			OsqueryHostID: &enrollConfig.OsqueryHostID, NodeKey: &enrollConfig.NodeKey,
+		}, nil
+	}
+	ds.AppConfigFunc = func(ctx context.Context) (*fleet.AppConfig, error) {
+		return &fleet.AppConfig{}, nil
+	}
+	ds.GetHostIdentityCertByNameFunc = func(ctx context.Context, name string) (*types.HostIdentityCertificate, error) {
+		return nil, newNotFoundError()
+	}
+
+	svc, ctx := newTestService(t, ds, nil, nil)
+
+	nodeKey, err := svc.EnrollOsquery(ctx, "valid_secret", "host123", nil)
+	require.NoError(t, err)
+	assert.NotEmpty(t, nodeKey)
+}
+
+func TestEnrollOsqueryCertLoadError(t *testing.T) {
+	ds := new(mock.Store)
+	ds.VerifyEnrollSecretFunc = func(ctx context.Context, secret string) (*fleet.EnrollSecret, error) {
+		return &fleet.EnrollSecret{Secret: "valid_secret", TeamID: new(uint(3))}, nil
+	}
+	ds.GetHostIdentityCertByNameFunc = func(ctx context.Context, name string) (*types.HostIdentityCertificate, error) {
+		return nil, errors.New("connection refused reading host_identity_certificates")
+	}
+	svc, ctx := newTestService(t, ds, nil, nil)
+
+	_, err := svc.EnrollOsquery(ctx, "valid_secret", "host123", nil)
+	require.Error(t, err)
+	// the osquery plane must answer with an OsqueryError, not an OrbitError, and
+	// the datastore detail stays out of the message
+	var oqErr *OsqueryError
+	require.ErrorAs(t, err, &oqErr)
+	require.NotContains(t, oqErr.Error(), "connection refused")
+	var orbitErr fleet.OrbitError
+	require.NotErrorAs(t, err, &orbitErr)
+}
+
+func TestEnrollOsqueryEnforceLimit(t *testing.T) {
+	runTest := func(t *testing.T, pool fleet.RedisPool) {
+		const maxHosts = 2
+
+		var hostIDSeq uint
+		ds := new(mock.Store)
+		ds.VerifyEnrollSecretFunc = func(ctx context.Context, secret string) (*fleet.EnrollSecret, error) {
+			switch secret {
+			case "valid_secret":
+				return &fleet.EnrollSecret{Secret: "valid_secret"}, nil
+			default:
+				return nil, errors.New("not found")
+			}
+		}
+		ds.EnrollOsqueryFunc = func(ctx context.Context, opts ...fleet.DatastoreEnrollOsqueryOption) (*fleet.Host, error) {
+			enrollConfig := &fleet.DatastoreEnrollOsqueryConfig{}
+			for _, opt := range opts {
+				opt(enrollConfig)
+			}
+			hostIDSeq++
+			return &fleet.Host{
+				ID: hostIDSeq, OsqueryHostID: &enrollConfig.OsqueryHostID, NodeKey: &enrollConfig.NodeKey,
+			}, nil
+		}
+		ds.AppConfigFunc = func(ctx context.Context) (*fleet.AppConfig, error) {
+			return &fleet.AppConfig{}, nil
+		}
+		ds.HostLiteFunc = func(ctx context.Context, id uint) (*fleet.Host, error) {
+			return &fleet.Host{ID: id}, nil
+		}
+		ds.DeleteHostFunc = func(ctx context.Context, id uint) error {
+			return nil
+		}
+		ds.GetHostIdentityCertByNameFunc = func(ctx context.Context, name string) (*types.HostIdentityCertificate, error) {
+			return nil, newNotFoundError()
+		}
+		redisWrapDS := mysqlredis.New(ds, pool, mysqlredis.WithEnforcedHostLimit(maxHosts))
+		svc, ctx := newTestService(t, redisWrapDS, nil, nil, &TestServerOpts{
+			EnrollHostLimiter: redisWrapDS,
+			License:           &fleet.LicenseInfo{DeviceCount: maxHosts},
+		})
+		ctx = viewer.NewContext(ctx, viewer.Viewer{
+			User: &fleet.User{
+				ID:         0,
+				GlobalRole: ptr.String(fleet.RoleAdmin),
+			},
+		})
+
+		nodeKey, err := svc.EnrollOsquery(ctx, "valid_secret", "host001", nil)
+		require.NoError(t, err)
+		assert.NotEmpty(t, nodeKey)
+
+		nodeKey, err = svc.EnrollOsquery(ctx, "valid_secret", "host002", nil)
+		require.NoError(t, err)
+		assert.NotEmpty(t, nodeKey)
+
+		_, err = svc.EnrollOsquery(ctx, "valid_secret", "host003", nil)
+		require.Error(t, err)
+		require.Contains(t, err.Error(), fmt.Sprintf("maximum number of hosts reached: %d", maxHosts))
+
+		// delete a host with id 1
+		err = svc.DeleteHost(ctx, 1)
+		require.NoError(t, err)
+
+		// now host 003 can be enrolled
+		nodeKey, err = svc.EnrollOsquery(ctx, "valid_secret", "host003", nil)
+		require.NoError(t, err)
+		assert.NotEmpty(t, nodeKey)
+	}
+
+	t.Run("standalone", func(t *testing.T) {
+		pool := redistest.SetupRedis(t, "enrolled_hosts:*", false, false, false)
+		runTest(t, pool)
+	})
+
+	t.Run("cluster", func(t *testing.T) {
+		pool := redistest.SetupRedis(t, "enrolled_hosts:*", true, true, false)
+		runTest(t, pool)
+	})
+}
+
+func TestEnrollOsqueryIncorrectEnrollSecret(t *testing.T) {
+	ds := new(mock.Store)
+	ds.VerifyEnrollSecretFunc = func(ctx context.Context, secret string) (*fleet.EnrollSecret, error) {
+		switch secret {
+		case "valid_secret":
+			return &fleet.EnrollSecret{Secret: "valid_secret", TeamID: ptr.Uint(3)}, nil
+		default:
+			return nil, errors.New("not found")
+		}
+	}
+
+	svc, ctx := newTestService(t, ds, nil, nil)
+
+	nodeKey, err := svc.EnrollOsquery(ctx, "not_correct", "host123", nil)
+	assert.NotNil(t, err)
+	assert.Empty(t, nodeKey)
+}
+
+func TestEnrollOsqueryDetails(t *testing.T) {
+	ds := new(mock.Store)
+	ds.VerifyEnrollSecretFunc = func(ctx context.Context, secret string) (*fleet.EnrollSecret, error) {
+		return &fleet.EnrollSecret{}, nil
+	}
+	ds.EnrollOsqueryFunc = func(ctx context.Context, opts ...fleet.DatastoreEnrollOsqueryOption) (*fleet.Host, error) {
+		config := &fleet.DatastoreEnrollOsqueryConfig{}
+		for _, opt := range opts {
+			opt(config)
+		}
+		return &fleet.Host{
+			OsqueryHostID: &config.OsqueryHostID, NodeKey: &config.NodeKey,
+		}, nil
+	}
+	var gotHost *fleet.Host
+	ds.UpdateHostFunc = func(ctx context.Context, host *fleet.Host) error {
+		gotHost = host
+		return nil
+	}
+	ds.AppConfigFunc = func(ctx context.Context) (*fleet.AppConfig, error) {
+		return &fleet.AppConfig{}, nil
+	}
+	ds.GetHostIdentityCertByNameFunc = func(ctx context.Context, name string) (*types.HostIdentityCertificate, error) {
+		return nil, newNotFoundError()
+	}
+
+	svc, ctx := newTestService(t, ds, nil, nil)
+
+	details := map[string](map[string]string){
+		"osquery_info": {"version": "2.12.0"},
+		"system_info":  {"hostname": "zwass.local", "uuid": "froobling_uuid"},
+		"os_version": {
+			"name":     "Mac OS X",
+			"major":    "10",
+			"minor":    "14",
+			"patch":    "5",
+			"platform": "darwin",
+		},
+		"foo": {"foo": "bar"},
+	}
+	nodeKey, err := svc.EnrollOsquery(ctx, "", "host123", details)
+	require.NoError(t, err)
+	assert.NotEmpty(t, nodeKey)
+
+	assert.Equal(t, "Mac OS X 10.14.5", gotHost.OSVersion)
+	assert.Equal(t, "darwin", gotHost.Platform)
+	assert.Equal(t, "2.12.0", gotHost.OsqueryVersion)
+	assert.Equal(t, "zwass.local", gotHost.Hostname)
+	assert.Equal(t, "froobling_uuid", gotHost.UUID)
+}
+
+func TestAuthenticateHost(t *testing.T) {
+	ds := new(mock.Store)
+	task := async.NewTask(ds, nil, clock.C, nil)
+	svc, ctx := newTestService(t, ds, nil, nil, &TestServerOpts{Task: task})
+
+	var gotKey string
+	host := fleet.Host{ID: 1, Hostname: "foobar", HasHostIdentityCert: ptr.Bool(false)}
+	ds.LoadHostByNodeKeyFunc = func(ctx context.Context, nodeKey string) (*fleet.Host, error) {
+		gotKey = nodeKey
+		return &host, nil
+	}
+	var gotHostIDs []uint
+	ds.MarkHostsSeenFunc = func(ctx context.Context, hostIDs []uint, t time.Time) error {
+		gotHostIDs = hostIDs
+		return nil
+	}
+	ds.AppConfigFunc = func(ctx context.Context) (*fleet.AppConfig, error) {
+		return &fleet.AppConfig{}, nil
+	}
+
+	_, _, err := svc.AuthenticateHost(ctx, "test")
+	require.NoError(t, err)
+	assert.Equal(t, "test", gotKey)
+	assert.False(t, ds.MarkHostsSeenFuncInvoked)
+
+	host = fleet.Host{ID: 7, Hostname: "foobar", HasHostIdentityCert: ptr.Bool(false)}
+	_, _, err = svc.AuthenticateHost(ctx, "floobar")
+	require.NoError(t, err)
+	assert.Equal(t, "floobar", gotKey)
+	assert.False(t, ds.MarkHostsSeenFuncInvoked)
+	// Host checks in twice
+	host = fleet.Host{ID: 7, Hostname: "foobar", HasHostIdentityCert: ptr.Bool(false)}
+	_, _, err = svc.AuthenticateHost(ctx, "floobar")
+	require.NoError(t, err)
+	assert.Equal(t, "floobar", gotKey)
+	assert.False(t, ds.MarkHostsSeenFuncInvoked)
+
+	err = task.FlushHostsLastSeen(ctx, time.Now())
+	require.NoError(t, err)
+	assert.True(t, ds.MarkHostsSeenFuncInvoked)
+	ds.MarkHostsSeenFuncInvoked = false
+	assert.ElementsMatch(t, []uint{1, 7}, gotHostIDs)
+
+	err = task.FlushHostsLastSeen(ctx, time.Now())
+	require.NoError(t, err)
+	assert.True(t, ds.MarkHostsSeenFuncInvoked)
+	require.Len(t, gotHostIDs, 0)
+}
+
+func TestAuthenticateHostFailure(t *testing.T) {
+	ds := new(mock.Store)
+	svc, ctx := newTestService(t, ds, nil, nil)
+
+	ds.LoadHostByNodeKeyFunc = func(ctx context.Context, nodeKey string) (*fleet.Host, error) {
+		return nil, errors.New("not found")
+	}
+
+	_, _, err := svc.AuthenticateHost(ctx, "test")
+	require.NotNil(t, err)
+}
+
+func TestAuthenticateHostOrbitNodeKeyFallback(t *testing.T) {
+	ds := new(mock.Store)
+	task := async.NewTask(ds, nil, clock.C, nil)
+	cfg := config.TestConfig()
+	cfg.WebSocket.TransportEnabled = true
+	svc, ctx := newTestServiceWithConfig(t, ds, cfg, nil, nil, &TestServerOpts{Task: task})
+
+	host := fleet.Host{ID: 42, Hostname: "orbit-host", HasHostIdentityCert: new(false)}
+	ds.LoadHostByNodeKeyFunc = func(ctx context.Context, nodeKey string) (*fleet.Host, error) {
+		return nil, newNotFoundError()
+	}
+	ds.LoadHostByOrbitNodeKeyFunc = func(ctx context.Context, nodeKey string) (*fleet.Host, error) {
+		if nodeKey == "orbit-key" {
+			return &host, nil
+		}
+		return nil, newNotFoundError()
+	}
+	ds.MarkHostsSeenFunc = func(ctx context.Context, hostIDs []uint, t time.Time) error {
+		return nil
+	}
+	ds.AppConfigFunc = func(ctx context.Context) (*fleet.AppConfig, error) {
+		return &fleet.AppConfig{}, nil
+	}
+
+	// An orbit node key authenticates via the fallback lookup.
+	gotHost, _, err := svc.AuthenticateHost(ctx, "orbit-key")
+	require.NoError(t, err)
+	assert.Equal(t, uint(42), gotHost.ID)
+	assert.True(t, ds.LoadHostByNodeKeyFuncInvoked)
+	assert.True(t, ds.LoadHostByOrbitNodeKeyFuncInvoked)
+
+	// A key that matches neither lookup is rejected with an invalid-node error.
+	ds.LoadHostByNodeKeyFuncInvoked = false
+	ds.LoadHostByOrbitNodeKeyFuncInvoked = false
+	_, _, err = svc.AuthenticateHost(ctx, "bogus")
+	require.Error(t, err)
+	var osqueryErr *OsqueryError
+	require.ErrorAs(t, err, &osqueryErr)
+	assert.True(t, osqueryErr.NodeInvalid())
+	assert.True(t, ds.LoadHostByNodeKeyFuncInvoked)
+	assert.True(t, ds.LoadHostByOrbitNodeKeyFuncInvoked)
+
+	// An osquery node key never reaches the fallback lookup.
+	ds.LoadHostByNodeKeyFunc = func(ctx context.Context, nodeKey string) (*fleet.Host, error) {
+		return &host, nil
+	}
+	ds.LoadHostByOrbitNodeKeyFuncInvoked = false
+	_, _, err = svc.AuthenticateHost(ctx, "osquery-key")
+	require.NoError(t, err)
+	assert.False(t, ds.LoadHostByOrbitNodeKeyFuncInvoked)
+}
+
+func TestAuthenticateHostNoOrbitNodeKeyFallbackWhenTransportDisabled(t *testing.T) {
+	ds := new(mock.Store)
+	svc, ctx := newTestService(t, ds, nil, nil)
+
+	ds.LoadHostByNodeKeyFunc = func(ctx context.Context, nodeKey string) (*fleet.Host, error) {
+		return nil, newNotFoundError()
+	}
+
+	_, _, err := svc.AuthenticateHost(ctx, "orbit-key")
+	require.Error(t, err)
+	var osqueryErr *OsqueryError
+	require.ErrorAs(t, err, &osqueryErr)
+	assert.True(t, osqueryErr.NodeInvalid())
+	assert.False(t, ds.LoadHostByOrbitNodeKeyFuncInvoked)
+}
+
+func TestListHostIDsDueForDistributedRead(t *testing.T) {
+	now := time.Now()
+	fresh := now.Add(-time.Minute)
+	// TestConfig sets the label/policy/detail update intervals to 1 hour with
+	// zero jitter.
+	stale := now.Add(-2 * time.Hour)
+
+	hosts := []*fleet.Host{
+		{ID: 1, DetailUpdatedAt: fresh, LabelUpdatedAt: fresh, PolicyUpdatedAt: fresh},                                                        // not due
+		{ID: 2, DetailUpdatedAt: stale, LabelUpdatedAt: fresh, PolicyUpdatedAt: fresh},                                                        // stale details
+		{ID: 3, DetailUpdatedAt: fresh, LabelUpdatedAt: stale, PolicyUpdatedAt: fresh},                                                        // stale labels
+		{ID: 4, DetailUpdatedAt: fresh, LabelUpdatedAt: fresh, PolicyUpdatedAt: stale},                                                        // stale policies
+		{ID: 5, DetailUpdatedAt: fresh, LabelUpdatedAt: fresh, PolicyUpdatedAt: fresh, RefetchRequested: true},                                // refetch requested
+		{ID: 6, DetailUpdatedAt: fresh, LabelUpdatedAt: fresh, PolicyUpdatedAt: fresh, RefetchCriticalQueriesUntil: new(now.Add(time.Hour))},  // critical queries window
+		{ID: 7, DetailUpdatedAt: fresh, LabelUpdatedAt: fresh, PolicyUpdatedAt: fresh, RefetchCriticalQueriesUntil: new(now.Add(-time.Hour))}, // expired critical queries window
+	}
+	allIDs := []uint{1, 2, 3, 4, 5, 6, 7}
+	intervalDue := map[uint]string{
+		2: fleet.AgentWSReasonDetail,
+		3: fleet.AgentWSReasonLabel,
+		4: fleet.AgentWSReasonPolicy,
+		5: fleet.AgentWSReasonRefetch,
+		6: fleet.AgentWSReasonRefetch,
+	}
+
+	// The mock live query store fails the test on any call without a matching
+	// expectation, so each subtest's expectations double as assertions that no
+	// other store calls are made.
+	setup := func(t *testing.T) (fleet.Service, context.Context, *live_query_mock.MockLiveQuery, *[]uint) {
+		ds := new(mock.Store)
+		lq := live_query_mock.New(t)
+		svc, ctx := newTestService(t, ds, nil, lq)
+		gotIDs := new([]uint)
+		ds.ListHostsLiteByIDsFunc = func(ctx context.Context, ids []uint) ([]*fleet.Host, error) {
+			*gotIDs = ids
+			return hosts, nil
+		}
+		return svc, ctx, lq, gotIDs
+	}
+
+	t.Run("interval work, no active campaigns", func(t *testing.T) {
+		svc, ctx, lq, gotIDs := setup(t)
+		// No active campaigns: the per-host live query check is skipped.
+		lq.On("LoadActiveQueryNames").Return([]string{}, nil)
+
+		due, err := svc.ListHostIDsDueForDistributedRead(ctx, allIDs)
+		require.NoError(t, err)
+		assert.Equal(t, allIDs, *gotIDs)
+		assert.Equal(t, intervalDue, due)
+	})
+
+	t.Run("active campaign targeting a host", func(t *testing.T) {
+		svc, ctx, lq, _ := setup(t)
+		lq.On("LoadActiveQueryNames").Return([]string{"42"}, nil)
+		// Only the hosts without interval work (1 and 7) are checked: host 1 is
+		// targeted by campaign 42 and hasn't answered, host 7 is not (or already
+		// answered).
+		lq.On("QueriesForHost", uint(1)).Return(map[string]string{"42": "SELECT 1"}, nil)
+		lq.On("QueriesForHost", uint(7)).Return(map[string]string{}, nil)
+
+		due, err := svc.ListHostIDsDueForDistributedRead(ctx, allIDs)
+		require.NoError(t, err)
+		want := map[uint]string{1: fleet.AgentWSReasonLiveQuery(42)}
+		maps.Copy(want, intervalDue)
+		assert.Equal(t, want, due)
+	})
+
+	t.Run("live query store errors are non-fatal", func(t *testing.T) {
+		svc, ctx, lq, _ := setup(t)
+		lq.On("LoadActiveQueryNames").Return([]string{"42"}, nil)
+		lq.On("QueriesForHost", uint(1)).Return(map[string]string(nil), errors.New("boom"))
+		lq.On("QueriesForHost", uint(7)).Return(map[string]string(nil), errors.New("boom"))
+
+		due, err := svc.ListHostIDsDueForDistributedRead(ctx, allIDs)
+		require.NoError(t, err)
+		assert.Equal(t, intervalDue, due)
+	})
+
+	t.Run("active campaign listing errors are non-fatal", func(t *testing.T) {
+		svc, ctx, lq, _ := setup(t)
+		lq.On("LoadActiveQueryNames").Return([]string(nil), errors.New("boom"))
+
+		due, err := svc.ListHostIDsDueForDistributedRead(ctx, allIDs)
+		require.NoError(t, err)
+		assert.Equal(t, intervalDue, due)
+	})
+
+	t.Run("deleted hosts are reported as not found", func(t *testing.T) {
+		svc, ctx, lq, _ := setup(t)
+		lq.On("LoadActiveQueryNames").Return([]string{}, nil)
+
+		// IDs 8 and 9 have no hosts row (deleted while their agent was connected).
+		due, err := svc.ListHostIDsDueForDistributedRead(ctx, append(slices.Clone(allIDs), 8, 9))
+		require.NoError(t, err)
+		want := map[uint]string{8: fleet.AgentWSReasonHostNotFound, 9: fleet.AgentWSReasonHostNotFound}
+		maps.Copy(want, intervalDue)
+		assert.Equal(t, want, due)
+	})
+}
+
+func TestAuthenticateHostContextCanceled(t *testing.T) {
+	ds := new(mock.Store)
+	svc, ctx := newTestService(t, ds, nil, nil)
+
+	ds.LoadHostByNodeKeyFunc = func(ctx context.Context, nodeKey string) (*fleet.Host, error) {
+		return nil, context.Canceled
+	}
+
+	_, _, err := svc.AuthenticateHost(ctx, "test")
+	require.Error(t, err)
+	// The error must preserve context.Canceled in the chain so that
+	// downstream error handling (e.g. ctxerr.isClientError) correctly
+	// classifies it as a client error instead of recording it as an
+	// OTEL exception.
+	require.ErrorIs(t, err, context.Canceled)
+	var osqueryErr *OsqueryError
+	require.False(t, errors.As(err, &osqueryErr), "context.Canceled should not be wrapped in OsqueryError")
+}
+
+func TestSubmitDistributedQueryResultsDecodeBodyDeadlineExceeded(t *testing.T) {
+	deadlineErr := &net.OpError{
+		Op:  "read",
+		Net: "tcp",
+		Err: os.ErrDeadlineExceeded,
+	}
+	failingReader := &errorReader{err: deadlineErr}
+
+	shim := &submitDistributedQueryResultsRequestShim{}
+	err := shim.DecodeBody(t.Context(), failingReader, nil, nil)
+	require.Error(t, err)
+
+	var osqueryErr *OsqueryError
+	require.True(t, errors.As(err, &osqueryErr), "expected OsqueryError wrapping deadline exceeded")
+	require.True(t, osqueryErr.IsClientError(), "deadline exceeded during body read should be a client error")
+	require.Equal(t, http.StatusRequestTimeout, osqueryErr.StatusCode)
+}
+
+// errorReader is an io.Reader that returns the given error on Read.
+type errorReader struct {
+	err error
+}
+
+func (r *errorReader) Read([]byte) (int, error) {
+	return 0, r.err
+}
+
+type testJSONLogger struct {
+	logs []json.RawMessage
+}
+
+func (n *testJSONLogger) Write(ctx context.Context, logs []json.RawMessage) error {
+	n.logs = logs
+	return nil
+}
+
+func TestSubmitStatusLogs(t *testing.T) {
+	ds := new(mock.Store)
+	svc, ctx := newTestService(t, ds, nil, nil)
+
+	// Hack to get at the service internals and modify the writer
+	serv := ((svc.(validationMiddleware)).Service).(*Service)
+
+	testLogger := &testJSONLogger{}
+	serv.osqueryLogWriter = &OsqueryLogger{Status: testLogger}
+
+	logs := []string{
+		`{"severity":"0","filename":"tls.cpp","line":"216","message":"some message","version":"1.8.2","decorations":{"host_uuid":"uuid_foobar","username":"zwass"}}`,
+		`{"severity":"1","filename":"buffered.cpp","line":"122","message":"warning!","version":"1.8.2","decorations":{"host_uuid":"uuid_foobar","username":"zwass"}}`,
+	}
+	logJSON := fmt.Sprintf("[%s]", strings.Join(logs, ","))
+
+	var status []json.RawMessage
+	err := json.Unmarshal([]byte(logJSON), &status)
+	require.NoError(t, err)
+
+	host := fleet.Host{}
+	ctx = hostctx.NewContext(ctx, &host)
+	err = serv.SubmitStatusLogs(ctx, status)
+	require.NoError(t, err)
+
+	assert.Equal(t, status, testLogger.logs)
+}
+
+func TestSubmitResultLogsToLogDestination(t *testing.T) {
+	ds := new(mock.Store)
+	svc, ctx := newTestService(t, ds, nil, nil, &TestServerOpts{Logger: slog.New(slog.NewJSONHandler(os.Stdout, nil))})
+
+	ds.AppConfigFunc = func(ctx context.Context) (*fleet.AppConfig, error) {
+		return &fleet.AppConfig{}, nil
+	}
+	ds.QueryByNameFunc = func(ctx context.Context, teamID *uint, name string) (*fleet.Query, error) {
+		switch {
+		case teamID != nil && *teamID == 1:
+			return &fleet.Query{
+				ID:                 4242,
+				Name:               name,
+				AutomationsEnabled: true,
+				TeamID:             ptr.Uint(1),
+				Logging:            fleet.LoggingSnapshot,
+			}, nil
+		case teamID != nil && *teamID == 2:
+			return &fleet.Query{
+				ID:                 4343,
+				Name:               name,
+				AutomationsEnabled: true,
+				TeamID:             ptr.Uint(2),
+				Logging:            fleet.LoggingSnapshot,
+			}, nil
+		case teamID == nil && (name == "time" || name == "system_info" || name == "encrypted" || name == "hosts"):
+			return &fleet.Query{
+				ID:                 uint(name[0]),
+				Name:               name,
+				AutomationsEnabled: true,
+			}, nil
+		case teamID != nil && *teamID == 1 && name == "hosts":
+			return &fleet.Query{
+				Name:               name,
+				AutomationsEnabled: true,
+				TeamID:             teamID,
+			}, nil
+		case teamID == nil && name == "query_not_automated":
+			return &fleet.Query{
+				Name:               name,
+				AutomationsEnabled: false,
+			}, nil
+		case teamID == nil && name == "query_should_be_saved_and_submitted":
+			return &fleet.Query{
+				ID:                 123,
+				Name:               name,
+				AutomationsEnabled: true,
+				Logging:            fleet.LoggingSnapshot,
+			}, nil
+		case teamID == nil && name == "All USB devices":
+			return &fleet.Query{
+				ID:                 777,
+				Name:               name,
+				AutomationsEnabled: true,
+				Logging:            fleet.LoggingSnapshot,
+			}, nil
+		case teamID == nil && name == "query_should_be_saved_and_submitted_with_custom_pack_delimiter":
+			return &fleet.Query{
+				ID:                 1234,
+				Name:               name,
+				AutomationsEnabled: true,
+				Logging:            fleet.LoggingSnapshot,
+			}, nil
+		case teamID == nil && name == "query_should_be_saved_but_not_submitted":
+			return &fleet.Query{
+				ID:                 444,
+				Name:               name,
+				AutomationsEnabled: false,
+				Logging:            fleet.LoggingSnapshot,
+			}, nil
+		case teamID == nil && name == "query_no_rows":
+			return &fleet.Query{
+				ID:                 555,
+				Name:               name,
+				AutomationsEnabled: true,
+				Logging:            fleet.LoggingSnapshot,
+			}, nil
+		default:
+			return nil, newNotFoundError()
+		}
+	}
+	ds.QueriesByNameFunc = queriesByNameFromQueryByName(ds.QueryByNameFunc)
+	ds.QueriesPerHostFunc = func(ctx context.Context, hostID uint, teamID *uint) ([]uint, error) {
+		// Mirrors the IDs returned by QueryByNameFunc above. Team 1 queries are never
+		// scheduled here because no host in this test belongs to team 1.
+		if teamID != nil && *teamID == 2 {
+			return []uint{4343}, nil
+		}
+		return []uint{
+			uint('t'), uint('s'), uint('e'), uint('h'), // time, system_info, encrypted, hosts
+			123, 444, 555, 777, 1234,
+		}, nil
+	}
+	ds.ResultCountForQueryFunc = func(ctx context.Context, queryID uint) (int, error) {
+		return 0, nil
+	}
+	teamQueryResultsStored := false
+	ds.OverwriteQueryResultRowsFunc = func(ctx context.Context, rows []*fleet.ScheduledQueryResultRow, maxQueryReportRows int) (int, error) {
+		if len(rows) == 0 {
+			return 0, nil
+		}
+		if rows[0].QueryID == 777 {
+			require.Len(t, rows, 3)
+
+			for i := 0; i < 3; i++ {
+				require.NotZero(t, rows[i].LastFetched)
+				require.Equal(t, uint(999), rows[i].HostID)
+				require.Equal(t, uint(777), rows[i].QueryID)
+			}
+
+			require.JSONEq(t,
+				`{"class":"9","model":"AppleUSBVHCIBCE Root Hub Simulation","model_id":"8007","protocol":"","removable":"0","serial":"0","subclass":"255","usb_address":"","usb_port":"","vendor":"Apple Inc.","vendor_id":"05ac","version":"0.0"}`,
+				string(*rows[0].Data))
+			require.JSONEq(t,
+				`{"class":"9","model":"AppleUSBXHCI Root Hub Simulation","model_id":"8007","protocol":"","removable":"0","serial":"0","subclass":"255","usb_address":"","usb_port":"","vendor":"Apple Inc.","vendor_id":"05ac","version":"0.0"}`,
+				string(*rows[1].Data))
+			require.JSONEq(t,
+				`{"class":"9","model":"AppleUSBXHCI Root Hub Simulation","model_id":"8008","protocol":"","removable":"0","serial":"1","subclass":"255","usb_address":"","usb_port":"","vendor":"Apple Inc.","vendor_id":"05ac","version":"0.0"}`,
+				string(*rows[2].Data))
+		}
+		switch {
+		case rows[0].QueryID == 4242:
+			t.Fatal("should not happen, as query 4242 is a team query and host is global")
+		case rows[0].QueryID == 4343:
+			teamQueryResultsStored = true
+		case rows[0].QueryID == 123:
+			require.Len(t, rows, 1)
+			require.Equal(t, uint(999), rows[0].HostID)
+			require.NotZero(t, rows[0].LastFetched)
+			require.JSONEq(t, `{"hour":"20","minutes":"8"}`, string(*rows[0].Data))
+		case rows[0].QueryID == 444:
+			require.Len(t, rows, 2)
+			require.Equal(t, uint(999), rows[0].HostID)
+			require.NotZero(t, rows[0].LastFetched)
+			require.JSONEq(t, `{"hour":"20","minutes":"8"}`, string(*rows[0].Data))
+			require.Equal(t, uint(999), rows[1].HostID)
+			require.Equal(t, uint(444), rows[1].QueryID)
+			require.NotZero(t, rows[1].LastFetched)
+			require.JSONEq(t, `{"hour":"21","minutes":"9"}`, string(*rows[1].Data))
+		}
+		return 0, nil
+	}
+
+	// Hack to get at the service internals and modify the writer
+	serv := ((svc.(validationMiddleware)).Service).(*Service)
+
+	testLogger := &testJSONLogger{}
+	serv.osqueryLogWriter = &OsqueryLogger{Result: testLogger}
+
+	validLogResults := []string{
+		`{"action":"added","calendarTime":"Fri Sep 30 17:55:15 2016 UTC","columns":{"cpu_brand":"Intel(R) Core(TM) i7-4770HQ CPU @ 2.20GHz","hostname":"hostimus","physical_memory":"17179869184"},"decorations":{"host_uuid":"some_uuid","username":"zwass"},"hostIdentifier":"some_uuid","name":"pack/Global/system_info","query_id":115,"unixTime":1475258115}`,
+
+		`{"name":"pack/SomePack/encrypted","hostIdentifier":"some_uuid","calendarTime":"Fri Sep 30 21:19:15 2016 UTC","unixTime":1475270355,"decorations":{"host_uuid":"4740D59F-699E-5B29-960B-979AAF9BBEEB","username":"zwass"},"columns":{"encrypted":"1","name":"\/dev\/disk1","type":"AES-XTS","uid":"","user_uuid":"","uuid":"some_uuid"},"action":"added"}`,
+		`{"name":"pack/SomePack/encrypted","hostIdentifier":"some_uuid","calendarTime":"Fri Sep 30 21:19:14 2016 UTC","unixTime":1475270354,"decorations":{"host_uuid":"4740D59F-699E-5B29-960B-979AAF9BBEEB","username":"zwass"},"columns":{"encrypted":"1","name":"\/dev\/disk1","type":"AES-XTS","uid":"","user_uuid":"","uuid":"some_uuid"},"action":"added"}`,
+
+		// These results belong to the same query but have 1 second difference.
+		`{"action":"snapshot","calendarTime":"Tue Jan 10 20:08:51 2017 UTC","decorations":{"host_uuid":"EB714C9D-C1F8-A436-B6DA-3F853C5502EA"},"hostIdentifier":"1379f59d98f4","name":"pack/Global/time","query_id":116,"snapshot":[{"hour":"20","minutes":"8"}],"unixTime":1484078931}`,
+		`{"action":"snapshot","calendarTime":"Tue Jan 10 20:08:50 2017 UTC","decorations":{"host_uuid":"EB714C9D-C1F8-A436-B6DA-3F853C5502EA"},"hostIdentifier":"1379f59d98f4","name":"pack/Global/time","query_id":116,"snapshot":[{"hour":"20","minutes":"8"}],"unixTime":1484078930}`,
+		`{"action":"snapshot","calendarTime":"Tue Jan 10 20:08:52 2017 UTC","decorations":{"host_uuid":"EB714C9D-C1F8-A436-B6DA-3F853C5502EA"},"hostIdentifier":"1379f59d98f4","name":"pack/Global/time","query_id":116,"snapshot":[{"hour":"20","minutes":"8"}],"unixTime":1484078932}`,
+
+		`{"calendarTime":"Sun Nov 19 00:02:08 2017 UTC","counter":"10","decorations":{"host_uuid":"FA01680E-98CA-5557-8F59-7716ECFEE964","hostname":"kl.groob.io"},"diffResults":{"removed":[{"address":"127.0.0.1","hostnames":"kl.groob.io"}],"added":""},"epoch":"0","hostIdentifier":"FA01680E-98CA-5557-8F59-7716ECFEE964","name":"pack\/team-1/hosts","query_id":4242,"unixTime":1511049728}`,
+
+		`{"action":"snapshot","calendarTime":"Tue Jan 10 20:08:51 2017 UTC","decorations":{"host_uuid":"EB714C9D-C1F8-A436-B6DA-3F853C5502EA"},"hostIdentifier":"1379f59d98f4","name":"pack/Global/query_should_be_saved_and_submitted","query_id":123,"snapshot":[{"hour":"20","minutes":"8"}],"unixTime":1484078931}`,
+		`{"action":"snapshot","calendarTime":"Tue Jan 10 20:08:52 2017 UTC","decorations":{"host_uuid":"EB714C9D-C1F8-A436-B6DA-3F853C5502EA"},"hostIdentifier":"1379f59d98f4","name":"pack_Global_query_should_be_saved_and_submitted_with_custom_pack_delimiter","query_id":1234,"snapshot":[{"hour":"20","minutes":"8"}],"unixTime":1484078932}`,
+
+		// Fleet doesn't know of this query, so this result should be streamed as is (This is to support streaming results for osquery nodes that are configured outside of Fleet, e.g. `--config_plugin=filesystem`).
+		`{"snapshot":[{"hour":"20","minutes":"8"}],"action":"snapshot","name":"pack/Global/doesntexist","hostIdentifier":"1379f59d98f4","calendarTime":"Tue Jan 10 20:08:51 2017 UTC","unixTime":1484078931,"decorations":{"host_uuid":"EB714C9D-C1F8-A436-B6DA-3F853C5502EA"}}`,
+
+		// If a global query belongs to a 2017/legacy pack, it should be automated even if the global query has automations turned off.
+		`{"snapshot":[{"hour":"20","minutes":"8"}],"action":"snapshot","name":"pack/Some Pack Name/query_not_automated","hostIdentifier":"1379f59d98f4","calendarTime":"Tue Jan 10 20:08:51 2017 UTC","unixTime":1484078931,"decorations":{"host_uuid":"EB714C9D-C1F8-A436-B6DA-3F853C5502EA"}}`,
+
+		// The "name" field has invalid format, so this result will be streamed as is (This is to support streaming results for osquery nodes that are configured outside of Fleet, e.g. `--config_plugin=filesystem`).
+		`{"name":"com.foo.bar","hostIdentifier":"52eb420a-2085-438a-abf0-5670e97588e2","calendarTime":"Thu Dec  7 15:15:20 2023 UTC","unixTime":1701962120,"epoch":0,"counter":0,"numerics":false,"columns":{"foo": "bar"},"action":"snapshot"}`,
+		`{"snapshot":[{"hour":"20","minutes":"8"}],"action":"snapshot","name":"some_name","hostIdentifier":"1379f59d98f4","calendarTime":"Tue Jan 10 20:08:51 2017 UTC","unixTime":1484078931,"decorations":{"host_uuid":"EB714C9D-C1F8-A436-B6DA-3F853C5502EA"}}`,
+		`{"snapshot":[{"hour":"20","minutes":"8"}],"action":"snapshot","name":"pack/team-foo/bar","hostIdentifier":"1379f59d98f4","calendarTime":"Tue Jan 10 20:08:51 2017 UTC","unixTime":1484078931,"decorations":{"host_uuid":"EB714C9D-C1F8-A436-B6DA-3F853C5502EA"}}`,
+		`{"snapshot":[{"hour":"20","minutes":"8"}],"action":"snapshot","name":"pack/team-","hostIdentifier":"1379f59d98f4","calendarTime":"Tue Jan 10 20:08:51 2017 UTC","unixTime":1484078931,"decorations":{"host_uuid":"EB714C9D-C1F8-A436-B6DA-3F853C5502EA"}}`,
+		`{"snapshot":[{"hour":"20","minutes":"8"}],"action":"snapshot","name":"pack/PackName","hostIdentifier":"1379f59d98f4","calendarTime":"Tue Jan 10 20:08:51 2017 UTC","unixTime":1484078931,"decorations":{"host_uuid":"EB714C9D-C1F8-A436-B6DA-3F853C5502EA"}}`,
+
+		// Query results of a query that belongs to a different team than the host's team (can happen when host is transferred from one team to another or no team).
+		`{"action":"snapshot","calendarTime":"Tue Jan 10 20:08:51 2017 UTC","decorations":{"host_uuid":"EB714C9D-C1F8-A436-B6DA-3F853C5502EA"},"hostIdentifier":"1379f59d98f4","name":"pack/team-1/Foobar","query_id":4242,"snapshot":[{"hour":"20","minutes":"8"}],"unixTime":1484078931}`,
+
+		// Query results in event format (this is received for scheduled query results when the host is configured with `--logger_snapshot_event_type=true`).
+		// The "event format" contains one result for each row returned by the query and the columns in the "columns" key.
+		`{"action":"snapshot","calendarTime":"Wed Jan 29 12:32:54 2025 UTC","columns":{"class":"9","model":"AppleUSBVHCIBCE Root Hub Simulation","model_id":"8007","protocol":"","removable":"0","serial":"0","subclass":"255","usb_address":"","usb_port":"","vendor":"Apple Inc.","vendor_id":"05ac","version":"0.0"},"counter":0,"decorations":{"host_uuid":"634B6F24-97FB-44C9-8342-5CF20A08619F","hostname":"foobar.local"},"epoch":0,"hostIdentifier":"634B6F24-97FB-44C9-8342-5CF20A08619F","name":"pack/Global/All USB devices","numerics":false,"query_id":777,"unixTime":1738153974}`,
+		`{"action":"snapshot","calendarTime":"Wed Jan 29 12:32:54 2025 UTC","columns":{"class":"9","model":"AppleUSBXHCI Root Hub Simulation","model_id":"8007","protocol":"","removable":"0","serial":"0","subclass":"255","usb_address":"","usb_port":"","vendor":"Apple Inc.","vendor_id":"05ac","version":"0.0"},"counter":0,"decorations":{"host_uuid":"634B6F24-97FB-44C9-8342-5CF20A08619F","hostname":"foobar.local"},"epoch":0,"hostIdentifier":"634B6F24-97FB-44C9-8342-5CF20A08619F","name":"pack/Global/All USB devices","numerics":false,"query_id":777,"unixTime":1738153974}`,
+		`{"action":"snapshot","calendarTime":"Wed Jan 29 12:32:54 2025 UTC","columns":{"class":"9","model":"AppleUSBXHCI Root Hub Simulation","model_id":"8008","protocol":"","removable":"0","serial":"1","subclass":"255","usb_address":"","usb_port":"","vendor":"Apple Inc.","vendor_id":"05ac","version":"0.0"},"counter":0,"decorations":{"host_uuid":"634B6F24-97FB-44C9-8342-5CF20A08619F","hostname":"foobar.local"},"epoch":0,"hostIdentifier":"634B6F24-97FB-44C9-8342-5CF20A08619F","name":"pack/Global/All USB devices","numerics":false,"query_id":777,"unixTime":1738153974}`,
+	}
+	logJSON := fmt.Sprintf("[%s]", strings.Join(validLogResults, ","))
+
+	resultWithInvalidJSON := []byte("foobar:\n\t123")
+	resultWithInvalidJSONLong := []byte("foobar:\n\t1233333333333333333333333333333333333333333333333333333333")
+	// The "name" field will be empty, so this result will be ignored.
+	resultWithoutName := []byte(`{"unknown":{"foo": [] }}`)
+	// The query was configured with automations disabled, so this result will be ignored.
+	resultWithQueryNotAutomated := []byte(`{"snapshot":[{"hour":"20","minutes":"8"}],"action":"snapshot","name":"pack/Global/query_not_automated","hostIdentifier":"1379f59d98f4","calendarTime":"Tue Jan 10 20:08:51 2017 UTC","unixTime":1484078931,"decorations":{"host_uuid":"EB714C9D-C1F8-A436-B6DA-3F853C5502EA"}}`)
+	// The query is supposed to be saved but with automations disabled (and has two columns).
+	resultWithQuerySavedNotAutomated := []byte(`{"snapshot":[{"hour":"20","minutes":"8"},{"hour":"21","minutes":"9"}],"action":"snapshot","name":"pack/Global/query_should_be_saved_but_not_submitted","hostIdentifier":"1379f59d98f4","calendarTime":"Tue Jan 10 20:08:51 2017 UTC","unixTime":1484078931,"decorations":{"host_uuid":"EB714C9D-C1F8-A436-B6DA-3F853C5502EA"}}`)
+
+	var validResults []json.RawMessage
+	err := json.Unmarshal([]byte(logJSON), &validResults)
+	require.NoError(t, err)
+
+	host := fleet.Host{
+		ID:     999,
+		TeamID: nil, // Global host.
+	}
+	ctx = hostctx.NewContext(ctx, &host)
+
+	// Submit valid, invalid and to-be-ignored log results mixed.
+	validAndInvalidResults := make([]json.RawMessage, 0, len(validResults)+5)
+	for i, result := range validResults {
+		validAndInvalidResults = append(validAndInvalidResults, result)
+		if i == 2 {
+			validAndInvalidResults = append(validAndInvalidResults,
+				resultWithInvalidJSON, resultWithInvalidJSONLong,
+				resultWithoutName, resultWithQueryNotAutomated,
+				resultWithQuerySavedNotAutomated,
+			)
+		}
+	}
+	err = serv.SubmitResultLogs(ctx, validAndInvalidResults)
+	require.NoError(t, err)
+
+	// Results naming a team 1 query are dropped before reaching the logging destination:
+	// this host is global, so Fleet never put that query on its schedule.
+	var expectedLogs []json.RawMessage
+	for _, result := range validResults {
+		if !strings.Contains(string(result), "team-1") {
+			expectedLogs = append(expectedLogs, result)
+		}
+	}
+	require.Len(t, expectedLogs, len(validResults)-2)
+	assert.Equal(t, expectedLogs, testLogger.logs)
+
+	//
+	// Run a similar test but now with a team host.
+	//
+	host = fleet.Host{
+		ID:     999,
+		TeamID: ptr.Uint(2),
+	}
+	ctx = hostctx.NewContext(ctx, &host)
+	results := []json.RawMessage{
+		// This query should be ignored.
+		json.RawMessage(`{"snapshot":[{"hour":"20","minutes":"8"}],"action":"snapshot","name":"pack/team-1/Foobar","hostIdentifier":"1379f59d98f4","calendarTime":"Tue Jan 10 20:08:51 2017 UTC","unixTime":1484078931,"decorations":{"host_uuid":"EB714C9D-C1F8-A436-B6DA-3F853C5502EA"}}`),
+		// This query should be stored.
+		json.RawMessage(`{"snapshot":[{"hour":"20","minutes":"8"}],"action":"snapshot","name":"pack/team-2/Zoobar","hostIdentifier":"1379f59d98f4","calendarTime":"Tue Jan 10 20:08:51 2017 UTC","unixTime":1484078931,"decorations":{"host_uuid":"EB714C9D-C1F8-A436-B6DA-3F853C5502EA"}}`),
+	}
+	err = serv.SubmitResultLogs(ctx, results)
+	require.NoError(t, err)
+
+	require.True(t, teamQueryResultsStored)
+}
+
+func TestSaveResultLogsToQueryReports(t *testing.T) {
+	ds := new(mock.Store)
+	liveQueryStore := makeLiveQueryStore(t, 10)
+	svc, ctx := newTestService(t, ds, nil, liveQueryStore)
+
+	// Hack to get at the private methods
+	serv := ((svc.(validationMiddleware)).Service).(*Service)
+
+	host := fleet.Host{}
+	ctx = hostctx.NewContext(ctx, &host)
+
+	results := []*fleet.ScheduledQueryResult{
+		{
+			QueryName:     "pack/Global/Uptime",
+			OsqueryHostID: "1379f59d98f4",
+			Snapshot: []*json.RawMessage{
+				ptr.RawMessage(json.RawMessage(`{"hour":"20","minutes":"8"}`)),
+			},
+			UnixTime: 1484078931,
+		},
+	}
+
+	// Results not saved if DiscardData is true in Query
+	discardDataTrue := map[string]*fleet.Query{
+		"pack/Global/Uptime": {
+			ID:          1,
+			DiscardData: true,
+			Logging:     fleet.LoggingSnapshot,
+		},
+	}
+	serv.saveResultLogsToQueryReports(ctx, results, discardDataTrue, fleet.DefaultMaxQueryReportRows)
+	assert.False(t, ds.OverwriteQueryResultRowsFuncInvoked)
+
+	// Happy Path: Results saved
+	discardDataFalse := map[string]*fleet.Query{
+		"pack/Global/Uptime": {
+			ID:          1,
+			DiscardData: false,
+			Logging:     fleet.LoggingSnapshot,
+		},
+	}
+	ds.OverwriteQueryResultRowsFunc = func(ctx context.Context, rows []*fleet.ScheduledQueryResultRow, maxQueryReportRows int) (int, error) {
+		return 0, nil
+	}
+	serv.saveResultLogsToQueryReports(ctx, results, discardDataFalse, fleet.DefaultMaxQueryReportRows)
+	require.True(t, ds.OverwriteQueryResultRowsFuncInvoked)
+}
+
+func TestSaveResultLogsToQueryReportsWithTableOverLimit(t *testing.T) {
+	ds := new(mock.Store)
+	// We allow 10% overage on the limit so that the cleanup job helps to rotate the rows.
+	// So we want to do 1000 + 10% + 1 here.
+	liveQueryStore := makeLiveQueryStore(t, 1101)
+	svc, ctx := newTestService(t, ds, nil, liveQueryStore)
+
+	// Hack to get at the private methods
+	serv := ((svc.(validationMiddleware)).Service).(*Service)
+
+	host := fleet.Host{}
+	ctx = hostctx.NewContext(ctx, &host)
+
+	results := []*fleet.ScheduledQueryResult{
+		{
+			QueryName:     "pack/Global/Uptime",
+			OsqueryHostID: "1379f59d98f4",
+			Snapshot: []*json.RawMessage{
+				ptr.RawMessage(json.RawMessage(`{"hour":"20","minutes":"8"}`)),
+			},
+			UnixTime: 1484078931,
+		},
+	}
+
+	discardDataFalse := map[string]*fleet.Query{
+		"pack/Global/Uptime": {
+			ID:          1,
+			DiscardData: false,
+			Logging:     fleet.LoggingSnapshot,
+		},
+	}
+	ds.OverwriteQueryResultRowsFunc = func(ctx context.Context, rows []*fleet.ScheduledQueryResultRow, maxQueryReportRows int) (int, error) {
+		return 0, nil
+	}
+	ds.ResultCountForQueryFunc = func(ctx context.Context, queryID uint) (int, error) {
+		return 0, nil
+	}
+	serv.saveResultLogsToQueryReports(ctx, results, discardDataFalse, fleet.DefaultMaxQueryReportRows)
+	require.False(t, ds.OverwriteQueryResultRowsFuncInvoked)
+}
+
+func TestSubmitResultLogsToQueryResultsWithEmptySnapShot(t *testing.T) {
+	ds := new(mock.Store)
+	svc, ctx := newTestService(t, ds, nil, nil)
+
+	host := fleet.Host{
+		ID: 999,
+	}
+	ctx = hostctx.NewContext(ctx, &host)
+
+	logs := []string{
+		`{"snapshot":[],"action":"snapshot","name":"pack/Global/query_no_rows","hostIdentifier":"1379f59d98f4","calendarTime":"Tue Jan 10 20:08:51 2017 UTC","unixTime":1484078931,"decorations":{"host_uuid":"EB714C9D-C1F8-A436-B6DA-3F853C5502EA"}}`,
+	}
+
+	logJSON := fmt.Sprintf("[%s]", strings.Join(logs, ","))
+	var results []json.RawMessage
+	err := json.Unmarshal([]byte(logJSON), &results)
+	require.NoError(t, err)
+
+	ds.AppConfigFunc = func(ctx context.Context) (*fleet.AppConfig, error) {
+		return &fleet.AppConfig{
+			ServerSettings: fleet.ServerSettings{
+				QueryReportsDisabled: false,
+			},
+		}, nil
+	}
+
+	ds.QueryByNameFunc = func(ctx context.Context, teamID *uint, name string) (*fleet.Query, error) {
+		return &fleet.Query{
+			ID:          1,
+			DiscardData: false,
+			Logging:     fleet.LoggingSnapshot,
+		}, nil
+	}
+	ds.QueriesByNameFunc = queriesByNameFromQueryByName(ds.QueryByNameFunc)
+
+	ds.QueriesPerHostFunc = func(ctx context.Context, hostID uint, teamID *uint) ([]uint, error) {
+		return []uint{1}, nil
+	}
+
+	ds.ResultCountForQueryFunc = func(ctx context.Context, queryID uint) (int, error) {
+		return 0, nil
+	}
+
+	ds.OverwriteQueryResultRowsFunc = func(ctx context.Context, rows []*fleet.ScheduledQueryResultRow, maxQueryReportRows int) (int, error) {
+		require.Len(t, rows, 1)
+		require.Equal(t, uint(999), rows[0].HostID)
+		require.NotZero(t, rows[0].LastFetched)
+		require.Nil(t, rows[0].Data)
+		return 0, nil
+	}
+
+	err = svc.SubmitResultLogs(ctx, results)
+	require.NoError(t, err)
+	assert.True(t, ds.OverwriteQueryResultRowsFuncInvoked)
+}
+
+func TestSubmitResultLogsToQueryResultsDoesNotCountNullDataRows(t *testing.T) {
+	ds := new(mock.Store)
+	svc, ctx := newTestService(t, ds, nil, nil)
+
+	host := fleet.Host{
+		ID: 999,
+	}
+	ctx = hostctx.NewContext(ctx, &host)
+
+	logs := []string{
+		`{"snapshot":[],"action":"snapshot","name":"pack/Global/query_no_rows","hostIdentifier":"1379f59d98f4","calendarTime":"Tue Jan 10 20:08:51 2017 UTC","unixTime":1484078931,"decorations":{"host_uuid":"EB714C9D-C1F8-A436-B6DA-3F853C5502EA"}}`,
+	}
+
+	logJSON := fmt.Sprintf("[%s]", strings.Join(logs, ","))
+	var results []json.RawMessage
+	err := json.Unmarshal([]byte(logJSON), &results)
+	require.NoError(t, err)
+
+	ds.AppConfigFunc = func(ctx context.Context) (*fleet.AppConfig, error) {
+		return &fleet.AppConfig{
+			ServerSettings: fleet.ServerSettings{
+				QueryReportsDisabled: false,
+			},
+		}, nil
+	}
+
+	ds.QueryByNameFunc = func(ctx context.Context, teamID *uint, name string) (*fleet.Query, error) {
+		return &fleet.Query{
+			ID:          1,
+			DiscardData: false,
+			Logging:     fleet.LoggingSnapshot,
+		}, nil
+	}
+	ds.QueriesByNameFunc = queriesByNameFromQueryByName(ds.QueryByNameFunc)
+
+	ds.QueriesPerHostFunc = func(ctx context.Context, hostID uint, teamID *uint) ([]uint, error) {
+		return []uint{1}, nil
+	}
+
+	ds.ResultCountForQueryFunc = func(ctx context.Context, queryID uint) (int, error) {
+		return 0, nil
+	}
+
+	ds.OverwriteQueryResultRowsFunc = func(ctx context.Context, rows []*fleet.ScheduledQueryResultRow, maxQueryReportRows int) (int, error) {
+		require.Len(t, rows, 1)
+		require.Equal(t, uint(999), rows[0].HostID)
+		require.NotZero(t, rows[0].LastFetched)
+		require.Nil(t, rows[0].Data)
+		return 0, nil
+	}
+
+	err = svc.SubmitResultLogs(ctx, results)
+	require.NoError(t, err)
+	assert.True(t, ds.OverwriteQueryResultRowsFuncInvoked)
+}
+
+func TestSubmitResultLogsQueryNotScheduledForHost(t *testing.T) {
+	const (
+		reportQueryID = 42
+		hostID        = 999
+	)
+
+	// A forged result log naming a real global report, submitted by a host that was
+	// never scheduled to run it.
+	//
+	// Built fresh per subtest because preProcessOsqueryResults rewrites the raw log in
+	// place to inject query_id, which would otherwise leak into later subtests.
+	newResults := func() []json.RawMessage {
+		return []json.RawMessage{
+			json.RawMessage(`{"action":"snapshot","name":"pack/Global/report_query","hostIdentifier":"1379f59d98f4","calendarTime":"Tue Jan 10 20:08:51 2017 UTC","unixTime":1484078931,"snapshot":[{"forged":"true"}]}`),
+		}
+	}
+
+	setUp := func(t *testing.T, scheduledForHost bool) (*Service, context.Context, *mock.Store, *testJSONLogger) {
+		ds := new(mock.Store)
+		svc, ctx := newTestService(t, ds, nil, nil)
+
+		ds.AppConfigFunc = func(ctx context.Context) (*fleet.AppConfig, error) {
+			return &fleet.AppConfig{}, nil
+		}
+		ds.QueryByNameFunc = func(ctx context.Context, teamID *uint, name string) (*fleet.Query, error) {
+			return &fleet.Query{
+				ID:                 reportQueryID,
+				Name:               name,
+				Logging:            fleet.LoggingSnapshot,
+				AutomationsEnabled: true,
+			}, nil
+		}
+		ds.QueriesByNameFunc = queriesByNameFromQueryByName(ds.QueryByNameFunc)
+		ds.QueriesPerHostFunc = func(ctx context.Context, hostID uint, teamID *uint) ([]uint, error) {
+			if !scheduledForHost {
+				return nil, nil
+			}
+			return []uint{reportQueryID}, nil
+		}
+		ds.OverwriteQueryResultRowsFunc = func(ctx context.Context, rows []*fleet.ScheduledQueryResultRow, maxQueryReportRows int) (int, error) {
+			return len(rows), nil
+		}
+
+		logDestination := &testJSONLogger{}
+		serv := ((svc.(validationMiddleware)).Service).(*Service)
+		serv.osqueryLogWriter = &OsqueryLogger{Result: logDestination}
+		return serv, ctx, ds, logDestination
+	}
+
+	t.Run("query not scheduled for the host", func(t *testing.T) {
+		svc, ctx, ds, logDestination := setUp(t, false)
+		ctx = hostctx.NewContext(ctx, &fleet.Host{ID: hostID})
+
+		require.NoError(t, svc.SubmitResultLogs(ctx, newResults()))
+
+		assert.False(t, ds.OverwriteQueryResultRowsFuncInvoked)
+		// Dropped before automations too, so the results never reach the log destination
+		// even though the query has automations enabled.
+		assert.Empty(t, logDestination.logs)
+	})
+
+	t.Run("query scheduled for the host", func(t *testing.T) {
+		svc, ctx, ds, logDestination := setUp(t, true)
+		ctx = hostctx.NewContext(ctx, &fleet.Host{ID: hostID})
+
+		results := newResults()
+		require.NoError(t, svc.SubmitResultLogs(ctx, results))
+
+		assert.True(t, ds.OverwriteQueryResultRowsFuncInvoked)
+		assert.Equal(t, results, logDestination.logs)
+	})
+
+	t.Run("host missing from context fails closed", func(t *testing.T) {
+		// Not reachable in production: both callers authenticate the host before this point.
+		// ctx deliberately carries no host.
+		svc, ctx, ds, logDestination := setUp(t, true)
+
+		require.NoError(t, svc.SubmitResultLogs(ctx, newResults()))
+
+		assert.False(t, ds.OverwriteQueryResultRowsFuncInvoked)
+		assert.Empty(t, logDestination.logs)
+	})
+
+	t.Run("query Fleet does not know is passed through", func(t *testing.T) {
+		svc, ctx, ds, logDestination := setUp(t, false)
+		ctx = hostctx.NewContext(ctx, &fleet.Host{ID: hostID})
+		ds.QueryByNameFunc = func(ctx context.Context, teamID *uint, name string) (*fleet.Query, error) {
+			return nil, newNotFoundError()
+		}
+		ds.QueriesByNameFunc = queriesByNameFromQueryByName(ds.QueryByNameFunc)
+
+		results := newResults()
+		require.NoError(t, svc.SubmitResultLogs(ctx, results))
+
+		assert.False(t, ds.OverwriteQueryResultRowsFuncInvoked)
+		// Supports osquery nodes that load their config from outside Fleet.
+		assert.Equal(t, results, logDestination.logs)
+	})
+
+	// Query reports being disabled removes the report destination but not the log one, so
+	// an unscheduled result must not reach automations there either.
+	t.Run("query reports disabled and query not scheduled for the host", func(t *testing.T) {
+		svc, ctx, ds, logDestination := setUp(t, false)
+		ctx = hostctx.NewContext(ctx, &fleet.Host{ID: hostID})
+		ds.AppConfigFunc = func(ctx context.Context) (*fleet.AppConfig, error) {
+			return &fleet.AppConfig{ServerSettings: fleet.ServerSettings{QueryReportsDisabled: true}}, nil
+		}
+
+		require.NoError(t, svc.SubmitResultLogs(ctx, newResults()))
+
+		assert.False(t, ds.OverwriteQueryResultRowsFuncInvoked)
+		assert.Empty(t, logDestination.logs)
+	})
+
+	t.Run("query reports disabled and query scheduled for the host", func(t *testing.T) {
+		svc, ctx, ds, logDestination := setUp(t, true)
+		ctx = hostctx.NewContext(ctx, &fleet.Host{ID: hostID})
+		ds.AppConfigFunc = func(ctx context.Context) (*fleet.AppConfig, error) {
+			return &fleet.AppConfig{ServerSettings: fleet.ServerSettings{QueryReportsDisabled: true}}, nil
+		}
+
+		results := newResults()
+		require.NoError(t, svc.SubmitResultLogs(ctx, results))
+
+		assert.False(t, ds.OverwriteQueryResultRowsFuncInvoked)
+		// Resolving the query to check the schedule must not change the payload reaching the
+		// logging destination: query_id is only injected when reports are enabled.
+		assert.Equal(t, results, logDestination.logs)
+		require.Len(t, logDestination.logs, 1)
+		assert.NotContains(t, string(logDestination.logs[0]), "query_id")
+	})
+}
+
+type failingLogger struct{}
+
+func (n *failingLogger) Write(context.Context, []json.RawMessage) error {
+	return errors.New("some error")
+}
+
+func TestSubmitResultLogsFail(t *testing.T) {
+	ds := new(mock.Store)
+	svc, ctx := newTestService(t, ds, nil, nil)
+
+	host := fleet.Host{
+		ID: 999,
+	}
+	ctx = hostctx.NewContext(ctx, &host)
+
+	// Hack to get at the service internals and modify the writer
+	serv := ((svc.(validationMiddleware)).Service).(*Service)
+
+	testLogger := &failingLogger{}
+	serv.osqueryLogWriter = &OsqueryLogger{Result: testLogger}
+
+	logs := []string{
+		`{"name":"pack/Global/system_info","hostIdentifier":"some_uuid","calendarTime":"Fri Sep 30 17:55:15 2016 UTC","unixTime":1475258115,"decorations":{"host_uuid":"some_uuid","username":"zwass"},"columns":{"cpu_brand":"Intel(R) Core(TM) i7-4770HQ CPU @ 2.20GHz","hostname":"hostimus","physical_memory":"17179869184"},"action":"added"}`,
+	}
+
+	logJSON := fmt.Sprintf("[%s]", strings.Join(logs, ","))
+	var results []json.RawMessage
+	err := json.Unmarshal([]byte(logJSON), &results)
+	require.NoError(t, err)
+
+	ds.AppConfigFunc = func(ctx context.Context) (*fleet.AppConfig, error) {
+		return &fleet.AppConfig{}, nil
+	}
+	ds.QueryByNameFunc = func(ctx context.Context, teamID *uint, name string) (*fleet.Query, error) {
+		return &fleet.Query{
+			ID:                 1,
+			DiscardData:        false,
+			AutomationsEnabled: true,
+			Name:               name,
+		}, nil
+	}
+	ds.QueriesByNameFunc = queriesByNameFromQueryByName(ds.QueryByNameFunc)
+	ds.QueriesPerHostFunc = func(ctx context.Context, hostID uint, teamID *uint) ([]uint, error) {
+		return []uint{1}, nil
+	}
+	ds.ResultCountForQueryFunc = func(ctx context.Context, queryID uint) (int, error) {
+		return 0, nil
+	}
+	ds.OverwriteQueryResultRowsFunc = func(ctx context.Context, rows []*fleet.ScheduledQueryResultRow, maxQueryReportRows int) (int, error) {
+		return 0, nil
+	}
+
+	// Expect an error when unable to write to logging destination.
+	err = svc.SubmitResultLogs(ctx, results)
+	require.Error(t, err)
+	assert.Equal(t, http.StatusRequestEntityTooLarge, err.(*OsqueryError).Status())
+}
+
+func TestGetQueryNameAndTeamIDFromResult(t *testing.T) {
+	tests := []struct {
+		input        string
+		expectedID   *uint
+		expectedName string
+		hasErr       bool
+	}{
+		{"pack/Global/Query Name", nil, "Query Name", false},                       // valid global query
+		{"pack/team-1/Query Name", ptr.Uint(1), "Query Name", false},               // valid team query
+		{"pack/team-12345/Another Query", ptr.Uint(12345), "Another Query", false}, // valid team query
+		{"pack/team-foo/Query", nil, "", true},                                     // missing team ID
+		{"pack/Global/QueryWith/Slash", nil, "QueryWith/Slash", false},             // query name contains forward slash
+		{"packGlobalGlobalGlobalGlobal", nil, "Global", false},                     // pack_delimiter=Global
+		{"packXGlobalGlobalXGlobalQueryWith/Slash", nil, "QueryWith/Slash", false}, // pack_delimiter=XGlobal
+		{"pack//Global//QueryWith/Slash", nil, "QueryWith/Slash", false},           // pack_delimiter=//
+		{"pack/team-1/QueryWith/Slash", ptr.Uint(1), "QueryWith/Slash", false},
+		{"pack_team-1_QueryWith/Slash", ptr.Uint(1), "QueryWith/Slash", false},
+		{"packFOOBARteam-1FOOBARQueryWith/Slash", ptr.Uint(1), "QueryWith/Slash", false},   // pack_delimiter=FOOBAR
+		{"pack123😁123team-1123😁123QueryWith/Slash", ptr.Uint(1), "QueryWith/Slash", false}, // pack_delimiter=123😁123
+		{"pack(foo)team-1(foo)fo(o)bar", ptr.Uint(1), "fo(o)bar", false},                   // pack_delimiter=(foo)
+		{"packteam-1team-1team-1team-1", ptr.Uint(1), "team-1", false},                     // pack_delimiter=team-1
+		{"pack/Global/GlobalInQueryName", nil, "GlobalInQueryName", false},                 // query name contains Global
+		{"pack/team-1/team-1InQueryName", ptr.Uint(1), "team-1InQueryName", false},         // query name contains team-1
+
+		{"InvalidString", nil, "", true},
+		{"Invalid/Query", nil, "", true},
+		{"pac", nil, "", true},
+		{"pack", nil, "", true},
+		{"pack/", nil, "", true},
+		{"pack/Global", nil, "", true},
+		{"pack/Global/", nil, "", true},
+		{"pack/team/foo", nil, "", true},
+		{"pack/team-123", nil, "", true},
+		{"pack/team-/foo", nil, "", true},
+		{"pack/team-123/", nil, "", true},
+
+		// Legacy 2017 packs should fail the parsing as they are separate
+		// from global or team queries.
+		{"pack/PackName/Query", nil, "", true},
+		{"pack/PackName/QueryWith/Slash", nil, "", true},
+		{"packFOOBARPackNameFOOBARQueryWith/Slash", nil, "", true}, // pack_delimiter=FOOBAR
+	}
+
+	for _, tt := range tests {
+		tt := tt
+		t.Run(tt.input, func(t *testing.T) {
+			t.Parallel()
+
+			id, str, err := getQueryNameAndTeamIDFromResult(tt.input)
+			assert.Equal(t, tt.expectedID, id)
+			assert.Equal(t, tt.expectedName, str)
+			if tt.hasErr {
+				assert.Error(t, err)
+			} else {
+				assert.NoError(t, err)
+			}
+		})
+	}
+}
+
+func TestGetMostRecentResults(t *testing.T) {
+	tests := []struct {
+		name     string
+		input    []*fleet.ScheduledQueryResult
+		expected []*fleet.ScheduledQueryResult
+	}{
+		{
+			name: "basic test",
+			input: []*fleet.ScheduledQueryResult{
+				{QueryName: "test1", UnixTime: 1},
+				{QueryName: "test1", UnixTime: 2},
+				{QueryName: "test1", UnixTime: 3},
+				{QueryName: "test2", UnixTime: 1},
+				{QueryName: "test2", UnixTime: 2},
+				{QueryName: "test2", UnixTime: 3},
+			},
+			expected: []*fleet.ScheduledQueryResult{
+				{QueryName: "test1", UnixTime: 3},
+				{QueryName: "test2", UnixTime: 3},
+			},
+		},
+		{
+			name: "out of order test",
+			input: []*fleet.ScheduledQueryResult{
+				{QueryName: "test1", UnixTime: 2},
+				{QueryName: "test1", UnixTime: 3},
+				{QueryName: "test1", UnixTime: 1},
+				{QueryName: "test2", UnixTime: 3},
+				{QueryName: "test2", UnixTime: 2},
+				{QueryName: "test2", UnixTime: 1},
+			},
+			expected: []*fleet.ScheduledQueryResult{
+				{QueryName: "test1", UnixTime: 3},
+				{QueryName: "test2", UnixTime: 3},
+			},
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			results := getMostRecentResults(tt.input)
+			assert.ElementsMatch(t, tt.expected, results)
+		})
+	}
+}
+
+func verifyDiscovery(t *testing.T, queries, discovery map[string]string) {
+	t.Helper()
+	assert.Equal(t, len(queries), len(discovery))
+	// discoveryUsed holds the queries where we know use the distributed discovery feature.
+	discoveryUsed := map[string]struct{}{
+		hostDetailQueryPrefix + "google_chrome_profiles":                  {},
+		hostDetailQueryPrefix + "mdm":                                     {},
+		hostDetailQueryPrefix + "munki_info":                              {},
+		hostDetailQueryPrefix + "kubequery_info":                          {},
+		hostDetailQueryPrefix + "orbit_info":                              {},
+		hostDetailQueryPrefix + "software_vscode_extensions":              {},
+		hostDetailQueryPrefix + "software_jetbrains_plugins":              {},
+		hostDetailQueryPrefix + "software_adobe_plugins":                  {},
+		hostDetailQueryPrefix + "software_linux_fleetd_pacman":            {},
+		hostDetailQueryPrefix + "software_go_binaries":                    {},
+		hostDetailQueryPrefix + "software_python_packages":                {},
+		hostDetailQueryPrefix + "software_python_packages_with_users_dir": {},
+		hostDetailQueryPrefix + "software_macos_firefox":                  {},
+		hostDetailQueryPrefix + "battery":                                 {},
+		hostDetailQueryPrefix + "software_macos_codesign":                 {},
+		hostDetailQueryPrefix + "software_macos_executable_sha256":        {},
+		hostDetailQueryPrefix + "software_rpm_last_opened_at":             {},
+		hostDetailQueryPrefix + "software_deb_last_opened_at":             {},
+		hostDetailQueryPrefix + "disk_space_darwin":                       {},
+		hostDetailQueryPrefix + "disk_space_darwin_legacy":                {},
+		hostDetailQueryPrefix + "certificates_windows":                    {},
+		hostDetailQueryPrefix + "tpm_pin_config_verify":                   {},
+		hostDetailQueryPrefix + "bitlocker_startup_policy_relax":          {},
+		hostDetailQueryPrefix + "bitlocker_key_protectors_verify":         {},
+	}
+	for name := range queries {
+		require.NotEmpty(t, discovery[name])
+		if _, ok := discoveryUsed[name]; ok {
+			require.NotEqual(t, alwaysTrueQuery, discovery[name])
+		} else {
+			require.Equal(t, alwaysTrueQuery, discovery[name])
+		}
+	}
+}
+
+func TestHostDetailQueries(t *testing.T) {
+	ctx := context.Background()
+	ds := new(mock.Store)
+	additional := json.RawMessage(`{"foobar": "select foo", "bim": "bam"}`)
+	ds.AppConfigFunc = func(ctx context.Context) (*fleet.AppConfig, error) {
+		return &fleet.AppConfig{Features: fleet.Features{
+			AdditionalQueries:       &additional,
+			EnableHostUsers:         true,
+			EnableSoftwareInventory: true,
+		}}, nil
+	}
+
+	mockClock := clock.NewMockClock()
+	host := fleet.Host{
+		ID: 1,
+		UpdateCreateTimestamps: fleet.UpdateCreateTimestamps{
+			UpdateTimestamp: fleet.UpdateTimestamp{
+				UpdatedAt: mockClock.Now(),
+			},
+			CreateTimestamp: fleet.CreateTimestamp{
+				CreatedAt: mockClock.Now(),
+			},
+		},
+
+		Platform:        "darwin",
+		DetailUpdatedAt: mockClock.Now(),
+		NodeKey:         new("test_key"),
+		Hostname:        "test_hostname",
+		UUID:            "test_uuid",
+	}
+
+	svc := &Service{
+		clock:    mockClock,
+		logger:   slog.New(slog.DiscardHandler),
+		config:   config.TestConfig(),
+		ds:       ds,
+		jitterMu: new(sync.RWMutex),
+		jitterH:  make(map[time.Duration]*jitterHashTable),
+	}
+
+	// detail_updated_at is now, so nothing gets returned by default
+	queries, discovery, err := svc.detailQueriesForHost(ctx, &host)
+	require.NoError(t, err)
+	assert.Empty(t, queries)
+	verifyDiscovery(t, queries, discovery)
+
+	// With refetch requested detail queries should be returned
+	host.RefetchRequested = true
+	queries, discovery, err = svc.detailQueriesForHost(ctx, &host)
+	require.NoError(t, err)
+	// +2: additional queries: bim, foobar
+	require.Equal(t, len(expectedDetailQueriesForPlatform(host.Platform))+2, len(queries), distQueriesMapKeys(queries))
+	verifyDiscovery(t, queries, discovery)
+	host.RefetchRequested = false
+
+	// Advance the time
+	mockClock.AddTime(1*time.Hour + 1*time.Minute)
+
+	// all queries returned now that detail udpated at is in the past
+	queries, discovery, err = svc.detailQueriesForHost(ctx, &host)
+	require.NoError(t, err)
+	// +2: additional queries: bim, foobar
+	require.Equal(t, len(expectedDetailQueriesForPlatform(host.Platform))+2, len(queries), distQueriesMapKeys(queries))
+	verifyDiscovery(t, queries, discovery)
+	for name := range queries {
+		assert.True(t,
+			strings.HasPrefix(name, hostDetailQueryPrefix) || strings.HasPrefix(name, hostAdditionalQueryPrefix),
+		)
+	}
+	assert.Equal(t, "bam", queries[hostAdditionalQueryPrefix+"bim"])
+	assert.Equal(t, "select foo", queries[hostAdditionalQueryPrefix+"foobar"])
+
+	host.DetailUpdatedAt = mockClock.Now()
+
+	// detail_updated_at is now, so nothing gets returned
+	queries, discovery, err = svc.detailQueriesForHost(ctx, &host)
+	require.NoError(t, err)
+	assert.Empty(t, queries)
+	verifyDiscovery(t, queries, discovery)
+
+	// setting refetch_critical_queries_until in the past still returns nothing
+	host.RefetchCriticalQueriesUntil = ptr.Time(mockClock.Now().Add(-1 * time.Minute))
+	queries, discovery, err = svc.detailQueriesForHost(ctx, &host)
+	require.NoError(t, err)
+	assert.Empty(t, queries)
+	verifyDiscovery(t, queries, discovery)
+
+	// setting refetch_critical_queries_until in the future returns only the critical queries
+	host.RefetchCriticalQueriesUntil = ptr.Time(mockClock.Now().Add(1 * time.Minute))
+	queries, discovery, err = svc.detailQueriesForHost(ctx, &host)
+	require.NoError(t, err)
+	// host is darwin so it gets only the darwin critical query
+	require.Equal(t, 1, len(queries), distQueriesMapKeys(queries))
+	for name := range criticalDetailQueries {
+		if strings.HasSuffix(name, "_windows") {
+			continue
+		}
+		assert.Contains(t, queries, hostDetailQueryPrefix+name)
+	}
+	verifyDiscovery(t, queries, discovery)
+}
+
+// TestHostDetailQueriesTeamBitLockerPIN is a regression test for #50729: the scheduler must honor team-level disk encryption /
+// BitLocker PIN settings even when Apple MDM is not configured, and must not fall back to the global settings for hosts that
+// belong to a team.
+func TestHostDetailQueriesTeamBitLockerPIN(t *testing.T) {
+	pinQueryNames := []string{
+		hostDetailQueryPrefix + "tpm_pin_config_verify",
+	}
+	// Also records whether a PIN is set, so it runs wherever disk encryption is enforced, PIN or not.
+	keyProtectorsQueryName := hostDetailQueryPrefix + "bitlocker_key_protectors_verify"
+
+	globalRequiresPIN := false
+	teamMDMConfig := fleet.TeamMDM{EnableDiskEncryption: true, WindowsSettings: fleet.WindowsSettings{EnableDiskEncryption: optjson.SetBool(true)}, RequireBitLockerPIN: true}
+
+	ds := new(mock.Store)
+	ds.AppConfigFunc = func(ctx context.Context) (*fleet.AppConfig, error) {
+		appConfig := &fleet.AppConfig{}
+		appConfig.MDM.WindowsEnabledAndConfigured = true // Apple MDM stays unconfigured
+		if globalRequiresPIN {
+			appConfig.MDM.EnableDiskEncryption = optjson.SetBool(true)
+			appConfig.MDM.WindowsSettings.EnableDiskEncryption = optjson.SetBool(true)
+			appConfig.MDM.RequireBitLockerPIN = optjson.SetBool(true)
+		}
+		return appConfig, nil
+	}
+	ds.TeamMDMConfigFunc = func(ctx context.Context, teamID uint) (*fleet.TeamMDM, error) {
+		return &teamMDMConfig, nil
+	}
+
+	host := fleet.Host{
+		ID:               1,
+		Platform:         "windows",
+		TeamID:           new(uint(7)),
+		NodeKey:          new("test_key"),
+		Hostname:         "test_hostname",
+		UUID:             "test_uuid",
+		RefetchRequested: true,
+	}
+	svc := &Service{
+		clock:    clock.NewMockClock(),
+		logger:   slog.New(slog.DiscardHandler),
+		config:   config.TestConfig(),
+		ds:       ds,
+		jitterMu: new(sync.RWMutex),
+		jitterH:  make(map[time.Duration]*jitterHashTable),
+	}
+
+	// The team requiring a PIN must schedule the PIN queries even though the global config does not.
+	queries, discovery, err := svc.detailQueriesForHost(t.Context(), &host)
+	require.NoError(t, err)
+	require.True(t, ds.TeamMDMConfigFuncInvoked)
+	verifyDiscovery(t, queries, discovery)
+	for _, queryName := range pinQueryNames {
+		assert.Contains(t, queries, queryName)
+	}
+	assert.Contains(t, queries, keyProtectorsQueryName)
+
+	// The reverse: the global config requiring a PIN must not leak to a host whose team does not.
+	globalRequiresPIN = true
+	teamMDMConfig = fleet.TeamMDM{EnableDiskEncryption: true, WindowsSettings: fleet.WindowsSettings{EnableDiskEncryption: optjson.SetBool(true)}}
+	queries, _, err = svc.detailQueriesForHost(t.Context(), &host)
+	require.NoError(t, err)
+	for _, queryName := range pinQueryNames {
+		assert.NotContains(t, queries, queryName)
+	}
+	assert.Contains(t, queries, keyProtectorsQueryName)
+}
+
+func TestQueriesAndHostFeatures(t *testing.T) {
+	ds := new(mock.Store)
+	team1 := fleet.Team{
+		ID: 1,
+		Config: fleet.TeamConfig{
+			Features: fleet.Features{
+				EnableHostUsers:         true,
+				EnableSoftwareInventory: false,
+			},
+		},
+	}
+
+	team2 := fleet.Team{
+		ID: 2,
+		Config: fleet.TeamConfig{
+			Features: fleet.Features{
+				EnableHostUsers:         false,
+				EnableSoftwareInventory: true,
+			},
+		},
+	}
+
+	host := fleet.Host{
+		ID:       1,
+		Platform: "darwin",
+		NodeKey:  new("test_key"),
+		Hostname: "test_hostname",
+		UUID:     "test_uuid",
+		TeamID:   nil,
+	}
+
+	ds.AppConfigFunc = func(ctx context.Context) (*fleet.AppConfig, error) {
+		return &fleet.AppConfig{
+			Features: fleet.Features{
+				EnableHostUsers:         false,
+				EnableSoftwareInventory: false,
+			},
+		}, nil
+	}
+
+	ds.TeamFeaturesFunc = func(ctx context.Context, id uint) (*fleet.Features, error) {
+		switch id {
+		case uint(1):
+			return &team1.Config.Features, nil
+		case uint(2):
+			return &team2.Config.Features, nil
+		default:
+			return nil, errors.New("team not found")
+		}
+	}
+
+	ds.LabelQueriesForHostFunc = func(ctx context.Context, host *fleet.Host) (map[string]string, error) {
+		return map[string]string{}, nil
+	}
+
+	ds.PolicyQueriesForHostFunc = func(ctx context.Context, host *fleet.Host) (map[string]string, error) {
+		return map[string]string{}, nil
+	}
+
+	ds.GetHostAwaitingConfigurationFunc = func(ctx context.Context, hostuuid string) (bool, error) {
+		return false, nil
+	}
+
+	lq := live_query_mock.New(t)
+	lq.On("QueriesForHost", uint(1)).Return(map[string]string{}, nil)
+	lq.On("QueriesForHost", uint(2)).Return(map[string]string{}, nil)
+	lq.On("QueriesForHost", nil).Return(map[string]string{}, nil)
+
+	t.Run("free license", func(t *testing.T) {
+		license := &fleet.LicenseInfo{Tier: fleet.TierFree}
+		svc, ctx := newTestService(t, ds, nil, lq, &TestServerOpts{License: license})
+
+		ctx = hostctx.NewContext(ctx, &host)
+		queries, _, _, err := svc.GetDistributedQueries(ctx)
+		require.NoError(t, err)
+		require.NotContains(t, queries, "fleet_detail_query_users")
+		require.NotContains(t, queries, "fleet_detail_query_software_macos")
+		require.NotContains(t, queries, "fleet_detail_query_software_linux")
+		require.NotContains(t, queries, "fleet_detail_query_software_windows")
+
+		// assign team 1 to host
+		host.TeamID = &team1.ID
+		queries, _, _, err = svc.GetDistributedQueries(ctx)
+		require.NoError(t, err)
+		require.NotContains(t, queries, "fleet_detail_query_users")
+		require.NotContains(t, queries, "fleet_detail_query_software_macos")
+		require.NotContains(t, queries, "fleet_detail_query_software_linux")
+		require.NotContains(t, queries, "fleet_detail_query_software_windows")
+
+		// assign team 2 to host
+		host.TeamID = &team2.ID
+		queries, _, _, err = svc.GetDistributedQueries(ctx)
+		require.NoError(t, err)
+		require.NotContains(t, queries, "fleet_detail_query_users")
+		require.NotContains(t, queries, "fleet_detail_query_software_macos")
+		require.NotContains(t, queries, "fleet_detail_query_software_linux")
+		require.NotContains(t, queries, "fleet_detail_query_software_windows")
+	})
+
+	t.Run("premium license", func(t *testing.T) {
+		license := &fleet.LicenseInfo{Tier: fleet.TierPremium}
+		svc, ctx := newTestService(t, ds, nil, lq, &TestServerOpts{License: license})
+
+		host.TeamID = nil
+		ctx = hostctx.NewContext(ctx, &host)
+		queries, _, _, err := svc.GetDistributedQueries(ctx)
+		require.NoError(t, err)
+		require.NotContains(t, queries, "fleet_detail_query_users")
+		require.NotContains(t, queries, "fleet_detail_query_software_macos")
+		require.NotContains(t, queries, "fleet_detail_query_software_linux")
+		require.NotContains(t, queries, "fleet_detail_query_software_windows")
+
+		// assign team 1 to host
+		host.TeamID = &team1.ID
+		queries, _, _, err = svc.GetDistributedQueries(ctx)
+		require.NoError(t, err)
+		require.Contains(t, queries, "fleet_detail_query_users")
+		require.NotContains(t, queries, "fleet_detail_query_software_macos")
+		require.NotContains(t, queries, "fleet_detail_query_software_linux")
+		require.NotContains(t, queries, "fleet_detail_query_software_windows")
+
+		// assign team 2 to host
+		host.TeamID = &team2.ID
+		queries, _, _, err = svc.GetDistributedQueries(ctx)
+		require.NoError(t, err)
+		require.NotContains(t, queries, "fleet_detail_query_users")
+		require.Contains(t, queries, "fleet_detail_query_software_macos")
+	})
+}
+
+func TestGetDistributedQueriesMissingHost(t *testing.T) {
+	svc, ctx := newTestService(t, &mock.Store{}, nil, nil)
+
+	_, _, _, err := svc.GetDistributedQueries(ctx)
+	require.NotNil(t, err)
+	assert.Contains(t, err.Error(), "missing host")
+}
+
+func TestGetDistributedQueriesEmptyQuery(t *testing.T) {
+	mockClock := clock.NewMockClock()
+	ds := new(mock.Store)
+	lq := live_query_mock.New(t)
+	svc, ctx := newTestServiceWithClock(t, ds, nil, lq, mockClock)
+
+	host := &fleet.Host{
+		Platform: "darwin",
+	}
+
+	ds.LabelQueriesForHostFunc = func(ctx context.Context, host *fleet.Host) (map[string]string, error) {
+		return map[string]string{"empty_label_query": ""}, nil
+	}
+	ds.HostLiteFunc = func(ctx context.Context, id uint) (*fleet.Host, error) {
+		return host, nil
+	}
+	ds.UpdateHostFunc = func(ctx context.Context, gotHost *fleet.Host) error {
+		return nil
+	}
+	ds.AppConfigFunc = func(ctx context.Context) (*fleet.AppConfig, error) {
+		return &fleet.AppConfig{Features: fleet.Features{EnableHostUsers: true}}, nil
+	}
+	ds.PolicyQueriesForHostFunc = func(ctx context.Context, host *fleet.Host) (map[string]string, error) {
+		return map[string]string{"empty_policy_query": ""}, nil
+	}
+	ds.GetHostAwaitingConfigurationFunc = func(ctx context.Context, hostuuid string) (bool, error) {
+		return false, nil
+	}
+
+	lq.On("QueriesForHost", uint(0)).Return(map[string]string{"empty_live_query": ""}, nil)
+
+	ctx = hostctx.NewContext(ctx, host)
+	queries, discovery, _, err := svc.GetDistributedQueries(ctx)
+	require.NoError(t, err)
+	require.NotEmpty(t, queries)
+	for n, q := range queries {
+		require.NotEmpty(t, q, n)
+	}
+	for n, q := range discovery {
+		require.NotEmpty(t, q, n)
+	}
+}
+
+func TestLabelQueries(t *testing.T) {
+	mockClock := clock.NewMockClock()
+	ds := new(mock.Store)
+	lq := live_query_mock.New(t)
+	svc, ctx := newTestServiceWithClock(t, ds, nil, lq, mockClock)
+
+	host := &fleet.Host{
+		Platform: "darwin",
+	}
+
+	ds.LabelQueriesForHostFunc = func(ctx context.Context, host *fleet.Host) (map[string]string, error) {
+		return map[string]string{}, nil
+	}
+	ds.HostLiteFunc = func(ctx context.Context, id uint) (*fleet.Host, error) {
+		return host, nil
+	}
+	ds.UpdateHostFunc = func(ctx context.Context, gotHost *fleet.Host) error {
+		host = gotHost
+		return nil
+	}
+	ds.AppConfigFunc = func(ctx context.Context) (*fleet.AppConfig, error) {
+		return &fleet.AppConfig{Features: fleet.Features{
+			EnableHostUsers:         true,
+			EnableSoftwareInventory: true,
+		}}, nil
+	}
+	ds.GetHostAwaitingConfigurationFunc = func(ctx context.Context, hostuuid string) (bool, error) {
+		return false, nil
+	}
+	ds.PolicyQueriesForHostFunc = func(ctx context.Context, host *fleet.Host) (map[string]string, error) {
+		return map[string]string{}, nil
+	}
+
+	lq.On("QueriesForHost", uint(0)).Return(map[string]string{}, nil)
+
+	ctx = hostctx.NewContext(ctx, host)
+
+	// With a new host, we should get the detail queries (and accelerate
+	// should be turned on so that we can quickly fill labels)
+	queries, discovery, acc, err := svc.GetDistributedQueries(ctx)
+	require.NoError(t, err)
+	// +1 for the fleet_no_policies_wildcard query.
+	require.Equal(t, len(expectedDetailQueriesForPlatform(host.Platform))+1, len(queries), distQueriesMapKeys(queries))
+	verifyDiscovery(t, queries, discovery)
+	assert.NotZero(t, acc)
+
+	// Simulate the detail queries being added.
+	host.DetailUpdatedAt = mockClock.Now().Add(-1 * time.Minute)
+	host.Hostname = "zwass.local"
+	ctx = hostctx.NewContext(ctx, host)
+
+	queries, discovery, acc, err = svc.GetDistributedQueries(ctx)
+	require.NoError(t, err)
+	require.Len(t, queries, 1) // fleet_no_policies_wildcard query
+	verifyDiscovery(t, queries, discovery)
+	assert.Zero(t, acc)
+
+	ds.LabelQueriesForHostFunc = func(ctx context.Context, host *fleet.Host) (map[string]string, error) {
+		return map[string]string{
+			"1": "query1",
+			"2": "query2",
+			"3": "query3",
+		}, nil
+	}
+
+	// Now we should get the label queries
+	queries, discovery, acc, err = svc.GetDistributedQueries(ctx)
+	require.NoError(t, err)
+	// +1 for the fleet_no_policies_wildcard query.
+	require.Len(t, queries, 3+1)
+	verifyDiscovery(t, queries, discovery)
+	assert.Zero(t, acc)
+
+	var gotHost *fleet.Host
+	var gotResults map[uint]*bool
+	var gotTime time.Time
+	ds.RecordLabelQueryExecutionsFunc = func(ctx context.Context, host *fleet.Host, results map[uint]*bool, t time.Time, deferred bool) error {
+		gotHost = host
+		gotResults = results
+		gotTime = t
+		return nil
+	}
+
+	// Record a query execution
+	err = svc.SubmitDistributedQueryResults(
+		ctx,
+		map[string][]map[string]string{
+			hostLabelQueryPrefix + "1": {{"col1": "val1"}},
+		},
+		map[string]fleet.OsqueryStatus{},
+		map[string]string{},
+		map[string]*fleet.Stats{},
+	)
+	require.NoError(t, err)
+	host.LabelUpdatedAt = mockClock.Now()
+	assert.Equal(t, host, gotHost)
+	assert.Equal(t, mockClock.Now(), gotTime)
+	require.Len(t, gotResults, 1)
+	assert.Equal(t, true, *gotResults[1])
+
+	mockClock.AddTime(1 * time.Second)
+
+	// Record a query execution
+	err = svc.SubmitDistributedQueryResults(
+		ctx,
+		map[string][]map[string]string{
+			hostLabelQueryPrefix + "2": {{"col1": "val1"}},
+			hostLabelQueryPrefix + "3": {},
+		},
+		map[string]fleet.OsqueryStatus{},
+		map[string]string{},
+		map[string]*fleet.Stats{},
+	)
+	require.NoError(t, err)
+	host.LabelUpdatedAt = mockClock.Now()
+	assert.Equal(t, host, gotHost)
+	assert.Equal(t, mockClock.Now(), gotTime)
+	require.Len(t, gotResults, 2)
+	assert.Equal(t, true, *gotResults[2])
+	assert.Equal(t, false, *gotResults[3])
+
+	mockClock.AddTime(1 * time.Second)
+
+	// A label query errors out (e.g. the extension socket is unavailable),
+	// rather than returning a definitive 0 rows. This must be recorded as an
+	// unknown (nil) result, not a non-match, so that existing label
+	// membership is left untouched (see #46399).
+	err = svc.SubmitDistributedQueryResults(
+		ctx,
+		map[string][]map[string]string{
+			hostLabelQueryPrefix + "2": {},
+		},
+		map[string]fleet.OsqueryStatus{
+			hostLabelQueryPrefix + "2": 1,
+		},
+		map[string]string{
+			hostLabelQueryPrefix + "2": "extension socket not available",
+		},
+		map[string]*fleet.Stats{},
+	)
+	require.NoError(t, err)
+	require.Len(t, gotResults, 1)
+	assert.Nil(t, gotResults[2])
+
+	// We should get no labels now.
+	host.LabelUpdatedAt = mockClock.Now()
+	ctx = hostctx.NewContext(ctx, host)
+	queries, discovery, acc, err = svc.GetDistributedQueries(ctx)
+	require.NoError(t, err)
+	require.Len(t, queries, 1) // fleet_no_policies_wildcard query
+	verifyDiscovery(t, queries, discovery)
+	assert.Zero(t, acc)
+
+	// With refetch requested details+label queries should be returned.
+	host.RefetchRequested = true
+	ctx = hostctx.NewContext(ctx, host)
+	queries, discovery, acc, err = svc.GetDistributedQueries(ctx)
+	require.NoError(t, err)
+	// +3 for label queries, +1 for the fleet_no_policies_wildcard query.
+	require.Equal(t, len(expectedDetailQueriesForPlatform(host.Platform))+3+1, len(queries), distQueriesMapKeys(queries))
+	verifyDiscovery(t, queries, discovery)
+	assert.Zero(t, acc)
+
+	// Record a query execution
+	err = svc.SubmitDistributedQueryResults(
+		ctx,
+		map[string][]map[string]string{
+			hostLabelQueryPrefix + "2": {{"col1": "val1"}},
+			hostLabelQueryPrefix + "3": {},
+		},
+		map[string]fleet.OsqueryStatus{},
+		map[string]string{},
+		map[string]*fleet.Stats{},
+	)
+	require.NoError(t, err)
+	host.LabelUpdatedAt = mockClock.Now()
+	assert.Equal(t, host, gotHost)
+	assert.Equal(t, mockClock.Now(), gotTime)
+	require.Len(t, gotResults, 2)
+	assert.Equal(t, true, *gotResults[2])
+	assert.Equal(t, false, *gotResults[3])
+
+	// SubmitDistributedQueryResults will set RefetchRequested to false.
+	require.False(t, host.RefetchRequested)
+
+	// There shouldn't be any labels now.
+	ctx = hostctx.NewContext(ctx, host)
+	queries, discovery, acc, err = svc.GetDistributedQueries(ctx)
+	require.NoError(t, err)
+	require.Len(t, queries, 1) // fleet_no_policies_wildcard query
+	verifyDiscovery(t, queries, discovery)
+	assert.Zero(t, acc)
+}
+
+func TestDetailQueriesWithEmptyStrings(t *testing.T) {
+	ds := new(mock.Store)
+	mockClock := clock.NewMockClock()
+	lq := live_query_mock.New(t)
+	svc, ctx := newTestServiceWithClock(t, ds, nil, lq, mockClock)
+
+	host := &fleet.Host{
+		ID:            1,
+		Platform:      "windows",
+		OsqueryHostID: new("very_random"),
+	}
+	ctx = hostctx.NewContext(ctx, host)
+
+	ds.UpdateHostDeviceNameStatusFromReportFunc = func(ctx context.Context, hostUUID, reportedName string) error {
+		return nil
+	}
+	ds.AppConfigFunc = func(ctx context.Context) (*fleet.AppConfig, error) {
+		return &fleet.AppConfig{Features: fleet.Features{
+			EnableHostUsers:         true,
+			EnableSoftwareInventory: true,
+		}}, nil
+	}
+	ds.LabelQueriesForHostFunc = func(context.Context, *fleet.Host) (map[string]string, error) {
+		return map[string]string{}, nil
+	}
+	ds.PolicyQueriesForHostFunc = func(ctx context.Context, host *fleet.Host) (map[string]string, error) {
+		return map[string]string{}, nil
+	}
+	ds.GetHostAwaitingConfigurationFunc = func(ctx context.Context, hostuuid string) (bool, error) {
+		return false, nil
+	}
+	ds.HostLiteFunc = func(ctx context.Context, id uint) (*fleet.Host, error) {
+		if id != 1 {
+			return nil, errors.New("not found")
+		}
+		return host, nil
+	}
+	ds.ListSetupExperienceResultsByHostUUIDFunc = func(ctx context.Context, hostUUID string, teamID uint) ([]*fleet.SetupExperienceStatusResult, error) {
+		return nil, nil
+	}
+
+	lq.On("QueriesForHost", host.ID).Return(map[string]string{}, nil)
+
+	// With a new host, we should get the detail queries (and accelerated
+	// queries)
+	queries, discovery, acc, err := svc.GetDistributedQueries(ctx)
+	require.NoError(t, err)
+	// +1 due to fleet_no_policies_wildcard query.
+	if expected := expectedDetailQueriesForPlatform(host.Platform); !assert.Len(t, expected, len(queries)-1) {
+		// this is just to print the diff between the expected and actual query
+		// keys when the count assertion fails, to help debugging - they are not
+		// expected to match.
+		require.ElementsMatch(t, osqueryMapKeys(expected), distQueriesMapKeys(queries))
+	}
+	verifyDiscovery(t, queries, discovery)
+	assert.NotZero(t, acc)
+
+	resultJSON := `
+{
+  "fleet_detail_query_network_interface_windows": [
+    {
+      "address": "192.168.0.1",
+      "mac": "5f:3d:4b:10:25:82"
+    }
+  ],
+  "fleet_detail_query_os_version": [
+    {
+      "platform": "darwin",
+      "build": "15G1004",
+      "major": "10",
+      "minor": "10",
+      "name": "Mac OS X",
+      "patch": "6"
+    }
+  ],
+  "fleet_detail_query_osquery_info": [
+    {
+      "build_distro": "10.10",
+      "build_platform": "darwin",
+      "config_hash": "3c6e4537c4d0eb71a7c6dda19d",
+      "config_valid": "1",
+      "extensions": "active",
+      "pid": "38113",
+      "start_time": "1475603155",
+      "version": "1.8.2",
+      "watcher": "38112"
+    }
+  ],
+  "fleet_detail_query_system_info": [
+    {
+      "computer_name": "computer",
+      "cpu_brand": "Intel(R) Core(TM) i7-4770HQ CPU @ 2.20GHz",
+      "cpu_logical_cores": "8",
+      "cpu_physical_cores": "4",
+      "cpu_subtype": "Intel x86-64h Haswell",
+      "cpu_type": "x86_64h",
+      "hardware_model": "MacBookPro11,4",
+      "hardware_serial": "NEW_HW_SRL",
+      "hardware_vendor": "Apple Inc.",
+      "hardware_version": "1.0",
+      "hostname": "computer.local",
+      "physical_memory": "17179869184",
+      "uuid": "uuid"
+    }
+  ],
+  "fleet_detail_query_uptime": [
+    {
+      "days": "20",
+      "hours": "0",
+      "minutes": "48",
+      "seconds": "13",
+      "total_seconds": "1730893"
+    }
+  ],
+  "fleet_detail_query_osquery_flags": [
+    {
+      "name": "config_tls_refresh",
+      "value": ""
+    },
+    {
+      "name": "distributed_interval",
+      "value": ""
+    },
+    {
+      "name": "logger_tls_period",
+      "value": ""
+    }
+  ],
+  "fleet_detail_query_orbit_info": [
+    {
+      "name": "version",
+      "value": "42"
+    },
+    {
+      "name": "device_auth_token",
+      "value": "foo"
+    }
+  ]
+}
+`
+
+	var results fleet.OsqueryDistributedQueryResults
+	err = json.Unmarshal([]byte(resultJSON), &results)
+	require.NoError(t, err)
+
+	var gotHost *fleet.Host
+	ds.UpdateHostFunc = func(ctx context.Context, host *fleet.Host) error {
+		gotHost = host
+		return nil
+	}
+
+	// Verify that results are ingested properly
+	require.NoError(
+		t, svc.SubmitDistributedQueryResults(ctx, results, map[string]fleet.OsqueryStatus{}, map[string]string{}, map[string]*fleet.Stats{}),
+	)
+
+	// osquery_info
+	assert.Equal(t, "darwin", gotHost.Platform)
+	assert.Equal(t, "1.8.2", gotHost.OsqueryVersion)
+
+	// system_info
+	assert.Equal(t, int64(17179869184), gotHost.Memory)
+	assert.Equal(t, "computer.local", gotHost.Hostname)
+	assert.Equal(t, "uuid", gotHost.UUID)
+	assert.Equal(t, "NEW_HW_SRL", gotHost.HardwareSerial)
+
+	// os_version
+	assert.Equal(t, "Mac OS X 10.10.6", gotHost.OSVersion)
+
+	// uptime
+	assert.Equal(t, 1730893*time.Second, gotHost.Uptime)
+
+	// osquery_flags
+	assert.Equal(t, uint(0), gotHost.ConfigTLSRefresh)
+	assert.Equal(t, uint(0), gotHost.DistributedInterval)
+	assert.Equal(t, uint(0), gotHost.LoggerTLSPeriod)
+
+	host.Hostname = "computer.local"
+	host.DetailUpdatedAt = mockClock.Now()
+	mockClock.AddTime(1 * time.Minute)
+
+	// Now no detail queries should be required
+	ctx = hostctx.NewContext(ctx, host)
+	queries, discovery, acc, err = svc.GetDistributedQueries(ctx)
+	require.NoError(t, err)
+	require.Len(t, queries, 1) // fleet_no_policies_wildcard query
+	verifyDiscovery(t, queries, discovery)
+	assert.Zero(t, acc)
+
+	// Advance clock and queries should exist again
+	mockClock.AddTime(1*time.Hour + 1*time.Minute)
+
+	queries, discovery, acc, err = svc.GetDistributedQueries(ctx)
+	require.NoError(t, err)
+	// somehow confusingly, the query response above changed the host's platform
+	// from windows to darwin
+	// +1 due to fleet_no_policies_wildcard query.
+	require.Equal(t, len(expectedDetailQueriesForPlatform(gotHost.Platform))+1, len(queries), distQueriesMapKeys(queries))
+	verifyDiscovery(t, queries, discovery)
+	assert.Zero(t, acc)
+}
+
+func TestDetailQueries(t *testing.T) {
+	ds := new(mock.Store)
+	mockClock := clock.NewMockClock()
+	lq := live_query_mock.New(t)
+	svc, ctx := newTestServiceWithClock(t, ds, nil, lq, mockClock)
+
+	host := &fleet.Host{
+		ID:             1,
+		Platform:       "linux",
+		HardwareSerial: "HW_SRL",
+		OsqueryHostID:  new("foobar"),
+	}
+	ctx = hostctx.NewContext(ctx, host)
+
+	lq.On("QueriesForHost", host.ID).Return(map[string]string{}, nil)
+
+	ds.UpdateHostDeviceNameStatusFromReportFunc = func(ctx context.Context, hostUUID, reportedName string) error {
+		return nil
+	}
+	ds.AppConfigFunc = func(ctx context.Context) (*fleet.AppConfig, error) {
+		return &fleet.AppConfig{Features: fleet.Features{
+			EnableHostUsers:         true,
+			EnableSoftwareInventory: true,
+		}}, nil
+	}
+	ds.LabelQueriesForHostFunc = func(context.Context, *fleet.Host) (map[string]string, error) {
+		return map[string]string{}, nil
+	}
+	ds.PolicyQueriesForHostFunc = func(ctx context.Context, host *fleet.Host) (map[string]string, error) {
+		return map[string]string{}, nil
+	}
+	ds.SetOrUpdateMDMDataFunc = func(ctx context.Context, hostID uint, isServer, enrolled bool, serverURL string, installedFromDep bool, name string,
+		fleetEnrollmentRef string, isPersonalEnrollment bool,
+	) error {
+		require.True(t, enrolled)
+		require.False(t, installedFromDep)
+		require.Equal(t, "hi.com", serverURL)
+		require.Empty(t, fleetEnrollmentRef)
+		require.False(t, isPersonalEnrollment)
+		return nil
+	}
+	ds.SetOrUpdateMunkiInfoFunc = func(ctx context.Context, hostID uint, version string, errs, warns []string) error {
+		require.Equal(t, "3.4.5", version)
+		return nil
+	}
+	ds.SetOrUpdateHostOrbitInfoFunc = func(
+		ctx context.Context, hostID uint, version string, desktopVersion sql.NullString, scriptsEnabled sql.NullBool,
+	) error {
+		require.Equal(t, "42", version)
+		require.Equal(t, sql.NullString{String: "1.2.3", Valid: true}, desktopVersion)
+		require.Equal(t, sql.NullBool{Bool: true, Valid: true}, scriptsEnabled)
+		return nil
+	}
+	ds.SetOrUpdateDeviceAuthTokenFunc = func(ctx context.Context, hostID uint, authToken string) error {
+		require.Equal(t, uint(1), hostID)
+		require.Equal(t, "foo", authToken)
+		return nil
+	}
+	ds.SetOrUpdateHostDisksSpaceFunc = func(ctx context.Context, hostID uint, gigsAvailable, percentAvailable, gigsTotal float64, gigsAll *float64) error {
+		require.Equal(t, 277.0, gigsAvailable)
+		require.Equal(t, 56.0, percentAvailable)
+		require.Equal(t, 500.1, gigsTotal)
+		return nil
+	}
+	ds.GetNanoMDMUserEnrollmentUsernameAndUUIDFunc = func(ctx context.Context, hostUUID string) (string, string, error) {
+		return "", "", nil
+	}
+	ds.HostLiteFunc = func(ctx context.Context, id uint) (*fleet.Host, error) {
+		if id != 1 {
+			return nil, errors.New("not found")
+		}
+		return host, nil
+	}
+	ds.GetHostAwaitingConfigurationFunc = func(ctx context.Context, hostuuid string) (bool, error) {
+		return false, nil
+	}
+	ds.ListSetupExperienceResultsByHostUUIDFunc = func(ctx context.Context, hostUUID string, teamID uint) ([]*fleet.SetupExperienceStatusResult, error) {
+		return nil, nil
+	}
+
+	// With a new host, we should get the detail queries (and accelerated
+	// queries)
+	queries, discovery, acc, err := svc.GetDistributedQueries(ctx)
+	require.NoError(t, err)
+	// +1 for fleet_no_policies_wildcard
+	if expected := expectedDetailQueriesForPlatform(host.Platform); !assert.Len(t, expected, len(queries)-1) {
+		// this is just to print the diff between the expected and actual query
+		// keys when the count assertion fails, to help debugging - they are not
+		// expected to match.
+		require.ElementsMatch(t, osqueryMapKeys(expected), distQueriesMapKeys(queries))
+	}
+	verifyDiscovery(t, queries, discovery)
+	assert.NotZero(t, acc)
+
+	resultJSON := `
+{
+"fleet_detail_query_network_interface": [
+    {
+        "address": "192.168.0.1",
+        "broadcast": "192.168.0.255",
+        "ibytes": "1601207629",
+        "ierrors": "314179",
+        "interface": "en0",
+        "ipackets": "25698094",
+        "last_change": "1474233476",
+        "mac": "5f:3d:4b:10:25:82",
+        "mask": "255.255.255.0",
+        "metric": "1",
+        "mtu": "1453",
+        "obytes": "2607283152",
+        "oerrors": "101010",
+        "opackets": "12264603",
+        "point_to_point": "",
+        "type": "6"
+    }
+],
+"fleet_detail_query_os_version": [
+    {
+        "platform": "darwin",
+        "build": "15G1004",
+        "major": "10",
+        "minor": "10",
+        "name": "Mac OS X",
+        "patch": "6"
+    }
+],
+"fleet_detail_query_osquery_info": [
+    {
+        "build_distro": "10.10",
+        "build_platform": "darwin",
+        "config_hash": "3c6e4537c4d0eb71a7c6dda19d",
+        "config_valid": "1",
+        "extensions": "active",
+        "pid": "38113",
+        "start_time": "1475603155",
+        "version": "1.8.2",
+        "watcher": "38112"
+    }
+],
+"fleet_detail_query_system_info": [
+    {
+        "computer_name": "computer",
+        "cpu_brand": "Intel(R) Core(TM) i7-4770HQ CPU @ 2.20GHz",
+        "cpu_logical_cores": "8",
+        "cpu_physical_cores": "4",
+        "cpu_subtype": "Intel x86-64h Haswell",
+        "cpu_type": "x86_64h",
+        "hardware_model": "MacBookPro11,4",
+        "hardware_serial": "-1",
+        "hardware_vendor": "Apple Inc.",
+        "hardware_version": "1.0",
+        "hostname": "computer.local",
+        "physical_memory": "17179869184",
+        "uuid": "uuid"
+    }
+],
+"fleet_detail_query_uptime": [
+    {
+        "days": "20",
+        "hours": "0",
+        "minutes": "48",
+        "seconds": "13",
+        "total_seconds": "1730893"
+    }
+],
+"fleet_detail_query_osquery_flags": [
+    {
+      "name":"config_tls_refresh",
+      "value":"10"
+    },
+    {
+      "name":"config_refresh",
+      "value":"9"
+    },
+    {
+      "name":"distributed_interval",
+      "value":"5"
+    },
+    {
+      "name":"logger_tls_period",
+      "value":"60"
+    }
+],
+"fleet_detail_query_users": [
+    {
+      "uid": "1234",
+      "username": "user1",
+      "type": "sometype",
+      "groupname": "somegroup",
+	  "shell": "someloginshell"
+    },
+	{
+      "uid": "5678",
+      "username": "user2",
+      "type": "sometype",
+      "groupname": "somegroup"
+    }
+],
+"fleet_detail_query_software_macos": [
+    {
+      "name": "app1",
+      "version": "1.0.0",
+      "source": "source1"
+    },
+    {
+      "name": "app2",
+      "version": "1.0.0",
+      "source": "source2",
+      "bundle_identifier": "somebundle"
+    }
+],
+"fleet_detail_query_disk_space_unix": [
+	{
+		"percent_disk_space_available": "56",
+		"gigs_disk_space_available": "277.0",
+		"gigs_total_disk_space": "500.1"
+	}
+],
+"fleet_detail_query_mdm": [
+	{
+		"enrolled": "true",
+		"server_url": "hi.com",
+		"installed_from_dep": "false"
+	}
+],
+"fleet_detail_query_munki_info": [
+	{
+		"version": "3.4.5"
+	}
+],
+"fleet_detail_query_orbit_info": [
+	{
+		"version": "42",
+		"desktop_version": "1.2.3",
+		"scripts_enabled": "1"
+	}
+]
+}
+`
+
+	var results fleet.OsqueryDistributedQueryResults
+	err = json.Unmarshal([]byte(resultJSON), &results)
+	require.NoError(t, err)
+
+	var gotHost *fleet.Host
+	ds.UpdateHostFunc = func(ctx context.Context, host *fleet.Host) error {
+		gotHost = host
+		return nil
+	}
+	var gotUsers []fleet.HostUser
+	ds.SaveHostUsersFunc = func(ctx context.Context, hostID uint, users []fleet.HostUser) error {
+		if hostID != 1 {
+			return errors.New("not found")
+		}
+		gotUsers = users
+		return nil
+	}
+	var gotSoftware []fleet.Software
+	ds.UpdateHostSoftwareFunc = func(ctx context.Context, hostID uint, software []fleet.Software) (*fleet.UpdateHostSoftwareDBResult, error) {
+		if hostID != 1 {
+			return nil, errors.New("not found")
+		}
+		gotSoftware = software
+		return nil, nil
+	}
+
+	ds.UpdateHostSoftwareInstalledPathsFunc = func(ctx context.Context, hostID uint, paths map[string]struct{},
+		result *fleet.UpdateHostSoftwareDBResult,
+	) error {
+		return nil
+	}
+
+	// Verify that results are ingested properly
+	require.NoError(
+		t, svc.SubmitDistributedQueryResults(ctx, results, map[string]fleet.OsqueryStatus{}, map[string]string{}, map[string]*fleet.Stats{}),
+	)
+	require.NotNil(t, gotHost)
+
+	require.True(t, ds.SetOrUpdateMDMDataFuncInvoked)
+	require.True(t, ds.SetOrUpdateMunkiInfoFuncInvoked)
+	require.True(t, ds.SetOrUpdateHostDisksSpaceFuncInvoked)
+
+	// osquery_info
+	assert.Equal(t, "darwin", gotHost.Platform)
+	assert.Equal(t, "1.8.2", gotHost.OsqueryVersion)
+
+	// system_info
+	assert.Equal(t, int64(17179869184), gotHost.Memory)
+	assert.Equal(t, "computer.local", gotHost.Hostname)
+	assert.Equal(t, "uuid", gotHost.UUID)
+	// The hardware serial should not have updated because return value was -1. See: https://github.com/fleetdm/fleet/issues/19789
+	assert.Equal(t, "HW_SRL", gotHost.HardwareSerial)
+
+	// os_version
+	assert.Equal(t, "Mac OS X 10.10.6", gotHost.OSVersion)
+
+	// uptime
+	assert.Equal(t, 1730893*time.Second, gotHost.Uptime)
+
+	// osquery_flags
+	assert.Equal(t, uint(10), gotHost.ConfigTLSRefresh)
+	assert.Equal(t, uint(5), gotHost.DistributedInterval)
+	assert.Equal(t, uint(60), gotHost.LoggerTLSPeriod)
+
+	// users
+	require.Len(t, gotUsers, 2)
+	assert.Equal(t, fleet.HostUser{
+		Uid:       1234,
+		Username:  "user1",
+		Type:      "sometype",
+		GroupName: "somegroup",
+		Shell:     "someloginshell",
+	}, gotUsers[0])
+	assert.Equal(t, fleet.HostUser{
+		Uid:       5678,
+		Username:  "user2",
+		Type:      "sometype",
+		GroupName: "somegroup",
+		Shell:     "",
+	}, gotUsers[1])
+
+	// software
+	require.Len(t, gotSoftware, 2)
+	assert.Equal(t, []fleet.Software{
+		{
+			Name:    "app1",
+			Version: "1.0.0",
+			Source:  "source1",
+		},
+		{
+			Name:             "app2",
+			Version:          "1.0.0",
+			BundleIdentifier: "somebundle",
+			Source:           "source2",
+		},
+	}, gotSoftware)
+
+	// Since this is set directly in the ingest function, it doesn't use the mock clock.
+	// So the expected restarted at time is calculated based on the current time.
+	expectedLastRestartedAt := time.Now().Add(-1730893 * time.Second)
+	require.NoError(t, err)
+	assert.LessOrEqual(t, gotHost.LastRestartedAt.Sub(expectedLastRestartedAt), 1*time.Second)
+
+	// Set the last restarted at date, then change the uptime result to simulate
+	// a small drift (less than 30s). Verify that the LastRestartedAt is not updated.
+	host.LastRestartedAt = expectedLastRestartedAt
+	results["fleet_detail_query_uptime"] = []map[string]string{
+		{
+			"days":          "21",
+			"hours":         "0",
+			"minutes":       "46",
+			"seconds":       "13",
+			"total_seconds": "1730865",
+		},
+	}
+	// Verify that results are ingested properly
+	require.NoError(
+		t, svc.SubmitDistributedQueryResults(ctx, results, map[string]fleet.OsqueryStatus{}, map[string]string{}, map[string]*fleet.Stats{}),
+	)
+	require.NotNil(t, gotHost)
+	assert.LessOrEqual(t, gotHost.LastRestartedAt.Sub(expectedLastRestartedAt), 1*time.Second)
+
+	// Test again with _forward_ drift, which would push the last restarted at date
+	// back, and verify that we ignore it.
+	results["fleet_detail_query_uptime"] = []map[string]string{
+		{
+			"days":          "0",
+			"hours":         "0",
+			"minutes":       "30",
+			"seconds":       "0",
+			"total_seconds": "1740865",
+		},
+	}
+	// Verify that results are ingested properly
+	require.NoError(
+		t, svc.SubmitDistributedQueryResults(ctx, results, map[string]fleet.OsqueryStatus{}, map[string]string{}, map[string]*fleet.Stats{}),
+	)
+	require.NotNil(t, gotHost)
+	assert.LessOrEqual(t, gotHost.LastRestartedAt.Sub(expectedLastRestartedAt), 1*time.Second)
+
+	// One final test -- change the uptime to just one minute, and verify that we do update last restarted at.
+	results["fleet_detail_query_uptime"] = []map[string]string{
+		{
+			"days":          "0",
+			"hours":         "0",
+			"minutes":       "1",
+			"seconds":       "0",
+			"total_seconds": "60",
+		},
+	}
+	// Verify that results are ingested properly
+	require.NoError(
+		t, svc.SubmitDistributedQueryResults(ctx, results, map[string]fleet.OsqueryStatus{}, map[string]string{}, map[string]*fleet.Stats{}),
+	)
+	require.NotNil(t, gotHost)
+	expectedLastRestartedAt = time.Now().Add(-60 * time.Second)
+	assert.LessOrEqual(t, gotHost.LastRestartedAt.Sub(expectedLastRestartedAt), 1*time.Second)
+
+	host.Hostname = "computer.local"
+	host.Platform = "darwin"
+	host.DetailUpdatedAt = mockClock.Now()
+	mockClock.AddTime(1 * time.Minute)
+
+	// Now no detail queries should be required
+	ctx = hostctx.NewContext(ctx, host)
+	queries, discovery, acc, err = svc.GetDistributedQueries(ctx)
+	require.NoError(t, err)
+	require.Len(t, queries, 1) // fleet_no_policies_wildcard query
+	verifyDiscovery(t, queries, discovery)
+	assert.Zero(t, acc)
+
+	// Advance clock and queries should exist again
+	mockClock.AddTime(1*time.Hour + 1*time.Minute)
+
+	queries, discovery, acc, err = svc.GetDistributedQueries(ctx)
+	require.NoError(t, err)
+	// +1 fleet_no_policies_wildcard query
+	require.Equal(t, len(expectedDetailQueriesForPlatform(host.Platform))+1, len(queries), distQueriesMapKeys(queries))
+	verifyDiscovery(t, queries, discovery)
+	assert.Zero(t, acc)
+}
+
+func TestMDMQueries(t *testing.T) {
+	ds := new(mock.Store)
+	svc := &Service{
+		clock:    clock.NewMockClock(),
+		logger:   slog.New(slog.DiscardHandler),
+		config:   config.TestConfig(),
+		ds:       ds,
+		jitterMu: new(sync.RWMutex),
+		jitterH:  make(map[time.Duration]*jitterHashTable),
+	}
+
+	expectedMDMQueries := []struct {
+		name           string
+		discoveryTable string
+	}{
+		{"fleet_detail_query_mdm_config_profiles_darwin", "macos_profiles"},
+		{"fleet_detail_query_mdm_disk_encryption_key_file_darwin", "filevault_prk"},
+		{"fleet_detail_query_mdm_disk_encryption_key_file_lines_darwin", "file_lines"},
+	}
+
+	mdmEnabled := true
+	ds.AppConfigFunc = func(ctx context.Context) (*fleet.AppConfig, error) {
+		return &fleet.AppConfig{MDM: fleet.MDM{EnabledAndConfigured: mdmEnabled}}, nil
+	}
+	ds.GetNanoMDMUserEnrollmentUsernameAndUUIDFunc = func(ctx context.Context, deviceID string) (string, string, error) {
+		return "", "", nil
+	}
+
+	host := fleet.Host{
+		ID:       1,
+		Platform: "darwin",
+		NodeKey:  new("test_key"),
+		Hostname: "test_hostname",
+		UUID:     "test_uuid",
+		TeamID:   nil,
+	}
+	ctx := hostctx.NewContext(context.Background(), &host)
+
+	// MDM enabled, darwin
+	queries, discovery, err := svc.detailQueriesForHost(ctx, &host)
+	require.NoError(t, err)
+	for _, q := range expectedMDMQueries {
+		require.Contains(t, queries, q.name)
+		d, ok := discovery[q.name]
+		require.True(t, ok)
+		require.Contains(t, d, fmt.Sprintf("name = '%s'", q.discoveryTable))
+	}
+
+	// MDM disabled, darwin
+	mdmEnabled = false
+	queries, discovery, err = svc.detailQueriesForHost(ctx, &host)
+	require.NoError(t, err)
+	for _, q := range expectedMDMQueries {
+		require.NotContains(t, queries, q.name)
+		require.NotContains(t, discovery, q.name)
+	}
+
+	// MDM enabled, not darwin
+	mdmEnabled = true
+	host.Platform = "windows"
+	ctx = hostctx.NewContext(context.Background(), &host)
+	queries, discovery, err = svc.detailQueriesForHost(ctx, &host)
+	require.NoError(t, err)
+	for _, q := range expectedMDMQueries {
+		require.NotContains(t, queries, q.name)
+		require.NotContains(t, discovery, q.name)
+	}
+
+	// MDM disabled, not darwin
+	mdmEnabled = false
+	queries, discovery, err = svc.detailQueriesForHost(ctx, &host)
+	require.NoError(t, err)
+	for _, q := range expectedMDMQueries {
+		require.NotContains(t, queries, q.name)
+		require.NotContains(t, discovery, q.name)
+	}
+}
+
+func TestNewDistributedQueryCampaign(t *testing.T) {
+	ds := new(mock.Store)
+	ds.AppConfigFunc = func(ctx context.Context) (*fleet.AppConfig, error) {
+		return &fleet.AppConfig{}, nil
+	}
+	rs := &mockresult.QueryResultStore{
+		HealthCheckFunc: func() error {
+			return nil
+		},
+	}
+	lq := live_query_mock.New(t)
+	mockClock := clock.NewMockClock()
+	svc, ctx := newTestServiceWithClock(t, ds, rs, lq, mockClock)
+
+	ds.LabelQueriesForHostFunc = func(ctx context.Context, host *fleet.Host) (map[string]string, error) {
+		return map[string]string{}, nil
+	}
+	var gotQuery *fleet.Query
+	ds.NewQueryFunc = func(ctx context.Context, query *fleet.Query, opts ...fleet.OptionalArg) (*fleet.Query, error) {
+		gotQuery = query
+		query.ID = 42
+		return query, nil
+	}
+	var gotCampaign *fleet.DistributedQueryCampaign
+	ds.NewDistributedQueryCampaignFunc = func(ctx context.Context, camp *fleet.DistributedQueryCampaign) (*fleet.DistributedQueryCampaign, error) {
+		gotCampaign = camp
+		camp.ID = 21
+		return camp, nil
+	}
+	var gotTargets []*fleet.DistributedQueryCampaignTarget
+	ds.NewDistributedQueryCampaignTargetFunc = func(ctx context.Context,
+		target *fleet.DistributedQueryCampaignTarget,
+	) (*fleet.DistributedQueryCampaignTarget, error) {
+		gotTargets = append(gotTargets, target)
+		return target, nil
+	}
+
+	ds.CountHostsInTargetsFunc = func(ctx context.Context, filter fleet.TeamFilter, targets fleet.HostTargets, now time.Time) (fleet.TargetMetrics,
+		error,
+	) {
+		return fleet.TargetMetrics{}, nil
+	}
+	ds.HostIDsInTargetsFunc = func(ctx context.Context, filter fleet.TeamFilter, targets fleet.HostTargets) ([]uint, error) {
+		return []uint{1, 3, 5}, nil
+	}
+	lq.On("RunQuery", "21", "select year, month, day, hour, minutes, seconds from time", []uint{1, 3, 5}).Return(nil)
+	viewerCtx := viewer.NewContext(ctx, viewer.Viewer{
+		User: &fleet.User{
+			ID:         0,
+			GlobalRole: ptr.String(fleet.RoleAdmin),
+		},
+	})
+	q := "select year, month, day, hour, minutes, seconds from time"
+	campaign, err := svc.NewDistributedQueryCampaign(viewerCtx, q, nil, fleet.HostTargets{HostIDs: []uint{2}, LabelIDs: []uint{1}})
+	require.NoError(t, err)
+	assert.Equal(t, gotQuery.ID, gotCampaign.QueryID)
+	assert.Equal(t, []*fleet.DistributedQueryCampaignTarget{
+		{
+			Type:                       fleet.TargetHost,
+			DistributedQueryCampaignID: campaign.ID,
+			TargetID:                   2,
+		},
+		{
+			Type:                       fleet.TargetLabel,
+			DistributedQueryCampaignID: campaign.ID,
+			TargetID:                   1,
+		},
+	}, gotTargets,
+	)
+}
+
+func TestDistributedQueryResults(t *testing.T) {
+	mockClock := clock.NewMockClock()
+	ds := new(mock.Store)
+	rs := pubsub.NewInmemQueryResults()
+	lq := live_query_mock.New(t)
+	svc, ctx := newTestServiceWithClock(t, ds, rs, lq, mockClock)
+
+	campaign := &fleet.DistributedQueryCampaign{ID: 42}
+
+	ds.LabelQueriesForHostFunc = func(ctx context.Context, host *fleet.Host) (map[string]string, error) {
+		return map[string]string{}, nil
+	}
+	ds.PolicyQueriesForHostFunc = func(ctx context.Context, host *fleet.Host) (map[string]string, error) {
+		return map[string]string{}, nil
+	}
+	mockPolicyQueriesForHostFiltered(ds)
+	host := &fleet.Host{
+		ID:            1,
+		Platform:      "windows",
+		OsqueryHostID: new("other_random_value"),
+	}
+	ds.HostLiteFunc = func(ctx context.Context, id uint) (*fleet.Host, error) {
+		if id != 1 {
+			return nil, errors.New("not found")
+		}
+		return host, nil
+	}
+	ds.UpdateHostFunc = func(ctx context.Context, host *fleet.Host) error {
+		if host.ID != 1 {
+			return errors.New("not found")
+		}
+		return nil
+	}
+	ds.AppConfigFunc = func(ctx context.Context) (*fleet.AppConfig, error) {
+		return &fleet.AppConfig{Features: fleet.Features{
+			EnableHostUsers:         true,
+			EnableSoftwareInventory: true,
+		}}, nil
+	}
+	ds.ListSetupExperienceResultsByHostUUIDFunc = func(ctx context.Context, hostUUID string, teamID uint) ([]*fleet.SetupExperienceStatusResult, error) {
+		return nil, nil
+	}
+
+	hostCtx := hostctx.NewContext(ctx, host)
+
+	lq.On("QueriesForHost", uint(1)).Return(
+		map[string]string{
+			fmt.Sprint(campaign.ID): "select * from time",
+		},
+		nil,
+	)
+	lq.On("QueryCompletedByHost", fmt.Sprint(campaign.ID), host.ID).Return(nil)
+
+	// Now we should get the active distributed query
+	queries, discovery, acc, err := svc.GetDistributedQueries(hostCtx)
+	require.NoError(t, err)
+	// +1 for the distributed query for campaign ID 42, +1 for the fleet_no_policies_wildcard query.
+	if expected := expectedDetailQueriesForPlatform(host.Platform); !assert.Len(t, expected, len(queries)-2) {
+		// this is just to print the diff between the expected and actual query
+		// keys when the count assertion fails, to help debugging - they are not
+		// expected to match.
+		require.ElementsMatch(t, osqueryMapKeys(expected), distQueriesMapKeys(queries))
+	}
+	verifyDiscovery(t, queries, discovery)
+	queryKey := fmt.Sprintf("%s%d", hostDistributedQueryPrefix, campaign.ID)
+	assert.Equal(t, "select * from time", queries[queryKey])
+	assert.NotZero(t, acc)
+
+	expectedRows := []map[string]string{
+		{
+			"year":    "2016",
+			"month":   "11",
+			"day":     "11",
+			"hour":    "6",
+			"minutes": "12",
+			"seconds": "10",
+		},
+	}
+	results := map[string][]map[string]string{
+		queryKey: expectedRows,
+	}
+	expectedStats := fleet.Stats{
+		UserTime: uint64(1),
+	}
+	stats := map[string]*fleet.Stats{
+		queryKey: &expectedStats,
+	}
+
+	// TODO use service method
+	readChan, err := rs.ReadChannel(context.Background(), *campaign)
+	require.NoError(t, err)
+
+	// We need to listen for the result in a separate thread to prevent the
+	// write to the result channel from failing
+	var waitSetup, waitComplete sync.WaitGroup
+	waitSetup.Add(1)
+	waitComplete.Add(1)
+	go func() {
+		waitSetup.Done()
+		select {
+		case val := <-readChan:
+			if res, ok := val.(fleet.DistributedQueryResult); ok {
+				assert.Equal(t, campaign.ID, res.DistributedQueryCampaignID)
+				assert.Equal(t, expectedRows, res.Rows)
+				assert.Equal(t, host.ID, res.Host.ID)
+				assert.Equal(t, host.Hostname, res.Host.Hostname)
+				assert.Equal(t, host.DisplayName(), res.Host.DisplayName)
+				assert.Equal(t, &expectedStats, res.Stats)
+			} else {
+				t.Error("Wrong result type")
+			}
+			assert.NotNil(t, val)
+
+		case <-time.After(1 * time.Second):
+			t.Error("No result received")
+		}
+		waitComplete.Done()
+	}()
+
+	waitSetup.Wait()
+	// Sleep a short time to ensure that the above goroutine is blocking on
+	// the channel read (the waitSetup.Wait() is not necessarily sufficient
+	// if there is a context switch immediately after waitSetup.Done() is
+	// called). This should be a small price to pay to prevent flakiness in
+	// this test.
+	time.Sleep(10 * time.Millisecond)
+
+	err = svc.SubmitDistributedQueryResults(
+		hostCtx, results, map[string]fleet.OsqueryStatus{}, map[string]string{}, stats,
+	)
+	require.NoError(t, err)
+	// Sleep to ensure checks in the goroutine are actually done.
+	time.Sleep(10 * time.Millisecond)
+}
+
+func TestIngestDistributedQueryParseIdError(t *testing.T) {
+	mockClock := clock.NewMockClock()
+	ds := new(mock.Store)
+	rs := pubsub.NewInmemQueryResults()
+	lq := live_query_mock.New(t)
+	svc := &Service{
+		ds:             ds,
+		resultStore:    rs,
+		liveQueryStore: lq,
+		logger:         slog.New(slog.DiscardHandler),
+		clock:          mockClock,
+	}
+
+	host := fleet.Host{ID: 1}
+	err := svc.ingestDistributedQuery(context.Background(), host, "bad_name", []map[string]string{}, "", nil)
+	require.Error(t, err)
+	assert.Contains(t, err.Error(), "unable to parse campaign")
+}
+
+func TestIngestDistributedQueryOrphanedCampaignLoadError(t *testing.T) {
+	mockClock := clock.NewMockClock()
+	ds := new(mock.Store)
+	rs := pubsub.NewInmemQueryResults()
+	lq := live_query_mock.New(t)
+	svc := &Service{
+		ds:             ds,
+		resultStore:    rs,
+		liveQueryStore: lq,
+		logger:         slog.New(slog.DiscardHandler),
+		clock:          mockClock,
+	}
+
+	ds.DistributedQueryCampaignFunc = func(ctx context.Context, id uint) (*fleet.DistributedQueryCampaign, error) {
+		return nil, errors.New("missing campaign")
+	}
+
+	lq.On("StopQuery", "42").Return(nil)
+
+	host := fleet.Host{ID: 1}
+
+	err := svc.ingestDistributedQuery(context.Background(), host, "fleet_distributed_query_42", []map[string]string{}, "", nil)
+	require.Error(t, err)
+	assert.Contains(t, err.Error(), "loading orphaned campaign")
+}
+
+func TestIngestDistributedQueryOrphanedCampaignWaitListener(t *testing.T) {
+	mockClock := clock.NewMockClock()
+	ds := new(mock.Store)
+	rs := pubsub.NewInmemQueryResults()
+	lq := live_query_mock.New(t)
+	svc := &Service{
+		ds:             ds,
+		resultStore:    rs,
+		liveQueryStore: lq,
+		logger:         slog.New(slog.DiscardHandler),
+		clock:          mockClock,
+	}
+
+	campaign := &fleet.DistributedQueryCampaign{
+		ID: 42,
+		UpdateCreateTimestamps: fleet.UpdateCreateTimestamps{
+			CreateTimestamp: fleet.CreateTimestamp{
+				CreatedAt: mockClock.Now().Add(-1 * time.Second),
+			},
+		},
+	}
+
+	ds.DistributedQueryCampaignFunc = func(ctx context.Context, id uint) (*fleet.DistributedQueryCampaign, error) {
+		return campaign, nil
+	}
+
+	host := fleet.Host{ID: 1}
+
+	err := svc.ingestDistributedQuery(context.Background(), host, "fleet_distributed_query_42", []map[string]string{}, "", nil)
+	require.Error(t, err)
+	assert.Contains(t, err.Error(), "campaignID=42 waiting for listener")
+}
+
+func TestIngestDistributedQueryOrphanedCloseError(t *testing.T) {
+	mockClock := clock.NewMockClock()
+	ds := new(mock.Store)
+	rs := pubsub.NewInmemQueryResults()
+	lq := live_query_mock.New(t)
+	svc := &Service{
+		ds:             ds,
+		resultStore:    rs,
+		liveQueryStore: lq,
+		logger:         slog.New(slog.DiscardHandler),
+		clock:          mockClock,
+	}
+
+	campaign := &fleet.DistributedQueryCampaign{
+		ID: 42,
+		UpdateCreateTimestamps: fleet.UpdateCreateTimestamps{
+			CreateTimestamp: fleet.CreateTimestamp{
+				CreatedAt: mockClock.Now().Add(-2 * time.Minute),
+			},
+		},
+	}
+
+	ds.DistributedQueryCampaignFunc = func(ctx context.Context, id uint) (*fleet.DistributedQueryCampaign, error) {
+		return campaign, nil
+	}
+	ds.SaveDistributedQueryCampaignFunc = func(ctx context.Context, campaign *fleet.DistributedQueryCampaign) error {
+		return errors.New("failed save")
+	}
+
+	host := fleet.Host{ID: 1}
+
+	err := svc.ingestDistributedQuery(context.Background(), host, "fleet_distributed_query_42", []map[string]string{}, "", nil)
+	require.Error(t, err)
+	assert.Contains(t, err.Error(), "closing orphaned campaign")
+}
+
+func TestIngestDistributedQueryOrphanedStopError(t *testing.T) {
+	mockClock := clock.NewMockClock()
+	ds := new(mock.Store)
+	rs := pubsub.NewInmemQueryResults()
+	lq := live_query_mock.New(t)
+	svc := &Service{
+		ds:             ds,
+		resultStore:    rs,
+		liveQueryStore: lq,
+		logger:         slog.New(slog.DiscardHandler),
+		clock:          mockClock,
+	}
+
+	campaign := &fleet.DistributedQueryCampaign{
+		ID: 42,
+		UpdateCreateTimestamps: fleet.UpdateCreateTimestamps{
+			CreateTimestamp: fleet.CreateTimestamp{
+				CreatedAt: mockClock.Now().Add(-2 * time.Minute),
+			},
+		},
+	}
+
+	ds.DistributedQueryCampaignFunc = func(ctx context.Context, id uint) (*fleet.DistributedQueryCampaign, error) {
+		return campaign, nil
+	}
+	ds.SaveDistributedQueryCampaignFunc = func(ctx context.Context, campaign *fleet.DistributedQueryCampaign) error {
+		return nil
+	}
+	lq.On("StopQuery", fmt.Sprint(campaign.ID)).Return(errors.New("failed"))
+
+	host := fleet.Host{ID: 1}
+
+	err := svc.ingestDistributedQuery(context.Background(), host, "fleet_distributed_query_42", []map[string]string{}, "", nil)
+	require.Error(t, err)
+	assert.Contains(t, err.Error(), "stopping orphaned campaign")
+}
+
+func TestIngestDistributedQueryOrphanedStop(t *testing.T) {
+	mockClock := clock.NewMockClock()
+	ds := new(mock.Store)
+	rs := pubsub.NewInmemQueryResults()
+	lq := live_query_mock.New(t)
+	svc := &Service{
+		ds:             ds,
+		resultStore:    rs,
+		liveQueryStore: lq,
+		logger:         slog.New(slog.DiscardHandler),
+		clock:          mockClock,
+	}
+
+	campaign := &fleet.DistributedQueryCampaign{
+		ID: 42,
+		UpdateCreateTimestamps: fleet.UpdateCreateTimestamps{
+			CreateTimestamp: fleet.CreateTimestamp{
+				CreatedAt: mockClock.Now().Add(-2 * time.Minute),
+			},
+		},
+	}
+
+	ds.DistributedQueryCampaignFunc = func(ctx context.Context, id uint) (*fleet.DistributedQueryCampaign, error) {
+		return campaign, nil
+	}
+	ds.SaveDistributedQueryCampaignFunc = func(ctx context.Context, campaign *fleet.DistributedQueryCampaign) error {
+		return nil
+	}
+	lq.On("StopQuery", fmt.Sprint(campaign.ID)).Return(nil)
+
+	host := fleet.Host{ID: 1}
+
+	err := svc.ingestDistributedQuery(context.Background(), host, "fleet_distributed_query_42", []map[string]string{}, "", nil)
+	require.Error(t, err)
+	assert.Contains(t, err.Error(), "campaignID=42 stopped")
+	lq.AssertExpectations(t)
+}
+
+func TestIngestDistributedQueryRecordCompletionError(t *testing.T) {
+	mockClock := clock.NewMockClock()
+	ds := new(mock.Store)
+	rs := pubsub.NewInmemQueryResults()
+	lq := live_query_mock.New(t)
+	svc := &Service{
+		ds:             ds,
+		resultStore:    rs,
+		liveQueryStore: lq,
+		logger:         slog.New(slog.DiscardHandler),
+		clock:          mockClock,
+	}
+
+	campaign := &fleet.DistributedQueryCampaign{ID: 42}
+	host := fleet.Host{ID: 1}
+
+	lq.On("QueryCompletedByHost", fmt.Sprint(campaign.ID), host.ID).Return(errors.New("fail"))
+
+	go func() {
+		ch, err := rs.ReadChannel(context.Background(), *campaign)
+		require.NoError(t, err)
+		<-ch
+	}()
+	time.Sleep(10 * time.Millisecond)
+
+	err := svc.ingestDistributedQuery(context.Background(), host, "fleet_distributed_query_42", []map[string]string{}, "", nil)
+	require.Error(t, err)
+	assert.Contains(t, err.Error(), "record query completion")
+	lq.AssertExpectations(t)
+}
+
+func TestIngestDistributedQuery(t *testing.T) {
+	mockClock := clock.NewMockClock()
+	ds := new(mock.Store)
+	rs := pubsub.NewInmemQueryResults()
+	lq := live_query_mock.New(t)
+	svc := &Service{
+		ds:             ds,
+		resultStore:    rs,
+		liveQueryStore: lq,
+		logger:         slog.New(slog.DiscardHandler),
+		clock:          mockClock,
+	}
+
+	campaign := &fleet.DistributedQueryCampaign{ID: 42}
+	host := fleet.Host{ID: 1}
+
+	lq.On("QueryCompletedByHost", fmt.Sprint(campaign.ID), host.ID).Return(nil)
+
+	go func() {
+		ch, err := rs.ReadChannel(context.Background(), *campaign)
+		require.NoError(t, err)
+		<-ch
+	}()
+	time.Sleep(10 * time.Millisecond)
+
+	err := svc.ingestDistributedQuery(context.Background(), host, "fleet_distributed_query_42", []map[string]string{}, "", nil)
+	require.NoError(t, err)
+	lq.AssertExpectations(t)
+}
+
+func TestUpdateHostIntervals(t *testing.T) {
+	ds := new(mock.Store)
+
+	svc, ctx := newTestService(t, ds, nil, nil)
+
+	ds.ListScheduledQueriesForAgentsFunc = func(ctx context.Context, teamID *uint, hostID *uint, queryReportsDisabled bool) ([]*fleet.Query, error) {
+		return nil, nil
+	}
+
+	ds.ListPacksForHostFunc = func(ctx context.Context, hid uint) ([]*fleet.Pack, error) {
+		return []*fleet.Pack{}, nil
+	}
+	ds.ListQueriesFunc = func(ctx context.Context, opt fleet.ListQueryOptions) ([]*fleet.Query, int, int, *fleet.PaginationMetadata, error) {
+		return nil, 0, 0, nil, nil
+	}
+
+	testCases := []struct {
+		name                  string
+		initIntervals         fleet.HostOsqueryIntervals
+		finalIntervals        fleet.HostOsqueryIntervals
+		configOptions         json.RawMessage
+		updateIntervalsCalled bool
+	}{
+		{
+			"Both updated",
+			fleet.HostOsqueryIntervals{
+				ConfigTLSRefresh: 60,
+			},
+			fleet.HostOsqueryIntervals{
+				DistributedInterval: 11,
+				LoggerTLSPeriod:     33,
+				ConfigTLSRefresh:    60,
+			},
+			json.RawMessage(`{"options": {
+				"distributed_interval": 11,
+				"logger_tls_period":    33,
+				"logger_plugin":        "tls"
+			}}`),
+			true,
+		},
+		{
+			"Only logger_tls_period updated",
+			fleet.HostOsqueryIntervals{
+				DistributedInterval: 11,
+				ConfigTLSRefresh:    60,
+			},
+			fleet.HostOsqueryIntervals{
+				DistributedInterval: 11,
+				LoggerTLSPeriod:     33,
+				ConfigTLSRefresh:    60,
+			},
+			json.RawMessage(`{"options": {
+				"distributed_interval": 11,
+				"logger_tls_period":    33
+			}}`),
+			true,
+		},
+		{
+			"Only distributed_interval updated",
+			fleet.HostOsqueryIntervals{
+				ConfigTLSRefresh: 60,
+				LoggerTLSPeriod:  33,
+			},
+			fleet.HostOsqueryIntervals{
+				DistributedInterval: 11,
+				LoggerTLSPeriod:     33,
+				ConfigTLSRefresh:    60,
+			},
+			json.RawMessage(`{"options": {
+				"distributed_interval": 11,
+				"logger_tls_period":    33
+			}}`),
+			true,
+		},
+		{
+			"Fleet not managing distributed_interval",
+			fleet.HostOsqueryIntervals{
+				ConfigTLSRefresh:    60,
+				DistributedInterval: 11,
+			},
+			fleet.HostOsqueryIntervals{
+				DistributedInterval: 11,
+				LoggerTLSPeriod:     33,
+				ConfigTLSRefresh:    60,
+			},
+			json.RawMessage(`{"options":{
+				"logger_tls_period": 33
+			}}`),
+			true,
+		},
+		{
+			"config_refresh should also cause an update",
+			fleet.HostOsqueryIntervals{
+				DistributedInterval: 11,
+				LoggerTLSPeriod:     33,
+				ConfigTLSRefresh:    60,
+			},
+			fleet.HostOsqueryIntervals{
+				DistributedInterval: 11,
+				LoggerTLSPeriod:     33,
+				ConfigTLSRefresh:    42,
+			},
+			json.RawMessage(`{"options":{
+				"distributed_interval": 11,
+				"logger_tls_period":    33,
+				"config_refresh":    42
+			}}`),
+			true,
+		},
+		{
+			"update intervals should not be called with no changes",
+			fleet.HostOsqueryIntervals{
+				DistributedInterval: 11,
+				LoggerTLSPeriod:     33,
+				ConfigTLSRefresh:    60,
+			},
+			fleet.HostOsqueryIntervals{
+				DistributedInterval: 11,
+				LoggerTLSPeriod:     33,
+				ConfigTLSRefresh:    60,
+			},
+			json.RawMessage(`{"options":{
+				"distributed_interval": 11,
+				"logger_tls_period":    33
+			}}`),
+			false,
+		},
+	}
+
+	for _, tt := range testCases {
+		t.Run(tt.name, func(t *testing.T) {
+			ctx := hostctx.NewContext(ctx, &fleet.Host{
+				ID:                  1,
+				NodeKey:             new("123456"),
+				DistributedInterval: tt.initIntervals.DistributedInterval,
+				ConfigTLSRefresh:    tt.initIntervals.ConfigTLSRefresh,
+				LoggerTLSPeriod:     tt.initIntervals.LoggerTLSPeriod,
+			})
+
+			ds.AppConfigFunc = func(ctx context.Context) (*fleet.AppConfig, error) {
+				return &fleet.AppConfig{AgentOptions: ptr.RawMessage(json.RawMessage(`{"config":` + string(tt.configOptions) + `}`))}, nil
+			}
+
+			updateIntervalsCalled := false
+			ds.UpdateHostOsqueryIntervalsFunc = func(ctx context.Context, hostID uint, intervals fleet.HostOsqueryIntervals) error {
+				if hostID != 1 {
+					return errors.New("not found")
+				}
+				updateIntervalsCalled = true
+				assert.Equal(t, tt.finalIntervals, intervals)
+				return nil
+			}
+
+			_, err := svc.GetClientConfig(ctx)
+			require.NoError(t, err)
+			assert.Equal(t, tt.updateIntervalsCalled, updateIntervalsCalled)
+		})
+	}
+}
+
+func TestAuthenticationErrors(t *testing.T) {
+	ms := new(mock.Store)
+	ms.LoadHostByNodeKeyFunc = func(ctx context.Context, nodeKey string) (*fleet.Host, error) {
+		return nil, nil
+	}
+
+	svc, ctx := newTestService(t, ms, nil, nil)
+
+	_, _, err := svc.AuthenticateHost(ctx, "")
+	require.Error(t, err)
+	require.True(t, err.(*OsqueryError).NodeInvalid())
+
+	ms.LoadHostByNodeKeyFunc = func(ctx context.Context, nodeKey string) (*fleet.Host, error) {
+		return &fleet.Host{ID: 1, HasHostIdentityCert: ptr.Bool(false)}, nil
+	}
+	ms.AppConfigFunc = func(ctx context.Context) (*fleet.AppConfig, error) {
+		return &fleet.AppConfig{}, nil
+	}
+	ms.GetHostIdentityCertByNameFunc = func(ctx context.Context, name string) (*types.HostIdentityCertificate, error) {
+		return nil, newNotFoundError()
+	}
+	_, _, err = svc.AuthenticateHost(ctx, "foo")
+	require.NoError(t, err)
+
+	// return not found error
+	ms.LoadHostByNodeKeyFunc = func(ctx context.Context, nodeKey string) (*fleet.Host, error) {
+		return nil, newNotFoundError()
+	}
+
+	_, _, err = svc.AuthenticateHost(ctx, "foo")
+	require.Error(t, err)
+	require.True(t, err.(*OsqueryError).NodeInvalid())
+
+	// return other error
+	ms.LoadHostByNodeKeyFunc = func(ctx context.Context, nodeKey string) (*fleet.Host, error) {
+		return nil, errors.New("foo")
+	}
+
+	_, _, err = svc.AuthenticateHost(ctx, "foo")
+	require.NotNil(t, err)
+	require.False(t, err.(*OsqueryError).NodeInvalid())
+}
+
+func TestGetHostIdentifier(t *testing.T) {
+	t.Parallel()
+
+	details := map[string](map[string]string){
+		"osquery_info": map[string]string{
+			"uuid":        "foouuid",
+			"instance_id": "fooinstance",
+		},
+		"system_info": map[string]string{
+			"hostname": "foohost",
+		},
+	}
+
+	emptyDetails := map[string](map[string]string){
+		"osquery_info": map[string]string{
+			"uuid":        "",
+			"instance_id": "",
+		},
+		"system_info": map[string]string{
+			"hostname": "",
+		},
+	}
+
+	testCases := []struct {
+		identifierOption   string
+		providedIdentifier string
+		details            map[string](map[string]string)
+		expected           string
+		shouldPanic        bool
+	}{
+		// Panix
+		{identifierOption: "bad", shouldPanic: true},
+		{identifierOption: "", shouldPanic: true},
+
+		// Missing details
+		{identifierOption: "instance", providedIdentifier: "foobar", expected: "foobar"},
+		{identifierOption: "uuid", providedIdentifier: "foobar", expected: "foobar"},
+		{identifierOption: "hostname", providedIdentifier: "foobar", expected: "foobar"},
+		{identifierOption: "provided", providedIdentifier: "foobar", expected: "foobar"},
+
+		// Empty details
+		{identifierOption: "instance", providedIdentifier: "foobar", details: emptyDetails, expected: "foobar"},
+		{identifierOption: "uuid", providedIdentifier: "foobar", details: emptyDetails, expected: "foobar"},
+		{identifierOption: "hostname", providedIdentifier: "foobar", details: emptyDetails, expected: "foobar"},
+		{identifierOption: "provided", providedIdentifier: "foobar", details: emptyDetails, expected: "foobar"},
+
+		// Successes
+		{identifierOption: "instance", providedIdentifier: "foobar", details: details, expected: "fooinstance"},
+		{identifierOption: "uuid", providedIdentifier: "foobar", details: details, expected: "foouuid"},
+		{identifierOption: "hostname", providedIdentifier: "foobar", details: details, expected: "foohost"},
+		{identifierOption: "provided", providedIdentifier: "foobar", details: details, expected: "foobar"},
+	}
+	logger := slog.New(slog.DiscardHandler)
+
+	for _, tt := range testCases {
+		t.Run("", func(t *testing.T) {
+			if tt.shouldPanic {
+				assert.Panics(
+					t,
+					func() { getHostIdentifier(t.Context(), logger, tt.identifierOption, tt.providedIdentifier, tt.details) },
+				)
+				return
+			}
+
+			assert.Equal(
+				t,
+				tt.expected,
+				getHostIdentifier(t.Context(), logger, tt.identifierOption, tt.providedIdentifier, tt.details),
+			)
+		})
+	}
+}
+
+func TestDistributedQueriesLogsManyErrors(t *testing.T) {
+	buf := new(bytes.Buffer)
+	logger := slog.New(slog.NewJSONHandler(buf, nil))
+	ds := new(mock.Store)
+	svc, ctx := newTestService(t, ds, nil, nil)
+
+	host := &fleet.Host{
+		ID:       1,
+		Platform: "darwin",
+	}
+
+	ds.UpdateHostFunc = func(ctx context.Context, host *fleet.Host) error {
+		return authz.CheckMissingWithResponse(nil)
+	}
+	ds.RecordLabelQueryExecutionsFunc = func(ctx context.Context, host *fleet.Host, results map[uint]*bool, t time.Time, deferred bool) error {
+		return errors.New("something went wrong")
+	}
+	ds.AppConfigFunc = func(ctx context.Context) (*fleet.AppConfig, error) {
+		return &fleet.AppConfig{}, nil
+	}
+	ds.SaveHostAdditionalFunc = func(ctx context.Context, hostID uint, additional *json.RawMessage) error {
+		return errors.New("something went wrong")
+	}
+	ds.LabelQueriesForHostFunc = func(ctx context.Context, host *fleet.Host) (map[string]string, error) {
+		return map[string]string{"1": "SELECT 1;"}, nil
+	}
+
+	lCtx := &fleetLogging.LoggingContext{}
+	ctx = fleetLogging.NewContext(ctx, lCtx)
+	ctx = hostctx.NewContext(ctx, host)
+
+	err := svc.SubmitDistributedQueryResults(
+		ctx,
+		map[string][]map[string]string{
+			hostDetailQueryPrefix + "network_interface_unix": {{"col1": "val1"}}, // we need one detail query that updates hosts.
+			hostLabelQueryPrefix + "1":                       {{"col1": "val1"}},
+			hostAdditionalQueryPrefix + "1":                  {{"col1": "val1"}},
+		},
+		map[string]fleet.OsqueryStatus{},
+		map[string]string{},
+		map[string]*fleet.Stats{},
+	)
+	require.NoError(t, err)
+
+	lCtx.Log(ctx, logger)
+
+	logs := buf.String()
+	parts := strings.Split(strings.TrimSpace(logs), "\n")
+	require.Len(t, parts, 1)
+
+	var logData map[string]interface{}
+	err = json.Unmarshal([]byte(parts[0]), &logData)
+	require.NoError(t, err)
+	assert.Equal(t, "something went wrong || something went wrong", logData["err"])
+	assert.Equal(t, "Missing authorization check", logData["internal"])
+}
+
+func TestDistributedQueriesReloadsHostIfDetailsAreIn(t *testing.T) {
+	ds := new(mock.Store)
+	svc, ctx := newTestService(t, ds, nil, nil)
+
+	host := &fleet.Host{
+		ID:       42,
+		Platform: "darwin",
+	}
+
+	ds.UpdateHostFunc = func(ctx context.Context, host *fleet.Host) error {
+		return nil
+	}
+	ds.AppConfigFunc = func(ctx context.Context) (*fleet.AppConfig, error) {
+		return &fleet.AppConfig{}, nil
+	}
+
+	ctx = hostctx.NewContext(ctx, host)
+
+	err := svc.SubmitDistributedQueryResults(
+		ctx,
+		map[string][]map[string]string{
+			hostDetailQueryPrefix + "network_interface_unix": {{"col1": "val1"}},
+		},
+		map[string]fleet.OsqueryStatus{},
+		map[string]string{},
+		map[string]*fleet.Stats{},
+	)
+	require.NoError(t, err)
+	assert.True(t, ds.UpdateHostFuncInvoked)
+}
+
+func TestObserversCanOnlyRunDistributedCampaigns(t *testing.T) {
+	ds := new(mock.Store)
+	rs := &mockresult.QueryResultStore{
+		HealthCheckFunc: func() error {
+			return nil
+		},
+	}
+	lq := live_query_mock.New(t)
+	mockClock := clock.NewMockClock()
+	svc, ctx := newTestServiceWithClock(t, ds, rs, lq, mockClock)
+
+	ds.AppConfigFunc = func(ctx context.Context) (*fleet.AppConfig, error) {
+		return &fleet.AppConfig{}, nil
+	}
+
+	ds.NewDistributedQueryCampaignFunc = func(ctx context.Context, camp *fleet.DistributedQueryCampaign) (*fleet.DistributedQueryCampaign, error) {
+		return camp, nil
+	}
+	ds.QueryFunc = func(ctx context.Context, id uint) (*fleet.Query, error) {
+		return &fleet.Query{
+			ID:             42,
+			Name:           "query",
+			Query:          "select 1;",
+			ObserverCanRun: false,
+		}, nil
+	}
+	viewerCtx := viewer.NewContext(ctx, viewer.Viewer{
+		User: &fleet.User{ID: 0, GlobalRole: ptr.String(fleet.RoleObserver)},
+	})
+
+	q := "select year, month, day, hour, minutes, seconds from time"
+	_, err := svc.NewDistributedQueryCampaign(viewerCtx, q, nil, fleet.HostTargets{HostIDs: []uint{2}, LabelIDs: []uint{1}})
+	require.Error(t, err)
+
+	_, err = svc.NewDistributedQueryCampaign(viewerCtx, "", ptr.Uint(42), fleet.HostTargets{HostIDs: []uint{2}, LabelIDs: []uint{1}})
+	require.Error(t, err)
+
+	ds.QueryFunc = func(ctx context.Context, id uint) (*fleet.Query, error) {
+		return &fleet.Query{
+			ID:             42,
+			Name:           "query",
+			Query:          "select 1;",
+			ObserverCanRun: true,
+		}, nil
+	}
+
+	ds.LabelQueriesForHostFunc = func(ctx context.Context, host *fleet.Host) (map[string]string, error) {
+		return map[string]string{}, nil
+	}
+	ds.NewDistributedQueryCampaignFunc = func(ctx context.Context, camp *fleet.DistributedQueryCampaign) (*fleet.DistributedQueryCampaign, error) {
+		camp.ID = 21
+		return camp, nil
+	}
+	ds.NewDistributedQueryCampaignTargetFunc = func(ctx context.Context,
+		target *fleet.DistributedQueryCampaignTarget,
+	) (*fleet.DistributedQueryCampaignTarget, error) {
+		return target, nil
+	}
+	ds.CountHostsInTargetsFunc = func(ctx context.Context, filter fleet.TeamFilter, targets fleet.HostTargets, now time.Time) (fleet.TargetMetrics,
+		error,
+	) {
+		return fleet.TargetMetrics{}, nil
+	}
+	ds.HostIDsInTargetsFunc = func(ctx context.Context, filter fleet.TeamFilter, targets fleet.HostTargets) ([]uint, error) {
+		return []uint{1, 3, 5}, nil
+	}
+	lq.On("RunQuery", "21", "select 1;", []uint{1, 3, 5}).Return(nil)
+	_, err = svc.NewDistributedQueryCampaign(viewerCtx, "", ptr.Uint(42), fleet.HostTargets{HostIDs: []uint{2}, LabelIDs: []uint{1}})
+	require.NoError(t, err)
+}
+
+func TestTeamMaintainerCanRunNewDistributedCampaigns(t *testing.T) {
+	ds := new(mock.Store)
+	rs := &mockresult.QueryResultStore{
+		HealthCheckFunc: func() error {
+			return nil
+		},
+	}
+	lq := live_query_mock.New(t)
+	mockClock := clock.NewMockClock()
+	svc, ctx := newTestServiceWithClock(t, ds, rs, lq, mockClock)
+
+	ds.AppConfigFunc = func(ctx context.Context) (*fleet.AppConfig, error) {
+		return &fleet.AppConfig{}, nil
+	}
+
+	ds.NewDistributedQueryCampaignFunc = func(ctx context.Context, camp *fleet.DistributedQueryCampaign) (*fleet.DistributedQueryCampaign, error) {
+		return camp, nil
+	}
+	ds.QueryFunc = func(ctx context.Context, id uint) (*fleet.Query, error) {
+		return &fleet.Query{
+			ID:             42,
+			AuthorID:       ptr.Uint(99),
+			Name:           "query",
+			Query:          "select 1;",
+			ObserverCanRun: false,
+		}, nil
+	}
+	viewerCtx := viewer.NewContext(ctx, viewer.Viewer{
+		User: &fleet.User{ID: 99, Teams: []fleet.UserTeam{{Team: fleet.Team{ID: 123}, Role: fleet.RoleMaintainer}}},
+	})
+
+	q := "select year, month, day, hour, minutes, seconds from time"
+	// var gotQuery *fleet.Query
+	ds.NewQueryFunc = func(ctx context.Context, query *fleet.Query, opts ...fleet.OptionalArg) (*fleet.Query, error) {
+		// gotQuery = query
+		query.ID = 42
+		return query, nil
+	}
+	ds.NewDistributedQueryCampaignTargetFunc = func(ctx context.Context,
+		target *fleet.DistributedQueryCampaignTarget,
+	) (*fleet.DistributedQueryCampaignTarget, error) {
+		return target, nil
+	}
+	ds.CountHostsInTargetsFunc = func(ctx context.Context, filter fleet.TeamFilter, targets fleet.HostTargets, now time.Time) (fleet.TargetMetrics,
+		error,
+	) {
+		return fleet.TargetMetrics{}, nil
+	}
+	ds.HostIDsInTargetsFunc = func(ctx context.Context, filter fleet.TeamFilter, targets fleet.HostTargets) ([]uint, error) {
+		return []uint{1, 3, 5}, nil
+	}
+	lq.On("RunQuery", "0", "select year, month, day, hour, minutes, seconds from time", []uint{1, 3, 5}).Return(nil)
+	_, err := svc.NewDistributedQueryCampaign(viewerCtx, q, nil, fleet.HostTargets{HostIDs: []uint{2}, LabelIDs: []uint{1}, TeamIDs: []uint{123}})
+	require.NoError(t, err)
+}
+
+// filterPolicyQueries narrows a host's in-scope policy queries to the requested IDs, as the real
+// PolicyQueriesForHostFiltered does.
+func filterPolicyQueries(inScope map[string]string, policyIDs []uint) map[string]string {
+	filtered := make(map[string]string, len(policyIDs))
+	for _, policyID := range policyIDs {
+		if query, ok := inScope[fmt.Sprint(policyID)]; ok {
+			filtered[fmt.Sprint(policyID)] = query
+		}
+	}
+	return filtered
+}
+
+// mockPolicyQueriesForHostFiltered wires PolicyQueriesForHostFiltered to the store's already-configured
+// PolicyQueriesForHost mock -- the same relationship the real datastore has between the two. distributed/write
+// validates incoming policy results through the filtered variant, so tests that submit policy results need it.
+func mockPolicyQueriesForHostFiltered(ds *mock.Store) {
+	ds.PolicyQueriesForHostFilteredFunc = func(ctx context.Context, host *fleet.Host, policyIDs []uint) (map[string]string, error) {
+		inScope, err := ds.PolicyQueriesForHostFunc(ctx, host)
+		if err != nil {
+			return nil, err
+		}
+		return filterPolicyQueries(inScope, policyIDs), nil
+	}
+}
+
+func TestPolicyQueries(t *testing.T) {
+	mockClock := clock.NewMockClock()
+	ds := new(mock.Store)
+	lq := live_query_mock.New(t)
+	svc, ctx := newTestServiceWithClock(t, ds, nil, lq, mockClock)
+
+	host := &fleet.Host{
+		Platform: "darwin",
+	}
+
+	ds.LabelQueriesForHostFunc = func(ctx context.Context, host *fleet.Host) (map[string]string, error) {
+		return map[string]string{}, nil
+	}
+	ds.HostLiteFunc = func(ctx context.Context, id uint) (*fleet.Host, error) {
+		return host, nil
+	}
+	ds.UpdateHostFunc = func(ctx context.Context, gotHost *fleet.Host) error {
+		host = gotHost
+		return nil
+	}
+	ds.AppConfigFunc = func(ctx context.Context) (*fleet.AppConfig, error) {
+		return &fleet.AppConfig{Features: fleet.Features{
+			EnableHostUsers:         true,
+			EnableSoftwareInventory: true,
+		}}, nil
+	}
+	ds.GetHostAwaitingConfigurationFunc = func(ctx context.Context, hostuuid string) (bool, error) {
+		return false, nil
+	}
+
+	lq.On("QueriesForHost", uint(0)).Return(map[string]string{}, nil)
+
+	ds.PolicyQueriesForHostFunc = func(ctx context.Context, host *fleet.Host) (map[string]string, error) {
+		return map[string]string{"1": "select 1", "2": "select 42;"}, nil
+	}
+	mockPolicyQueriesForHostFiltered(ds)
+	recordedResults := make(map[uint]*bool)
+	ds.RecordPolicyQueryExecutionsFunc = func(ctx context.Context, gotHost *fleet.Host, results map[uint]*bool, updated time.Time,
+		deferred bool, newlyPassingPolicyIDs []uint,
+	) ([]uint, error) {
+		recordedResults = results
+		host = gotHost
+		return nil, nil
+	}
+	ds.FlippingPoliciesForHostFunc = func(ctx context.Context, hostID uint, incomingResults map[uint]*bool) (newFailing []uint, newPassing []uint,
+		err error,
+	) {
+		return nil, nil, nil
+	}
+	ds.TeamLiteFunc = func(ctx context.Context, id uint) (*fleet.TeamLite, error) {
+		return &fleet.TeamLite{ID: 0}, nil
+	}
+
+	ctx = hostctx.NewContext(ctx, host)
+
+	queries, discovery, _, err := svc.GetDistributedQueries(ctx)
+	require.NoError(t, err)
+	// +2 policy queries
+	require.Equal(t, len(expectedDetailQueriesForPlatform(host.Platform))+2, len(queries), distQueriesMapKeys(queries))
+	verifyDiscovery(t, queries, discovery)
+
+	checkPolicyResults := func(queries map[string]string) {
+		hasPolicy1, hasPolicy2 := false, false
+		for name := range queries {
+			if strings.HasPrefix(name, hostPolicyQueryPrefix) {
+				if name[len(hostPolicyQueryPrefix):] == "1" {
+					hasPolicy1 = true
+				}
+				if name[len(hostPolicyQueryPrefix):] == "2" {
+					hasPolicy2 = true
+				}
+			}
+		}
+		assert.True(t, hasPolicy1)
+		assert.True(t, hasPolicy2)
+	}
+
+	checkPolicyResults(queries)
+
+	// Record a query execution.
+	err = svc.SubmitDistributedQueryResults(
+		ctx,
+		map[string][]map[string]string{
+			hostPolicyQueryPrefix + "1": {{"col1": "val1"}},
+			hostPolicyQueryPrefix + "2": {},
+		},
+		map[string]fleet.OsqueryStatus{
+			hostPolicyQueryPrefix + "2": 1,
+		},
+		map[string]string{},
+		map[string]*fleet.Stats{},
+	)
+	require.NoError(t, err)
+	require.Len(t, recordedResults, 2)
+	require.NotNil(t, recordedResults[1])
+	require.True(t, *recordedResults[1])
+	result, ok := recordedResults[2]
+	require.True(t, ok)
+	require.Nil(t, result)
+
+	noPolicyResults := func(queries map[string]string) {
+		hasAnyPolicy := false
+		for name := range queries {
+			if strings.HasPrefix(name, hostPolicyQueryPrefix) {
+				hasAnyPolicy = true
+				break
+			}
+		}
+		assert.False(t, hasAnyPolicy)
+	}
+
+	// After the first time we get policies and update the host, then there shouldn't be any policies.
+	ctx = hostctx.NewContext(ctx, host)
+	queries, discovery, _, err = svc.GetDistributedQueries(ctx)
+	require.NoError(t, err)
+	require.Equal(t, len(expectedDetailQueriesForPlatform(host.Platform)), len(queries), distQueriesMapKeys(queries))
+	verifyDiscovery(t, queries, discovery)
+	noPolicyResults(queries)
+
+	// Let's move time forward, there should be policies now.
+	mockClock.AddTime(2 * time.Hour)
+
+	queries, discovery, _, err = svc.GetDistributedQueries(ctx)
+	require.NoError(t, err)
+	// +2 policy queries
+	require.Equal(t, len(expectedDetailQueriesForPlatform(host.Platform))+2, len(queries), distQueriesMapKeys(queries))
+	verifyDiscovery(t, queries, discovery)
+	checkPolicyResults(queries)
+
+	// Record another query execution.
+	err = svc.SubmitDistributedQueryResults(
+		ctx,
+		map[string][]map[string]string{
+			hostPolicyQueryPrefix + "1": {{"col1": "val1"}},
+			hostPolicyQueryPrefix + "2": {},
+		},
+		map[string]fleet.OsqueryStatus{
+			hostPolicyQueryPrefix + "2": 1,
+		},
+		map[string]string{},
+		map[string]*fleet.Stats{},
+	)
+	require.NoError(t, err)
+	require.Len(t, recordedResults, 2)
+	require.NotNil(t, recordedResults[1])
+	require.True(t, *recordedResults[1])
+	result, ok = recordedResults[2]
+	require.True(t, ok)
+	require.Nil(t, result)
+
+	// There shouldn't be any policies now.
+	ctx = hostctx.NewContext(ctx, host)
+	queries, discovery, _, err = svc.GetDistributedQueries(ctx)
+	require.NoError(t, err)
+	require.Equal(t, len(expectedDetailQueriesForPlatform(host.Platform)), len(queries), distQueriesMapKeys(queries))
+	verifyDiscovery(t, queries, discovery)
+	noPolicyResults(queries)
+
+	// With refetch requested policy queries should be returned.
+	host.RefetchRequested = true
+	ctx = hostctx.NewContext(ctx, host)
+	queries, discovery, _, err = svc.GetDistributedQueries(ctx)
+	require.NoError(t, err)
+	// +2 policy queries
+	require.Equal(t, len(expectedDetailQueriesForPlatform(host.Platform))+2, len(queries), distQueriesMapKeys(queries))
+	verifyDiscovery(t, queries, discovery)
+	checkPolicyResults(queries)
+
+	// Record another query execution.
+	err = svc.SubmitDistributedQueryResults(
+		ctx,
+		map[string][]map[string]string{
+			hostPolicyQueryPrefix + "1": {{"col1": "val1"}},
+			hostPolicyQueryPrefix + "2": {},
+		},
+		map[string]fleet.OsqueryStatus{
+			hostPolicyQueryPrefix + "2": 1,
+		},
+		map[string]string{},
+		map[string]*fleet.Stats{},
+	)
+	require.NoError(t, err)
+	require.NotNil(t, recordedResults[1])
+	require.True(t, *recordedResults[1])
+	result, ok = recordedResults[2]
+	require.True(t, ok)
+	require.Nil(t, result)
+
+	// SubmitDistributedQueryResults will set RefetchRequested to false.
+	require.False(t, host.RefetchRequested)
+
+	// There shouldn't be any policies now.
+	ctx = hostctx.NewContext(ctx, host)
+	queries, discovery, _, err = svc.GetDistributedQueries(ctx)
+	require.NoError(t, err)
+	require.Equal(t, len(expectedDetailQueriesForPlatform(host.Platform)), len(queries), distQueriesMapKeys(queries))
+	verifyDiscovery(t, queries, discovery)
+	noPolicyResults(queries)
+}
+
+func TestPolicyMembershipOutOfScopeCleanup(t *testing.T) {
+	ds := new(mock.Store)
+	lq := live_query_mock.New(t)
+	svc, ctx := newTestService(t, ds, nil, lq)
+
+	host := &fleet.Host{ID: 42, Platform: "darwin"}
+
+	ds.AppConfigFunc = func(ctx context.Context) (*fleet.AppConfig, error) {
+		return &fleet.AppConfig{}, nil
+	}
+	inSetupExperience := false
+	ds.GetHostAwaitingConfigurationFunc = func(ctx context.Context, hostUUID string) (bool, error) {
+		return inSetupExperience, nil
+	}
+	ds.FlippingPoliciesForHostFunc = func(ctx context.Context, hostID uint, incomingResults map[uint]*bool) ([]uint, []uint, error) {
+		return nil, nil, nil
+	}
+	ds.TeamLiteFunc = func(ctx context.Context, id uint) (*fleet.TeamLite, error) {
+		return &fleet.TeamLite{ID: 0}, nil
+	}
+	ds.PolicyQueriesForHostFunc = func(ctx context.Context, host *fleet.Host) (map[string]string, error) {
+		return map[string]string{"1": "select 1"}, nil
+	}
+	mockPolicyQueriesForHostFiltered(ds)
+	stalePolicyIDs := []uint{7, 9}
+	ds.RecordPolicyQueryExecutionsFunc = func(ctx context.Context, gotHost *fleet.Host, results map[uint]*bool, updated time.Time,
+		deferred bool, newlyPassingPolicyIDs []uint,
+	) ([]uint, error) {
+		return stalePolicyIDs, nil
+	}
+	var clearedPolicyIDs []uint
+	ds.ClearHostPolicyMembershipForPoliciesFunc = func(ctx context.Context, hostID uint, policyIDs []uint) error {
+		require.Equal(t, host.ID, hostID)
+		clearedPolicyIDs = policyIDs
+		return nil
+	}
+	ds.UpdateHostIssuesFailingPoliciesForSingleHostFunc = func(ctx context.Context, hostID uint) error {
+		return nil
+	}
+
+	ctx = hostctx.NewContext(ctx, host)
+
+	submit := func(results map[string][]map[string]string) {
+		err := svc.SubmitDistributedQueryResults(
+			ctx, results, map[string]fleet.OsqueryStatus{}, map[string]string{}, map[string]*fleet.Stats{},
+		)
+		require.NoError(t, err)
+	}
+	resetInvoked := func() {
+		clearedPolicyIDs = nil
+		ds.ClearHostPolicyMembershipForPoliciesFuncInvoked = false
+		ds.UpdateHostIssuesFailingPoliciesForSingleHostFuncInvoked = false
+		ds.GetHostAwaitingConfigurationFuncInvoked = false
+	}
+	policyResults := map[string][]map[string]string{
+		hostPolicyQueryPrefix + "1": {{"col1": "val1"}},
+	}
+
+	// Stale policies reported by RecordPolicyQueryExecutions are deleted and
+	// the host's failing policies count is refreshed.
+	submit(policyResults)
+	require.Equal(t, []uint{7, 9}, clearedPolicyIDs)
+	require.True(t, ds.UpdateHostIssuesFailingPoliciesForSingleHostFuncInvoked)
+
+	// Hosts in setup experience are sent a filtered subset of policy queries,
+	// so their stale set is not meaningful and nothing is deleted.
+	resetInvoked()
+	inSetupExperience = true
+	submit(policyResults)
+	require.False(t, ds.ClearHostPolicyMembershipForPoliciesFuncInvoked)
+	require.False(t, ds.UpdateHostIssuesFailingPoliciesForSingleHostFuncInvoked)
+
+	// No stale policies: nothing is deleted and the setup experience gate is
+	// not even checked.
+	resetInvoked()
+	inSetupExperience = false
+	stalePolicyIDs = nil
+	submit(policyResults)
+	require.False(t, ds.ClearHostPolicyMembershipForPoliciesFuncInvoked)
+	require.False(t, ds.GetHostAwaitingConfigurationFuncInvoked)
+
+	// The "no policies in scope" wildcard also cleans up stale rows.
+	resetInvoked()
+	stalePolicyIDs = []uint{7}
+	submit(map[string][]map[string]string{
+		hostNoPoliciesWildcard: {{"1": "1"}},
+	})
+	require.Equal(t, []uint{7}, clearedPolicyIDs)
+	require.True(t, ds.UpdateHostIssuesFailingPoliciesForSingleHostFuncInvoked)
+}
+
+func TestOutOfScopePolicyResultsAreDiscarded(t *testing.T) {
+	ds := new(mock.Store)
+	lq := live_query_mock.New(t)
+	svc, ctx := newTestService(t, ds, nil, lq)
+
+	host := &fleet.Host{ID: 42, Platform: "darwin"}
+
+	ds.AppConfigFunc = func(ctx context.Context) (*fleet.AppConfig, error) {
+		return &fleet.AppConfig{}, nil
+	}
+	ds.TeamLiteFunc = func(ctx context.Context, id uint) (*fleet.TeamLite, error) {
+		return &fleet.TeamLite{ID: 0}, nil
+	}
+	inSetupExperience := false
+	ds.GetHostAwaitingConfigurationFunc = func(ctx context.Context, hostUUID string) (bool, error) {
+		return inSetupExperience, nil
+	}
+	var setupExperiencePolicyIDs []uint
+	ds.GetSetupExperiencePolicyIDsForHostFunc = func(ctx context.Context, hostUUID string) ([]uint, error) {
+		return setupExperiencePolicyIDs, nil
+	}
+	inScopePolicies := map[string]string{"1": "select 1", "2": "select 2"}
+	// Set directly rather than via mockPolicyQueriesForHostFiltered: that helper reads through
+	// PolicyQueriesForHostFunc, which this test asserts is never invoked. filteredForIDs records the IDs the scope
+	// lookup was asked about.
+	var filteredForIDs []uint
+	ds.PolicyQueriesForHostFilteredFunc = func(ctx context.Context, gotHost *fleet.Host, policyIDs []uint) (map[string]string, error) {
+		require.Equal(t, host.ID, gotHost.ID)
+		filteredForIDs = policyIDs
+		return filterPolicyQueries(inScopePolicies, policyIDs), nil
+	}
+	var flippingResults map[uint]*bool
+	ds.FlippingPoliciesForHostFunc = func(ctx context.Context, hostID uint, incomingResults map[uint]*bool) ([]uint, []uint, error) {
+		flippingResults = incomingResults
+		return nil, nil, nil
+	}
+	var recordedResults map[uint]*bool
+	ds.RecordPolicyQueryExecutionsFunc = func(ctx context.Context, gotHost *fleet.Host, results map[uint]*bool, updated time.Time,
+		deferred bool, newlyPassingPolicyIDs []uint,
+	) ([]uint, error) {
+		recordedResults = results
+		return nil, nil
+	}
+	// A failing policy on a macOS host reaches the profile resend automation, which is not what
+	// this test is about. The other automations skip this host on their own (no orbit node key,
+	// no license, no enterprise overrides); this one has no such gate.
+	ds.GetPoliciesWithAssociatedProfileFunc = func(ctx context.Context, teamID uint, policyIDs []uint) ([]fleet.PolicyProfileData, error) {
+		return nil, nil
+	}
+
+	ctx = hostctx.NewContext(ctx, host)
+
+	submit := func(results map[string][]map[string]string, statuses map[string]fleet.OsqueryStatus) {
+		flippingResults, recordedResults, filteredForIDs = nil, nil, nil
+		ds.RecordPolicyQueryExecutionsFuncInvoked = false
+		ds.PolicyQueriesForHostFilteredFuncInvoked = false
+		ds.PolicyQueriesForHostFuncInvoked = false
+		ds.UpdateHostFuncInvoked = false
+		ds.SaveHostAdditionalFuncInvoked = false
+		ds.GetHostAwaitingConfigurationFuncInvoked = false
+		ds.GetSetupExperiencePolicyIDsForHostFuncInvoked = false
+		err := svc.SubmitDistributedQueryResults(ctx, results, statuses, map[string]string{}, map[string]*fleet.Stats{})
+		require.NoError(t, err)
+	}
+
+	t.Run("scope lookup is restricted to the reported policy IDs", func(t *testing.T) {
+		submit(map[string][]map[string]string{
+			hostPolicyQueryPrefix + "1":  {{"col1": "val1"}},
+			hostPolicyQueryPrefix + "99": {},
+		}, map[string]fleet.OsqueryStatus{})
+
+		// Never the host's whole policy set: this runs on every policy-reporting check-in.
+		require.True(t, ds.PolicyQueriesForHostFilteredFuncInvoked)
+		require.False(t, ds.PolicyQueriesForHostFuncInvoked)
+		require.ElementsMatch(t, []uint{1, 99}, filteredForIDs)
+	})
+
+	t.Run("forged policy IDs are dropped, in-scope results kept", func(t *testing.T) {
+		submit(map[string][]map[string]string{
+			hostPolicyQueryPrefix + "1":  {{"col1": "val1"}}, // in scope, passes
+			hostPolicyQueryPrefix + "2":  {},                 // in scope, fails
+			hostPolicyQueryPrefix + "99": {},                 // not in scope: another fleet's policy
+		}, map[string]fleet.OsqueryStatus{})
+
+		require.True(t, ds.RecordPolicyQueryExecutionsFuncInvoked)
+		require.Equal(t, map[uint]*bool{1: new(true), 2: new(false)}, recordedResults)
+		require.Equal(t, map[uint]*bool{1: new(true), 2: new(false)}, flippingResults)
+	})
+
+	t.Run("failed results for forged policy IDs are dropped too", func(t *testing.T) {
+		submit(map[string][]map[string]string{
+			hostPolicyQueryPrefix + "1":  {{"col1": "val1"}},
+			hostPolicyQueryPrefix + "99": {},
+		}, map[string]fleet.OsqueryStatus{
+			hostPolicyQueryPrefix + "99": 1, // reported as errored, which records a nil (unknown) result
+		})
+
+		require.Equal(t, map[uint]*bool{1: new(true)}, recordedResults)
+	})
+
+	t.Run("payload of only forged policy IDs records nothing", func(t *testing.T) {
+		submit(map[string][]map[string]string{
+			hostPolicyQueryPrefix + "99": {},
+		}, map[string]fleet.OsqueryStatus{})
+
+		require.False(t, ds.RecordPolicyQueryExecutionsFuncInvoked)
+	})
+
+	t.Run("policy that fell out of scope between read and write is dropped", func(t *testing.T) {
+		inScopePolicies = map[string]string{"1": "select 1"}
+		t.Cleanup(func() { inScopePolicies = map[string]string{"1": "select 1", "2": "select 2"} })
+
+		submit(map[string][]map[string]string{
+			hostPolicyQueryPrefix + "1": {{"col1": "val1"}},
+			hostPolicyQueryPrefix + "2": {{"col1": "val1"}},
+		}, map[string]fleet.OsqueryStatus{})
+
+		require.Equal(t, map[uint]*bool{1: new(true)}, recordedResults)
+	})
+
+	// A host in setup experience is sent only the policies gating its pending items, but results are checked against
+	// its full in-scope set: those policies are legitimately the host's, so a result for one is worth keeping even if
+	// setup experience had not asked for it yet. Setup experience is therefore not consulted on this path at all.
+	t.Run("setup experience does not narrow the accepted set", func(t *testing.T) {
+		inSetupExperience = true
+		setupExperiencePolicyIDs = []uint{1}
+		t.Cleanup(func() {
+			inSetupExperience = false
+			setupExperiencePolicyIDs = nil
+		})
+
+		submit(map[string][]map[string]string{
+			hostPolicyQueryPrefix + "1":  {{"col1": "val1"}}, // gates a pending setup item
+			hostPolicyQueryPrefix + "2":  {{"col1": "val1"}}, // in scope, but not gating one
+			hostPolicyQueryPrefix + "99": {},                 // not in scope for this host at all
+		}, map[string]fleet.OsqueryStatus{})
+
+		require.Equal(t, map[uint]*bool{1: new(true), 2: new(true)}, recordedResults)
+		require.ElementsMatch(t, []uint{1, 2, 99}, filteredForIDs)
+		// No setup-experience lookup: a policy-reporting check-in pays for the scope query and nothing else.
+		require.False(t, ds.GetHostAwaitingConfigurationFuncInvoked)
+		require.False(t, ds.GetSetupExperiencePolicyIDsForHostFuncInvoked)
+	})
+
+	t.Run("scope lookup failure drops policy results without failing the write", func(t *testing.T) {
+		ds.PolicyQueriesForHostFilteredFunc = func(ctx context.Context, gotHost *fleet.Host, policyIDs []uint) (map[string]string, error) {
+			return nil, errors.New("database is on fire")
+		}
+		ds.LabelQueriesForHostFunc = func(ctx context.Context, gotHost *fleet.Host) (map[string]string, error) {
+			return map[string]string{"5": "select 5"}, nil
+		}
+		ds.RecordLabelQueryExecutionsFunc = func(ctx context.Context, gotHost *fleet.Host, results map[uint]*bool, t time.Time, deferred bool) error {
+			return nil
+		}
+		t.Cleanup(func() {
+			ds.PolicyQueriesForHostFilteredFunc = func(ctx context.Context, gotHost *fleet.Host, policyIDs []uint) (map[string]string, error) {
+				filteredForIDs = policyIDs
+				return filterPolicyQueries(inScopePolicies, policyIDs), nil
+			}
+		})
+		var savedHost *fleet.Host
+		ds.UpdateHostFunc = func(ctx context.Context, gotHost *fleet.Host) error {
+			savedHost = gotHost
+			return nil
+		}
+		var savedAdditional *json.RawMessage
+		ds.SaveHostAdditionalFunc = func(ctx context.Context, hostID uint, additional *json.RawMessage) error {
+			savedAdditional = additional
+			return nil
+		}
+		ds.RecordLabelQueryExecutionsFuncInvoked = false
+
+		// One write carrying a label, a policy, a detail and an additional result. submit asserts it succeeds.
+		submit(map[string][]map[string]string{
+			hostLabelQueryPrefix + "5":               {{"col1": "val1"}},
+			hostPolicyQueryPrefix + "1":              {{"col1": "val1"}},
+			hostDetailQueryPrefix + "osquery_info":   {{"version": "5.99.0"}},
+			hostAdditionalQueryPrefix + "extra_bits": {{"n": "1"}},
+		}, map[string]fleet.OsqueryStatus{})
+
+		// Policy results are dropped, so nothing unvalidated is persisted. RecordPolicyQueryExecutions is where
+		// hosts.policy_updated_at is advanced, so not calling it also leaves the host due to report again.
+		require.False(t, ds.RecordPolicyQueryExecutionsFuncInvoked)
+
+		require.True(t, ds.RecordLabelQueryExecutionsFuncInvoked)
+
+		// The detail and additional results are still persisted.
+		require.True(t, ds.UpdateHostFuncInvoked)
+		require.NotNil(t, savedHost)
+		require.Equal(t, "5.99.0", savedHost.OsqueryVersion)
+
+		require.True(t, ds.SaveHostAdditionalFuncInvoked)
+		require.NotNil(t, savedAdditional)
+		require.JSONEq(t, `{"extra_bits":[{"n":"1"}]}`, string(*savedAdditional))
+	})
+}
+
+func TestPolicyQueriesDuringSetupExperience(t *testing.T) {
+	ds := new(mock.Store)
+	lq := live_query_mock.New(t)
+	svc, ctx := newTestService(t, ds, nil, lq)
+
+	host := &fleet.Host{
+		Platform: "darwin",
+	}
+
+	ds.LabelQueriesForHostFunc = func(ctx context.Context, host *fleet.Host) (map[string]string, error) {
+		return map[string]string{}, nil
+	}
+	ds.HostLiteFunc = func(ctx context.Context, id uint) (*fleet.Host, error) {
+		return host, nil
+	}
+	ds.UpdateHostFunc = func(ctx context.Context, gotHost *fleet.Host) error {
+		host = gotHost
+		return nil
+	}
+	ds.AppConfigFunc = func(ctx context.Context) (*fleet.AppConfig, error) {
+		return &fleet.AppConfig{Features: fleet.Features{
+			EnableHostUsers:         true,
+			EnableSoftwareInventory: true,
+		}}, nil
+	}
+
+	ds.GetHostAwaitingConfigurationFunc = func(ctx context.Context, hostUUID string) (bool, error) {
+		return true, nil
+	}
+
+	lq.On("QueriesForHost", uint(0)).Return(map[string]string{}, nil)
+
+	ds.PolicyQueriesForHostFunc = func(ctx context.Context, host *fleet.Host) (map[string]string, error) {
+		return map[string]string{"1": "select 1", "2": "select 42;"}, nil
+	}
+
+	// No policy-gated setup-experience items for this host, so during setup experience no policy queries are distributed.
+	ds.GetSetupExperiencePolicyIDsForHostFunc = func(ctx context.Context, hostUUID string) ([]uint, error) {
+		return nil, nil
+	}
+
+	ctx = hostctx.NewContext(ctx, host)
+
+	queries, discovery, _, err := svc.GetDistributedQueries(ctx)
+	require.NoError(t, err)
+
+	// Should not return the 2 policy queries because we're in setup experience
+	require.Equal(t, len(expectedDetailQueriesForPlatform(host.Platform)), len(queries), distQueriesMapKeys(queries))
+	verifyDiscovery(t, queries, discovery)
+
+	checkPolicyResults := func(queries map[string]string, shouldHavePolicies bool) {
+		hasPolicy1, hasPolicy2 := false, false
+		for name := range queries {
+			if strings.HasPrefix(name, hostPolicyQueryPrefix) {
+				if name[len(hostPolicyQueryPrefix):] == "1" {
+					hasPolicy1 = true
+				}
+				if name[len(hostPolicyQueryPrefix):] == "2" {
+					hasPolicy2 = true
+				}
+			}
+		}
+		assert.Equal(t, hasPolicy1, shouldHavePolicies)
+		assert.Equal(t, hasPolicy2, shouldHavePolicies)
+	}
+
+	// Make it appear the host is out of setup experience and ask again for policies
+	ds.GetHostAwaitingConfigurationFunc = func(ctx context.Context, hostUUID string) (bool, error) {
+		return false, nil
+	}
+
+	queries, discovery, _, err = svc.GetDistributedQueries(ctx)
+	require.NoError(t, err)
+	// Should now return the 2 additional policy queries because we're out of setup experience
+	assert.Equal(t, len(expectedDetailQueriesForPlatform(host.Platform))+2, len(queries), distQueriesMapKeys(queries))
+	verifyDiscovery(t, queries, discovery)
+
+	checkPolicyResults(queries, true)
+}
+
+func TestPolicyWebhooks(t *testing.T) {
+	mockClock := clock.NewMockClock()
+	ds := new(mock.Store)
+	lq := live_query_mock.New(t)
+	pool := redistest.SetupRedis(t, t.Name(), false, false, false)
+	failingPolicySet := redis_policy_set.NewFailingTest(t, pool)
+	testConfig := config.TestConfig()
+	svc, ctx := newTestServiceWithConfig(t, ds, testConfig, nil, lq, &TestServerOpts{
+		FailingPolicySet: failingPolicySet,
+		Clock:            mockClock,
+	})
+
+	host := &fleet.Host{
+		ID:       5,
+		Platform: "darwin",
+		Hostname: "test.hostname",
+	}
+
+	// A newly-failing policy on a macOS host reaches the profile resend automation, which this
+	// test isn't about.
+	ds.GetPoliciesWithAssociatedProfileFunc = func(ctx context.Context, teamID uint, policyIDs []uint) ([]fleet.PolicyProfileData, error) {
+		return nil, nil
+	}
+
+	lq.On("QueriesForHost", uint(5)).Return(map[string]string{}, nil)
+	ds.LabelQueriesForHostFunc = func(ctx context.Context, host *fleet.Host) (map[string]string, error) {
+		return map[string]string{}, nil
+	}
+	ds.HostLiteFunc = func(ctx context.Context, id uint) (*fleet.Host, error) {
+		return host, nil
+	}
+	ds.UpdateHostFunc = func(ctx context.Context, gotHost *fleet.Host) error {
+		host = gotHost
+		return nil
+	}
+	ds.GetHostAwaitingConfigurationFunc = func(ctx context.Context, hostuuid string) (bool, error) {
+		return false, nil
+	}
+	ds.AppConfigFunc = func(ctx context.Context) (*fleet.AppConfig, error) {
+		return &fleet.AppConfig{
+			Features: fleet.Features{
+				EnableHostUsers:         true,
+				EnableSoftwareInventory: true,
+			},
+			WebhookSettings: fleet.WebhookSettings{
+				FailingPoliciesWebhook: fleet.FailingPoliciesWebhookSettings{
+					Enable:    true,
+					PolicyIDs: []uint{1, 2, 3},
+				},
+			},
+		}, nil
+	}
+
+	// Since the host doesn't have a team, DefaultTeamConfig will be called
+	ds.TeamLiteFunc = func(ctx context.Context, id uint) (*fleet.TeamLite, error) {
+		if id == 0 {
+			return &fleet.TeamLite{
+				ID: 0,
+				Config: fleet.TeamConfigLite{
+					WebhookSettings: fleet.TeamWebhookSettings{
+						FailingPoliciesWebhook: fleet.FailingPoliciesWebhookSettings{
+							Enable:    true,
+							PolicyIDs: []uint{1, 2, 3},
+						},
+					},
+				},
+			}, nil
+		}
+		return nil, nil
+	}
+
+	ds.PolicyQueriesForHostFunc = func(ctx context.Context, host *fleet.Host) (map[string]string, error) {
+		return map[string]string{
+			"1": "select 1;",                       // passing policy
+			"2": "select * from unexistent_table;", // policy that fails to execute (e.g. missing table)
+			"3": "select 1 where 1 = 0;",           // failing policy
+		}, nil
+	}
+	mockPolicyQueriesForHostFiltered(ds)
+	recordedResults := make(map[uint]*bool)
+	ds.RecordPolicyQueryExecutionsFunc = func(ctx context.Context, gotHost *fleet.Host, results map[uint]*bool, updated time.Time,
+		deferred bool, newlyPassingPolicyIDs []uint,
+	) ([]uint, error) {
+		recordedResults = results
+		host = gotHost
+		return nil, nil
+	}
+	ctx = hostctx.NewContext(ctx, host)
+
+	queries, discovery, _, err := svc.GetDistributedQueries(ctx)
+	require.NoError(t, err)
+	// +3 for policies
+	require.Equal(t, len(expectedDetailQueriesForPlatform(host.Platform))+3, len(queries), distQueriesMapKeys(queries))
+	verifyDiscovery(t, queries, discovery)
+
+	checkPolicyResults := func(queries map[string]string) {
+		hasPolicy1, hasPolicy2, hasPolicy3 := false, false, false
+		for name := range queries {
+			if strings.HasPrefix(name, hostPolicyQueryPrefix) {
+				switch name[len(hostPolicyQueryPrefix):] {
+				case "1":
+					hasPolicy1 = true
+				case "2":
+					hasPolicy2 = true
+				case "3":
+					hasPolicy3 = true
+				}
+			}
+		}
+		assert.True(t, hasPolicy1)
+		assert.True(t, hasPolicy2)
+		assert.True(t, hasPolicy3)
+	}
+
+	checkPolicyResults(queries)
+
+	// Track FlippingPoliciesForHost calls to verify the deduplication optimization: it should be called exactly once
+	// per SubmitDistributedQueryResults with ALL policy results, not multiple times with subsets.
+	var flippingCallCount int
+	var flippingIncomingResults map[uint]*bool
+	ds.FlippingPoliciesForHostFunc = func(ctx context.Context, hostID uint, incomingResults map[uint]*bool) (newFailing []uint, newPassing []uint,
+		err error,
+	) {
+		flippingCallCount++
+		flippingIncomingResults = incomingResults
+		return []uint{3}, nil, nil
+	}
+
+	// Track that pre-computed newlyPassingPolicyIDs is forwarded to RecordPolicyQueryExecutions.
+	var recordedNewlyPassing []uint
+	ds.RecordPolicyQueryExecutionsFunc = func(ctx context.Context, gotHost *fleet.Host, results map[uint]*bool, updated time.Time,
+		deferred bool, newlyPassingPolicyIDs []uint,
+	) ([]uint, error) {
+		recordedResults = results
+		recordedNewlyPassing = newlyPassingPolicyIDs
+		host = gotHost
+		return nil, nil
+	}
+
+	flippingCallCount = 0
+	// Record a query execution.
+	err = svc.SubmitDistributedQueryResults(
+		ctx,
+		map[string][]map[string]string{
+			hostPolicyQueryPrefix + "1": {{"col1": "val1"}}, // succeeds
+			hostPolicyQueryPrefix + "2": {},                 // didn't execute
+			hostPolicyQueryPrefix + "3": {},                 // fails
+		},
+		map[string]fleet.OsqueryStatus{
+			hostPolicyQueryPrefix + "2": 1, // didn't execute
+		},
+		map[string]string{},
+		map[string]*fleet.Stats{},
+	)
+	require.NoError(t, err)
+	require.Len(t, recordedResults, 3)
+	require.NotNil(t, recordedResults[1])
+	require.True(t, *recordedResults[1])
+	result, ok := recordedResults[2]
+	require.True(t, ok)
+	require.Nil(t, result)
+	require.NotNil(t, recordedResults[3])
+	require.False(t, *recordedResults[3])
+
+	// Verify FlippingPoliciesForHost was called exactly once with all 3 policy results.
+	require.Equal(t, 1, flippingCallCount, "FlippingPoliciesForHost should be called exactly once per SubmitDistributedQueryResults")
+	require.Len(t, flippingIncomingResults, 3, "FlippingPoliciesForHost should receive all policy results")
+	// Verify pre-computed newlyPassingPolicyIDs was forwarded (FlippingPoliciesForHost returned nil for newPassing,
+	// but the caller normalizes it to a non-nil empty slice).
+	require.NotNil(t, recordedNewlyPassing, "pre-computed newlyPassingPolicyIDs should be forwarded to RecordPolicyQueryExecutions")
+	require.Empty(t, recordedNewlyPassing)
+
+	cmpSets := func(expSets map[uint][]fleet.PolicySetHost) error {
+		actualSets, err := failingPolicySet.ListSets()
+		if err != nil {
+			return err
+		}
+		var expSets_ []uint
+		for expSet := range expSets {
+			expSets_ = append(expSets_, expSet)
+		}
+		sort.Slice(expSets_, func(i, j int) bool {
+			return expSets_[i] < expSets_[j]
+		})
+		sort.Slice(actualSets, func(i, j int) bool {
+			return actualSets[i] < actualSets[j]
+		})
+		if !reflect.DeepEqual(actualSets, expSets_) {
+			return fmt.Errorf("sets mismatch: %+v vs %+v", actualSets, expSets_)
+		}
+		for expID, expHosts := range expSets {
+			actualHosts, err := failingPolicySet.ListHosts(expID)
+			if err != nil {
+				return err
+			}
+			sort.Slice(actualHosts, func(i, j int) bool {
+				return actualHosts[i].ID < actualHosts[j].ID
+			})
+			sort.Slice(expHosts, func(i, j int) bool {
+				return expHosts[i].ID < expHosts[j].ID
+			})
+			if !reflect.DeepEqual(actualHosts, expHosts) {
+				return fmt.Errorf("hosts mismatch %d: %+v vs %+v", expID, actualHosts, expHosts)
+			}
+		}
+		return nil
+	}
+
+	assert.Eventually(t, func() bool {
+		err = cmpSets(map[uint][]fleet.PolicySetHost{
+			3: {{
+				ID:       host.ID,
+				Hostname: host.Hostname,
+			}},
+		})
+		return err == nil
+	}, 1*time.Minute, 250*time.Millisecond)
+	require.NoError(t, err)
+
+	noPolicyResults := func(queries map[string]string) {
+		hasAnyPolicy := false
+		for name := range queries {
+			if strings.HasPrefix(name, hostPolicyQueryPrefix) {
+				hasAnyPolicy = true
+				break
+			}
+		}
+		assert.False(t, hasAnyPolicy)
+	}
+
+	// After the first time we get policies and update the host, then there shouldn't be any policies.
+	ctx = hostctx.NewContext(ctx, host)
+	queries, discovery, _, err = svc.GetDistributedQueries(ctx)
+	require.NoError(t, err)
+	require.Equal(t, len(expectedDetailQueriesForPlatform(host.Platform)), len(queries), distQueriesMapKeys(queries))
+	verifyDiscovery(t, queries, discovery)
+	noPolicyResults(queries)
+
+	// Let's move time forward, there should be policies now.
+	mockClock.AddTime(2 * time.Hour)
+
+	queries, discovery, _, err = svc.GetDistributedQueries(ctx)
+	require.NoError(t, err)
+	// +3 for policies
+	require.Equal(t, len(expectedDetailQueriesForPlatform(host.Platform))+3, len(queries), distQueriesMapKeys(queries))
+	verifyDiscovery(t, queries, discovery)
+	checkPolicyResults(queries)
+
+	ds.FlippingPoliciesForHostFunc = func(ctx context.Context, hostID uint, incomingResults map[uint]*bool) (newFailing []uint, newPassing []uint,
+		err error,
+	) {
+		flippingCallCount++
+		flippingIncomingResults = incomingResults
+		return []uint{1}, []uint{3}, nil
+	}
+
+	flippingCallCount = 0
+	// Record another query execution.
+	err = svc.SubmitDistributedQueryResults(
+		ctx,
+		map[string][]map[string]string{
+			hostPolicyQueryPrefix + "1": {},                 // 1 now fails
+			hostPolicyQueryPrefix + "2": {},                 // didn't execute
+			hostPolicyQueryPrefix + "3": {{"col1": "val1"}}, // 1 now succeeds
+		},
+		map[string]fleet.OsqueryStatus{
+			hostPolicyQueryPrefix + "2": 1, // didn't execute
+		},
+		map[string]string{},
+		map[string]*fleet.Stats{},
+	)
+	require.NoError(t, err)
+	require.Len(t, recordedResults, 3)
+	require.NotNil(t, recordedResults[1])
+	require.False(t, *recordedResults[1])
+	result, ok = recordedResults[2]
+	require.True(t, ok)
+	require.Nil(t, result)
+	require.NotNil(t, recordedResults[3])
+	require.True(t, *recordedResults[3])
+
+	// Verify single call and correct forwarding when there are actual flips.
+	require.Equal(t, 1, flippingCallCount, "FlippingPoliciesForHost should be called exactly once")
+	require.Len(t, flippingIncomingResults, 3)
+	require.NotNil(t, recordedNewlyPassing)
+	require.ElementsMatch(t, []uint{3}, recordedNewlyPassing, "newlyPassingPolicyIDs should be forwarded from FlippingPoliciesForHost")
+
+	assert.Eventually(t, func() bool {
+		err = cmpSets(map[uint][]fleet.PolicySetHost{
+			1: {{
+				ID:       host.ID,
+				Hostname: host.Hostname,
+			}},
+			3: {},
+		})
+		return err == nil
+	}, 1*time.Minute, 250*time.Millisecond)
+	require.NoError(t, err)
+
+	// Simulate webhook trigger by removing the hosts.
+	err = failingPolicySet.RemoveHosts(1, []fleet.PolicySetHost{{
+		ID:       host.ID,
+		Hostname: host.Hostname,
+	}})
+	require.NoError(t, err)
+
+	ds.FlippingPoliciesForHostFunc = func(ctx context.Context, hostID uint, incomingResults map[uint]*bool) (newFailing []uint, newPassing []uint,
+		err error,
+	) {
+		return []uint{}, []uint{2}, nil
+	}
+
+	// Record another query execution.
+	err = svc.SubmitDistributedQueryResults(
+		ctx,
+		map[string][]map[string]string{
+			hostPolicyQueryPrefix + "1": {},                 // continues to fail
+			hostPolicyQueryPrefix + "2": {{"col1": "val1"}}, // now passes
+			hostPolicyQueryPrefix + "3": {{"col1": "val1"}}, // continues to succeed
+		},
+		map[string]fleet.OsqueryStatus{},
+		map[string]string{},
+		map[string]*fleet.Stats{},
+	)
+	require.NoError(t, err)
+	require.Len(t, recordedResults, 3)
+	require.NotNil(t, recordedResults[1])
+	require.False(t, *recordedResults[1])
+	require.NotNil(t, recordedResults[2])
+	require.True(t, *recordedResults[2])
+	require.NotNil(t, recordedResults[3])
+	require.True(t, *recordedResults[3])
+
+	assert.Eventually(t, func() bool {
+		err = cmpSets(map[uint][]fleet.PolicySetHost{
+			1: {},
+			3: {},
+		})
+		return err == nil
+	}, 1*time.Minute, 250*time.Millisecond)
+	require.NoError(t, err)
+}
+
+// If the live query store (Redis) is down we still (see #3503)
+// want hosts to get queries and continue to check in.
+func TestLiveQueriesFailing(t *testing.T) {
+	ds := new(mock.Store)
+	lq := live_query_mock.New(t)
+	cfg := config.TestConfig()
+	buf := new(bytes.Buffer)
+	logger := slog.New(slog.NewTextHandler(buf, nil))
+	svc, ctx := newTestServiceWithConfig(t, ds, cfg, nil, lq, &TestServerOpts{
+		Logger: logger,
+	})
+
+	hostID := uint(1)
+	host := &fleet.Host{
+		ID:       hostID,
+		Platform: "darwin",
+	}
+	lq.On("QueriesForHost", hostID).Return(
+		map[string]string{},
+		errors.New("failed to get queries for host"),
+	)
+
+	ds.LabelQueriesForHostFunc = func(ctx context.Context, host *fleet.Host) (map[string]string, error) {
+		return map[string]string{}, nil
+	}
+	ds.HostLiteFunc = func(ctx context.Context, id uint) (*fleet.Host, error) {
+		return host, nil
+	}
+	ds.AppConfigFunc = func(ctx context.Context) (*fleet.AppConfig, error) {
+		return &fleet.AppConfig{Features: fleet.Features{
+			EnableHostUsers:         true,
+			EnableSoftwareInventory: true,
+		}}, nil
+	}
+	ds.PolicyQueriesForHostFunc = func(ctx context.Context, host *fleet.Host) (map[string]string, error) {
+		return map[string]string{}, nil
+	}
+	mockPolicyQueriesForHostFiltered(ds)
+	ds.GetHostAwaitingConfigurationFunc = func(ctx context.Context, hostuuid string) (bool, error) {
+		return false, nil
+	}
+
+	ctx = hostctx.NewContext(ctx, host)
+
+	queries, discovery, _, err := svc.GetDistributedQueries(ctx)
+	require.NoError(t, err)
+	// +1 to account for the fleet_no_policies_wildcard query.
+	require.Equal(t, len(expectedDetailQueriesForPlatform(host.Platform))+1, len(queries), distQueriesMapKeys(queries))
+	verifyDiscovery(t, queries, discovery)
+
+	logs, err := io.ReadAll(buf)
+	require.NoError(t, err)
+	require.Contains(t, string(logs), "level=ERROR")
+	require.Contains(t, string(logs), "failed to get queries for host")
+}
+
+func distQueriesMapKeys(m map[string]string) []string {
+	keys := make([]string, 0, len(m))
+	for k := range m {
+		keys = append(keys, strings.TrimPrefix(k, "fleet_detail_query_"))
+	}
+	sort.Strings(keys)
+	return keys
+}
+
+func osqueryMapKeys(m map[string]osquery_utils.DetailQuery) []string {
+	keys := make([]string, 0, len(m))
+	for k := range m {
+		keys = append(keys, k)
+	}
+	sort.Strings(keys)
+	return keys
+}
+
+func TestPreProcessSoftwareResults(t *testing.T) {
+	foobarApp := map[string]string{
+		"name":              "Foobar.app",
+		"version":           "1.2.3",
+		"type":              "Application (macOS)",
+		"bundle_identifier": "com.zoobar.foobar",
+		"extension_id":      "",
+		"browser":           "",
+		"source":            "apps",
+		"vendor":            "",
+		"last_opened_at":    "0",
+		"installed_path":    "/some/path",
+	}
+	zoobarApp := map[string]string{
+		"name":              "Zoobar.app",
+		"version":           "3.2.1",
+		"type":              "Application (macOS)",
+		"bundle_identifier": "com.acme.zoobar",
+		"extension_id":      "",
+		"browser":           "",
+		"source":            "apps",
+		"vendor":            "",
+		"last_opened_at":    "0",
+		"installed_path":    "/some/other/path",
+	}
+	foobarVSCodeExtension := map[string]string{
+		"name":              "vendor-x.foobar",
+		"version":           "2024.2.1",
+		"type":              "IDE extension (VS Code)",
+		"bundle_identifier": "",
+		"extension_id":      "",
+		"browser":           "",
+		"source":            "vscode_extensions",
+		"vendor":            "VendorX",
+		"last_opened_at":    "",
+		"installed_path":    "/some/foobar/path",
+	}
+	zoobarVSCodeExtension := map[string]string{
+		"name":              "vendor-x.zoobar",
+		"version":           "2023.2.1",
+		"type":              "IDE extension (VS Code)",
+		"bundle_identifier": "",
+		"extension_id":      "",
+		"browser":           "",
+		"source":            "vscode_extensions",
+		"vendor":            "VendorX",
+		"last_opened_at":    "",
+		"installed_path":    "/some/zoobar/path",
+	}
+	artisanAdobePlugin := map[string]string{
+		"name":              "Artisan Pro X",
+		"version":           "1.3.3",
+		"bundle_identifier": "",
+		"extension_id":      "com.vendorx.artisanprox",
+		"extension_for":     "",
+		"source":            "adobe_plugins",
+		"vendor":            "VendorX",
+		"last_opened_at":    "",
+		"installed_path":    "/Library/Application Support/Adobe/CEP/extensions/com.vendorx.artisanprox",
+	}
+	colorizerAdobePlugin := map[string]string{
+		"name":              "Colorizer",
+		"version":           "2.0.1",
+		"bundle_identifier": "",
+		"extension_id":      "com.vendory.colorizer",
+		"extension_for":     "",
+		"source":            "adobe_plugins",
+		"vendor":            "VendorY",
+		"last_opened_at":    "",
+		"installed_path":    "/Library/Application Support/Adobe/UXP/extensions/com.vendory.colorizer",
+	}
+	someRow := map[string]string{
+		"1": "1",
+	}
+	appToOverride := map[string]string{
+		"name":              "OverrideMe.app",
+		"version":           "1.2.3",
+		"type":              "Application (macOS)",
+		"bundle_identifier": "com.zoobar.overrideme",
+		"extension_id":      "",
+		"browser":           "",
+		"source":            "apps",
+		"vendor":            "OverrideMe",
+		"last_opened_at":    "0",
+		"installed_path":    "/some/override/path",
+	}
+
+	appThatOverrides := map[string]string{
+		"name":              "OverrideMeSuccess.app",
+		"version":           "1.2.3",
+		"type":              "Application (macOS)",
+		"bundle_identifier": "com.zoobar.overrideme",
+		"extension_id":      "",
+		"browser":           "",
+		"source":            "apps",
+		"vendor":            "OverrideMe",
+		"last_opened_at":    "0",
+		"installed_path":    "/some/override/path",
+	}
+
+	pythonPackageOne := map[string]string{
+		"name":           "cryptography",
+		"version":        "41.0.7",
+		"extension_id":   "",
+		"browser":        "",
+		"source":         "python_packages",
+		"vendor":         "",
+		"installed_path": "/usr/lib/python3/dist-packages",
+	}
+	pythonPackageTwo := map[string]string{
+		"name":           "pip",
+		"version":        "25.0.1",
+		"extension_id":   "",
+		"browser":        "",
+		"source":         "python_packages",
+		"vendor":         "",
+		"installed_path": "/Users/fleetdm/.pyenv/versions/3.13.1/lib/python3.13/site-packages",
+	}
+
+	for _, tc := range []struct {
+		name       string
+		host       *fleet.Host
+		resultsIn  fleet.OsqueryDistributedQueryResults
+		statusesIn map[string]fleet.OsqueryStatus
+		messagesIn map[string]string
+		overrides  map[string]osquery_utils.DetailQuery
+
+		resultsExpected fleet.OsqueryDistributedQueryResults
+	}{
+		{
+			name: "python packages using original query in extras adds results",
+
+			statusesIn: map[string]fleet.OsqueryStatus{
+				hostDetailQueryPrefix + "software_macos":           fleet.StatusOK,
+				hostDetailQueryPrefix + "software_python_packages": fleet.StatusOK,
+			},
+			resultsIn: fleet.OsqueryDistributedQueryResults{
+				hostDetailQueryPrefix + "software_macos": []map[string]string{
+					foobarApp,
+				},
+				hostDetailQueryPrefix + "software_python_packages": []map[string]string{
+					pythonPackageOne,
+				},
+			},
+			resultsExpected: fleet.OsqueryDistributedQueryResults{
+				hostDetailQueryPrefix + "software_macos": []map[string]string{
+					foobarApp,
+					pythonPackageOne,
+				},
+			},
+		},
+		{
+			name: "python packages using user query in extras adds results",
+
+			statusesIn: map[string]fleet.OsqueryStatus{
+				hostDetailQueryPrefix + "software_macos":                          fleet.StatusOK,
+				hostDetailQueryPrefix + "software_python_packages_with_users_dir": fleet.StatusOK,
+			},
+			resultsIn: fleet.OsqueryDistributedQueryResults{
+				hostDetailQueryPrefix + "software_macos": []map[string]string{
+					foobarApp,
+				},
+				hostDetailQueryPrefix + "software_python_packages_with_users_dir": []map[string]string{
+					pythonPackageTwo,
+				},
+			},
+			resultsExpected: fleet.OsqueryDistributedQueryResults{
+				hostDetailQueryPrefix + "software_macos": []map[string]string{
+					foobarApp,
+					pythonPackageTwo,
+				},
+			},
+		},
+		{
+			name: "software query works and there are vs code extensions in extra",
+
+			statusesIn: map[string]fleet.OsqueryStatus{
+				hostDetailQueryPrefix + "other_detail_query":         fleet.StatusOK,
+				hostDetailQueryPrefix + "software_macos":             fleet.StatusOK,
+				hostDetailQueryPrefix + "software_vscode_extensions": fleet.StatusOK,
+			},
+			resultsIn: fleet.OsqueryDistributedQueryResults{
+				hostDetailQueryPrefix + "other_detail_query": []map[string]string{
+					someRow,
+				},
+				hostDetailQueryPrefix + "software_macos": []map[string]string{
+					foobarApp,
+					zoobarApp,
+				},
+				hostDetailQueryPrefix + "software_vscode_extensions": []map[string]string{
+					foobarVSCodeExtension,
+					zoobarVSCodeExtension,
+				},
+			},
+
+			resultsExpected: fleet.OsqueryDistributedQueryResults{
+				hostDetailQueryPrefix + "other_detail_query": []map[string]string{
+					someRow,
+				},
+				hostDetailQueryPrefix + "software_macos": []map[string]string{
+					foobarApp,
+					zoobarApp,
+					foobarVSCodeExtension,
+					zoobarVSCodeExtension,
+				},
+			},
+		},
+		{
+			name: "software query works and there are adobe plugins in extra",
+
+			statusesIn: map[string]fleet.OsqueryStatus{
+				hostDetailQueryPrefix + "software_macos":         fleet.StatusOK,
+				hostDetailQueryPrefix + "software_adobe_plugins": fleet.StatusOK,
+			},
+			resultsIn: fleet.OsqueryDistributedQueryResults{
+				hostDetailQueryPrefix + "software_macos": []map[string]string{
+					foobarApp,
+				},
+				hostDetailQueryPrefix + "software_adobe_plugins": []map[string]string{
+					artisanAdobePlugin,
+					colorizerAdobePlugin,
+				},
+			},
+
+			resultsExpected: fleet.OsqueryDistributedQueryResults{
+				hostDetailQueryPrefix + "software_macos": []map[string]string{
+					foobarApp,
+					artisanAdobePlugin,
+					colorizerAdobePlugin,
+				},
+			},
+		},
+		{
+			name: "windows software query works and there are adobe plugins in extra",
+			host: &fleet.Host{ID: 1, Platform: "windows"},
+
+			statusesIn: map[string]fleet.OsqueryStatus{
+				hostDetailQueryPrefix + "software_windows":       fleet.StatusOK,
+				hostDetailQueryPrefix + "software_adobe_plugins": fleet.StatusOK,
+			},
+			resultsIn: fleet.OsqueryDistributedQueryResults{
+				hostDetailQueryPrefix + "software_windows": []map[string]string{
+					foobarApp,
+				},
+				hostDetailQueryPrefix + "software_adobe_plugins": []map[string]string{
+					artisanAdobePlugin,
+				},
+			},
+
+			resultsExpected: fleet.OsqueryDistributedQueryResults{
+				hostDetailQueryPrefix + "software_windows": []map[string]string{
+					foobarApp,
+					artisanAdobePlugin,
+				},
+			},
+		},
+		{
+			// A host without the adobe_plugins table doesn't run the query at all
+			// (discovery filters it out), so it reports no status — that path is covered
+			// by the "status and results are not returned" case below. Here the query ran
+			// and failed, which must leave the main software results untouched.
+			name: "software query works, but the adobe_plugins query fails",
+
+			statusesIn: map[string]fleet.OsqueryStatus{
+				hostDetailQueryPrefix + "software_macos":         fleet.StatusOK,
+				hostDetailQueryPrefix + "software_adobe_plugins": fleet.OsqueryStatus(1),
+			},
+			resultsIn: fleet.OsqueryDistributedQueryResults{
+				hostDetailQueryPrefix + "software_macos": []map[string]string{
+					foobarApp,
+				},
+				hostDetailQueryPrefix + "software_adobe_plugins": []map[string]string{},
+			},
+
+			resultsExpected: fleet.OsqueryDistributedQueryResults{
+				hostDetailQueryPrefix + "software_macos": []map[string]string{
+					foobarApp,
+				},
+			},
+		},
+		{
+			name: "software query and extra works and there are no vscode extensions",
+
+			statusesIn: map[string]fleet.OsqueryStatus{
+				hostDetailQueryPrefix + "other_detail_query":         fleet.StatusOK,
+				hostDetailQueryPrefix + "software_macos":             fleet.StatusOK,
+				hostDetailQueryPrefix + "software_vscode_extensions": fleet.StatusOK,
+			},
+			resultsIn: fleet.OsqueryDistributedQueryResults{
+				hostDetailQueryPrefix + "other_detail_query": []map[string]string{
+					someRow,
+				},
+				hostDetailQueryPrefix + "software_macos": []map[string]string{
+					foobarApp,
+					zoobarApp,
+				},
+				hostDetailQueryPrefix + "software_vscode_extensions": []map[string]string{},
+			},
+
+			resultsExpected: fleet.OsqueryDistributedQueryResults{
+				hostDetailQueryPrefix + "other_detail_query": []map[string]string{
+					someRow,
+				},
+				hostDetailQueryPrefix + "software_macos": []map[string]string{
+					foobarApp,
+					zoobarApp,
+				},
+			},
+		},
+		{
+			name: "software query works and the software extra status and results are not returned",
+
+			statusesIn: map[string]fleet.OsqueryStatus{
+				hostDetailQueryPrefix + "other_detail_query": fleet.StatusOK,
+				hostDetailQueryPrefix + "software_macos":     fleet.StatusOK,
+			},
+			resultsIn: fleet.OsqueryDistributedQueryResults{
+				hostDetailQueryPrefix + "other_detail_query": []map[string]string{
+					someRow,
+				},
+				hostDetailQueryPrefix + "software_macos": []map[string]string{
+					foobarApp,
+					zoobarApp,
+				},
+			},
+
+			resultsExpected: fleet.OsqueryDistributedQueryResults{
+				hostDetailQueryPrefix + "other_detail_query": []map[string]string{
+					someRow,
+				},
+				hostDetailQueryPrefix + "software_macos": []map[string]string{
+					foobarApp,
+					zoobarApp,
+				},
+			},
+		},
+		{
+			name: "software doesn't return status or results but the software extra does",
+
+			statusesIn: map[string]fleet.OsqueryStatus{
+				hostDetailQueryPrefix + "software_vscode_extensions": fleet.StatusOK,
+			},
+			resultsIn: fleet.OsqueryDistributedQueryResults{
+				hostDetailQueryPrefix + "software_vscode_extensions": []map[string]string{
+					foobarVSCodeExtension,
+					zoobarVSCodeExtension,
+				},
+			},
+
+			resultsExpected: fleet.OsqueryDistributedQueryResults{},
+		},
+		{
+			name: "software query works, but vscode_extensions table doesn't exist",
+
+			statusesIn: map[string]fleet.OsqueryStatus{
+				hostDetailQueryPrefix + "software_macos":             fleet.StatusOK,
+				hostDetailQueryPrefix + "software_vscode_extensions": fleet.OsqueryStatus(1),
+			},
+			resultsIn: fleet.OsqueryDistributedQueryResults{
+				hostDetailQueryPrefix + "software_macos": []map[string]string{
+					foobarApp,
+					zoobarApp,
+				},
+				hostDetailQueryPrefix + "software_vscode_extensions": []map[string]string{},
+			},
+
+			resultsExpected: fleet.OsqueryDistributedQueryResults{
+				hostDetailQueryPrefix + "software_macos": []map[string]string{
+					foobarApp,
+					zoobarApp,
+				},
+			},
+		},
+		{
+			name: "software query fails, vscode_extensions table returns results",
+
+			statusesIn: map[string]fleet.OsqueryStatus{
+				hostDetailQueryPrefix + "software_macos":             fleet.OsqueryStatus(1),
+				hostDetailQueryPrefix + "software_vscode_extensions": fleet.StatusOK,
+			},
+			resultsIn: fleet.OsqueryDistributedQueryResults{
+				hostDetailQueryPrefix + "software_macos": []map[string]string{},
+				hostDetailQueryPrefix + "software_vscode_extensions": []map[string]string{
+					foobarVSCodeExtension,
+					zoobarVSCodeExtension,
+				},
+			},
+
+			resultsExpected: fleet.OsqueryDistributedQueryResults{
+				hostDetailQueryPrefix + "software_macos": []map[string]string{},
+			},
+		},
+		{
+			name: "software query fails, software extra query also fails",
+
+			statusesIn: map[string]fleet.OsqueryStatus{
+				hostDetailQueryPrefix + "software_macos":             fleet.OsqueryStatus(1),
+				hostDetailQueryPrefix + "software_vscode_extensions": fleet.OsqueryStatus(1),
+			},
+			resultsIn: fleet.OsqueryDistributedQueryResults{
+				hostDetailQueryPrefix + "software_macos":             []map[string]string{},
+				hostDetailQueryPrefix + "software_vscode_extensions": []map[string]string{},
+			},
+
+			resultsExpected: fleet.OsqueryDistributedQueryResults{
+				hostDetailQueryPrefix + "software_macos": []map[string]string{},
+			},
+		},
+		{
+			name: "software inventory turned off",
+
+			statusesIn: map[string]fleet.OsqueryStatus{
+				hostDetailQueryPrefix + "other_detail_query": fleet.StatusOK,
+			},
+			resultsIn: fleet.OsqueryDistributedQueryResults{
+				hostDetailQueryPrefix + "other_detail_query": []map[string]string{
+					someRow,
+				},
+			},
+
+			resultsExpected: fleet.OsqueryDistributedQueryResults{
+				hostDetailQueryPrefix + "other_detail_query": []map[string]string{
+					someRow,
+				},
+			},
+		},
+		{
+			name: "override works",
+
+			statusesIn: map[string]fleet.OsqueryStatus{
+				hostDetailQueryPrefix + "software_macos":      fleet.StatusOK,
+				hostDetailQueryPrefix + "software_overrideMe": fleet.StatusOK,
+			},
+			resultsIn: fleet.OsqueryDistributedQueryResults{
+				hostDetailQueryPrefix + "software_macos": []map[string]string{
+					appToOverride,
+					foobarApp,
+				},
+				hostDetailQueryPrefix + "software_overrideMe": []map[string]string{
+					appThatOverrides,
+				},
+			},
+
+			resultsExpected: fleet.OsqueryDistributedQueryResults{
+				hostDetailQueryPrefix + "software_macos": []map[string]string{
+					foobarApp,
+					appThatOverrides,
+				},
+			},
+			overrides: map[string]osquery_utils.DetailQuery{
+				"overrideMe": {
+					SoftwareOverrideMatch: func(row map[string]string) bool {
+						return row["name"] == "OverrideMe.app"
+					},
+				},
+			},
+		},
+		{
+			name: "ubuntu dpkg installed python packages are filtered out",
+			host: &fleet.Host{ID: 1, Platform: "ubuntu"},
+			statusesIn: map[string]fleet.OsqueryStatus{
+				hostDetailQueryPrefix + "software_linux": fleet.StatusOK,
+			},
+			resultsIn: fleet.OsqueryDistributedQueryResults{
+				hostDetailQueryPrefix + "software_linux": []map[string]string{
+					{
+						"name":    "python3-twisted",
+						"version": "20.3.0-2",
+						"source":  "deb_packages",
+					},
+					{
+						"name":    "Twisted", // duplicate of python3-twisted
+						"version": "20.3.0-2",
+						"source":  "python_packages",
+					},
+					{
+						"name":    "python3-setuptools",
+						"version": "50.3.2",
+						"source":  "deb_packages",
+					},
+					{
+						"name":    "setuptools",
+						"version": "50.3.2",
+						"source":  "python_packages",
+					},
+					{
+						"name":    "pillow",
+						"version": "8.1.0",
+						"source":  "python_packages",
+					},
+					{
+						"name":    "python3-urllib3",
+						"version": "1.26.2-2",
+						"source":  "deb_packages",
+					},
+				},
+			},
+			resultsExpected: fleet.OsqueryDistributedQueryResults{
+				hostDetailQueryPrefix + "software_linux": []map[string]string{
+					{
+						"name":    "python3-twisted",
+						"version": "20.3.0-2",
+						"source":  "deb_packages",
+					},
+					{
+						"name":    "python3-setuptools",
+						"version": "50.3.2",
+						"source":  "deb_packages",
+					},
+					{
+						"name":    "python3-pillow", // renamed from pillow
+						"version": "8.1.0",
+						"source":  "python_packages",
+					},
+					{
+						"name":    "python3-urllib3",
+						"version": "1.26.2-2",
+						"source":  "deb_packages",
+					},
+				},
+			},
+		},
+		{
+			name: "debian dpkg installed python packages are filtered out",
+			host: &fleet.Host{ID: 1, Platform: "debian"},
+			statusesIn: map[string]fleet.OsqueryStatus{
+				hostDetailQueryPrefix + "software_linux": fleet.StatusOK,
+			},
+			resultsIn: fleet.OsqueryDistributedQueryResults{
+				hostDetailQueryPrefix + "software_linux": []map[string]string{
+					{
+						"name":    "python3-twisted",
+						"version": "22.4.0-4",
+						"source":  "deb_packages",
+					},
+					{
+						"name":    "Twisted", // duplicate of python3-twisted
+						"version": "22.4.0-4",
+						"source":  "python_packages",
+					},
+					// known issue below: names don't match so we don't deduplicate
+					{
+						"name":    "python3-attr", // osquery source column is python-attrs
+						"version": "22.2.0-1",
+						"source":  "deb_packages",
+					},
+					{
+						"name":    "Attrs",
+						"version": "22.2.0",
+						"source":  "python_packages",
+					},
+				},
+			},
+			resultsExpected: fleet.OsqueryDistributedQueryResults{
+				hostDetailQueryPrefix + "software_linux": []map[string]string{
+					{
+						"name":    "python3-twisted",
+						"version": "22.4.0-4",
+						"source":  "deb_packages",
+					},
+					{
+						"name":    "python3-attr",
+						"version": "22.2.0-1",
+						"source":  "deb_packages",
+					},
+					{
+						"name":    "python3-attrs",
+						"version": "22.2.0",
+						"source":  "python_packages",
+					},
+				},
+			},
+		},
+		{
+			name: "non-ubuntu/debian installed python packages are filtered out",
+			host: &fleet.Host{ID: 1, Platform: "rhel"},
+			statusesIn: map[string]fleet.OsqueryStatus{
+				hostDetailQueryPrefix + "software_linux": fleet.StatusOK,
+			},
+			resultsIn: fleet.OsqueryDistributedQueryResults{
+				hostDetailQueryPrefix + "software_linux": []map[string]string{
+					{
+						"name":    "python3-twisted",
+						"version": "20.3.0-2",
+						"source":  "rpm_packages",
+					},
+					{
+						"name":    "twisted", // duplicate of python3-twisted
+						"version": "20.3.0-2",
+						"source":  "python_packages",
+					},
+					{
+						"name":    "pillow",
+						"version": "8.1.0",
+						"source":  "python_packages",
+					},
+					{
+						"name":    "python3-urllib3",
+						"version": "1.26.2-2",
+						"source":  "rpm_packages",
+					},
+				},
+			},
+			resultsExpected: fleet.OsqueryDistributedQueryResults{
+				hostDetailQueryPrefix + "software_linux": []map[string]string{
+					{
+						"name":    "python3-twisted",
+						"version": "20.3.0-2",
+						"source":  "rpm_packages",
+					},
+					{
+						"name":    "python3-pillow",
+						"version": "8.1.0",
+						"source":  "python_packages",
+					},
+					{
+						"name":    "python3-urllib3",
+						"version": "1.26.2-2",
+						"source":  "rpm_packages",
+					},
+				},
+			},
+		},
+		{
+			name: "macos codesign query with cdhash_sha256",
+			host: &fleet.Host{ID: 1, Platform: "darwin"},
+			statusesIn: map[string]fleet.OsqueryStatus{
+				hostDetailQueryPrefix + "software_macos_codesign": fleet.StatusOK,
+			},
+			resultsIn: fleet.OsqueryDistributedQueryResults{
+				hostDetailQueryPrefix + "software_macos_codesign": []map[string]string{
+					{
+						"path":            "/Applications/Slack.app",
+						"team_identifier": "com.slack.slack",
+						"cdhash_sha256":   "1234567890abcdef1234567890abcdef1234567890abcdef1234567890abcdef",
+					},
+				},
+			},
+			resultsExpected: fleet.OsqueryDistributedQueryResults{
+				hostDetailQueryPrefix + "software_macos_codesign": []map[string]string{
+					{
+						"path":            "/Applications/Slack.app",
+						"team_identifier": "com.slack.slack",
+						"cdhash_sha256":   "1234567890abcdef1234567890abcdef1234567890abcdef1234567890abcdef",
+					},
+				},
+			},
+		},
+		{
+			name: "macos codesign query with no cdhash_sha256 column",
+			host: &fleet.Host{ID: 1, Platform: "darwin"},
+			statusesIn: map[string]fleet.OsqueryStatus{
+				hostDetailQueryPrefix + "software_macos_codesign": fleet.StatusOK,
+			},
+			resultsIn: fleet.OsqueryDistributedQueryResults{
+				hostDetailQueryPrefix + "software_macos_codesign": []map[string]string{
+					{
+						"path":            "/Applications/Slack.app",
+						"team_identifier": "com.slack.slack",
+					},
+				},
+			},
+			resultsExpected: fleet.OsqueryDistributedQueryResults{
+				hostDetailQueryPrefix + "software_macos_codesign": []map[string]string{
+					{
+						"path":            "/Applications/Slack.app",
+						"team_identifier": "com.slack.slack",
+					},
+				},
+			},
+		},
+		{
+			name: "macos executable_hashes query with sha256 column",
+			host: &fleet.Host{ID: 1, Platform: "darwin"},
+			statusesIn: map[string]fleet.OsqueryStatus{
+				hostDetailQueryPrefix + "software_macos_executable_sha256": fleet.StatusOK,
+			},
+			resultsIn: fleet.OsqueryDistributedQueryResults{
+				hostDetailQueryPrefix + "software_macos_executable_sha256": []map[string]string{
+					{
+						"path":   "/Applications/Slack.app",
+						"sha256": "1234567890abcdef1234567890abcdef1234567890abcdef1234567890abcdef",
+					},
+				},
+			},
+			resultsExpected: fleet.OsqueryDistributedQueryResults{
+				hostDetailQueryPrefix + "software_macos_executable_sha256": []map[string]string{
+					{
+						"path":   "/Applications/Slack.app",
+						"sha256": "1234567890abcdef1234567890abcdef1234567890abcdef1234567890abcdef",
+					},
+				},
+			},
+		},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			host := &fleet.Host{ID: 1}
+			if tc.host != nil {
+				host = tc.host
+			}
+			// mutates tc.resultsIn
+			preProcessSoftwareResults(t.Context(), host, tc.resultsIn, tc.statusesIn, tc.messagesIn, tc.overrides, slog.New(slog.DiscardHandler))
+			require.Equal(t, tc.resultsExpected, tc.resultsIn)
+		})
+	}
+}
+
+func TestDetailQueriesAdobePlugins(t *testing.T) {
+	// Adobe Creative Cloud only runs on macOS and Windows, so the query must not be
+	// sent anywhere else.
+	for _, platform := range []string{"darwin", "windows"} {
+		require.Contains(t, expectedDetailQueriesForPlatform(platform), "software_adobe_plugins")
+	}
+	for _, platform := range append(fleet.HostLinuxOSs, "chrome") {
+		require.NotContains(t, expectedDetailQueriesForPlatform(platform), "software_adobe_plugins")
+	}
+}
+
+func TestDetailQueriesLinuxDistros(t *testing.T) {
+	for _, linuxPlatform := range fleet.HostLinuxOSs {
+		m := expectedDetailQueriesForPlatform(linuxPlatform)
+		require.Contains(t, m, "users")
+		require.Contains(t, m, "network_interface_unix")
+		require.Contains(t, m, "disk_space_unix")
+		require.Contains(t, m, "os_unix_like")
+		require.Contains(t, m, "orbit_info")
+		require.Contains(t, m, "disk_encryption_linux")
+		require.Contains(t, m, "software_vscode_extensions")
+		require.Contains(t, m, "software_linux")
+	}
+}
+
+// Benchmark function
+func BenchmarkFindPackDelimiterStringCommon(b *testing.B) {
+	// Input data for benchmarking
+	input := "pack/Global/Foo"
+
+	// Run the benchmark
+	b.ResetTimer()
+	for i := 0; i < b.N; i++ {
+		findPackDelimiterString(input)
+	}
+}
+
+func BenchmarkFindPackDelimiterStringTeamPack(b *testing.B) {
+	// Input data for benchmarking
+	input := "packGlobalGlobalGlobalGlobal" // global pack delimiter, global team, query name global
+
+	// Run the benchmark
+	b.ResetTimer()
+	for i := 0; i < b.N; i++ {
+		findPackDelimiterString(input)
+	}
+}
+
+func mockUbuntuResults() fleet.OsqueryDistributedQueryResults {
+	results := fleet.OsqueryDistributedQueryResults{
+		hostDetailQueryPrefix + "software_linux": make([]map[string]string, 0),
+	}
+
+	// Adding 40 python packages with matching deb packages
+	// Adding 2 python packages without matching deb packages
+	for i := 1; i <= 42; i++ {
+		pythonPkg := fmt.Sprintf("package%d", i)
+		results[hostDetailQueryPrefix+"software_linux"] = append(results[hostDetailQueryPrefix+"software_linux"], map[string]string{
+			"source": "python_packages",
+			"name":   pythonPkg,
+		})
+	}
+
+	// Adding 1500 deb packages, with the first 40 matching python packages
+	for i := 1; i <= 1500; i++ {
+		var debPkg string
+		if i <= 38 { // Match first 38 python packages
+			debPkg = fmt.Sprintf("python3-package%d", i)
+		} else { // Non-python packages
+			debPkg = fmt.Sprintf("unrelated_package%d", i)
+		}
+		results[hostDetailQueryPrefix+"software_linux"] = append(results[hostDetailQueryPrefix+"software_linux"], map[string]string{
+			"source": "deb_packages",
+			"name":   debPkg,
+		})
+	}
+
+	return results
+}
+
+func BenchmarkPreprocessUbuntuPythonPackageFilter(b *testing.B) {
+	platform := "ubuntu"
+	results := mockUbuntuResults()
+	statuses := map[string]fleet.OsqueryStatus{
+		hostDetailQueryPrefix + "software_linux": fleet.StatusOK,
+	}
+
+	for i := 0; i < b.N; i++ {
+		preProcessSoftwareResults(context.Background(), &fleet.Host{ID: 1, Platform: platform}, results, statuses, nil, nil, slog.New(slog.DiscardHandler))
+	}
+}
+
+// TestPythonPackageFilterDuplicateUserDirs verifies that when osquery
+// reports the same python package multiple times (once per user via CROSS JOIN users),
+// all duplicates are handled correctly. The old code used map[string]int which only
+// tracked the last index, leaving earlier duplicates unfiltered or unrenamed.
+func TestPythonPackageFilterDuplicateUserDirs(t *testing.T) {
+	const swLinux = hostDetailQueryPrefix + "software_linux"
+
+	t.Run("matched duplicates are all removed", func(t *testing.T) {
+		results := fleet.OsqueryDistributedQueryResults{
+			swLinux: []map[string]string{
+				{"name": "python3-cryptography", "version": "41.0.7-4ubuntu0.1", "source": "deb_packages"},
+				{"name": "cryptography", "version": "41.0.7", "source": "python_packages"},
+				{"name": "cryptography", "version": "41.0.7", "source": "python_packages"},
+			},
+		}
+		statuses := map[string]fleet.OsqueryStatus{swLinux: fleet.StatusOK}
+
+		pythonPackageFilter("ubuntu", results, statuses)
+
+		require.Len(t, results[swLinux], 1, "both duplicate python_packages entries should be removed")
+		require.Equal(t, "python3-cryptography", results[swLinux][0]["name"])
+	})
+
+	t.Run("unmatched duplicates are all renamed", func(t *testing.T) {
+		results := fleet.OsqueryDistributedQueryResults{
+			swLinux: []map[string]string{
+				{"name": "flask", "version": "3.0.0", "source": "python_packages"},
+				{"name": "flask", "version": "3.0.0", "source": "python_packages"},
+			},
+		}
+		statuses := map[string]fleet.OsqueryStatus{swLinux: fleet.StatusOK}
+
+		pythonPackageFilter("ubuntu", results, statuses)
+
+		require.Len(t, results[swLinux], 2)
+		for _, row := range results[swLinux] {
+			require.Equal(t, "python3-flask", row["name"], "all duplicates should be renamed")
+		}
+	})
+}
+
+func TestUpdateFleetdVersion(t *testing.T) {
+	const (
+		orbitInfoQuery     = hostDetailQueryPrefix + "orbit_info"
+		softwareLinuxQuery = hostDetailQueryPrefix + "software_linux"
+	)
+
+	t.Run("updates fleet-osquery version on linux", func(t *testing.T) {
+		results := fleet.OsqueryDistributedQueryResults{
+			orbitInfoQuery: []map[string]string{
+				{"version": "1.2.3"},
+			},
+			softwareLinuxQuery: []map[string]string{
+				{"name": "some-other-package", "version": "0.0.1"},
+				{"name": "fleet-osquery", "version": "0.0.0"},
+			},
+		}
+
+		updateFleetdVersion("linux", results)
+
+		require.Equal(t, "1.2.3", results[softwareLinuxQuery][1]["version"])
+		require.Equal(t, "0.0.1", results[softwareLinuxQuery][0]["version"])
+	})
+
+	t.Run("non-linux platform - does nothing", func(t *testing.T) {
+		originalResults := fleet.OsqueryDistributedQueryResults{
+			orbitInfoQuery: []map[string]string{
+				{"version": "1.2.3"},
+			},
+			softwareLinuxQuery: []map[string]string{
+				{"name": "fleet-osquery", "version": "0.0.0"},
+			},
+		}
+
+		results := fleet.OsqueryDistributedQueryResults{
+			orbitInfoQuery: []map[string]string{
+				{"version": "1.2.3"},
+			},
+			softwareLinuxQuery: []map[string]string{
+				{"name": "fleet-osquery", "version": "0.0.0"},
+			},
+		}
+
+		updateFleetdVersion("darwin", results)
+		require.Equal(t, originalResults, results)
+
+		updateFleetdVersion("windows", results)
+		require.Equal(t, originalResults, results)
+	})
+}
+
+// makeLiveQueryStore creates a mock live query store that returns `countToReturn` from the
+// GetQueryResultsCounts method.
+func makeLiveQueryStore(t *testing.T, countToReturn int) *live_query_mock.MockLiveQuery {
+	lq := live_query_mock.New(t)
+	lq.GetQueryResultsCountsOverride = func(queryIDs []uint) (map[uint]int, error) {
+		result := make(map[uint]int, len(queryIDs))
+		for _, id := range queryIDs {
+			result[id] = countToReturn
+		}
+		return result, nil
+	}
+	lq.IncrQueryResultsCountsOverride = func(queryIDsToAmounts map[uint]int) error {
+		return nil
+	}
+	return lq
+}
+
+func TestContinuousAutomationOnCooldown(t *testing.T) {
+	ds := new(mock.Store)
+	mockClock := clock.NewMockClock()
+	svc, _ := newTestServiceWithConfig(t, ds, config.TestConfig(), nil, nil, &TestServerOpts{Clock: mockClock})
+	svcImpl := svc.(validationMiddleware).Service.(*Service)
+
+	now := mockClock.Now()
+	// No prior automation install (zero time) is never on cooldown.
+	require.False(t, svcImpl.continuousAutomationOnCooldown(time.Time{}))
+	// Fired within the policy update interval (1h in TestConfig) => on cooldown.
+	require.True(t, svcImpl.continuousAutomationOnCooldown(now.Add(-30*time.Minute)))
+	// Fired before the policy update interval => not on cooldown.
+	require.False(t, svcImpl.continuousAutomationOnCooldown(now.Add(-2*time.Hour)))
+}
+
+// TestProcessSoftwareForNewlyFailingPoliciesContinuousCooldown verifies that a
+// continuous policy automation (continuous_automations_enabled) does not re-queue a
+// software install more than once per policy update interval. This prevents the tight
+// install→refetch→re-run→install loop that happens when the install succeeds but the
+// policy keeps failing. Newly-failing (pass→fail) policies still fire immediately.
+func TestProcessSoftwareForNewlyFailingPoliciesContinuousCooldown(t *testing.T) {
+	ds := new(mock.Store)
+	mockClock := clock.NewMockClock()
+	svc, ctx := newTestServiceWithConfig(t, ds, config.TestConfig(), nil, nil, &TestServerOpts{Clock: mockClock})
+	svcImpl := svc.(validationMiddleware).Service.(*Service)
+
+	const (
+		policyID    = uint(1)
+		installerID = uint(100)
+		hostID      = uint(42)
+	)
+	titleID := uint(7)
+
+	ds.GetPoliciesWithAssociatedInstallerFunc = func(ctx context.Context, teamID uint, policyIDs []uint) ([]fleet.PolicySoftwareInstallerData, error) {
+		return []fleet.PolicySoftwareInstallerData{{ID: policyID, InstallerID: installerID, ContinuousAutomationsEnabled: true}}, nil
+	}
+	ds.GetSoftwareInstallerMetadataByIDFunc = func(ctx context.Context, id uint) (*fleet.SoftwareInstaller, error) {
+		return &fleet.SoftwareInstaller{InstallerID: installerID, TitleID: &titleID, Platform: "darwin"}, nil
+	}
+	ds.IsSoftwareInstallerLabelScopedFunc = func(ctx context.Context, installerID, hostID uint) (bool, error) {
+		return true, nil
+	}
+	ds.ResetPolicyAutomationRetryAttemptsForHostFunc = func(ctx context.Context, hostID uint, policyIDs []uint) error {
+		return nil
+	}
+	var insertCalled bool
+	ds.InsertSoftwareInstallRequestFunc = func(ctx context.Context, hostID, swInstallerID uint, opts fleet.HostSoftwareInstallOptions) (string, error) {
+		insertCalled = true
+		return "exec-uuid", nil
+	}
+
+	orbitKey := "orbit-key"
+	failing := map[uint]*bool{policyID: new(false)}
+	noNewlyFailing := map[uint]struct{}{}
+	now := mockClock.Now()
+	installed := fleet.SoftwareInstalled
+	failedInstall := fleet.SoftwareInstallFailed
+
+	setLastInstall := func(status *fleet.SoftwareInstallerStatus, updatedAt time.Time) {
+		ds.GetHostLastInstallDataFunc = func(ctx context.Context, hostID, installerID uint) (*fleet.HostLastInstallData, error) {
+			return &fleet.HostLastInstallData{ExecutionID: "prev-exec", Status: status, UpdatedAt: updatedAt}, nil
+		}
+	}
+
+	// Continuous re-fire with a recent successful install => throttled.
+	insertCalled = false
+	setLastInstall(&installed, now.Add(-10*time.Minute))
+	require.NoError(t, svcImpl.processSoftwareForNewlyFailingPolicies(ctx, hostID, nil, "darwin", &orbitKey, "", failing, noNewlyFailing))
+	require.False(t, insertCalled, "continuous install should be throttled within the policy update interval")
+
+	// Continuous re-fire after the interval elapsed => fires.
+	insertCalled = false
+	setLastInstall(&installed, now.Add(-2*time.Hour))
+	require.NoError(t, svcImpl.processSoftwareForNewlyFailingPolicies(ctx, hostID, nil, "darwin", &orbitKey, "", failing, noNewlyFailing))
+	require.True(t, insertCalled, "continuous install should fire once the cooldown elapses")
+
+	// Newly failing (pass→fail) bypasses the cooldown even with a recent install.
+	insertCalled = false
+	setLastInstall(&installed, now.Add(-1*time.Minute))
+	require.NoError(t, svcImpl.processSoftwareForNewlyFailingPolicies(ctx, hostID, nil, "darwin", &orbitKey, "", failing, map[uint]struct{}{policyID: {}}))
+	require.True(t, insertCalled, "newly-failing install should fire regardless of cooldown")
+
+	// A recent FAILED install does not throttle: only successful installs request the
+	// refetch that drives the loop, and failures are retried via the dedicated path.
+	insertCalled = false
+	setLastInstall(&failedInstall, now.Add(-1*time.Minute))
+	require.NoError(t, svcImpl.processSoftwareForNewlyFailingPolicies(ctx, hostID, nil, "darwin", &orbitKey, "", failing, noNewlyFailing))
+	require.True(t, insertCalled, "continuous install should fire when the recent install failed")
+
+	// A recent install with nil status (installed then removed) does not throttle.
+	insertCalled = false
+	setLastInstall(nil, now.Add(-1*time.Minute))
+	require.NoError(t, svcImpl.processSoftwareForNewlyFailingPolicies(ctx, hostID, nil, "darwin", &orbitKey, "", failing, noNewlyFailing))
+	require.True(t, insertCalled, "continuous install should fire when the recent install has no resolved status")
+
+	// No prior install => fires.
+	insertCalled = false
+	ds.GetHostLastInstallDataFunc = func(ctx context.Context, hostID, installerID uint) (*fleet.HostLastInstallData, error) {
+		return nil, nil
+	}
+	require.NoError(t, svcImpl.processSoftwareForNewlyFailingPolicies(ctx, hostID, nil, "darwin", &orbitKey, "", failing, noNewlyFailing))
+	require.True(t, insertCalled, "install should fire when there is no prior install")
+}
+
+// TestProcessVPPForNewlyFailingPoliciesContinuousCooldown is the VPP analog of
+// TestProcessSoftwareForNewlyFailingPoliciesContinuousCooldown: a continuous
+// policy automation must not re-install a VPP app more than once per policy update
+// interval. The cooldown is keyed on apps verified-installed within the interval
+// (MapAdamIDsRecentlyVerifiedInstalls). Newly-failing (pass→fail) policies still
+// fire immediately.
+func TestProcessVPPForNewlyFailingPoliciesContinuousCooldown(t *testing.T) {
+	ds := new(mock.Store)
+	mockClock := clock.NewMockClock()
+	svc, ctx := newTestServiceWithConfig(t, ds, config.TestConfig(), nil, nil, &TestServerOpts{Clock: mockClock})
+	svcImpl := svc.(validationMiddleware).Service.(*Service)
+
+	const (
+		policyID = uint(1)
+		hostID   = uint(42)
+		adamID   = "adam-vpp-1"
+	)
+
+	ds.GetPoliciesWithAssociatedVPPFunc = func(ctx context.Context, teamID uint, policyIDs []uint) ([]fleet.PolicyVPPData, error) {
+		return []fleet.PolicyVPPData{{ID: policyID, AdamID: adamID, Platform: fleet.MacOSPlatform, ContinuousAutomationsEnabled: true}}, nil
+	}
+	ds.HostFunc = func(ctx context.Context, id uint) (*fleet.Host, error) {
+		return &fleet.Host{ID: hostID, Platform: "darwin"}, nil
+	}
+	ds.MapAdamIDsPendingInstallFunc = func(ctx context.Context, hostID uint) (map[string]struct{}, error) {
+		return map[string]struct{}{}, nil
+	}
+	ds.MapAdamIDsQueuedInstallsFunc = func(ctx context.Context, hostID uint) (map[string]struct{}, error) {
+		return map[string]struct{}{}, nil
+	}
+	ds.GetVPPAppMetadataByAdamIDPlatformTeamIDFunc = func(ctx context.Context, adamID string, platform fleet.InstallableDevicePlatform, teamID *uint) (*fleet.VPPApp, error) {
+		return &fleet.VPPApp{VPPAppTeam: fleet.VPPAppTeam{AppTeamID: 1, VPPAppID: fleet.VPPAppID{AdamID: adamID, Platform: platform}}}, nil
+	}
+	ds.IsVPPAppLabelScopedFunc = func(ctx context.Context, vppAppTeamID, hostID uint) (bool, error) {
+		return true, nil
+	}
+
+	var installCalled bool
+	svcImpl.SetEnterpriseOverrides(fleet.EnterpriseOverrides{
+		GetVPPTokenIfCanInstallVPPApps: func(ctx context.Context, appleDevice bool, host *fleet.Host) (string, error) {
+			return "vpp-token", nil
+		},
+		InstallVPPAppPostValidation: func(ctx context.Context, host *fleet.Host, vppApp *fleet.VPPApp, token string, opts fleet.HostSoftwareInstallOptions) (string, error) {
+			installCalled = true
+			return "command-uuid", nil
+		},
+	})
+
+	failing := map[uint]*bool{policyID: new(false)}
+	noNewlyFailing := map[uint]struct{}{}
+
+	setRecentlyVerified := func(recent bool) {
+		ds.MapAdamIDsRecentlyVerifiedInstallsFunc = func(ctx context.Context, hostID uint, seconds int) (map[string]struct{}, error) {
+			if recent {
+				return map[string]struct{}{adamID: {}}, nil
+			}
+			return map[string]struct{}{}, nil
+		}
+	}
+
+	// Continuous re-fire with the app verified-installed within the interval => throttled.
+	installCalled = false
+	setRecentlyVerified(true)
+	require.NoError(t, svcImpl.processVPPForNewlyFailingPolicies(ctx, hostID, nil, "darwin", failing, noNewlyFailing))
+	require.False(t, installCalled, "continuous VPP install should be throttled within the policy update interval")
+
+	// Continuous re-fire with no recent verified install (cooldown elapsed) => fires.
+	installCalled = false
+	setRecentlyVerified(false)
+	require.NoError(t, svcImpl.processVPPForNewlyFailingPolicies(ctx, hostID, nil, "darwin", failing, noNewlyFailing))
+	require.True(t, installCalled, "continuous VPP install should fire once the cooldown elapses")
+
+	// Newly failing (pass→fail) bypasses the cooldown even with a recent verified install.
+	installCalled = false
+	setRecentlyVerified(true)
+	require.NoError(t, svcImpl.processVPPForNewlyFailingPolicies(ctx, hostID, nil, "darwin", failing, map[uint]struct{}{policyID: {}}))
+	require.True(t, installCalled, "newly-failing VPP install should fire regardless of cooldown")
+}
+
+// TestProcessVPPForNewlyFailingPoliciesSkipsQueuedInstalls verifies that a policy automation does
+// not queue another install of an app that already has one in the host's upcoming activity queue.
+// MapAdamIDsPendingInstall only matches install commands that haven't been delivered yet, so on a
+// host whose queue is not draining it reports nothing and the automation re-fires on every run.
+func TestProcessVPPForNewlyFailingPoliciesSkipsQueuedInstalls(t *testing.T) {
+	ds := new(mock.Store)
+	svc, ctx := newTestServiceWithConfig(t, ds, config.TestConfig(), nil, nil, &TestServerOpts{})
+	svcImpl := svc.(validationMiddleware).Service.(*Service)
+
+	const (
+		policyID = uint(1)
+		hostID   = uint(42)
+		adamID   = "adam-vpp-1"
+	)
+
+	continuousAutomations := true
+	ds.GetPoliciesWithAssociatedVPPFunc = func(ctx context.Context, teamID uint, policyIDs []uint) ([]fleet.PolicyVPPData, error) {
+		return []fleet.PolicyVPPData{{ID: policyID, AdamID: adamID, Platform: fleet.MacOSPlatform, ContinuousAutomationsEnabled: continuousAutomations}}, nil
+	}
+	ds.HostFunc = func(ctx context.Context, id uint) (*fleet.Host, error) {
+		return &fleet.Host{ID: hostID, Platform: "darwin"}, nil
+	}
+	// A stuck queue leaves the command delivered and acknowledged, so neither of the existing
+	// lookups reports the app.
+	ds.MapAdamIDsPendingInstallFunc = func(ctx context.Context, hostID uint) (map[string]struct{}, error) {
+		return map[string]struct{}{}, nil
+	}
+	ds.MapAdamIDsRecentlyVerifiedInstallsFunc = func(ctx context.Context, hostID uint, seconds int) (map[string]struct{}, error) {
+		return map[string]struct{}{}, nil
+	}
+	installQueued := true
+	ds.MapAdamIDsQueuedInstallsFunc = func(ctx context.Context, hostID uint) (map[string]struct{}, error) {
+		if installQueued {
+			return map[string]struct{}{adamID: {}}, nil
+		}
+		return map[string]struct{}{}, nil
+	}
+	ds.GetVPPAppMetadataByAdamIDPlatformTeamIDFunc = func(ctx context.Context, adamID string, platform fleet.InstallableDevicePlatform, teamID *uint) (*fleet.VPPApp, error) {
+		return &fleet.VPPApp{VPPAppTeam: fleet.VPPAppTeam{AppTeamID: 1, VPPAppID: fleet.VPPAppID{AdamID: adamID, Platform: platform}}}, nil
+	}
+	ds.IsVPPAppLabelScopedFunc = func(ctx context.Context, vppAppTeamID, hostID uint) (bool, error) {
+		return true, nil
+	}
+
+	var (
+		installs         []string
+		installPolicyIDs []uint
+	)
+	svcImpl.SetEnterpriseOverrides(fleet.EnterpriseOverrides{
+		GetVPPTokenIfCanInstallVPPApps: func(ctx context.Context, appleDevice bool, host *fleet.Host) (string, error) {
+			return "vpp-token", nil
+		},
+		InstallVPPAppPostValidation: func(ctx context.Context, host *fleet.Host, vppApp *fleet.VPPApp, token string, opts fleet.HostSoftwareInstallOptions) (string, error) {
+			installs = append(installs, vppApp.AdamID)
+			if opts.PolicyID != nil {
+				installPolicyIDs = append(installPolicyIDs, *opts.PolicyID)
+			}
+			return "command-uuid", nil
+		},
+	})
+
+	noNewlyFailing := map[uint]struct{}{}
+	newlyFailing := map[uint]struct{}{policyID: {}}
+	// A fresh map per case, because the out-of-scope branch writes nil into it and sharing one would
+	// carry that between cases.
+	newFailingMap := func() map[uint]*bool { return map[uint]*bool{policyID: new(false)} }
+
+	// Continuous re-fire with an install already queued for the app => skipped.
+	installs = nil
+	require.NoError(t, svcImpl.processVPPForNewlyFailingPolicies(ctx, hostID, nil, "darwin", newFailingMap(), noNewlyFailing))
+	require.Empty(t, installs, "continuous VPP install should be skipped while one is queued for the app")
+
+	// A pass→fail transition is filtered too, matching processSoftwareForNewlyFailingPolicies, whose
+	// pending-install check has no such exemption. An exemption here would re-queue on every
+	// membership flap, since flipping() counts a missing prior row as newly failing.
+	installs = nil
+	continuousAutomations = false
+	require.NoError(t, svcImpl.processVPPForNewlyFailingPolicies(ctx, hostID, nil, "darwin", newFailingMap(), newlyFailing))
+	require.Empty(t, installs, "a newly-failing policy is filtered by a queued install, as on the installer path")
+
+	// Queue drained => fires. Without this the filter could never release and the first case would
+	// pass against a filter that blocks forever.
+	installs = nil
+	continuousAutomations = true
+	installQueued = false
+	require.NoError(t, svcImpl.processVPPForNewlyFailingPolicies(ctx, hostID, nil, "darwin", newFailingMap(), noNewlyFailing))
+	require.Equal(t, []string{adamID}, installs, "VPP install should fire once the queued install has drained")
+
+	// The lookups are read once before the loop, so one install here is only possible if the run
+	// tracks what it has queued.
+	const secondPolicyID = uint(2)
+	ds.GetPoliciesWithAssociatedVPPFunc = func(ctx context.Context, teamID uint, policyIDs []uint) ([]fleet.PolicyVPPData, error) {
+		// Highest id first, since the query has no ORDER BY, so only the sort decides which one wins.
+		return []fleet.PolicyVPPData{
+			{ID: secondPolicyID, AdamID: adamID, Platform: fleet.MacOSPlatform, ContinuousAutomationsEnabled: true},
+			{ID: policyID, AdamID: adamID, Platform: fleet.MacOSPlatform, ContinuousAutomationsEnabled: true},
+		}, nil
+	}
+	installs = nil
+	installPolicyIDs = nil
+	twoFailing := map[uint]*bool{policyID: new(false), secondPolicyID: new(false)}
+	require.NoError(t, svcImpl.processVPPForNewlyFailingPolicies(ctx, hostID, nil, "darwin", twoFailing, noNewlyFailing))
+	require.Equal(t, []string{adamID}, installs, "two policies on one app must not each queue an install")
+	require.Equal(t, []uint{policyID}, installPolicyIDs, "the policy credited with the install must not depend on row order")
+
+	// An app can be added for several platforms and the query filters on neither the app's platform
+	// nor the host's, so the iOS build of an app can reach a macOS host.
+	ds.GetPoliciesWithAssociatedVPPFunc = func(ctx context.Context, teamID uint, policyIDs []uint) ([]fleet.PolicyVPPData, error) {
+		return []fleet.PolicyVPPData{
+			{ID: policyID, AdamID: adamID, Platform: fleet.IOSPlatform, ContinuousAutomationsEnabled: true},
+		}, nil
+	}
+	installs = nil
+	require.NoError(t, svcImpl.processVPPForNewlyFailingPolicies(ctx, hostID, nil, "darwin", newFailingMap(), noNewlyFailing))
+	require.Empty(t, installs, "an iOS app must not be installed on a macOS host")
+
+	// An app out of scope for the host installs nothing, and the policy result is cleared so the host
+	// does not show it failing for something it cannot remediate.
+	ds.GetPoliciesWithAssociatedVPPFunc = func(ctx context.Context, teamID uint, policyIDs []uint) ([]fleet.PolicyVPPData, error) {
+		return []fleet.PolicyVPPData{
+			{ID: policyID, AdamID: adamID, Platform: fleet.MacOSPlatform, ContinuousAutomationsEnabled: true},
+		}, nil
+	}
+	ds.IsVPPAppLabelScopedFunc = func(ctx context.Context, vppAppTeamID, hostID uint) (bool, error) {
+		return false, nil
+	}
+	installs = nil
+	outOfScope := newFailingMap()
+	require.NoError(t, svcImpl.processVPPForNewlyFailingPolicies(ctx, hostID, nil, "darwin", outOfScope, noNewlyFailing))
+	require.Empty(t, installs, "an out-of-scope app must not be installed")
+	require.Nil(t, outOfScope[policyID], "an out-of-scope app must clear the policy result")
+}
+
+// TestProcessSoftwareForNewlyFailingPoliciesSuppressedDuringSetupExperience verifies that a failing install-software policy does
+// NOT enqueue an automation install while the host is in setup experience (setup experience performs that install itself), and
+// that it installs normally otherwise.
+func TestProcessSoftwareForNewlyFailingPoliciesSuppressedDuringSetupExperience(t *testing.T) {
+	ds := new(mock.Store)
+	svc, ctx := newTestServiceWithConfig(t, ds, config.TestConfig(), nil, nil, &TestServerOpts{})
+	svcImpl := svc.(validationMiddleware).Service.(*Service)
+
+	const (
+		policyID    = uint(1)
+		installerID = uint(100)
+		hostID      = uint(42)
+	)
+	titleID := uint(7)
+
+	ds.GetPoliciesWithAssociatedInstallerFunc = func(ctx context.Context, teamID uint, policyIDs []uint) ([]fleet.PolicySoftwareInstallerData, error) {
+		return []fleet.PolicySoftwareInstallerData{{ID: policyID, InstallerID: installerID}}, nil
+	}
+	ds.GetSoftwareInstallerMetadataByIDFunc = func(ctx context.Context, id uint) (*fleet.SoftwareInstaller, error) {
+		return &fleet.SoftwareInstaller{InstallerID: installerID, TitleID: &titleID, Platform: "windows"}, nil
+	}
+	ds.IsSoftwareInstallerLabelScopedFunc = func(ctx context.Context, installerID, hostID uint) (bool, error) { return true, nil }
+	ds.GetHostLastInstallDataFunc = func(ctx context.Context, hostID, installerID uint) (*fleet.HostLastInstallData, error) {
+		return nil, nil
+	}
+	var insertCalled bool
+	ds.InsertSoftwareInstallRequestFunc = func(ctx context.Context, hostID, swInstallerID uint, opts fleet.HostSoftwareInstallOptions) (string, error) {
+		insertCalled = true
+		return "exec-uuid", nil
+	}
+
+	orbitKey := "orbit-key"
+	policyFailed := false
+	failing := map[uint]*bool{policyID: &policyFailed}
+	newlyFailing := map[uint]struct{}{policyID: {}}
+
+	t.Run("suppressed when the policy gates an in-setup item", func(t *testing.T) {
+		insertCalled = false
+		ds.GetSetupExperiencePolicyIDsForHostFunc = func(ctx context.Context, hostUUID string) ([]uint, error) {
+			return []uint{policyID}, nil
+		}
+		require.NoError(t, svcImpl.processSoftwareForNewlyFailingPolicies(ctx, hostID, nil, "windows", &orbitKey, "setup-host-uuid", failing, newlyFailing))
+		require.False(t, insertCalled, "policy automation must be suppressed during setup experience")
+	})
+
+	t.Run("fires when the host is not in setup experience", func(t *testing.T) {
+		insertCalled = false
+		ds.GetSetupExperiencePolicyIDsForHostFunc = func(ctx context.Context, hostUUID string) ([]uint, error) {
+			return nil, nil
+		}
+		require.NoError(t, svcImpl.processSoftwareForNewlyFailingPolicies(ctx, hostID, nil, "windows", &orbitKey, "setup-host-uuid", failing, newlyFailing))
+		require.True(t, insertCalled, "outside setup experience the policy automation installs normally")
+	})
+}
+
+// TestPolicyAutomationDeferredActivation verifies that policy-automation
+// installs are enqueued with deferred activation when the fleet-initiated
+// release budget (activity.fleet_initiated_release_per_minute) is enabled, and
+// with inline activation when it is not.
+func TestPolicyAutomationDeferredActivation(t *testing.T) {
+	const (
+		policyID    = uint(1)
+		installerID = uint(100)
+		hostID      = uint(42)
+	)
+	titleID := uint(7)
+
+	setupMocks := func(ds *mock.Store) *bool {
+		ds.GetPoliciesWithAssociatedInstallerFunc = func(ctx context.Context, teamID uint, policyIDs []uint) ([]fleet.PolicySoftwareInstallerData, error) {
+			return []fleet.PolicySoftwareInstallerData{{ID: policyID, InstallerID: installerID}}, nil
+		}
+		ds.GetSoftwareInstallerMetadataByIDFunc = func(ctx context.Context, id uint) (*fleet.SoftwareInstaller, error) {
+			return &fleet.SoftwareInstaller{InstallerID: installerID, TitleID: &titleID, Platform: "windows"}, nil
+		}
+		ds.IsSoftwareInstallerLabelScopedFunc = func(ctx context.Context, installerID, hostID uint) (bool, error) { return true, nil }
+		ds.GetHostLastInstallDataFunc = func(ctx context.Context, hostID, installerID uint) (*fleet.HostLastInstallData, error) {
+			return nil, nil
+		}
+		var deferred bool
+		ds.InsertSoftwareInstallRequestFunc = func(ctx context.Context, hostID, swInstallerID uint, opts fleet.HostSoftwareInstallOptions) (string, error) {
+			deferred = opts.DeferActivation
+			return "exec-uuid", nil
+		}
+		return &deferred
+	}
+
+	orbitKey := "orbit-key"
+	policyFailed := false
+	failing := map[uint]*bool{policyID: &policyFailed}
+	newlyFailing := map[uint]struct{}{policyID: {}}
+
+	t.Run("release budget enabled defers activation", func(t *testing.T) {
+		ds := new(mock.Store)
+		cfg := config.TestConfig()
+		cfg.Activity.FleetInitiatedReleasePerMinute = 1000
+		svc, ctx := newTestServiceWithConfig(t, ds, cfg, nil, nil, &TestServerOpts{})
+		svcImpl := svc.(validationMiddleware).Service.(*Service)
+		deferred := setupMocks(ds)
+
+		require.NoError(t, svcImpl.processSoftwareForNewlyFailingPolicies(ctx, hostID, nil, "windows", &orbitKey, "", failing, newlyFailing))
+		require.True(t, ds.InsertSoftwareInstallRequestFuncInvoked)
+		require.True(t, *deferred, "policy automation must defer activation when the release budget is on")
+	})
+
+	t.Run("release budget disabled activates inline", func(t *testing.T) {
+		ds := new(mock.Store)
+		svc, ctx := newTestServiceWithConfig(t, ds, config.TestConfig(), nil, nil, &TestServerOpts{})
+		svcImpl := svc.(validationMiddleware).Service.(*Service)
+		deferred := setupMocks(ds)
+
+		require.NoError(t, svcImpl.processSoftwareForNewlyFailingPolicies(ctx, hostID, nil, "windows", &orbitKey, "", failing, newlyFailing))
+		require.True(t, ds.InsertSoftwareInstallRequestFuncInvoked)
+		require.False(t, *deferred, "with the budget off, enqueue must keep inline activation")
+	})
+}
+
+// TestProcessProfileResendsForNewlyFailingPolicies covers the policy automation that resends a
+// configuration profile when its policy fails on a host: which policies trigger a resend, and the
+// activity recorded for each one. The activity is the only record of an automated resend, so it
+// must carry the host, the profile and the policy that triggered it.
+func TestProcessProfileResendsForNewlyFailingPolicies(t *testing.T) {
+	const (
+		applePolicyID = uint(1)
+		winPolicyID   = uint(2)
+		noProfPolicy  = uint(3)
+	)
+	appleProfUUID := fleet.MDMAppleProfileUUIDPrefix + "apple-prof"
+	winProfUUID := fleet.MDMWindowsProfileUUIDPrefix + "windows-prof"
+
+	appleData := fleet.PolicyProfileData{
+		PolicyID:    applePolicyID,
+		PolicyName:  "apple policy",
+		ProfileUUID: appleProfUUID,
+		ProfileName: "apple profile",
+	}
+	winData := fleet.PolicyProfileData{
+		PolicyID:    winPolicyID,
+		PolicyName:  "windows policy",
+		ProfileUUID: winProfUUID,
+		ProfileName: "windows profile",
+	}
+
+	darwinHost := &fleet.Host{ID: 42, UUID: "host-uuid", Platform: "darwin", ComputerName: "Nancy's MacBook", Hostname: "nancy-mbp"}
+	windowsHost := &fleet.Host{ID: 43, UUID: "win-host-uuid", Platform: "windows", ComputerName: "WIN-BOX", Hostname: "win-box"}
+
+	// harness wires a service to a mock datastore reporting the given policy/profile associations,
+	// and records the resends performed and the activities logged.
+	type harness struct {
+		svc *Service
+		ctx context.Context
+		// statusFor decides what GetHostMDMProfileInstallStatus reports per profile UUID; a
+		// missing entry means the profile is not assigned to the host.
+		statusFor  map[string]fleet.MDMDeliveryStatus
+		resendErr  error
+		resent     []string
+		activities []fleet.ActivityTypeResentConfigurationProfile
+	}
+	setup := func(t *testing.T, assoc []fleet.PolicyProfileData) *harness {
+		t.Helper()
+		ds := new(mock.Store)
+		opts := &TestServerOpts{}
+		svc, ctx := newTestServiceWithConfig(t, ds, config.TestConfig(), nil, nil, opts)
+		h := &harness{
+			svc:       svc.(validationMiddleware).Service.(*Service),
+			ctx:       ctx,
+			statusFor: map[string]fleet.MDMDeliveryStatus{appleProfUUID: fleet.MDMDeliveryVerified, winProfUUID: fleet.MDMDeliveryVerified},
+		}
+
+		// Mirrors the real query's `id IN (?)`, so a policy the caller filtered out before the
+		// lookup can't come back from the mock anyway.
+		ds.GetPoliciesWithAssociatedProfileFunc = func(ctx context.Context, teamID uint, policyIDs []uint) ([]fleet.PolicyProfileData, error) {
+			var out []fleet.PolicyProfileData
+			for _, a := range assoc {
+				if slices.Contains(policyIDs, a.PolicyID) {
+					out = append(out, a)
+				}
+			}
+			return out, nil
+		}
+		ds.GetHostMDMProfileInstallStatusFunc = func(ctx context.Context, hostUUID, profUUID string) (fleet.MDMDeliveryStatus, error) {
+			status, ok := h.statusFor[profUUID]
+			if !ok {
+				return "", &notFoundErr{}
+			}
+			return status, nil
+		}
+		ds.ResendHostMDMProfileFunc = func(ctx context.Context, hostUUID, profUUID string) error {
+			if h.resendErr != nil {
+				return h.resendErr
+			}
+			h.resent = append(h.resent, profUUID)
+			return nil
+		}
+		opts.ActivityMock.NewActivityFunc = func(_ context.Context, user *activity_api.User, act activity_api.ActivityDetails) error {
+			// Fleet performs the resend, not a user.
+			require.Nil(t, user)
+			resentAct, ok := act.(*fleet.ActivityTypeResentConfigurationProfile)
+			require.True(t, ok, "unexpected activity type %T", act)
+			h.activities = append(h.activities, *resentAct)
+			return nil
+		}
+		return h
+	}
+
+	t.Run("failing policy resends its profile and records the activity", func(t *testing.T) {
+		h := setup(t, []fleet.PolicyProfileData{appleData})
+
+		require.NoError(t, h.svc.processProfileResendsForNewlyFailingPolicies(h.ctx, darwinHost,
+			map[uint]*bool{applePolicyID: new(false)}, map[uint]struct{}{applePolicyID: {}}))
+
+		require.Equal(t, []string{appleProfUUID}, h.resent)
+		require.Len(t, h.activities, 1)
+		require.Equal(t, fleet.ActivityTypeResentConfigurationProfile{
+			HostID:          new(darwinHost.ID),
+			HostDisplayName: new("Nancy's MacBook"),
+			ProfileName:     "apple profile",
+			ProfileUUID:     appleProfUUID,
+			PolicyID:        new(applePolicyID),
+			PolicyName:      new("apple policy"),
+		}, h.activities[0])
+		// The activity reports as automation-driven, which is what marks it Fleet-initiated
+		// rather than attributing it to a user.
+		require.True(t, h.activities[0].WasFromAutomation())
+	})
+
+	t.Run("policy that was already failing resends nothing", func(t *testing.T) {
+		// Only a pass→fail transition triggers a resend. A policy that keeps failing reports a
+		// failure on every run, so acting on those would resend once per policy run for as long
+		// as the host stays out of compliance.
+		h := setup(t, []fleet.PolicyProfileData{appleData})
+
+		require.NoError(t, h.svc.processProfileResendsForNewlyFailingPolicies(h.ctx, darwinHost,
+			map[uint]*bool{applePolicyID: new(false)}, map[uint]struct{}{}))
+
+		require.Empty(t, h.resent)
+		require.Empty(t, h.activities)
+	})
+
+	t.Run("only the newly failing policy of several resends", func(t *testing.T) {
+		otherAppleData := fleet.PolicyProfileData{
+			PolicyID:    winPolicyID,
+			PolicyName:  "second apple policy",
+			ProfileUUID: fleet.MDMAppleProfileUUIDPrefix + "apple-prof-2",
+			ProfileName: "second apple profile",
+		}
+		h := setup(t, []fleet.PolicyProfileData{appleData, otherAppleData})
+		h.statusFor[otherAppleData.ProfileUUID] = fleet.MDMDeliveryVerified
+
+		// Both policies report a failure, but only the second one just flipped.
+		require.NoError(t, h.svc.processProfileResendsForNewlyFailingPolicies(h.ctx, darwinHost,
+			map[uint]*bool{applePolicyID: new(false), winPolicyID: new(false)},
+			map[uint]struct{}{winPolicyID: {}}))
+
+		require.Equal(t, []string{otherAppleData.ProfileUUID}, h.resent)
+		require.Len(t, h.activities, 1)
+		require.Equal(t, new(winPolicyID), h.activities[0].PolicyID)
+	})
+
+	t.Run("passing and erroring policies resend nothing", func(t *testing.T) {
+		h := setup(t, []fleet.PolicyProfileData{appleData})
+
+		// A passing policy, and a policy whose query failed to execute (nil result).
+		require.NoError(t, h.svc.processProfileResendsForNewlyFailingPolicies(h.ctx, darwinHost,
+			map[uint]*bool{applePolicyID: new(true), winPolicyID: nil}, map[uint]struct{}{}))
+
+		require.Empty(t, h.resent)
+		require.Empty(t, h.activities)
+	})
+
+	t.Run("policy with no associated profile resends nothing", func(t *testing.T) {
+		h := setup(t, nil)
+
+		require.NoError(t, h.svc.processProfileResendsForNewlyFailingPolicies(h.ctx, darwinHost,
+			map[uint]*bool{noProfPolicy: new(false)}, map[uint]struct{}{noProfPolicy: {}}))
+
+		require.Empty(t, h.resent)
+		require.Empty(t, h.activities)
+	})
+
+	t.Run("profile the host doesn't have is skipped and records no activity", func(t *testing.T) {
+		// A policy can target more platforms than the profile it resends, so a Windows host can
+		// report a failure for a policy holding an Apple profile. The host has no row for that
+		// profile, so the resend is rejected as not-found and only the Windows profile goes out.
+		h := setup(t, []fleet.PolicyProfileData{appleData, winData})
+		delete(h.statusFor, appleProfUUID)
+
+		require.NoError(t, h.svc.processProfileResendsForNewlyFailingPolicies(h.ctx, windowsHost,
+			map[uint]*bool{applePolicyID: new(false), winPolicyID: new(false)}, map[uint]struct{}{applePolicyID: {}, winPolicyID: {}}))
+
+		require.Equal(t, []string{winProfUUID}, h.resent)
+		require.Len(t, h.activities, 1)
+		require.Equal(t, winProfUUID, h.activities[0].ProfileUUID)
+		require.Equal(t, new(winPolicyID), h.activities[0].PolicyID)
+	})
+
+	t.Run("delivery already in flight is skipped and records no activity", func(t *testing.T) {
+		// A resend from an earlier run leaves the profile pending, and the policy keeps failing
+		// until the profile is delivered and re-verified. Resending again would be pointless and
+		// would log a resend per policy run.
+		for _, status := range []fleet.MDMDeliveryStatus{fleet.MDMDeliveryPending, fleet.MDMDeliveryVerifying} {
+			t.Run(string(status), func(t *testing.T) {
+				h := setup(t, []fleet.PolicyProfileData{appleData})
+				h.statusFor[appleProfUUID] = status
+
+				require.NoError(t, h.svc.processProfileResendsForNewlyFailingPolicies(h.ctx, darwinHost,
+					map[uint]*bool{applePolicyID: new(false)}, map[uint]struct{}{applePolicyID: {}}))
+
+				require.Empty(t, h.resent)
+				require.Empty(t, h.activities)
+			})
+		}
+	})
+
+	t.Run("failed profile is resent", func(t *testing.T) {
+		h := setup(t, []fleet.PolicyProfileData{appleData})
+		h.statusFor[appleProfUUID] = fleet.MDMDeliveryFailed
+
+		require.NoError(t, h.svc.processProfileResendsForNewlyFailingPolicies(h.ctx, darwinHost,
+			map[uint]*bool{applePolicyID: new(false)}, map[uint]struct{}{applePolicyID: {}}))
+
+		require.Equal(t, []string{appleProfUUID}, h.resent)
+		require.Len(t, h.activities, 1)
+	})
+
+	t.Run("no activity when the resend fails", func(t *testing.T) {
+		h := setup(t, []fleet.PolicyProfileData{appleData})
+		h.resendErr = errors.New("resend boom")
+
+		// A failed resend is logged, not returned: one bad profile must not abort the rest of
+		// the distributed query results processing.
+		require.NoError(t, h.svc.processProfileResendsForNewlyFailingPolicies(h.ctx, darwinHost,
+			map[uint]*bool{applePolicyID: new(false)}, map[uint]struct{}{applePolicyID: {}}))
+
+		require.Empty(t, h.resent)
+		require.Empty(t, h.activities)
+	})
+
+	t.Run("one failing profile does not stop the others", func(t *testing.T) {
+		// Two Apple profiles resent for the same host in one run, the first of which can't be
+		// resent. Each successful resend gets its own activity, attributing every profile to the
+		// policy that triggered it.
+		otherAppleData := fleet.PolicyProfileData{
+			PolicyID:    winPolicyID,
+			PolicyName:  "second apple policy",
+			ProfileUUID: fleet.MDMAppleProfileUUIDPrefix + "apple-prof-2",
+			ProfileName: "second apple profile",
+		}
+		h := setup(t, []fleet.PolicyProfileData{appleData, otherAppleData})
+		h.statusFor[otherAppleData.ProfileUUID] = fleet.MDMDeliveryVerified
+		delete(h.statusFor, appleProfUUID)
+
+		require.NoError(t, h.svc.processProfileResendsForNewlyFailingPolicies(h.ctx, darwinHost,
+			map[uint]*bool{applePolicyID: new(false), winPolicyID: new(false)}, map[uint]struct{}{applePolicyID: {}, winPolicyID: {}}))
+
+		require.Equal(t, []string{otherAppleData.ProfileUUID}, h.resent)
+		require.Len(t, h.activities, 1)
+		require.NotNil(t, h.activities[0].PolicyName)
+		require.Equal(t, "second apple policy", *h.activities[0].PolicyName)
+	})
+
+	t.Run("host in no team looks up policies under the no-team ID", func(t *testing.T) {
+		ds := new(mock.Store)
+		opts := &TestServerOpts{}
+		svc, ctx := newTestServiceWithConfig(t, ds, config.TestConfig(), nil, nil, opts)
+		svcImpl := svc.(validationMiddleware).Service.(*Service)
+
+		var gotTeamID uint
+		ds.GetPoliciesWithAssociatedProfileFunc = func(ctx context.Context, teamID uint, policyIDs []uint) ([]fleet.PolicyProfileData, error) {
+			gotTeamID = teamID
+			return nil, nil
+		}
+
+		require.NoError(t, svcImpl.processProfileResendsForNewlyFailingPolicies(ctx,
+			&fleet.Host{ID: 1, UUID: "u", Platform: "darwin"},
+			map[uint]*bool{applePolicyID: new(false)}, map[uint]struct{}{applePolicyID: {}}))
+		require.Equal(t, fleet.PolicyNoTeamID, gotTeamID)
+
+		teamID := uint(7)
+		require.NoError(t, svcImpl.processProfileResendsForNewlyFailingPolicies(ctx,
+			&fleet.Host{ID: 1, UUID: "u", Platform: "darwin", TeamID: &teamID},
+			map[uint]*bool{applePolicyID: new(false)}, map[uint]struct{}{applePolicyID: {}}))
+		require.Equal(t, teamID, gotTeamID)
+	})
+}
+
+// TestClientConfigMarshal tests that marshalClientConfig produces the same
+// bytes as the existing jsonMarshal path (two-space indent, trailing newline).
+func TestClientConfigMarshal(t *testing.T) {
+	config := map[string]any{
+		"options": map[string]any{
+			"config": map[string]any{
+				"options": map[string]any{
+					"logger_plugin": "tls",
+				},
+			},
+		},
+	}
+
+	body, err := marshalClientConfig(config)
+	require.NoError(t, err)
+
+	// Verify it starts with { and ends with newline
+	assert.True(t, bytes.HasPrefix(body, []byte("{")))
+	assert.True(t, bytes.HasSuffix(body, []byte("\n")))
+
+	// Verify two-space indentation
+	assert.Contains(t, string(body), "  ")
+
+	// Verify it can be unmarshalled back
+	var decoded map[string]any
+	require.NoError(t, json.Unmarshal(body, &decoded))
+	assert.Equal(t, config["options"], decoded["options"])
+}
+
+// TestClientConfigMarshalDeterministic verifies that two maps with identical
+// logical contents produce identical bytes and ETags regardless of insertion order.
+func TestClientConfigMarshalDeterministic(t *testing.T) {
+	config1 := map[string]any{
+		"options": map[string]any{"a": 1, "b": 2},
+		"packs":   map[string]any{"p1": map[string]any{}},
+	}
+	config2 := map[string]any{
+		"packs":   map[string]any{"p1": map[string]any{}},
+		"options": map[string]any{"b": 2, "a": 1},
+	}
+
+	body1, err := marshalClientConfig(config1)
+	require.NoError(t, err)
+	body2, err := marshalClientConfig(config2)
+	require.NoError(t, err)
+
+	assert.Equal(t, body1, body2, "maps with same keys/values must produce identical bytes")
+	assert.Equal(t, clientConfigETag(body1), clientConfigETag(body2))
+}
+
+// TestClientConfigETag verifies the validator format.
+func TestClientConfigETag(t *testing.T) {
+	body := []byte(`{"test": true}`)
+	etag := clientConfigETag(body)
+
+	// Bare lowercase hex SHA-256: the validator travels in JSON bodies, not
+	// HTTP headers, so there is no quoting. Hex also can never collide with
+	// the reserved "ok" value.
+	assert.Len(t, etag, 64)
+	sum := sha256.Sum256(body)
+	assert.Equal(t, hex.EncodeToString(sum[:]), etag)
+	assert.NotEqual(t, "ok", etag)
+}
+
+// TestClientConfigETagMatches tests the body-carried etag comparison: a nil
+// etag (agent did not opt in) and an empty etag (opted in, no validator yet)
+// can never match, so an agent without history is never answered "unchanged".
+func TestClientConfigETagMatches(t *testing.T) {
+	etag := "abc123"
+
+	tests := []struct {
+		name       string
+		clientETag *string
+		wantMatch  bool
+	}{
+		{"field absent", nil, false},
+		{"empty etag", new(""), false},
+		{"exact match", new("abc123"), true},
+		{"mismatch", new("xyz789"), false},
+		{"whitespace is not trimmed", new(" abc123 "), false},
+		{"no wildcard semantics", new("*"), false},
+		{"reserved ok never matches a real etag", new("ok"), false},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			got := clientConfigETagMatches(tt.clientETag, etag)
+			assert.Equal(t, tt.wantMatch, got)
+		})
+	}
+}
+
+// TestGetClientConfigResponse_HijackRender tests the HijackRender method.
+func TestGetClientConfigResponse_HijackRender(t *testing.T) {
+	ctx := context.Background()
+	body := []byte("{\n  \"options\": {}\n}\n")
+
+	t.Run("full config", func(t *testing.T) {
+		rr := httptest.NewRecorder()
+		resp := getClientConfigResponse{
+			body:        body,
+			notModified: false,
+		}
+		resp.HijackRender(ctx, rr)
+
+		assert.Equal(t, http.StatusOK, rr.Code)
+		assert.Equal(t, body, rr.Body.Bytes())
+		assert.Empty(t, rr.Header().Get("ETag"))
+		assert.Equal(t, "private, no-cache", rr.Header().Get("Cache-Control"))
+		assert.Equal(t, "application/json; charset=utf-8", rr.Header().Get("Content-Type"))
+	})
+
+	t.Run("not modified", func(t *testing.T) {
+		rr := httptest.NewRecorder()
+		resp := getClientConfigResponse{
+			body:        body,
+			notModified: true,
+		}
+		resp.HijackRender(ctx, rr)
+
+		// The unchanged response is a plain 200 with the constant reserved
+		// body, never a 304 (nonstandard for POST) and never the config.
+		assert.Equal(t, http.StatusOK, rr.Code)
+		assert.JSONEq(t, configUnchangedBody, rr.Body.String())
+		assert.Len(t, rr.Body.Bytes(), len(configUnchangedBody),
+			"the unchanged body is the exact constant, byte for byte")
+		assert.Empty(t, rr.Header().Get("ETag"))
+	})
+
+	t.Run("error response never reaches HijackRender", func(t *testing.T) {
+		resp := getClientConfigResponse{Err: errors.New("test error")}
+		assert.Error(t, resp.Error())
+	})
+}
+
+// TestGetClientConfigResponse_JSON tests MarshalJSON and UnmarshalJSON.
+func TestGetClientConfigResponse_JSON(t *testing.T) {
+	config := map[string]any{"options": map[string]any{"logger_plugin": "tls"}}
+
+	t.Run("MarshalJSON success", func(t *testing.T) {
+		resp := getClientConfigResponse{Config: config}
+		data, err := json.Marshal(resp)
+		require.NoError(t, err)
+
+		// Should be a top-level object, not wrapped
+		var decoded map[string]any
+		require.NoError(t, json.Unmarshal(data, &decoded))
+		assert.Contains(t, decoded, "options")
+		// Should not contain transport-only fields
+		assert.NotContains(t, decoded, "body")
+		assert.NotContains(t, decoded, "etag")
+		assert.NotContains(t, decoded, "not_modified")
+	})
+
+	t.Run("MarshalJSON error", func(t *testing.T) {
+		resp := getClientConfigResponse{Err: errors.New("something failed")}
+		data, err := json.Marshal(resp)
+		require.NoError(t, err)
+
+		var decoded map[string]string
+		require.NoError(t, json.Unmarshal(data, &decoded))
+		assert.Equal(t, "something failed", decoded["error"])
+	})
+
+	t.Run("UnmarshalJSON", func(t *testing.T) {
+		var resp getClientConfigResponse
+		data := []byte(`{"options":{"logger_plugin":"tls"}}`)
+		require.NoError(t, json.Unmarshal(data, &resp))
+		assert.Equal(t, config["options"], resp.Config["options"])
+	})
+}
+
+// TestGetClientConfigRequest_DecodeRequest tests the custom decoder,
+// including the three etag states the body protocol distinguishes.
+func TestGetClientConfigRequest_DecodeRequest(t *testing.T) {
+	decoder := getClientConfigRequest{}
+
+	t.Run("etag field with a value", func(t *testing.T) {
+		body := []byte(`{"node_key": "test-key", "etag": "abc123"}`)
+		r := httptest.NewRequest("POST", "/api/osquery/config", bytes.NewReader(body))
+
+		result, err := decoder.DecodeRequest(context.Background(), r)
+		require.NoError(t, err)
+
+		req := result.(*getClientConfigRequest)
+		assert.Equal(t, "test-key", req.NodeKey)
+		require.NotNil(t, req.ETag)
+		assert.Equal(t, "abc123", *req.ETag)
+	})
+
+	t.Run("empty etag field is opted in", func(t *testing.T) {
+		body := []byte(`{"node_key": "test-key", "etag": ""}`)
+		r := httptest.NewRequest("POST", "/api/osquery/config", bytes.NewReader(body))
+
+		result, err := decoder.DecodeRequest(context.Background(), r)
+		require.NoError(t, err)
+
+		req := result.(*getClientConfigRequest)
+		require.NotNil(t, req.ETag)
+		assert.Empty(t, *req.ETag)
+	})
+
+	t.Run("absent etag field is not opted in", func(t *testing.T) {
+		body := []byte(`{"node_key": "test-key"}`)
+		r := httptest.NewRequest("POST", "/api/osquery/config", bytes.NewReader(body))
+
+		result, err := decoder.DecodeRequest(context.Background(), r)
+		require.NoError(t, err)
+
+		req := result.(*getClientConfigRequest)
+		assert.Equal(t, "test-key", req.NodeKey)
+		assert.Nil(t, req.ETag)
+	})
+
+	t.Run("If-None-Match header is ignored", func(t *testing.T) {
+		body := []byte(`{"node_key": "test-key"}`)
+		r := httptest.NewRequest("POST", "/api/osquery/config", bytes.NewReader(body))
+		r.Header.Set("If-None-Match", `"abc123"`)
+
+		result, err := decoder.DecodeRequest(context.Background(), r)
+		require.NoError(t, err)
+
+		req := result.(*getClientConfigRequest)
+		assert.Nil(t, req.ETag)
+	})
+
+	t.Run("malformed JSON returns error", func(t *testing.T) {
+		body := []byte(`not json`)
+		r := httptest.NewRequest("POST", "/api/osquery/config", bytes.NewReader(body))
+
+		_, err := decoder.DecodeRequest(context.Background(), r)
+		assert.Error(t, err)
+	})
+}

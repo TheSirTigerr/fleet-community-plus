@@ -1,0 +1,42 @@
+import React from "react";
+
+import CustomLink from "components/CustomLink";
+import UploadList from "components/UploadList";
+import { IEulaMetadataResponse } from "services/entities/mdm";
+
+import EulaListItem from "../EulaListItem/EulaListItem";
+
+const baseClass = "uploaded-eula-view";
+
+interface IUploadedEulaViewProps {
+  eulaMetadata: IEulaMetadataResponse;
+  onDelete: () => void;
+}
+
+const UploadedEulaView = ({
+  eulaMetadata,
+  onDelete,
+}: IUploadedEulaViewProps) => {
+  return (
+    <div className={baseClass}>
+      <p>
+        Require end users to agree to a EULA when they first set up their new
+        macOS hosts.{" "}
+        <CustomLink
+          url="https://fleetdm.com/learn-more-about/setup-experience/end-user-authentication"
+          text="Learn more"
+          newTab
+        />
+      </p>
+      <UploadList
+        keyAttribute="name"
+        listItems={[eulaMetadata]}
+        ListItemComponent={({ listItem }) => (
+          <EulaListItem eulaData={listItem} onDelete={onDelete} />
+        )}
+      />
+    </div>
+  );
+};
+
+export default UploadedEulaView;

@@ -1,0 +1,66 @@
+import classnames from "classnames";
+import React from "react";
+
+import Graphic from "components/Graphic";
+import { GraphicNames } from "components/graphics";
+
+const baseClass = "list-item";
+
+export type ISupportedGraphicNames = Extract<
+  GraphicNames,
+  | "file-configuration-profile"
+  | "file-sh"
+  | "file-ps1"
+  | "file-py"
+  | "file-script"
+  | "file-pdf"
+  | "file-pkg"
+  | "file-p7m"
+  | "file-pem"
+  | "file-json"
+  | "file-certificate"
+>;
+
+/**
+ * A generic ListItem component that can be used to display a list of items. It
+ * encapsulates the UI logic and styling for displaying a graphic, title,
+ * details, and actions.
+ */
+interface IListItemProps {
+  /** The graphic you want to display for this list item. */
+  graphic?: ISupportedGraphicNames;
+  title: string | JSX.Element;
+  details?: React.ReactNode;
+  /** A collection of React Nodes that will render as list item actions. Can be
+   * used to render buttons, links, etc.
+   */
+  actions?: React.ReactNode;
+  /** An optional function to call when the user clicks anywhere in the ListItem */
+  onClick?: () => void;
+  className?: string;
+}
+
+const ListItem = ({
+  graphic,
+  title,
+  details,
+  actions,
+  onClick,
+  className,
+}: IListItemProps) => {
+  const classNames = classnames(baseClass, className);
+  return (
+    <div className={classNames} onClick={onClick}>
+      <div className={`${baseClass}__main-content`}>
+        {graphic && <Graphic name={graphic} />}
+        <div className={`${baseClass}__info`}>
+          <span className={`${baseClass}__title`}>{title}</span>
+          {details && <div className={`${baseClass}__details`}>{details}</div>}
+        </div>
+      </div>
+      {actions && <div className={`${baseClass}__actions`}>{actions}</div>}
+    </div>
+  );
+};
+
+export default ListItem;

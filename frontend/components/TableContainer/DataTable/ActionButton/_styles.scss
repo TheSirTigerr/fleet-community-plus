@@ -1,0 +1,38 @@
+.action-button {
+  display: flex;
+  align-items: center;
+
+  img {
+    position: relative;
+  }
+
+  .button--link {
+    font-weight: $regular;
+  }
+
+  &__remove {
+    img {
+      left: -4px;
+    }
+  }
+
+  &__delete {
+    img {
+      top: -1px;
+      left: 1px;
+    }
+  }
+
+  &__disabled {
+    @include disabled;
+  }
+  .component__tooltip-wrapper__tip-text {
+    text-align: center;
+  }
+
+  .premium-icon-tip {
+    position: relative;
+    top: 3px;
+    padding-right: $pad-xsmall;
+  }
+}

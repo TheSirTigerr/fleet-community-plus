@@ -1,0 +1,21 @@
+.host-actions-dropdown {
+  @include button-dropdown;
+  color: $core-fleet-black;
+  .Select-multi-value-wrapper {
+    width: 55px;
+  }
+  .Select > .Select-menu-outer {
+    right: 0;
+    min-width: max-content;
+  }
+
+  .actions-dropdown-select__menu {
+    min-width: 200px;
+  }
+}
+
+// Left-align error tooltip.
+.host-actions-dropdown__managed-account-error {
+  display: block;
+  text-align: left;
+}

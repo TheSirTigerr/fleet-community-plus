@@ -1,0 +1,327 @@
+import classnames from "classnames";
+import FileSaver from "file-saver";
+import React, { useState, useContext, useEffect, useCallback } from "react";
+import { Row, Column } from "react-table";
+import { Tab, Tabs, TabList, TabPanel } from "react-tabs";
+import { useDebouncedCallback } from "use-debounce";
+
+import Button from "components/buttons/Button";
+import CustomLink from "components/CustomLink";
+import EmptyState from "components/EmptyState";
+import InfoBanner from "components/InfoBanner";
+import ShowQueryModal from "components/modals/ShowQueryModal";
+import AwaitingResults from "components/queries/LiveResults/AwaitingResults";
+import LiveResultsHeading from "components/queries/LiveResults/LiveResultsHeading";
+import TableContainer from "components/TableContainer";
+import TableCount from "components/TableContainer/TableCount";
+import TabNav from "components/TabNav";
+import TabText from "components/TabText";
+import { QueryContext } from "context/query";
+import { ICampaign, ICampaignError } from "interfaces/campaign";
+import { ITarget } from "interfaces/target";
+import { SUPPORT_LINK } from "utilities/constants";
+import {
+  generateCSVFilename,
+  generateCSVQueryResults,
+} from "utilities/generate_csv";
+
+import generateColumnConfigsFromRows from "./QueryResultsTableConfig";
+
+interface IQueryResultsProps {
+  campaign: ICampaign;
+  isQueryFinished: boolean;
+  isQueryClipped: boolean;
+  queryName?: string;
+  onRunQuery: () => void;
+  onStopQuery: (evt: React.MouseEvent<HTMLButtonElement>) => void;
+  setSelectedTargets: (value: ITarget[]) => void;
+  goToQueryEditor: () => void;
+  // set during target selection, persisted through each step of the flow
+  targetsTotalCount: number;
+}
+
+const baseClass = "query-results";
+const CSV_TITLE = "New Report";
+const NAV_TITLES = {
+  RESULTS: "Results",
+  ERRORS: "Errors",
+};
+
+const QueryResults = ({
+  campaign,
+  isQueryFinished,
+  isQueryClipped,
+  queryName,
+  onRunQuery,
+  onStopQuery,
+  setSelectedTargets,
+  goToQueryEditor,
+  targetsTotalCount,
+}: IQueryResultsProps): JSX.Element => {
+  const { lastEditedQueryBody } = useContext(QueryContext);
+
+  const { uiHostCounts, serverHostCounts, queryResults, errors } =
+    campaign || {};
+
+  const [navTabIndex, setNavTabIndex] = useState(0);
+  const [showQueryModal, setShowQueryModal] = useState(false);
+  const [filteredResults, setFilteredResults] = useState<Row[]>([]);
+  const [filteredErrors, setFilteredErrors] = useState<Row[]>([]);
+  const [resultsColumnConfigs, setResultsColumnConfigs] = useState<Column[]>(
+    []
+  );
+  const [errorColumnConfigs, setErrorColumnConfigs] = useState<
+    Column<ICampaignError>[]
+  >([]);
+  const [queryResultsForTableRender, setQueryResultsForTableRender] = useState(
+    queryResults
+  );
+
+  // immediately reset results
+  const onRunAgain = useCallback(() => {
+    setQueryResultsForTableRender([]);
+    onRunQuery();
+  }, [onRunQuery]);
+
+  const debounceQueryResults = useDebouncedCallback(
+    setQueryResultsForTableRender,
+    1000,
+    { maxWait: 2000 }
+  );
+
+  // This is throwing an error not to use hook within a useEffect
+  useEffect(() => {
+    debounceQueryResults(queryResults);
+  }, [queryResults, debounceQueryResults]);
+
+  useEffect(() => {
+    if (queryResults && queryResults.length > 0) {
+      const newResultsColumnConfigs = generateColumnConfigsFromRows(
+        queryResults
+      );
+      // Update tableHeaders if new headers are found
+      if (newResultsColumnConfigs !== resultsColumnConfigs) {
+        setResultsColumnConfigs(newResultsColumnConfigs);
+      }
+    }
+  }, [queryResults, lastEditedQueryBody]); // Cannot use tableHeaders as it will cause infinite loop with setTableHeaders
+
+  useEffect(() => {
+    if (errorColumnConfigs?.length === 0 && !!errors?.length) {
+      setErrorColumnConfigs(generateColumnConfigsFromRows(errors));
+
+      if (errorColumnConfigs && errorColumnConfigs.length > 0) {
+        const newErrorColumnConfigs = generateColumnConfigsFromRows(errors);
+
+        // Update errorTableHeaders if new headers are found
+        if (newErrorColumnConfigs !== resultsColumnConfigs) {
+          setErrorColumnConfigs(newErrorColumnConfigs);
+        }
+      }
+    }
+  }, [errors]); // Cannot use errorTableHeaders as it will cause infinite loop with setErrorTableHeaders
+
+  const onExportQueryResults = (evt: React.MouseEvent<HTMLButtonElement>) => {
+    evt.preventDefault();
+    FileSaver.saveAs(
+      generateCSVQueryResults(
+        filteredResults,
+        generateCSVFilename(`${queryName || CSV_TITLE} - Results`),
+        resultsColumnConfigs
+      )
+    );
+  };
+
+  const onExportErrorsResults = (evt: React.MouseEvent<HTMLButtonElement>) => {
+    evt.preventDefault();
+
+    FileSaver.saveAs(
+      generateCSVQueryResults(
+        filteredErrors,
+        generateCSVFilename(`${queryName || CSV_TITLE} - Errors`),
+        errorColumnConfigs
+      )
+    );
+  };
+
+  const onShowQueryModal = () => {
+    setShowQueryModal(!showQueryModal);
+  };
+
+  const onQueryDone = () => {
+    setSelectedTargets([]);
+    goToQueryEditor();
+  };
+
+  const renderNoResults = () => {
+    const hostVerb = targetsTotalCount === 1 ? "host is" : "hosts are";
+    const errorsMessage = errors?.length ? (
+      <>
+        {" "}
+        or review the <strong>Errors</strong> tab for details
+      </>
+    ) : null;
+    return (
+      <EmptyState
+        header="No results returned"
+        info={
+          <>
+            Check whether the {hostVerb} online{errorsMessage}.
+          </>
+        }
+      />
+    );
+  };
+
+  const renderCount = useCallback(
+    (tableType: "errors" | "results") => {
+      const count =
+        tableType === "results"
+          ? filteredResults.length
+          : filteredErrors.length;
+
+      return <TableCount name={tableType} count={count} />;
+    },
+    [filteredResults.length, filteredErrors.length]
+  );
+
+  const renderTableButtons = (tableType: "results" | "errors") => {
+    return (
+      <div className={`${baseClass}__results-cta`}>
+        <Button
+          className={`${baseClass}__show-query-btn`}
+          onClick={onShowQueryModal}
+          variant="secondary"
+          icon="eye"
+          iconPosition="right"
+        >
+          Show query
+        </Button>
+        <Button
+          className={`${baseClass}__export-btn`}
+          onClick={
+            tableType === "errors"
+              ? onExportErrorsResults
+              : onExportQueryResults
+          }
+          variant="secondary"
+          icon="download"
+          iconPosition="right"
+        >
+          Export {tableType}
+        </Button>
+      </div>
+    );
+  };
+
+  const renderTable = (
+    tableData: unknown[],
+    tableType: "errors" | "results"
+  ) => {
+    return (
+      <div className={`${baseClass}__results-table-container`}>
+        <TableContainer
+          defaultSortHeader="host_display_name"
+          columnConfigs={
+            tableType === "results" ? resultsColumnConfigs : errorColumnConfigs
+          }
+          data={tableData || []}
+          emptyComponent={renderNoResults}
+          isLoading={false}
+          isClientSidePagination
+          isClientSideFilter
+          isMultiColumnFilter
+          showMarkAllPages={false}
+          isAllPagesSelected={false}
+          resultsTitle={tableType}
+          customControl={() => renderTableButtons(tableType)}
+          setExportRows={
+            tableType === "results" ? setFilteredResults : setFilteredErrors
+          }
+          renderCount={() => renderCount(tableType)}
+          getRowId={(_row, index) => String(index)}
+        />
+      </div>
+    );
+  };
+
+  const renderResultsTab = () => {
+    // TODO - clean up these conditions
+    const hasNoResultsYet =
+      !isQueryFinished &&
+      (!queryResults?.length || resultsColumnConfigs === null);
+    const finishedWithNoResults = isQueryFinished && !queryResults?.length;
+
+    if (hasNoResultsYet) {
+      return <AwaitingResults />;
+    }
+
+    if (finishedWithNoResults) {
+      return renderNoResults();
+    }
+
+    return renderTable(queryResultsForTableRender, "results");
+  };
+
+  const renderErrorsTab = () => renderTable(errors, "errors");
+
+  const firstTabClass = classnames("react-tabs__tab", "no-count", {
+    "errors-empty": !errors || errors?.length === 0,
+  });
+
+  return (
+    // `notranslate`: Chrome's auto-translate wraps text nodes in <font> elements,
+    // detaching nodes React holds refs to. As live results stream in and cells
+    // unmount, React's removeChild throws NotFoundError and error-boundaries the
+    // page (#48277). Excluding this streaming subtree from translation avoids it.
+    <div className={`${baseClass} notranslate`}>
+      <LiveResultsHeading
+        numHostsTargeted={targetsTotalCount}
+        numHostsResponded={uiHostCounts.total}
+        numHostsRespondedResults={serverHostCounts.countOfHostsWithResults}
+        numHostsRespondedNoErrorsAndNoResults={
+          serverHostCounts.countOfHostsWithNoResults
+        }
+        numHostsRespondedErrors={uiHostCounts.failed}
+        isFinished={isQueryFinished}
+        onClickClose={onQueryDone}
+        onClickRunAgain={onRunAgain}
+        onClickStop={onStopQuery}
+      />
+      {isQueryClipped && (
+        <InfoBanner
+          color="yellow"
+          cta={<CustomLink url={SUPPORT_LINK} text="Get help" newTab />}
+        >
+          <div>
+            <b>Results clipped.</b> A sample of this report&apos;s results and
+            errors is included below. Please target fewer hosts at once to build
+            a full set of results.
+          </div>
+        </InfoBanner>
+      )}
+      <TabNav>
+        <Tabs selectedIndex={navTabIndex} onSelect={(i) => setNavTabIndex(i)}>
+          <TabList>
+            <Tab className={firstTabClass}>{NAV_TITLES.RESULTS}</Tab>
+            <Tab disabled={!errors?.length}>
+              <TabText count={errors?.length} countVariant="alert">
+                {NAV_TITLES.ERRORS}
+              </TabText>
+            </Tab>
+          </TabList>
+          <TabPanel>{renderResultsTab()}</TabPanel>
+          <TabPanel>{renderErrorsTab()}</TabPanel>
+        </Tabs>
+      </TabNav>
+      {showQueryModal && (
+        <ShowQueryModal
+          query={lastEditedQueryBody}
+          onCancel={onShowQueryModal}
+        />
+      )}
+    </div>
+  );
+};
+
+export default QueryResults;

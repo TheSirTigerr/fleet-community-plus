@@ -1,0 +1,76 @@
+import React from "react";
+import { useQuery } from "react-query";
+
+import Button from "components/buttons/Button";
+import CustomLink from "components/CustomLink";
+import DataError from "components/DataError";
+import InputFieldHiddenContent from "components/forms/fields/InputFieldHiddenContent";
+import Modal from "components/Modal";
+import { getErrorReason } from "interfaces/errors";
+import { IHostEncrpytionKeyResponse } from "interfaces/host";
+import { HostPlatform } from "interfaces/platform";
+import hostAPI from "services/entities/hosts";
+import { LEARN_MORE_ABOUT_BASE_LINK } from "utilities/constants";
+
+const baseClass = "disk-encryption-key-modal";
+
+interface IDiskEncryptionKeyModal {
+  platform: HostPlatform;
+  hostId: number;
+  onCancel: () => void;
+}
+
+const DiskEncryptionKeyModal = ({
+  platform,
+  hostId,
+  onCancel,
+}: IDiskEncryptionKeyModal) => {
+  const { data: encryptionKey, error: encryptionKeyError } = useQuery<
+    IHostEncrpytionKeyResponse,
+    unknown,
+    string
+  >(["hostEncrpytionKey", hostId], () => hostAPI.getEncryptionKey(hostId), {
+    refetchOnMount: false,
+    refetchOnReconnect: false,
+    refetchOnWindowFocus: false,
+    retry: false,
+    select: (data) => data.encryption_key.key,
+  });
+
+  const recoveryText =
+    platform === "darwin"
+      ? "Use this key to log in to the host if you forgot the password."
+      : "Use this key to unlock the encrypted drive.";
+
+  return (
+    <Modal
+      title="Disk encryption key"
+      onExit={onCancel}
+      onEnter={onCancel}
+      className={baseClass}
+    >
+      {encryptionKeyError ? (
+        <DataError
+          description={getErrorReason(encryptionKeyError) || undefined}
+        />
+      ) : (
+        <>
+          <InputFieldHiddenContent value={encryptionKey ?? ""} />
+          <p>
+            {recoveryText}{" "}
+            <CustomLink
+              newTab
+              url={`${LEARN_MORE_ABOUT_BASE_LINK}/mdm-disk-encryption`}
+              text="Learn more"
+            />
+          </p>
+          <div className="modal-cta-wrap">
+            <Button onClick={onCancel}>Close</Button>
+          </div>
+        </>
+      )}
+    </Modal>
+  );
+};
+
+export default DiskEncryptionKeyModal;

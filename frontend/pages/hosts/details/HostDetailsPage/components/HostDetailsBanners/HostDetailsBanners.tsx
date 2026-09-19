@@ -1,0 +1,225 @@
+import { addHours, isPast } from "date-fns";
+import React, { useContext } from "react";
+
+import CustomLink from "components/CustomLink";
+import InfoBanner from "components/InfoBanner";
+import { AppContext } from "context/app";
+import { IOSSettings, MacDiskEncryptionActionRequired } from "interfaces/host";
+import {
+  DiskEncryptionStatus,
+  MdmEnrollmentStatus,
+  isAutomaticDeviceEnrollment,
+} from "interfaces/mdm";
+import {
+  HostPlatform,
+  isAppleDevice,
+  isDiskEncryptionSupportedLinuxPlatform,
+} from "interfaces/platform";
+import {
+  INITIAL_FLEET_DATE,
+  LEARN_MORE_ABOUT_BASE_LINK,
+} from "utilities/constants";
+
+const baseClass = "host-details-banners";
+
+export interface IHostBannersBaseProps {
+  macDiskEncryptionStatus: DiskEncryptionStatus | null | undefined;
+  /** Why the macOS disk encryption status is action_required, if it is */
+  diskEncryptionActionRequired?: MacDiskEncryptionActionRequired | null;
+  mdmEnrollmentStatus: MdmEnrollmentStatus | null;
+  connectedToFleetMdm?: boolean;
+  hostPlatform?: HostPlatform;
+  // used to identify Fedora hosts, whose platform is "rhel"
+  hostOsVersion?: string;
+  /** Disk encryption setting status and detail, if any, that apply to this host (via a team or the "no team" team) */
+  diskEncryptionOSSetting?: IOSSettings["disk_encryption"];
+  /** Whether or not this host's disk is encrypted */
+  diskIsEncrypted?: boolean;
+  /** Whether or not Fleet has escrowed the host's disk encryption key */
+  diskEncryptionKeyAvailable?: boolean;
+  /** The timestamp of the last MDM enrollment */
+  lastMdmEnrolledAt?: string;
+  /** The timestamp of the last detail update */
+  detailUpdatedAt?: string;
+  /** Whether or not this host is assigned to Fleet via DEP */
+  depAssignedToFleet: boolean;
+  onlyAllowAppleBusinessEnrollment: boolean;
+}
+/**
+ * Handles the displaying of banners on the host details page
+ */
+const HostDetailsBanners = ({
+  mdmEnrollmentStatus,
+  hostPlatform,
+  hostOsVersion,
+  connectedToFleetMdm,
+  macDiskEncryptionStatus,
+  diskEncryptionActionRequired,
+  diskEncryptionOSSetting,
+  diskIsEncrypted,
+  diskEncryptionKeyAvailable,
+  lastMdmEnrolledAt,
+  detailUpdatedAt,
+  depAssignedToFleet,
+  onlyAllowAppleBusinessEnrollment,
+}: IHostBannersBaseProps) => {
+  const { config } = useContext(AppContext);
+
+  const isMdmUnenrolled = mdmEnrollmentStatus === "Off" || !mdmEnrollmentStatus;
+  const isNewMdmEnrollment =
+    !isMdmUnenrolled &&
+    !!lastMdmEnrolledAt &&
+    // if less than an hour has passed since the last MDM enrollment, we consider it a new
+    // enrollment and won't show the disk encryption action required banner, as it's possible the
+    // host just hasn't sent its disk encryption status to Fleet yet
+    !isPast(addHours(lastMdmEnrolledAt, 1));
+
+  const showTurnOnMdmInfoBanner =
+    hostPlatform === "darwin" &&
+    isMdmUnenrolled &&
+    config?.mdm.enabled_and_configured &&
+    detailUpdatedAt &&
+    detailUpdatedAt > INITIAL_FLEET_DATE;
+
+  const showMacDiskEncryptionUserActionRequired =
+    config?.mdm.enabled_and_configured &&
+    connectedToFleetMdm &&
+    macDiskEncryptionStatus === "action_required" &&
+    !isNewMdmEnrollment;
+
+  const actionRequiredBanner = (
+    <div className={baseClass}>
+      <InfoBanner color="yellow">
+        Disk encryption: Requires action from the end user. Ask the user to
+        follow <b>Disk encryption</b> instructions on their <b>My device</b>{" "}
+        page.
+      </InfoBanner>
+    </div>
+  );
+
+  if (
+    onlyAllowAppleBusinessEnrollment &&
+    !depAssignedToFleet &&
+    isMdmUnenrolled &&
+    isAppleDevice(hostPlatform)
+  ) {
+    return (
+      <div className={baseClass}>
+        <InfoBanner color="yellow">
+          This host can&apos;t enroll in Apple MDM. Only current devices listed
+          in Apple Business can enroll. To allow manual enrollment, turn off the
+          &quot;Only allow Apple Business enrollment&quot; setting <br /> in{" "}
+          <strong>Organization settings &gt; Advanced options</strong>.
+        </InfoBanner>
+      </div>
+    );
+  }
+
+  if (
+    onlyAllowAppleBusinessEnrollment &&
+    isAppleDevice(hostPlatform) &&
+    !depAssignedToFleet &&
+    !isAutomaticDeviceEnrollment(mdmEnrollmentStatus)
+  ) {
+    return (
+      <div className={baseClass}>
+        <InfoBanner color="yellow">
+          This host is no longer eligible for Apple MDM. It was enrolled
+          manually, but only Apple Business devices can enroll now. To allow
+          manual enrollment, turn off the &quot;Only allow Apple Business
+          enrollment&quot; setting in{" "}
+          <strong>Organization settings &gt; Advanced options</strong>.
+        </InfoBanner>
+      </div>
+    );
+  }
+  if (showTurnOnMdmInfoBanner) {
+    return (
+      <div className={baseClass}>
+        <InfoBanner color="yellow">
+          To enforce settings, OS updates, disk encryption, and more, ask the
+          end user to follow the <strong>Turn on MDM</strong> instructions on
+          their <strong>My device</strong> page.
+        </InfoBanner>
+      </div>
+    );
+  }
+  if (showMacDiskEncryptionUserActionRequired) {
+    return (
+      <div className={baseClass}>
+        <InfoBanner color="yellow">
+          {diskEncryptionActionRequired === "turn_on_encryption" ? (
+            <>
+              Disk encryption: Disk encryption is off, and this host&apos;s
+              fleet doesn&apos;t enforce it. Fleet will store the recovery key
+              when the end user turns on FileVault.
+            </>
+          ) : (
+            <>
+              Disk encryption: Requires action from the end user. Ask the end
+              user to log out of their device or restart it.
+            </>
+          )}
+        </InfoBanner>
+      </div>
+    );
+  }
+  if (
+    hostPlatform &&
+    isDiskEncryptionSupportedLinuxPlatform(hostPlatform, hostOsVersion ?? "") &&
+    diskEncryptionOSSetting?.status
+  ) {
+    // setting applies to a Linux host
+    if (!diskIsEncrypted) {
+      // linux host not in compliance with setting
+      return (
+        <div className={baseClass}>
+          <InfoBanner
+            color="yellow"
+            cta={
+              <CustomLink
+                url={`${LEARN_MORE_ABOUT_BASE_LINK}/mdm-disk-encryption`}
+                text="Guide"
+                variant="banner-link"
+                newTab
+              />
+            }
+          >
+            Disk encryption: Disk encryption is off. Currently, to turn on{" "}
+            <b>full</b> disk encryption, the end user has to re-install their
+            operating system.
+          </InfoBanner>
+        </div>
+      );
+    }
+    if (!diskEncryptionKeyAvailable) {
+      // linux host's disk is encrypted, but Fleet doesn't yet have a disk
+      // encryption key escrowed (note that this state is also possible for Windows hosts, which we
+      // don't show this banner for currently)
+      return actionRequiredBanner;
+    }
+  }
+  if (
+    hostPlatform === "windows" &&
+    diskEncryptionOSSetting?.status === "action_required"
+  ) {
+    // Fleet is holding the repair until the host restarts, so point the admin at the restart rather than at My device.
+    if (diskEncryptionOSSetting?.action_required === "restart") {
+      return (
+        <div className={baseClass}>
+          <InfoBanner color="yellow">
+            Disk encryption: Requires a restart. Ask the user to restart their
+            device so disk encryption protection can be turned back on.
+          </InfoBanner>
+        </div>
+      );
+    }
+    if (diskEncryptionOSSetting?.action_required === "create_pin") {
+      return actionRequiredBanner;
+    }
+  }
+
+  return null;
+};
+
+export default HostDetailsBanners;

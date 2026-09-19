@@ -1,0 +1,134 @@
+import PropTypes from "prop-types";
+
+import { IApiEndpointRef } from "./api_endpoint";
+import { IUserSettings } from "./config";
+import teamInterface, { ITeam } from "./team";
+
+export default PropTypes.shape({
+  created_at: PropTypes.string,
+  updated_at: PropTypes.string,
+  id: PropTypes.number,
+  name: PropTypes.string,
+  email: PropTypes.string,
+  role: PropTypes.string,
+  force_password_reset: PropTypes.bool,
+  gravatar_url: PropTypes.string,
+  sso_enabled: PropTypes.bool,
+  mfa_enabled: PropTypes.bool,
+  global_role: PropTypes.string,
+  api_only: PropTypes.bool,
+  teams: PropTypes.arrayOf(teamInterface),
+});
+
+export const USERS_ROLES = [
+  "admin",
+  "maintainer",
+  "observer",
+  "observer_plus",
+  "technician",
+] as const;
+export type IUserRole = typeof USERS_ROLES[number];
+export type UserRole =
+  | "admin"
+  | "maintainer"
+  | "observer"
+  | "observer_plus"
+  | "technician"
+  | "gitops"
+  | "Admin"
+  | "Maintainer"
+  | "Observer"
+  | "Observer+"
+  | "Technician"
+  | "GitOps"
+  | "Unassigned"
+  | ""
+  | "Various";
+
+export type UserStatus = "active" | "inactive" | "no_access";
+
+export interface IUser {
+  created_at?: string;
+  updated_at?: string;
+  id: number;
+  name: string;
+  email: string;
+  role?: UserRole;
+  force_password_reset: boolean;
+  gravatar_url?: string;
+  gravatar_url_dark?: string;
+  sso_enabled: boolean;
+  mfa_enabled?: boolean;
+  global_role: UserRole | null;
+  api_only: boolean;
+  /** Last time the user logged in. `null` if the user has never logged in. */
+  last_login_at: string | null;
+  /** Last time the user made an authenticated request with a live session.
+   * This is the inactivity signal for API-only users. `null` if the user has
+   * no live session. */
+  last_activity_at: string | null;
+  status?: UserStatus;
+  teams: ITeam[];
+  fleets: ITeam[]; // This will eventually replace `teams`, but for now we need both to avoid breaking changes.
+  api_endpoints?: IApiEndpointRef[];
+}
+
+/**
+ * The shape of the request body when updating a user.
+ */
+export interface IUserUpdateFormData {
+  global_role?: UserRole | null;
+  teams?: ITeam[];
+  name: string;
+  email?: string;
+  sso_enabled?: boolean;
+  mfa_enabled?: boolean;
+  role?: UserRole;
+  id: number;
+}
+
+export interface IResetPasswordFormErrors {
+  new_password?: string | null;
+  new_password_confirmation?: string | null;
+}
+
+export interface IResetPasswordForm {
+  new_password: string;
+  new_password_confirmation: string;
+}
+
+export interface ILoginUserData {
+  email: string;
+  password: string;
+}
+
+export interface ICreateUserFormData {
+  email?: string;
+  global_role: UserRole | null;
+  name: string;
+  password?: string | null;
+  sso_enabled?: boolean;
+  mfa_enabled?: boolean;
+  teams: ITeam[];
+}
+
+export interface IUpdateUserFormData {
+  currentUserId?: number;
+  email?: string;
+  global_role?: UserRole | null;
+  name?: string;
+  password?: string | null;
+  sso_enabled?: boolean;
+  mfa_enabled?: boolean;
+  teams?: ITeam[];
+  settings?: IUserSettings;
+}
+
+export interface ICreateUserWithInvitationFormData {
+  email: string;
+  invite_token: string;
+  name: string;
+  password?: string;
+  password_confirmation?: string;
+  sso_invite?: boolean;
+}

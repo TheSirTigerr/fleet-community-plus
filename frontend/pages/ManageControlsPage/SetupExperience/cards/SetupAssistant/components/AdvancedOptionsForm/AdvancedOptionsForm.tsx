@@ -1,0 +1,75 @@
+import React, { useState } from "react";
+
+import Button from "components/buttons/Button";
+import RevealButton from "components/buttons/RevealButton";
+import Checkbox from "components/forms/fields/Checkbox";
+import { notify } from "components/ToastNotification";
+import TooltipWrapper from "components/TooltipWrapper";
+import mdmAPI from "services/entities/mdm";
+
+const baseClass = "advanced-options-form";
+
+interface IAdvancedOptionsFormProps {
+  currentTeamId: number;
+  defaultReleaseDevice: boolean;
+}
+
+const AdvancedOptionsForm = ({
+  currentTeamId,
+  defaultReleaseDevice,
+}: IAdvancedOptionsFormProps) => {
+  const [showAdvancedOptions, setShowAdvancedOptions] = useState(false);
+  const [releaseDevice, setReleaseDevice] = useState(defaultReleaseDevice);
+
+  const handleSubmit = async (e: React.FormEvent<HTMLFormElement>) => {
+    e.preventDefault();
+
+    try {
+      await mdmAPI.updateReleaseDeviceSetting(currentTeamId, releaseDevice);
+      notify.success("Successfully updated.");
+    } catch (err) {
+      notify.error("Something went wrong. Please try again.", {
+        response: err,
+      });
+    }
+  };
+
+  const tooltip = (
+    <>
+      When enabled, you&apos;re responsible for sending the DeviceConfigured
+      command.
+      <br />
+      <i>
+        (Default: <strong>Off</strong>)
+      </i>
+    </>
+  );
+
+  return (
+    <div className={baseClass}>
+      <RevealButton
+        className={`${baseClass}__accordion-title`}
+        isShowing={showAdvancedOptions}
+        showText="Advanced options"
+        hideText="Advanced options"
+        caretPosition="after"
+        onClick={() => setShowAdvancedOptions(!showAdvancedOptions)}
+      />
+      {showAdvancedOptions && (
+        <form onSubmit={handleSubmit}>
+          <Checkbox
+            value={releaseDevice}
+            onChange={() => setReleaseDevice(!releaseDevice)}
+          >
+            <TooltipWrapper tipContent={tooltip}>
+              Release device manually
+            </TooltipWrapper>
+          </Checkbox>
+          <Button type="submit">Save</Button>
+        </form>
+      )}
+    </div>
+  );
+};
+
+export default AdvancedOptionsForm;

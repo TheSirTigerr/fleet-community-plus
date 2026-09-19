@@ -1,0 +1,41 @@
+.vpp-page {
+  @include vertical-page-layout;
+
+  &__page-content {
+    @include vertical-page-layout;
+  }
+
+  &__page-header-section {
+    display: flex;
+    flex-direction: row;
+    gap: $pad-large;
+    align-items: center;
+    justify-content: space-between;
+
+    h1 {
+      margin-bottom: 0;
+      font-size: $large;
+    }
+  }
+
+  &__url-inputs-wrapper {
+    display: flex;
+    flex-direction: column;
+    gap: $pad-icon;
+    margin-top: $pad-large;
+  }
+
+  &__url-input {
+    margin-bottom: 0;
+  }
+
+  // TODO: remove these styles when the updated error component is used
+  .data-error {
+    margin: $pad-xxlarge 0;
+    padding: $pad-xlarge 0;
+  }
+
+  .data-error__inner {
+    padding: $pad-xlarge 0;
+  }
+}

@@ -1,0 +1,9 @@
+.create-linux-key-modal {
+  ol,
+  ul {
+    display: flex;
+    flex-direction: column;
+    gap: $pad-medium;
+    line-height: $medium;
+  }
+}

@@ -1,0 +1,259 @@
+import React, {
+  useCallback,
+  useContext,
+  useEffect,
+  useRef,
+  useState,
+} from "react";
+import { useQuery, useQueryClient } from "react-query";
+import { InjectedRouter } from "react-router";
+
+import BackButton from "components/BackButton";
+import Button from "components/buttons/Button";
+import CustomLink from "components/CustomLink";
+import DataError from "components/DataError";
+import DataSet from "components/DataSet";
+import GitOpsModeTooltipWrapper from "components/GitOpsModeTooltipWrapper";
+import MainContent from "components/MainContent";
+import Spinner from "components/Spinner";
+import { notify } from "components/ToastNotification";
+import TooltipWrapper from "components/TooltipWrapper";
+import { AppContext } from "context/app";
+import { IConfig } from "interfaces/config";
+import { getErrorReason } from "interfaces/errors";
+import PATHS from "router/paths";
+import mdmAndroidAPI from "services/entities/mdm_android";
+import { DEFAULT_USE_QUERY_OPTIONS, SUPPORT_LINK } from "utilities/constants";
+
+import TurnOffAndroidMdmModal from "./components/TurnOffAndroidMdmModal";
+
+const baseClass = "android-mdm-page";
+
+const POPUP_WIDTH = 885;
+const POPUP_HEIGHT = 600;
+
+interface ITurnOnAndroidMdmProps {
+  router: InjectedRouter;
+}
+
+const TurnOnAndroidMdm = ({ router }: ITurnOnAndroidMdmProps) => {
+  const { setConfig } = useContext(AppContext);
+  const queryClient = useQueryClient();
+
+  // TODO: figure out issue with aborting the SSE fetch when the window is closed
+  const newWindow = useRef<Window | null>(null);
+
+  const [fetchingSignupUrl, setFetchingSignupUrl] = useState(false);
+  const [setupSse, setSetupSse] = useState(false);
+
+  const handleSSE = useCallback(
+    async (abortController: AbortController) => {
+      try {
+        await mdmAndroidAPI.startSSE(abortController.signal);
+      } catch (e) {
+        notify.error("Couldn't turn on Android MDM. Please try again.", {
+          response: e,
+        });
+        setSetupSse(false);
+        return;
+      }
+      abortController.abort();
+      // SSE success means the backend has already set
+      // android_enabled_and_configured=true. Patch the in-memory config so
+      // AppContext.isAndroidMdmEnabledAndConfigured flips immediately and
+      // AndroidMdmCard renders correctly on redirect, without a synchronous
+      // round-trip.
+      const prevConfig = queryClient.getQueryData<IConfig>(["config"]);
+      if (prevConfig) {
+        const patched: IConfig = {
+          ...prevConfig,
+          mdm: { ...prevConfig.mdm, android_enabled_and_configured: true },
+        };
+        setConfig(patched);
+        queryClient.setQueryData(["config"], patched);
+      }
+      notify.success("Android MDM turned on successfully.");
+      setSetupSse(false);
+      router.push(PATHS.ADMIN_INTEGRATIONS_MDM);
+    },
+    [queryClient, router, setConfig]
+  );
+
+  useEffect(() => {
+    const abortController = new AbortController();
+
+    if (setupSse) {
+      handleSSE(abortController);
+
+      return () => {
+        abortController.abort();
+      };
+    }
+
+    return undefined;
+  }, [setupSse, router, handleSSE]);
+
+  const onConnectMdm = async () => {
+    setFetchingSignupUrl(true);
+    try {
+      const res = await mdmAndroidAPI.getSignupUrl();
+
+      // Calculate the center position
+      const left = window.screenX + (window.innerWidth - POPUP_WIDTH) / 2;
+      const top = window.screenY + (window.innerHeight - POPUP_HEIGHT) / 2;
+
+      // TODO: figure out issue with aborting the SSE fetch when the window is closed
+      newWindow.current = window.open(
+        res.android_enterprise_signup_url,
+        "_blank",
+        `width=${POPUP_WIDTH},height=${POPUP_HEIGHT},top=${top},left=${left}`
+      );
+      setSetupSse(true);
+    } catch (e) {
+      const reason = getErrorReason(e);
+      if (reason.includes("android enterprise already exists")) {
+        notify.error(
+          <>
+            Couldn&apos;t connect. Android enterprise already exists for this
+            Fleet server. For help, please contact{" "}
+            <CustomLink
+              text="Fleet support"
+              url={SUPPORT_LINK}
+              newTab
+              variant="flash-message-link"
+            />
+          </>,
+          { response: e }
+        );
+      } else {
+        notify.error(`Couldn't connect. ${reason || "Please try again."}`, {
+          response: e,
+        });
+      }
+    }
+    setFetchingSignupUrl(false);
+  };
+
+  return (
+    <>
+      <div className={`${baseClass}__turn-on-description`}>
+        <p>Connect Android Enterprise to turn on Android MDM. </p>
+        <CustomLink
+          text="Learn More"
+          newTab
+          url="https://fleetdm.com/learn-more-about/how-to-connect-android-enterprise"
+        />
+      </div>
+      <GitOpsModeTooltipWrapper
+        tipOffset={8}
+        renderChildren={(disableChildren) => (
+          <Button
+            isLoading={fetchingSignupUrl}
+            disabled={disableChildren}
+            onClick={onConnectMdm}
+          >
+            Connect
+          </Button>
+        )}
+      />
+    </>
+  );
+};
+
+interface ITurnOffAndroidMdmProps {
+  onClickTurnOff: () => void;
+}
+
+const TurnOffAndroidMdm = ({ onClickTurnOff }: ITurnOffAndroidMdmProps) => {
+  const { data, isLoading, isError } = useQuery(
+    ["android_enterprise"],
+    () => mdmAndroidAPI.getAndroidEnterprise(),
+    {
+      ...DEFAULT_USE_QUERY_OPTIONS,
+    }
+  );
+
+  if (isLoading) {
+    return <Spinner />;
+  }
+
+  if (isError) {
+    return <DataError />;
+  }
+
+  if (!data) return null;
+
+  return (
+    <>
+      <DataSet
+        title={
+          <TooltipWrapper
+            position="top"
+            tipContent={
+              <>
+                Android Enterprise in{" "}
+                <CustomLink
+                  newTab
+                  text="Google Admin Console"
+                  url="https://fleetdm.com/learn-more-about/google-admin-emm"
+                  variant="tooltip-link"
+                />
+              </>
+            }
+          >
+            Android Enterprise ID
+          </TooltipWrapper>
+        }
+        value={data.android_enterprise_id}
+      />
+      <GitOpsModeTooltipWrapper
+        tipOffset={8}
+        renderChildren={(disableChildren) => (
+          <Button onClick={onClickTurnOff} disabled={disableChildren}>
+            Turn off Android MDM
+          </Button>
+        )}
+      />
+    </>
+  );
+};
+
+interface IAndroidMdmPageProps {
+  router: InjectedRouter;
+}
+
+const AndroidMdmPage = ({ router }: IAndroidMdmPageProps) => {
+  const { isAndroidMdmEnabledAndConfigured } = useContext(AppContext);
+  const [showTurnOffMdmModal, setShowTurnOffMdmModal] = useState(false);
+
+  return (
+    <MainContent className={baseClass}>
+      <div className={`${baseClass}__header-links`}>
+        <BackButton
+          text="Back to MDM"
+          path={PATHS.ADMIN_INTEGRATIONS_MDM}
+          className={`${baseClass}__back-to-mdm`}
+        />
+      </div>
+      <h1>Android Enterprise</h1>
+
+      <div className={`${baseClass}__content`}>
+        {!isAndroidMdmEnabledAndConfigured ? (
+          <TurnOnAndroidMdm router={router} />
+        ) : (
+          <TurnOffAndroidMdm
+            onClickTurnOff={() => setShowTurnOffMdmModal(true)}
+          />
+        )}
+      </div>
+      {showTurnOffMdmModal && (
+        <TurnOffAndroidMdmModal
+          router={router}
+          onExit={() => setShowTurnOffMdmModal(false)}
+        />
+      )}
+    </MainContent>
+  );
+};
+
+export default AndroidMdmPage;

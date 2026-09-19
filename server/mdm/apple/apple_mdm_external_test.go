@@ -1,0 +1,615 @@
+package apple_mdm_test
+
+import (
+	"context"
+	"database/sql"
+	"encoding/json"
+	"fmt"
+	"io"
+	"log/slog"
+	"net/http"
+	"net/http/httptest"
+	"testing"
+	"time"
+
+	"github.com/fleetdm/fleet/v4/server/datastore/mysql/mysqltest"
+	"github.com/fleetdm/fleet/v4/server/fleet"
+	apple_mdm "github.com/fleetdm/fleet/v4/server/mdm/apple"
+	nanodep_client "github.com/fleetdm/fleet/v4/server/mdm/nanodep/client"
+	"github.com/fleetdm/fleet/v4/server/mdm/nanodep/godep"
+	"github.com/fleetdm/fleet/v4/server/platform/mysql/testing_utils"
+	"github.com/fleetdm/fleet/v4/server/test"
+	"github.com/jmoiron/sqlx"
+	"github.com/stretchr/testify/assert"
+	"github.com/stretchr/testify/require"
+)
+
+func TestDEPService_RunAssigner(t *testing.T) {
+	ctx := context.Background()
+	ds := mysqltest.CreateMySQLDS(t)
+
+	const abmTokenOrgName = "test_org"
+	depStorage, err := ds.NewMDMAppleDEPStorage()
+	require.NoError(t, err)
+
+	setupTest := func(t *testing.T, depHandler http.HandlerFunc) *apple_mdm.DEPService {
+		// start a server that will mock the Apple DEP API
+		srv := httptest.NewServer(depHandler)
+		t.Cleanup(srv.Close)
+		t.Cleanup(func() { mysqltest.TruncateTables(t, ds) })
+
+		err = depStorage.StoreConfig(ctx, abmTokenOrgName, &nanodep_client.Config{BaseURL: srv.URL})
+		require.NoError(t, err)
+
+		mysqltest.SetTestABMAssets(t, ds, abmTokenOrgName)
+
+		logger := slog.New(slog.DiscardHandler)
+		return apple_mdm.NewDEPService(ds, depStorage, logger)
+	}
+
+	t.Run("no custom profiles, no devices", func(t *testing.T) {
+		start := time.Now().Truncate(time.Second)
+
+		svc := setupTest(t, func(w http.ResponseWriter, r *http.Request) {
+			w.WriteHeader(http.StatusOK)
+			encoder := json.NewEncoder(w)
+			switch r.URL.Path {
+			case "/session":
+				_, _ = w.Write([]byte(`{"auth_session_token": "session123"}`))
+			case "/account":
+				_, _ = w.Write([]byte(fmt.Sprintf(`{"admin_id": "admin123", "org_name": "%s"}`, abmTokenOrgName)))
+			case "/profile":
+				err := encoder.Encode(godep.ProfileResponse{ProfileUUID: "profile123"})
+				require.NoError(t, err)
+			case "/server/devices":
+				err := encoder.Encode(godep.DeviceResponse{Devices: nil})
+				require.NoError(t, err)
+			case "/devices/sync":
+				err := encoder.Encode(godep.DeviceResponse{Devices: nil})
+				require.NoError(t, err)
+			default:
+				t.Errorf("unexpected request to %s", r.URL.Path)
+			}
+		})
+		err := svc.RunAssigner(ctx)
+		require.NoError(t, err)
+
+		// the default profile was created
+		defProf, err := ds.GetMDMAppleEnrollmentProfileByType(ctx, fleet.MDMAppleEnrollmentTypeAutomatic)
+		require.NoError(t, err)
+		require.NotNil(t, defProf)
+		require.NotEmpty(t, defProf.Token)
+
+		// a profile UUID was assigned for no-team
+		profUUID, modTime, err := ds.GetMDMAppleDefaultSetupAssistant(ctx, nil, abmTokenOrgName)
+		require.NoError(t, err)
+		require.Equal(t, "profile123", profUUID)
+		require.False(t, modTime.Before(start))
+
+		// no team to assign to
+		appCfg, err := ds.AppConfig(ctx)
+		require.NoError(t, err)
+		require.Empty(t, appCfg.MDM.DeprecatedAppleBMDefaultTeam)
+		abmTok, err := ds.GetABMTokenByOrgName(ctx, abmTokenOrgName)
+		require.NoError(t, err)
+		require.Nil(t, abmTok.MacOSDefaultTeamID)
+		require.Nil(t, abmTok.IPadOSDefaultTeamID)
+		require.Nil(t, abmTok.IOSDefaultTeamID)
+
+		// no teams, so no team-specific custom setup assistants
+		teams, err := ds.ListTeams(ctx, fleet.TeamFilter{User: test.UserAdmin}, fleet.ListOptions{})
+		require.NoError(t, err)
+		require.Empty(t, teams)
+
+		// no no-team custom setup assistant
+		_, err = ds.GetMDMAppleSetupAssistant(ctx, nil)
+		require.ErrorIs(t, err, sql.ErrNoRows)
+
+		// no host got created
+		hosts, err := ds.ListHosts(ctx, fleet.TeamFilter{User: test.UserAdmin}, fleet.HostListOptions{})
+		require.NoError(t, err)
+		require.Empty(t, hosts)
+	})
+
+	t.Run("no custom profiles, some devices", func(t *testing.T) {
+		start := time.Now().Truncate(time.Second)
+
+		devices := []godep.Device{
+			{SerialNumber: "a", OpType: "added"},
+			{SerialNumber: "b", OpType: "ignore"},
+			{SerialNumber: "c", OpType: ""},
+		}
+
+		var assignCalled bool
+		svc := setupTest(t, func(w http.ResponseWriter, r *http.Request) {
+			w.WriteHeader(http.StatusOK)
+			encoder := json.NewEncoder(w)
+			switch r.URL.Path {
+			case "/session":
+				_, _ = w.Write([]byte(`{"auth_session_token": "session123"}`))
+			case "/account":
+				_, _ = w.Write([]byte(fmt.Sprintf(`{"admin_id": "admin123", "org_name": "%s"}`, abmTokenOrgName)))
+			case "/profile":
+				err := encoder.Encode(godep.ProfileResponse{ProfileUUID: "profile123"})
+				require.NoError(t, err)
+			case "/server/devices":
+				err := encoder.Encode(godep.DeviceResponse{Devices: devices})
+				require.NoError(t, err)
+			case "/devices/sync":
+				err := encoder.Encode(godep.DeviceResponse{Devices: devices})
+				require.NoError(t, err)
+			case "/profile/devices":
+				assignCalled = true
+
+				reqBody, err := io.ReadAll(r.Body)
+				require.NoError(t, err)
+
+				var assignReq godep.Profile
+				err = json.Unmarshal(reqBody, &assignReq)
+				require.NoError(t, err)
+				require.Equal(t, assignReq.ProfileUUID, "profile123")
+				require.ElementsMatch(t, []string{"a", "c"}, assignReq.Devices)
+
+				apiResp := godep.ProfileResponse{
+					ProfileUUID: "profile123",
+					Devices: map[string]string{
+						"a": string(fleet.DEPAssignProfileResponseSuccess),
+						"c": string(fleet.DEPAssignProfileResponseSuccess),
+					},
+				}
+				respBytes, err := json.Marshal(&apiResp)
+				require.NoError(t, err)
+
+				_, err = w.Write(respBytes)
+				require.NoError(t, err)
+			default:
+				t.Errorf("unexpected request to %s", r.URL.Path)
+			}
+		})
+		err := svc.RunAssigner(ctx)
+		require.NoError(t, err)
+		require.True(t, assignCalled)
+
+		// the default profile was created
+		defProf, err := ds.GetMDMAppleEnrollmentProfileByType(ctx, fleet.MDMAppleEnrollmentTypeAutomatic)
+		require.NoError(t, err)
+		require.NotNil(t, defProf)
+		require.NotEmpty(t, defProf.Token)
+
+		// a profile UUID was assigned to no-team
+		profUUID, modTime, err := ds.GetMDMAppleDefaultSetupAssistant(ctx, nil, abmTokenOrgName)
+		require.NoError(t, err)
+		require.Equal(t, "profile123", profUUID)
+		require.False(t, modTime.Before(start))
+
+		// a couple hosts were created (except the op_type ignored)
+		hosts, err := ds.ListHosts(ctx, fleet.TeamFilter{User: test.UserAdmin}, fleet.HostListOptions{})
+		require.NoError(t, err)
+		require.Len(t, hosts, 2)
+		serials := make([]string, len(hosts))
+		for i, h := range hosts {
+			serials[i] = h.HardwareSerial
+			require.Nil(t, h.TeamID, h.HardwareSerial)
+		}
+		require.ElementsMatch(t, []string{"a", "c"}, serials)
+
+		mysqltest.ExecAdhocSQL(t, ds, func(q sqlx.ExtContext) error {
+			stmt := "SELECT COUNT(*) FROM host_dep_assignments WHERE host_id IN (?, ?) AND assign_profile_response = ?"
+			var result int
+			require.NoError(t, sqlx.GetContext(ctx, q, &result, stmt, hosts[0].ID, hosts[1].ID, fleet.DEPAssignProfileResponseSuccess))
+			require.Equal(t, 2, result, "expected two successful assignments for serials a and c")
+			return nil
+		})
+	})
+
+	t.Run("a custom profile, some devices", func(t *testing.T) {
+		start := time.Now().Truncate(time.Second)
+
+		devices := []godep.Device{
+			{SerialNumber: "a", OpType: "added"},
+			{SerialNumber: "b", OpType: "ignore"},
+			{SerialNumber: "c", OpType: ""},
+		}
+
+		var assignCalled bool
+		svc := setupTest(t, func(w http.ResponseWriter, r *http.Request) {
+			w.WriteHeader(http.StatusOK)
+			encoder := json.NewEncoder(w)
+			switch r.URL.Path {
+			case "/session":
+				_, _ = w.Write([]byte(`{"auth_session_token": "session123"}`))
+			case "/account":
+				_, _ = w.Write([]byte(fmt.Sprintf(`{"admin_id": "admin123", "org_name": "%s"}`, abmTokenOrgName)))
+			case "/profile":
+				reqBody, err := io.ReadAll(r.Body)
+				require.NoError(t, err)
+
+				var defineReq godep.Profile
+				err = json.Unmarshal(reqBody, &defineReq)
+				require.NoError(t, err)
+
+				if defineReq.ProfileName == "team" {
+					err = encoder.Encode(godep.ProfileResponse{ProfileUUID: "profile456"})
+					require.NoError(t, err)
+				} else {
+					err = encoder.Encode(godep.ProfileResponse{ProfileUUID: "profile123"})
+					require.NoError(t, err)
+				}
+			case "/server/devices":
+				err := encoder.Encode(godep.DeviceResponse{Devices: devices})
+				require.NoError(t, err)
+			case "/devices/sync":
+				err := encoder.Encode(godep.DeviceResponse{Devices: devices})
+				require.NoError(t, err)
+			case "/profile/devices":
+				assignCalled = true
+
+				reqBody, err := io.ReadAll(r.Body)
+				require.NoError(t, err)
+
+				var assignReq godep.Profile
+				err = json.Unmarshal(reqBody, &assignReq)
+				require.NoError(t, err)
+				require.Equal(t, assignReq.ProfileUUID, "profile456")
+				require.ElementsMatch(t, []string{"a", "c"}, assignReq.Devices)
+
+				apiResp := godep.ProfileResponse{
+					ProfileUUID: "profile456",
+					Devices: map[string]string{
+						"a": string(fleet.DEPAssignProfileResponseSuccess),
+						"c": string(fleet.DEPAssignProfileResponseSuccess),
+					},
+				}
+				respBytes, err := json.Marshal(&apiResp)
+				require.NoError(t, err)
+
+				_, err = w.Write(respBytes)
+				require.NoError(t, err)
+			default:
+				t.Errorf("unexpected request to %s", r.URL.Path)
+			}
+		})
+
+		// create a team
+		tm, err := ds.NewTeam(ctx, &fleet.Team{Name: "test_team"})
+		require.NoError(t, err)
+
+		// set that team as default assignment for new macOS devices
+		tok, err := ds.GetABMTokenByOrgName(ctx, abmTokenOrgName)
+		require.NoError(t, err)
+		tok.MacOSDefaultTeamID = &tm.ID
+		err = ds.SaveABMToken(ctx, tok)
+		require.NoError(t, err)
+
+		// create a custom setup assistant for that team
+		tmAsst, err := ds.SetOrUpdateMDMAppleSetupAssistant(ctx, &fleet.MDMAppleSetupAssistant{
+			TeamID:  &tm.ID,
+			Name:    "test",
+			Profile: json.RawMessage(`{"profile_name": "team"}`),
+		})
+		require.NoError(t, err)
+		require.NotZero(t, tmAsst.ID)
+
+		err = svc.RunAssigner(ctx)
+		require.NoError(t, err)
+		require.True(t, assignCalled)
+
+		// the default profile was created
+		defProf, err := ds.GetMDMAppleEnrollmentProfileByType(ctx, fleet.MDMAppleEnrollmentTypeAutomatic)
+		require.NoError(t, err)
+		require.NotNil(t, defProf)
+		require.NotEmpty(t, defProf.Token)
+
+		// a profile UUID was assigned to the team
+		profUUID, modTime, err := ds.GetMDMAppleDefaultSetupAssistant(ctx, &tm.ID, abmTokenOrgName)
+		require.NoError(t, err)
+		require.Equal(t, "profile123", profUUID)
+		require.False(t, modTime.Before(start))
+
+		// the team-specific custom profile was registered
+		tmAsst, err = ds.GetMDMAppleSetupAssistant(ctx, tmAsst.TeamID)
+		require.NoError(t, err)
+		require.False(t, tmAsst.UploadedAt.Before(start))
+		profileUUID, modTime, err := ds.GetMDMAppleSetupAssistantProfileForABMToken(ctx, &tm.ID, abmTokenOrgName)
+		require.NoError(t, err)
+		require.Equal(t, "profile456", profileUUID)
+		require.True(t, tmAsst.UploadedAt.Equal(modTime))
+
+		// a couple hosts were created and assigned to the team (except the op_type ignored)
+		hosts, err := ds.ListHosts(ctx, fleet.TeamFilter{User: test.UserAdmin}, fleet.HostListOptions{})
+		require.NoError(t, err)
+		require.Len(t, hosts, 2)
+		serials := make([]string, len(hosts))
+		for i, h := range hosts {
+			serials[i] = h.HardwareSerial
+			require.NotNil(t, h.TeamID, h.HardwareSerial)
+			require.Equal(t, tm.ID, *h.TeamID, h.HardwareSerial)
+		}
+		require.ElementsMatch(t, []string{"a", "c"}, serials)
+
+		mysqltest.ExecAdhocSQL(t, ds, func(q sqlx.ExtContext) error {
+			stmt := "SELECT COUNT(*) FROM host_dep_assignments WHERE host_id IN (?, ?) AND assign_profile_response = ?"
+			var result int
+			require.NoError(t, sqlx.GetContext(ctx, q, &result, stmt, hosts[0].ID, hosts[1].ID, fleet.DEPAssignProfileResponseSuccess))
+			require.Equal(t, 2, result, "expected two successful assignments for serials a and c")
+			return nil
+		})
+	})
+
+	t.Run("assign returns 5xx", func(t *testing.T) {
+		start := time.Now().Truncate(time.Second)
+
+		devices := []godep.Device{
+			{SerialNumber: "a", OpType: "added"},
+			{SerialNumber: "b", OpType: "ignore"},
+			{SerialNumber: "c", OpType: ""},
+		}
+
+		var assignCalled bool
+		svc := setupTest(t, func(w http.ResponseWriter, r *http.Request) {
+			if r.URL.Path == "/profile/devices" {
+				w.WriteHeader(http.StatusInternalServerError)
+			} else {
+				w.WriteHeader(http.StatusOK)
+			}
+			encoder := json.NewEncoder(w)
+			switch r.URL.Path {
+			case "/session":
+				_, _ = w.Write([]byte(`{"auth_session_token": "session123"}`))
+			case "/account":
+				_, _ = w.Write([]byte(fmt.Sprintf(`{"admin_id": "admin123", "org_name": "%s"}`, abmTokenOrgName)))
+			case "/profile":
+				err := encoder.Encode(godep.ProfileResponse{ProfileUUID: "profile123"})
+				require.NoError(t, err)
+			case "/server/devices":
+				err := encoder.Encode(godep.DeviceResponse{Devices: devices})
+				require.NoError(t, err)
+			case "/devices/sync":
+				err := encoder.Encode(godep.DeviceResponse{Devices: devices})
+				require.NoError(t, err)
+			case "/profile/devices":
+				assignCalled = true
+
+				reqBody, err := io.ReadAll(r.Body)
+				require.NoError(t, err)
+
+				var assignReq godep.Profile
+				err = json.Unmarshal(reqBody, &assignReq)
+				require.NoError(t, err)
+				require.Equal(t, assignReq.ProfileUUID, "profile123")
+				require.ElementsMatch(t, []string{"a", "c"}, assignReq.Devices)
+				apiResp := godep.ProfileResponse{
+					ProfileUUID: "profile123",
+					Devices: map[string]string{
+						"a": string(fleet.DEPAssignProfileResponseSuccess),
+						"c": string(fleet.DEPAssignProfileResponseSuccess),
+					},
+				}
+				respBytes, err := json.Marshal(&apiResp)
+				require.NoError(t, err)
+
+				_, err = w.Write(respBytes)
+				require.NoError(t, err)
+			default:
+				t.Errorf("unexpected request to %s", r.URL.Path)
+			}
+		})
+		err := svc.RunAssigner(ctx)
+		require.NoError(t, err)
+		require.True(t, assignCalled)
+
+		// the default profile was created
+		defProf, err := ds.GetMDMAppleEnrollmentProfileByType(ctx, fleet.MDMAppleEnrollmentTypeAutomatic)
+		require.NoError(t, err)
+		require.NotNil(t, defProf)
+		require.NotEmpty(t, defProf.Token)
+
+		// a profile UUID was assigned to no-team
+		profUUID, modTime, err := ds.GetMDMAppleDefaultSetupAssistant(ctx, nil, abmTokenOrgName)
+		require.NoError(t, err)
+		require.Equal(t, "profile123", profUUID)
+		require.False(t, modTime.Before(start))
+
+		// a couple hosts were created (except the op_type ignored)
+		hosts, err := ds.ListHosts(ctx, fleet.TeamFilter{User: test.UserAdmin}, fleet.HostListOptions{})
+		require.NoError(t, err)
+		require.Len(t, hosts, 2)
+		serials := make([]string, len(hosts))
+		for i, h := range hosts {
+			serials[i] = h.HardwareSerial
+			require.Nil(t, h.TeamID, h.HardwareSerial)
+		}
+		require.ElementsMatch(t, []string{"a", "c"}, serials)
+
+		// Verify that the two hosts have assignments marked failed
+		mysqltest.ExecAdhocSQL(t, ds, func(q sqlx.ExtContext) error {
+			stmt := "SELECT COUNT(*) FROM host_dep_assignments WHERE host_id IN (?, ?) AND assign_profile_response = ?"
+			var result int
+			require.NoError(t, sqlx.GetContext(ctx, q, &result, stmt, hosts[0].ID, hosts[1].ID, fleet.DEPAssignProfileResponseFailed))
+			require.Equal(t, 2, result, "expected two failed assignments for serials a and c")
+			return nil
+		})
+	})
+
+	t.Run("assign returns throttled for one device", func(t *testing.T) {
+		start := time.Now().Truncate(time.Second)
+
+		devices := []godep.Device{
+			{SerialNumber: "a", OpType: "added"},
+			{SerialNumber: "b", OpType: "ignore"},
+			{SerialNumber: "c", OpType: ""},
+		}
+
+		var assignCalled bool
+		svc := setupTest(t, func(w http.ResponseWriter, r *http.Request) {
+			w.WriteHeader(http.StatusOK)
+			encoder := json.NewEncoder(w)
+			switch r.URL.Path {
+			case "/session":
+				_, _ = w.Write([]byte(`{"auth_session_token": "session123"}`))
+			case "/account":
+				_, _ = w.Write(fmt.Appendf(nil, `{"admin_id": "admin123", "org_name": "%s"}`, abmTokenOrgName))
+			case "/profile":
+				err := encoder.Encode(godep.ProfileResponse{ProfileUUID: "profile123"})
+				require.NoError(t, err)
+			case "/server/devices":
+				err := encoder.Encode(godep.DeviceResponse{})
+				require.NoError(t, err)
+			case "/devices/sync":
+				err := encoder.Encode(godep.DeviceResponse{Devices: devices})
+				require.NoError(t, err)
+			case "/profile/devices":
+				assignCalled = true
+
+				reqBody, err := io.ReadAll(r.Body)
+				require.NoError(t, err)
+
+				var assignReq godep.Profile
+				err = json.Unmarshal(reqBody, &assignReq)
+				require.NoError(t, err)
+				require.Equal(t, assignReq.ProfileUUID, "profile123")
+				require.ElementsMatch(t, []string{"a", "c"}, assignReq.Devices)
+				apiResp := godep.ProfileResponse{
+					ProfileUUID: "profile123",
+					Devices: map[string]string{
+						"a": string(fleet.DEPAssignProfileResponseSuccess),
+						"c": string(fleet.DEPAssignProfileResponseThrottled),
+					},
+				}
+				respBytes, err := json.Marshal(&apiResp)
+				require.NoError(t, err)
+
+				_, err = w.Write(respBytes)
+				require.NoError(t, err)
+			default:
+				t.Errorf("unexpected request to %s", r.URL.Path)
+			}
+		})
+		err := svc.RunAssigner(ctx)
+		require.NoError(t, err)
+		require.True(t, assignCalled)
+
+		// the default profile was created
+		defProf, err := ds.GetMDMAppleEnrollmentProfileByType(ctx, fleet.MDMAppleEnrollmentTypeAutomatic)
+		require.NoError(t, err)
+		require.NotNil(t, defProf)
+		require.NotEmpty(t, defProf.Token)
+
+		// a profile UUID was assigned to no-team
+		profUUID, modTime, err := ds.GetMDMAppleDefaultSetupAssistant(ctx, nil, abmTokenOrgName)
+		require.NoError(t, err)
+		require.Equal(t, "profile123", profUUID)
+		require.False(t, modTime.Before(start))
+
+		// a couple hosts were created (except the op_type ignored)
+		hosts, err := ds.ListHosts(ctx, fleet.TeamFilter{User: test.UserAdmin}, fleet.HostListOptions{})
+		require.NoError(t, err)
+		require.Len(t, hosts, 2)
+		serials := make([]string, len(hosts))
+		for i, h := range hosts {
+			serials[i] = h.HardwareSerial
+			require.Nil(t, h.TeamID, h.HardwareSerial)
+		}
+		require.ElementsMatch(t, []string{"a", "c"}, serials)
+
+		// Verify that the one host has an assignment marked throttled
+		mysqltest.ExecAdhocSQL(t, ds, func(q sqlx.ExtContext) error {
+			stmt := "SELECT COUNT(*) FROM host_dep_assignments WHERE host_id = ? AND assign_profile_response = ?"
+			var result int
+			require.NoError(t, sqlx.GetContext(ctx, q, &result, stmt, hosts[1].ID, fleet.DEPAssignProfileResponseThrottled))
+			require.Equal(t, 1, result, "expected one throttled assignment for serial c")
+			return nil
+		})
+
+		// And the other is marked success
+		mysqltest.ExecAdhocSQL(t, ds, func(q sqlx.ExtContext) error {
+			stmt := "SELECT COUNT(*) FROM host_dep_assignments WHERE host_id = ? AND assign_profile_response = ?"
+			var result int
+			require.NoError(t, sqlx.GetContext(ctx, q, &result, stmt, hosts[0].ID, fleet.DEPAssignProfileResponseSuccess))
+			require.Equal(t, 1, result, "expected one success assignment for serial a")
+			return nil
+		})
+	})
+}
+
+// We use the dummy-replica harness with explicit replication control: any writes
+// that happen between RunReplication() calls remain on the primary node only.
+func TestDEPService_RunAssigner_ReplicaLag(t *testing.T) {
+	ctx := context.Background()
+	opts := &testing_utils.DatastoreTestOptions{
+		DummyReplica:   true,
+		UniqueTestName: "dep_runassigner_replica_lag",
+	}
+	ds := mysqltest.CreateMySQLDSWithOptions(t, opts)
+
+	const abmTokenOrgName = "test_org"
+	depStorage, err := ds.NewMDMAppleDEPStorage()
+	require.NoError(t, err)
+
+	mysqltest.SetTestABMAssets(t, ds, abmTokenOrgName)
+	// Replicate ABM-related rows (abm_tokens, certs, app_config) so the JOIN target
+	// for the screen query exists on the replica. The lag we want to simulate is
+	// for the ghost-host rows ingested *during* RunAssigner, not for ABM setup.
+	opts.RunReplication()
+
+	laggedSerial := "LAGGED-001"
+	onTimeSerial := "ONTIME-001"
+	devices := []godep.Device{
+		{SerialNumber: laggedSerial, OpType: "added"},
+		{SerialNumber: onTimeSerial, OpType: "added"},
+	}
+
+	var assignedSerials []string
+	syncCallCount := 0
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.WriteHeader(http.StatusOK)
+		encoder := json.NewEncoder(w)
+		switch r.URL.Path {
+		case "/session":
+			_, _ = w.Write([]byte(`{"auth_session_token": "session123"}`))
+		case "/account":
+			_, _ = w.Write(fmt.Appendf([]byte{}, `{"admin_id": "admin123", "org_name": "%s"}`, abmTokenOrgName))
+		case "/profile":
+			assert.NoError(t, encoder.Encode(godep.ProfileResponse{ProfileUUID: "profile123"}))
+		case "/server/devices", "/devices/sync":
+			syncCallCount++
+			// Return our two devices on the very first sync; empty thereafter so the
+			// syncer terminates instead of looping on the same devices.
+			if syncCallCount == 1 {
+				assert.NoError(t, encoder.Encode(godep.DeviceResponse{Devices: devices}))
+			} else {
+				assert.NoError(t, encoder.Encode(godep.DeviceResponse{Devices: nil}))
+			}
+		case "/profile/devices":
+			body, err := io.ReadAll(r.Body)
+			assert.NoError(t, err)
+			var assignReq godep.Profile
+			assert.NoError(t, json.Unmarshal(body, &assignReq))
+			assignedSerials = append(assignedSerials, assignReq.Devices...)
+			apiResp := godep.ProfileResponse{
+				ProfileUUID: assignReq.ProfileUUID,
+				Devices:     map[string]string{},
+			}
+			for _, s := range assignReq.Devices {
+				apiResp.Devices[s] = string(fleet.DEPAssignProfileResponseSuccess)
+			}
+			assert.NoError(t, encoder.Encode(apiResp))
+		default:
+			t.Errorf("unexpected request to %s", r.URL.Path)
+		}
+	}))
+	t.Cleanup(srv.Close)
+
+	require.NoError(t, depStorage.StoreConfig(ctx, abmTokenOrgName, &nanodep_client.Config{BaseURL: srv.URL}))
+	logger := slog.New(slog.DiscardHandler)
+	svc := apple_mdm.NewDEPService(ds, depStorage, logger)
+
+	require.NoError(t, svc.RunAssigner(ctx))
+	// never call opts.RunReplication() after this point, so we exercise the replica lag.
+
+	// Both serials must reach AssignProfile, even though their host /
+	// host_dep_assignments rows were invisible to the cooldown screen on the
+	// lagged replica.
+	require.ElementsMatch(t, []string{laggedSerial, onTimeSerial}, assignedSerials,
+		"serials newly inserted on primary but not yet replicated must still be sent to AssignProfile")
+}

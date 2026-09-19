@@ -1,0 +1,8 @@
+.app {
+  @include gradient-background;
+  margin: 0;
+
+  & > div {
+    min-height: 100vh;
+  }
+}

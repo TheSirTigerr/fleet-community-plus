@@ -1,0 +1,42 @@
+.configuration-profiles {
+  @include vertical-card-layout;
+
+  .upload-list {
+    &__list {
+      .list-item__label-count {
+        align-self: center;
+      }
+      .list-item__actions {
+        display: none;
+      }
+      :hover:not(.component__tooltip-wrapper__tip-text):not(.custom-link--tooltip-link) {
+        .list-item__labels {
+          display: none;
+        }
+        .list-item__actions {
+          display: flex;
+          gap: $pad-small;
+        }
+      }
+    }
+  }
+
+}
+
+// Split from `.configuration-profiles` (the card wrapper above) because this
+// card renders two inner tabs — Profiles and Assets — and each tab needs its
+// own layout scope. `.assets-tab` mirrors this in AssetsTab/_styles.scss.
+// Certificates and ScriptLibrary don't split because each is a single-tab
+// card.
+.profiles-tab {
+  @include vertical-page-tab-panel-layout;
+
+  &__tab-header {
+    @include tab-header;
+  }
+}
+
+// this is used to format the long error message when uploading invalid keys
+.upload-profile-invalid-keys-error {
+  display: flex;
+}

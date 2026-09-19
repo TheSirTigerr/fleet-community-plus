@@ -1,0 +1,72 @@
+import FileSaver from "file-saver";
+import React from "react";
+
+import Button from "components/buttons/Button";
+import Card from "components/Card";
+import Graphic from "components/Graphic";
+import { notify } from "components/ToastNotification";
+import { API_NO_TEAM_ID } from "interfaces/team";
+import mdmAPI, {
+  IGetSetupExperienceScriptResponse,
+} from "services/entities/mdm";
+import { uploadedFromNow } from "utilities/date_format";
+
+const baseClass = "setup-experience-script-card";
+
+interface ISetupExperienceScriptCardProps {
+  script: IGetSetupExperienceScriptResponse;
+  onDelete: () => void;
+}
+
+const SetupExperienceScriptCard = ({
+  script,
+  onDelete,
+}: ISetupExperienceScriptCardProps) => {
+  const onDownload = async () => {
+    try {
+      const teamId = script.team_id ?? API_NO_TEAM_ID;
+      const data = await mdmAPI.downloadSetupExperienceScript(teamId);
+      const date = new Date();
+      const filename = `${date.getFullYear()}-${date.getMonth()}-${date.getDate()}_${
+        script.name
+      }`;
+      const file = new global.window.File([data], filename);
+
+      FileSaver.saveAs(file);
+    } catch (e) {
+      notify.error("Couldn't download script. Please try again.", {
+        response: e,
+      });
+    }
+  };
+
+  return (
+    <Card paddingSize="medium" className={baseClass}>
+      <Graphic name="file-sh" />
+      <div className={`${baseClass}__info`}>
+        <span className={`${baseClass}__profile-name`}>{script.name}</span>
+        <span className={`${baseClass}__uploaded-at`}>
+          {uploadedFromNow(script.created_at)}
+        </span>
+      </div>
+      <div className={`${baseClass}__actions`}>
+        <Button
+          className={`${baseClass}__download-button`}
+          variant="secondary"
+          onClick={onDownload}
+          icon="download"
+          ariaLabel="Download script"
+        />
+        <Button
+          className={`${baseClass}__delete-button`}
+          variant="secondary"
+          onClick={onDelete}
+          icon="trash"
+          ariaLabel="Delete script"
+        />
+      </div>
+    </Card>
+  );
+};
+
+export default SetupExperienceScriptCard;

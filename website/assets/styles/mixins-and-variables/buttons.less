@@ -1,0 +1,148 @@
+.searchbar-submit-btn() {
+  width: auto;
+  margin-top: 4px;
+  margin-right: 4px;
+  margin-bottom: 4px;
+  // Padding is intentionally asymmetric (5/3 instead of 4/4) to optically center the
+  // "⏎" glyph: the character's ink sits slightly above the middle of its own line box
+  // (a font ascent/descent quirk, not a flex alignment bug -- the box itself is
+  // centered correctly), so a touch more padding on top than bottom nudges it into
+  // place without changing the button's overall height.
+  padding: 5px 8px 3px 8px;
+  border: 1px solid @core-fleet-black-25;
+  border-radius: 4px;
+  color: @core-fleet-black-75;
+  background-color: @ui-off-white;
+  cursor: pointer;
+  &:hover {
+    background-color: @core-fleet-black-5;
+  }
+}
+
+.btn-reset() {
+  border-top: none;
+  border-bottom: none;
+  border-left: none;
+  border-right: none;
+  background: transparent;
+  font-family: inherit;
+  cursor: pointer;
+  &:focus {
+    border-image: none;
+    outline: none;
+  }
+}
+
+.btn-animated-arrow-red() {
+  padding-right: 40px;
+  cursor: pointer;
+  position: relative;
+  width: auto;
+  font-weight: bold;
+  user-select: none;
+  transition: 0.2s ease-in-out;
+  -o-transition: 0.2s ease-in-out;
+  -ms-transition: 0.2s ease-in-out;
+  -moz-transition: 0.2s ease-in-out;
+  -webkit-transition: 0.2s ease-in-out;
+  &:before {
+  content: url('/images/arrow-right-red-16x16@2x.png');
+  transform: scale(0.5);
+  position: absolute;
+  top: 12px;
+  left: 80%; // <--- here
+  transition: 0.2s ease-in-out;
+  -o-transition: 0.2s ease-in-out;
+  -ms-transition: 0.2s ease-in-out;
+  -moz-transition: 0.2s ease-in-out;
+  -webkit-transition: 0.2s ease-in-out;
+  /*   opacity: 0; */
+  }
+  &:hover:before {
+  left: 82%; // <--- here
+  transition: 0.2s ease-in-out;
+  -o-transition: 0.2s ease-in-out;
+  -ms-transition: 0.2s ease-in-out;
+  -moz-transition: 0.2s ease-in-out;
+  -webkit-transition: 0.2s ease-in-out;
+  /*   opacity:1; */
+  }
+}
+
+.btn-animated-arrow-white() {
+  padding-right: 40px;
+  cursor: pointer;
+  position: relative;
+  width: auto;
+  color: #FFF;
+  font-weight: bold;
+  user-select: none;
+  transition: 0.2s ease-in-out;
+  -o-transition: 0.2s ease-in-out;
+  -ms-transition: 0.2s ease-in-out;
+  -moz-transition: 0.2s ease-in-out;
+  -webkit-transition: 0.2s ease-in-out;
+  &:before {
+  content: url('/images/arrow-right-white-16x16@2x.png');
+  transform: scale(0.5);
+  position: absolute;
+  top: 10px;
+  left: 80%; // <--- here
+  transition: 0.2s ease-in-out;
+  -o-transition: 0.2s ease-in-out;
+  -ms-transition: 0.2s ease-in-out;
+  -moz-transition: 0.2s ease-in-out;
+  -webkit-transition: 0.2s ease-in-out;
+  /*   opacity: 0; */
+  }
+  &:hover:before {
+  left: 82%; // <--- here
+  transition: 0.2s ease-in-out;
+  -o-transition: 0.2s ease-in-out;
+  -ms-transition: 0.2s ease-in-out;
+  -moz-transition: 0.2s ease-in-out;
+  -webkit-transition: 0.2s ease-in-out;
+  /*   opacity:1; */
+  }
+}
+
+.cta-button() {
+  background-color: @core-vibrant-green;
+  border: none;
+  cursor: pointer;
+  color: #FFF;
+  overflow: hidden;
+  text-decoration: none;
+  position: relative;
+  display: flex;
+  justify-content: center;
+  align-items: center;
+  font-weight: 700;
+  border-radius: 8px;
+  &:hover {
+    color: #FFF;
+    text-decoration: none;
+  }
+  &:before {
+    background: linear-gradient(180deg, rgba(255, 255, 255, 0.2) 0%, rgba(255, 255, 255, 0) 100%);
+    opacity: 1;
+    content: ' ';
+    position: absolute;
+    top: 0;
+    left: -5px;
+    width: 50%;
+    height: 100%;
+    transform: skew(-10deg);
+    transition: left 0.5s ease-in, opacity 0.50s ease-in, width 0.5s ease-in;
+  }
+  &:hover:before {
+    opacity: 0;
+    left: 160px;
+    width: 110%;
+  }
+  &:focus:before {
+    opacity: 0;
+    left: 160px;
+    width: 110%;
+  }
+}

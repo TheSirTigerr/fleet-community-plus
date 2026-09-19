@@ -1,0 +1,98 @@
+// build with the help of this article, with some of our own modifications
+// https://moderncss.dev/pure-css-custom-styled-radio-buttons/
+
+.radio {
+  font-size: $x-small;
+  display: flex;
+  flex-direction: column;
+  gap: $pad-xsmall;
+
+  // this includes the control button and the radio label text
+  &__radio-control {
+    display: flex;
+    align-items: center;
+  }
+
+  &:hover:not(.radio__disabled) {
+    .radio__control-button {
+      border-color: $core-fleet-green-over;
+    }
+  }
+
+  &__input,
+  &__label {
+    &:hover {
+      cursor: pointer;
+    }
+  }
+  &__input {
+    display: flex;
+
+    input {
+      opacity: 0;
+      width: 0;
+      height: 0;
+      position: absolute;
+
+      & + .radio__control-button::before {
+        position: absolute;
+        content: "";
+        width: 10px;
+        height: 10px;
+        box-shadow: inset 1em 1em $core-fleet-green;
+        background-color: $core-fleet-green;
+        border-radius: 50%;
+        top: 3px;
+        left: 3px;
+        transition: 180ms transform ease-in-out;
+        transform: scale(0);
+      }
+
+      &:checked + .radio__control-button::before {
+        transform: scale(1);
+      }
+
+      &:focus + .radio__control-button {
+        border-color: $core-fleet-green;
+      }
+    }
+  }
+
+  &__control-button {
+    position: relative;
+    display: flex;
+    width: 16px;
+    height: 16px;
+    border-radius: 50%;
+    border: 2px solid $ui-fleet-black-10;
+    transform: translateY(-0.05em);
+  }
+
+  &__label {
+    margin-left: $pad-small;
+    line-height: 1;
+  }
+
+  &__help-text {
+    @include help-text;
+    // aligns helper text with the radio label instead of the radio control
+    padding-left: px-to-rem(28);
+  }
+
+  &__disabled {
+    .radio__label {
+      color: $ui-fleet-black-50;
+    }
+
+    .radio__help-text {
+      color: $ui-fleet-black-50;
+    }
+
+    .radio__input,
+    .radio__label {
+      &:hover {
+        cursor: not-allowed;
+      }
+    }
+  }
+}

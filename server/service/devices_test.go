@@ -1,0 +1,875 @@
+package service
+
+import (
+	"context"
+	"database/sql"
+	"errors"
+	"fmt"
+	"net/http"
+	"testing"
+	"time"
+
+	"github.com/fleetdm/fleet/v4/pkg/optjson"
+	"github.com/fleetdm/fleet/v4/server/fleet"
+	"github.com/fleetdm/fleet/v4/server/mock"
+	"github.com/fleetdm/fleet/v4/server/ptr"
+	"github.com/fleetdm/fleet/v4/server/test"
+	"github.com/stretchr/testify/assert"
+	"github.com/stretchr/testify/require"
+)
+
+func TestGetFleetDesktopSummary(t *testing.T) {
+	t.Run("free implementation", func(t *testing.T) {
+		ds := new(mock.Store)
+		svc, ctx := newTestService(t, ds, nil, nil)
+		sum, err := svc.GetFleetDesktopSummary(ctx)
+		require.ErrorIs(t, err, fleet.ErrMissingLicense)
+		require.Empty(t, sum)
+	})
+
+	t.Run("alternative browser host URL gets mapped from app config", func(t *testing.T) {
+		ds := new(mock.Store)
+		license := &fleet.LicenseInfo{Tier: fleet.TierPremium, Expiration: time.Now().Add(24 * time.Hour)}
+		svc, ctx := newTestService(t, ds, nil, nil, &TestServerOpts{License: license, SkipCreateTestUsers: true})
+
+		ds.IsHostConnectedToFleetMDMFunc = func(ctx context.Context, host *fleet.Host) (bool, error) {
+			return false, nil
+		}
+		ds.GetHostMDMFunc = func(ctx context.Context, hostID uint) (*fleet.HostMDM, error) {
+			return nil, nil
+		}
+		ds.HasSelfServiceSoftwareInstallersFunc = func(ctx context.Context, platform string, teamID *uint) (bool, error) {
+			return false, nil
+		}
+		ds.FailingPoliciesCountFunc = func(ctx context.Context, host *fleet.Host) (uint, error) {
+			return uint(0), nil
+		}
+
+		testCases := []struct {
+			name                   string
+			appCfg                 fleet.AppConfig
+			expectedBrowserHostURL string
+		}{
+			{
+				name:                   "empty app config",
+				appCfg:                 fleet.AppConfig{},
+				expectedBrowserHostURL: "",
+			},
+			{
+				name: "with some value stored",
+				appCfg: fleet.AppConfig{FleetDesktop: fleet.FleetDesktopSettings{
+					AlternativeBrowserHost: "https://example.com",
+				}},
+				expectedBrowserHostURL: "https://example.com",
+			},
+		}
+		for _, tc := range testCases {
+			c := tc
+			ds.AppConfigFunc = func(ctx context.Context) (*fleet.AppConfig, error) {
+				return &c.appCfg, nil
+			}
+
+			ctx := test.HostContext(ctx, &fleet.Host{
+				OsqueryHostID: ptr.String("test"),
+			})
+			sum, err := svc.GetFleetDesktopSummary(ctx)
+			require.NoError(t, err)
+			require.Equal(t, tc.expectedBrowserHostURL, sum.AlternativeBrowserHost)
+		}
+	})
+
+	t.Run("different app config values for managed host", func(t *testing.T) {
+		ds := new(mock.Store)
+		license := &fleet.LicenseInfo{Tier: fleet.TierPremium, Expiration: time.Now().Add(24 * time.Hour)}
+		svc, ctx := newTestService(t, ds, nil, nil, &TestServerOpts{License: license, SkipCreateTestUsers: true})
+		ds.FailingPoliciesCountFunc = func(ctx context.Context, host *fleet.Host) (uint, error) {
+			return uint(1), nil
+		}
+		const expectedPlatform = "darwin"
+		ds.HasSelfServiceSoftwareInstallersFunc = func(ctx context.Context, platform string, teamID *uint) (bool, error) {
+			assert.Equal(t, expectedPlatform, platform)
+			return true, nil
+		}
+
+		cases := []struct {
+			mdm         fleet.MDM
+			depAssigned bool
+			out         fleet.DesktopNotifications
+		}{
+			{
+				mdm: fleet.MDM{
+					EnabledAndConfigured: true,
+					MacOSMigration: fleet.MacOSMigration{
+						Enable: true,
+					},
+				},
+				depAssigned: true,
+				out: fleet.DesktopNotifications{
+					NeedsMDMMigration:      true,
+					RenewEnrollmentProfile: false,
+				},
+			},
+			{
+				mdm: fleet.MDM{
+					EnabledAndConfigured: true,
+					MacOSMigration: fleet.MacOSMigration{
+						Enable: true,
+					},
+				},
+				depAssigned: false,
+				out: fleet.DesktopNotifications{
+					NeedsMDMMigration:      false,
+					RenewEnrollmentProfile: false,
+				},
+			},
+			{
+				mdm: fleet.MDM{
+					EnabledAndConfigured: false,
+					MacOSMigration: fleet.MacOSMigration{
+						Enable: true,
+					},
+				},
+				depAssigned: true,
+				out: fleet.DesktopNotifications{
+					NeedsMDMMigration:      false,
+					RenewEnrollmentProfile: false,
+				},
+			},
+			{
+				mdm: fleet.MDM{
+					EnabledAndConfigured: true,
+					MacOSMigration: fleet.MacOSMigration{
+						Enable: false,
+					},
+				},
+				depAssigned: true,
+				out: fleet.DesktopNotifications{
+					NeedsMDMMigration:      false,
+					RenewEnrollmentProfile: false,
+				},
+			},
+			{
+				mdm: fleet.MDM{
+					EnabledAndConfigured: false,
+					MacOSMigration: fleet.MacOSMigration{
+						Enable: false,
+					},
+				},
+				depAssigned: true,
+				out: fleet.DesktopNotifications{
+					NeedsMDMMigration:      false,
+					RenewEnrollmentProfile: false,
+				},
+			},
+		}
+
+		for _, c := range cases {
+			c := c
+			ds.AppConfigFunc = func(ctx context.Context) (*fleet.AppConfig, error) {
+				appCfg := fleet.AppConfig{}
+				appCfg.MDM = c.mdm
+				return &appCfg, nil
+			}
+
+			ds.IsHostConnectedToFleetMDMFunc = func(ctx context.Context, host *fleet.Host) (bool, error) {
+				return false, nil
+			}
+			ds.GetHostMDMFunc = func(ctx context.Context, hostID uint) (*fleet.HostMDM, error) {
+				return &fleet.HostMDM{
+					IsServer:               false,
+					InstalledFromDep:       true,
+					Enrolled:               true,
+					Name:                   fleet.WellKnownMDMIntune,
+					DEPProfileAssignStatus: ptr.String(string(fleet.DEPAssignProfileResponseSuccess)),
+				}, nil
+			}
+
+			ctx := test.HostContext(ctx, &fleet.Host{
+				OsqueryHostID:      ptr.String("test"),
+				DEPAssignedToFleet: &c.depAssigned,
+				Platform:           expectedPlatform,
+			})
+			sum, err := svc.GetFleetDesktopSummary(ctx)
+			require.NoError(t, err)
+			require.Equal(t, c.out, sum.Notifications, fmt.Sprintf("enabled_and_configured: %t | macos_migration.enable: %t", c.mdm.EnabledAndConfigured, c.mdm.MacOSMigration.Enable))
+			require.EqualValues(t, 1, *sum.FailingPolicies)
+			assert.Equal(t, ptr.Bool(true), sum.SelfService)
+		}
+	})
+
+	t.Run("different app config values for unmanaged host", func(t *testing.T) {
+		ds := new(mock.Store)
+		license := &fleet.LicenseInfo{Tier: fleet.TierPremium, Expiration: time.Now().Add(24 * time.Hour)}
+		svc, ctx := newTestService(t, ds, nil, nil, &TestServerOpts{License: license, SkipCreateTestUsers: true})
+		ds.FailingPoliciesCountFunc = func(ctx context.Context, host *fleet.Host) (uint, error) {
+			return uint(1), nil
+		}
+		ds.HasSelfServiceSoftwareInstallersFunc = func(ctx context.Context, platform string, teamID *uint) (bool, error) {
+			return true, nil
+		}
+		cases := []struct {
+			mdm         fleet.MDM
+			depAssigned bool
+			out         fleet.DesktopNotifications
+		}{
+			{
+				mdm: fleet.MDM{
+					EnabledAndConfigured: true,
+					MacOSMigration: fleet.MacOSMigration{
+						Enable: true,
+					},
+				},
+				depAssigned: true,
+				out: fleet.DesktopNotifications{
+					NeedsMDMMigration:      false,
+					RenewEnrollmentProfile: true,
+				},
+			},
+			{
+				mdm: fleet.MDM{
+					EnabledAndConfigured: false,
+					MacOSMigration: fleet.MacOSMigration{
+						Enable: true,
+					},
+				},
+				depAssigned: true,
+				out: fleet.DesktopNotifications{
+					NeedsMDMMigration:      false,
+					RenewEnrollmentProfile: false,
+				},
+			},
+			{
+				mdm: fleet.MDM{
+					EnabledAndConfigured: true,
+					MacOSMigration: fleet.MacOSMigration{
+						Enable: false,
+					},
+				},
+				depAssigned: true,
+				out: fleet.DesktopNotifications{
+					NeedsMDMMigration:      false,
+					RenewEnrollmentProfile: false,
+				},
+			},
+			{
+				mdm: fleet.MDM{
+					EnabledAndConfigured: false,
+					MacOSMigration: fleet.MacOSMigration{
+						Enable: false,
+					},
+				},
+				depAssigned: true,
+				out: fleet.DesktopNotifications{
+					NeedsMDMMigration:      false,
+					RenewEnrollmentProfile: false,
+				},
+			},
+		}
+
+		mdmInfo := &fleet.HostMDM{
+			IsServer:               false,
+			InstalledFromDep:       true,
+			Enrolled:               false,
+			Name:                   fleet.WellKnownMDMFleet,
+			DEPProfileAssignStatus: ptr.String(string(fleet.DEPAssignProfileResponseSuccess)),
+		}
+
+		for _, c := range cases {
+			c := c
+			ds.AppConfigFunc = func(ctx context.Context) (*fleet.AppConfig, error) {
+				appCfg := fleet.AppConfig{}
+				appCfg.MDM = c.mdm
+				return &appCfg, nil
+			}
+			ds.IsHostConnectedToFleetMDMFunc = func(ctx context.Context, host *fleet.Host) (bool, error) {
+				return false, nil
+			}
+
+			ds.GetHostMDMFunc = func(ctx context.Context, hostID uint) (*fleet.HostMDM, error) {
+				return mdmInfo, nil
+			}
+
+			ctx = test.HostContext(ctx, &fleet.Host{
+				OsqueryHostID:      ptr.String("test"),
+				DEPAssignedToFleet: &c.depAssigned,
+			})
+			sum, err := svc.GetFleetDesktopSummary(ctx)
+			require.NoError(t, err)
+			require.Equal(t, c.out, sum.Notifications, fmt.Sprintf("enabled_and_configured: %t | macos_migration.enable: %t", c.mdm.EnabledAndConfigured, c.mdm.MacOSMigration.Enable))
+			require.EqualValues(t, 1, *sum.FailingPolicies)
+		}
+	})
+
+	t.Run("different host attributes", func(t *testing.T) {
+		ds := new(mock.Store)
+		license := &fleet.LicenseInfo{Tier: fleet.TierPremium, Expiration: time.Now().Add(24 * time.Hour)}
+		svc, ctx := newTestService(t, ds, nil, nil, &TestServerOpts{License: license, SkipCreateTestUsers: true})
+
+		// context without a host
+		sum, err := svc.GetFleetDesktopSummary(ctx)
+		require.Empty(t, sum)
+		var authErr *fleet.AuthRequiredError
+		require.ErrorAs(t, err, &authErr)
+
+		ds.FailingPoliciesCountFunc = func(ctx context.Context, host *fleet.Host) (uint, error) {
+			return uint(1), nil
+		}
+
+		ds.AppConfigFunc = func(ctx context.Context) (*fleet.AppConfig, error) {
+			appCfg := fleet.AppConfig{}
+			appCfg.MDM.EnabledAndConfigured = true
+			appCfg.MDM.MacOSMigration.Enable = true
+			return &appCfg, nil
+		}
+
+		ds.HasSelfServiceSoftwareInstallersFunc = func(ctx context.Context, platform string, teamID *uint) (bool, error) {
+			return false, nil
+		}
+
+		cases := []struct {
+			name    string
+			host    *fleet.Host
+			hostMDM *fleet.HostMDM
+			err     error
+			out     fleet.DesktopNotifications
+		}{
+			{
+				name: "not enrolled into osquery",
+				host: &fleet.Host{OsqueryHostID: nil},
+				err:  nil,
+				out: fleet.DesktopNotifications{
+					NeedsMDMMigration:      false,
+					RenewEnrollmentProfile: false,
+				},
+			},
+			{
+				name: "manually enrolled into another MDM",
+				host: &fleet.Host{
+					OsqueryHostID:      ptr.String("test"),
+					DEPAssignedToFleet: ptr.Bool(false),
+				},
+				hostMDM: &fleet.HostMDM{
+					IsServer:               false,
+					InstalledFromDep:       false,
+					Enrolled:               true,
+					Name:                   fleet.WellKnownMDMIntune,
+					DEPProfileAssignStatus: ptr.String(string(fleet.DEPAssignProfileResponseSuccess)),
+				},
+				err: nil,
+				out: fleet.DesktopNotifications{
+					NeedsMDMMigration:      false,
+					RenewEnrollmentProfile: false,
+				},
+			},
+			{
+				name: "DEP capable, but already unenrolled",
+				host: &fleet.Host{
+					DEPAssignedToFleet: ptr.Bool(true),
+					OsqueryHostID:      ptr.String("test"),
+				},
+				hostMDM: &fleet.HostMDM{
+					IsServer:               false,
+					InstalledFromDep:       true,
+					Enrolled:               false,
+					Name:                   fleet.WellKnownMDMFleet,
+					DEPProfileAssignStatus: ptr.String(string(fleet.DEPAssignProfileResponseSuccess)),
+				},
+				err: nil,
+				out: fleet.DesktopNotifications{
+					NeedsMDMMigration:      false,
+					RenewEnrollmentProfile: true,
+				},
+			},
+			{
+				name: "DEP capable, but enrolled into Fleet",
+				host: &fleet.Host{
+					DEPAssignedToFleet: ptr.Bool(true),
+					OsqueryHostID:      ptr.String("test"),
+				},
+				hostMDM: &fleet.HostMDM{
+					IsServer:               false,
+					InstalledFromDep:       true,
+					Enrolled:               true,
+					Name:                   fleet.WellKnownMDMFleet,
+					DEPProfileAssignStatus: ptr.String(string(fleet.DEPAssignProfileResponseSuccess)),
+				},
+				err: nil,
+				out: fleet.DesktopNotifications{
+					NeedsMDMMigration:      false,
+					RenewEnrollmentProfile: false,
+				},
+			},
+			{
+				name: "failed ADE assignment status",
+				host: &fleet.Host{
+					DEPAssignedToFleet: ptr.Bool(true),
+					OsqueryHostID:      ptr.String("test"),
+				},
+				hostMDM: &fleet.HostMDM{
+					IsServer:               false,
+					InstalledFromDep:       true,
+					Enrolled:               true,
+					Name:                   fleet.WellKnownMDMIntune,
+					DEPProfileAssignStatus: ptr.String(string(fleet.DEPAssignProfileResponseFailed)),
+				},
+				err: nil,
+				out: fleet.DesktopNotifications{
+					NeedsMDMMigration:      false,
+					RenewEnrollmentProfile: false,
+				},
+			},
+			{
+				name: "throttled ADE assignment status",
+				host: &fleet.Host{
+					DEPAssignedToFleet: ptr.Bool(true),
+					OsqueryHostID:      ptr.String("test"),
+				},
+				hostMDM: &fleet.HostMDM{
+					IsServer:               false,
+					InstalledFromDep:       true,
+					Enrolled:               true,
+					Name:                   fleet.WellKnownMDMIntune,
+					DEPProfileAssignStatus: ptr.String(string(fleet.DEPAssignProfileResponseThrottled)),
+				},
+				err: nil,
+				out: fleet.DesktopNotifications{
+					NeedsMDMMigration:      false,
+					RenewEnrollmentProfile: false,
+				},
+			},
+			{
+				name: "not accessible ADE assignment status",
+				host: &fleet.Host{
+					DEPAssignedToFleet: ptr.Bool(true),
+					OsqueryHostID:      ptr.String("test"),
+				},
+				hostMDM: &fleet.HostMDM{
+					IsServer:               false,
+					InstalledFromDep:       true,
+					Enrolled:               true,
+					Name:                   fleet.WellKnownMDMIntune,
+					DEPProfileAssignStatus: ptr.String(string(fleet.DEPAssignProfileResponseNotAccessible)),
+				},
+				err: nil,
+				out: fleet.DesktopNotifications{
+					NeedsMDMMigration:      false,
+					RenewEnrollmentProfile: false,
+				},
+			},
+			{
+				name: "empty ADE assignment status",
+				host: &fleet.Host{
+					DEPAssignedToFleet: ptr.Bool(true),
+					OsqueryHostID:      ptr.String("test"),
+				},
+				hostMDM: &fleet.HostMDM{
+					IsServer:               false,
+					InstalledFromDep:       true,
+					Enrolled:               true,
+					Name:                   fleet.WellKnownMDMIntune,
+					DEPProfileAssignStatus: ptr.String(""),
+				},
+				err: nil,
+				out: fleet.DesktopNotifications{
+					NeedsMDMMigration:      false,
+					RenewEnrollmentProfile: false,
+				},
+			},
+			{
+				name: "nil ADE assignment status",
+				host: &fleet.Host{
+					DEPAssignedToFleet: ptr.Bool(true),
+					OsqueryHostID:      ptr.String("test"),
+				},
+				hostMDM: &fleet.HostMDM{
+					IsServer:               false,
+					InstalledFromDep:       true,
+					Enrolled:               true,
+					Name:                   fleet.WellKnownMDMIntune,
+					DEPProfileAssignStatus: nil,
+				},
+				err: nil,
+				out: fleet.DesktopNotifications{
+					NeedsMDMMigration:      false,
+					RenewEnrollmentProfile: false,
+				},
+			},
+			{
+				name: "all conditions met",
+				host: &fleet.Host{
+					DEPAssignedToFleet: ptr.Bool(true),
+					OsqueryHostID:      ptr.String("test"),
+				},
+				hostMDM: &fleet.HostMDM{
+					IsServer:               false,
+					InstalledFromDep:       true,
+					Enrolled:               true,
+					Name:                   fleet.WellKnownMDMIntune,
+					DEPProfileAssignStatus: ptr.String(string(fleet.DEPAssignProfileResponseSuccess)),
+				},
+				err: nil,
+				out: fleet.DesktopNotifications{
+					NeedsMDMMigration:      true,
+					RenewEnrollmentProfile: false,
+				},
+			},
+		}
+
+		for _, c := range cases {
+			t.Run(c.name, func(t *testing.T) {
+				ctx = test.HostContext(ctx, c.host)
+
+				ds.GetHostMDMFunc = func(ctx context.Context, hostID uint) (*fleet.HostMDM, error) {
+					if c.hostMDM == nil {
+						return nil, sql.ErrNoRows
+					}
+					return c.hostMDM, nil
+				}
+
+				ds.IsHostConnectedToFleetMDMFunc = func(ctx context.Context, host *fleet.Host) (bool, error) {
+					return c.hostMDM != nil && c.hostMDM.Enrolled == true && c.hostMDM.Name == fleet.WellKnownMDMFleet, nil
+				}
+
+				sum, err := svc.GetFleetDesktopSummary(ctx)
+
+				if c.err != nil {
+					require.ErrorIs(t, err, c.err)
+					require.Empty(t, sum)
+				} else {
+
+					require.NoError(t, err)
+					require.Equal(t, c.out, sum.Notifications)
+					require.EqualValues(t, 1, *sum.FailingPolicies)
+				}
+			})
+		}
+	})
+
+	t.Run("BitLocker PIN prompt", func(t *testing.T) {
+		// The decision itself is tested in ee/server/service. These cases check the summary uses it.
+		for _, tc := range []struct {
+			name       string
+			statusErr  error
+			wantPrompt bool
+		}{
+			{name: "a host that needs a PIN is prompted", wantPrompt: true},
+			{name: "a failed lookup fails the summary", statusErr: errors.New("bitlocker status unavailable")},
+		} {
+			t.Run(tc.name, func(t *testing.T) {
+				ds := new(mock.Store)
+				license := &fleet.LicenseInfo{Tier: fleet.TierPremium, Expiration: time.Now().Add(24 * time.Hour)}
+				svc, ctx := newTestService(t, ds, nil, nil, &TestServerOpts{License: license, SkipCreateTestUsers: true})
+				ds.HasSelfServiceSoftwareInstallersFunc = func(ctx context.Context, platform string, teamID *uint) (bool, error) {
+					return false, nil
+				}
+				ds.FailingPoliciesCountFunc = func(ctx context.Context, host *fleet.Host) (uint, error) { return 0, nil }
+				ds.AppConfigFunc = func(ctx context.Context) (*fleet.AppConfig, error) {
+					ac := &fleet.AppConfig{}
+					ac.MDM.WindowsSettings.EnableDiskEncryption = optjson.SetBool(true)
+					ac.MDM.RequireBitLockerPIN = optjson.SetBool(true)
+					return ac, nil
+				}
+				ds.GetMDMWindowsHostConfigStateFunc = func(ctx context.Context, hostUUID string) (*fleet.MDMWindowsHostConfigState, error) {
+					return &fleet.MDMWindowsHostConfigState{FleetdBitLockerPINCapable: true}, nil
+				}
+				ds.GetMDMWindowsBitLockerStatusFunc = func(ctx context.Context, host *fleet.Host) (*fleet.HostMDMDiskEncryption, error) {
+					return &fleet.HostMDMDiskEncryption{ActionRequired: new(fleet.ActionRequiredCreatePIN)}, tc.statusErr
+				}
+
+				ctx = test.HostContext(ctx, &fleet.Host{ID: 1, UUID: "win-uuid", Platform: "windows", OsqueryHostID: new("win")})
+				sum, err := svc.GetFleetDesktopSummary(ctx)
+				if tc.statusErr != nil {
+					require.ErrorIs(t, err, tc.statusErr)
+					return
+				}
+				require.NoError(t, err)
+				assert.Equal(t, tc.wantPrompt, sum.Notifications.NeedsBitLockerPIN)
+			})
+		}
+	})
+}
+
+func TestTriggerLinuxDiskEncryptionEscrow(t *testing.T) {
+	t.Run("unavailable in Fleet Free", func(t *testing.T) {
+		ds := new(mock.Store)
+		svc, ctx := newTestService(t, ds, nil, nil, &TestServerOpts{SkipCreateTestUsers: true})
+		err := svc.TriggerLinuxDiskEncryptionEscrow(ctx, &fleet.Host{ID: 1})
+		require.ErrorIs(t, err, fleet.ErrMissingLicense)
+	})
+
+	t.Run("no-op on already pending", func(t *testing.T) {
+		ds := new(mock.Store)
+		svc, ctx := newTestService(t, ds, nil, nil, &TestServerOpts{License: &fleet.LicenseInfo{Tier: fleet.TierPremium}, SkipCreateTestUsers: true})
+		ds.GetHostEscrowStateFunc = func(ctx context.Context, hostID uint) (*fleet.HostEscrowState, error) {
+			return &fleet.HostEscrowState{Pending: true}, nil
+		}
+
+		err := svc.TriggerLinuxDiskEncryptionEscrow(ctx, &fleet.Host{ID: 1})
+		require.NoError(t, err)
+		require.True(t, ds.GetHostEscrowStateFuncInvoked)
+	})
+
+	t.Run("conflict while the agent is still prompting for the previous request", func(t *testing.T) {
+		ds := new(mock.Store)
+		svc, ctx := newTestService(t, ds, nil, nil, &TestServerOpts{License: &fleet.LicenseInfo{Tier: fleet.TierPremium}, SkipCreateTestUsers: true})
+		ds.GetHostEscrowStateFunc = func(ctx context.Context, hostID uint) (*fleet.HostEscrowState, error) {
+			require.Equal(t, uint(1), hostID)
+			since := fleet.LinuxEscrowInFlightWindow - (90*time.Second + 300*time.Millisecond)
+			return &fleet.HostEscrowState{SinceLastActivity: &since}, nil
+		}
+
+		err := svc.TriggerLinuxDiskEncryptionEscrow(ctx, &fleet.Host{ID: 1})
+		var inFlightErr *fleet.LinuxEscrowInFlightError
+		require.ErrorAs(t, err, &inFlightErr)
+		require.Equal(t, http.StatusConflict, inFlightErr.StatusCode())
+		require.Equal(t, fleet.LinuxEscrowInFlightMessage, inFlightErr.Error())
+		// rounded up so the caller never retries a moment too early
+		require.Equal(t, 91, inFlightErr.RetryAfter())
+		require.True(t, ds.GetHostEscrowStateFuncInvoked)
+		require.False(t, ds.QueueEscrowFuncInvoked)
+		require.False(t, ds.ReportEscrowErrorFuncInvoked)
+	})
+
+	t.Run("encryption key is already escrowed", func(t *testing.T) {
+		ds := new(mock.Store)
+		svc, ctx := newTestService(t, ds, nil, nil, &TestServerOpts{License: &fleet.LicenseInfo{Tier: fleet.TierPremium}, SkipCreateTestUsers: true})
+		var reportedErrors []string
+		host := &fleet.Host{ID: 1, Platform: "rhel", OSVersion: "Red Hat Enterprise Linux 9.0.0"}
+
+		ds.ReportEscrowErrorFunc = func(ctx context.Context, hostID uint, err string) error {
+			require.Equal(t, hostID, host.ID)
+			reportedErrors = append(reportedErrors, err)
+			return nil
+		}
+
+		orbitInfo := &fleet.HostOrbitInfo{Version: fleet.MinOrbitLUKSVersion}
+		ds.GetHostEscrowStateFunc = func(ctx context.Context, hostID uint) (*fleet.HostEscrowState, error) {
+			return &fleet.HostEscrowState{}, nil
+		}
+		ds.GetHostOrbitInfoFunc = func(ctx context.Context, id uint) (*fleet.HostOrbitInfo, error) {
+			return orbitInfo, nil
+		}
+		ds.AssertHasNoEncryptionKeyStoredFunc = func(ctx context.Context, hostID uint) error {
+			return errors.New("encryption key is already escrowed")
+		}
+
+		err := svc.TriggerLinuxDiskEncryptionEscrow(ctx, host)
+		require.ErrorContains(t, err, "encryption key is already escrowed")
+		require.Len(t, reportedErrors, 0, "No error should be reported when key is already escrowed")
+	})
+
+	t.Run("validation failures", func(t *testing.T) {
+		ds := new(mock.Store)
+		svc, ctx := newTestService(t, ds, nil, nil, &TestServerOpts{License: &fleet.LicenseInfo{Tier: fleet.TierPremium}, SkipCreateTestUsers: true})
+		ds.GetHostEscrowStateFunc = func(ctx context.Context, hostID uint) (*fleet.HostEscrowState, error) {
+			return &fleet.HostEscrowState{}, nil
+		}
+		var reportedErrors []string
+		host := &fleet.Host{ID: 1, Platform: "rhel", OSVersion: "Red Hat Enterprise Linux 9.0.0"}
+		ds.AssertHasNoEncryptionKeyStoredFunc = func(ctx context.Context, hostID uint) error { return nil }
+		ds.ReportEscrowErrorFunc = func(ctx context.Context, hostID uint, err string) error {
+			require.Equal(t, hostID, host.ID)
+			reportedErrors = append(reportedErrors, err)
+			return nil
+		}
+
+		// invalid platform
+		err := svc.TriggerLinuxDiskEncryptionEscrow(ctx, host)
+		require.ErrorContains(t, err, "Fleet does not yet support creating LUKS disk encryption keys on this platform.")
+		require.True(t, ds.GetHostEscrowStateFuncInvoked)
+
+		// valid platform, no-team, encryption not enabled
+		host.OSVersion = "Fedora 32.0.0"
+		appConfig := &fleet.AppConfig{MDM: fleet.MDM{EnableDiskEncryption: optjson.SetBool(false)}}
+		ds.AppConfigFunc = func(ctx context.Context) (*fleet.AppConfig, error) {
+			return appConfig, nil
+		}
+		err = svc.TriggerLinuxDiskEncryptionEscrow(ctx, host)
+		require.ErrorContains(t, err, "Disk encryption is not enabled for hosts not assigned to a fleet.")
+
+		// valid platform, team, encryption not enabled
+		host.TeamID = ptr.Uint(1)
+		teamConfig := &fleet.TeamMDM{}
+		ds.TeamMDMConfigFunc = func(ctx context.Context, teamID uint) (*fleet.TeamMDM, error) {
+			require.Equal(t, uint(1), teamID)
+			return teamConfig, nil
+		}
+		err = svc.TriggerLinuxDiskEncryptionEscrow(ctx, host)
+		require.ErrorContains(t, err, "Disk encryption is not enabled for this host's fleet.")
+
+		// valid platform, team, host disk is not encrypted or unknown encryption state
+		teamConfig = &fleet.TeamMDM{
+			EnableDiskEncryption: true,
+			LinuxSettings:        fleet.LinuxSettings{EnableEscrowDiskEncryptionKey: optjson.SetBool(true)},
+		}
+		err = svc.TriggerLinuxDiskEncryptionEscrow(ctx, host)
+		require.ErrorContains(t, err, "Host's disk is not encrypted. Please encrypt your disk first.")
+		host.DiskEncryptionEnabled = ptr.Bool(false)
+		err = svc.TriggerLinuxDiskEncryptionEscrow(ctx, host)
+		require.ErrorContains(t, err, "Host's disk is not encrypted. Please encrypt your disk first.")
+
+		// No Fleet Desktop
+		host.DiskEncryptionEnabled = ptr.Bool(true)
+		orbitInfo := &fleet.HostOrbitInfo{Version: "1.35.1"}
+		ds.GetHostOrbitInfoFunc = func(ctx context.Context, id uint) (*fleet.HostOrbitInfo, error) {
+			return orbitInfo, nil
+		}
+		err = svc.TriggerLinuxDiskEncryptionEscrow(ctx, host)
+		require.ErrorContains(t, err, "Your version of fleetd does not support creating disk encryption keys on Linux. Please upgrade fleetd, then click Refetch, then try again.")
+
+		require.Len(t, reportedErrors, 6)
+	})
+
+	t.Run("validation success", func(t *testing.T) {
+		ds := new(mock.Store)
+		svc, ctx := newTestService(t, ds, nil, nil, &TestServerOpts{License: &fleet.LicenseInfo{Tier: fleet.TierPremium}, SkipCreateTestUsers: true})
+		ds.GetHostEscrowStateFunc = func(ctx context.Context, hostID uint) (*fleet.HostEscrowState, error) {
+			return &fleet.HostEscrowState{}, nil
+		}
+		ds.AppConfigFunc = func(ctx context.Context) (*fleet.AppConfig, error) {
+			return &fleet.AppConfig{MDM: fleet.MDM{
+				EnableDiskEncryption: optjson.SetBool(true),
+				LinuxSettings:        fleet.LinuxSettings{EnableEscrowDiskEncryptionKey: optjson.SetBool(true)},
+			}}, nil
+		}
+		ds.GetHostOrbitInfoFunc = func(ctx context.Context, id uint) (*fleet.HostOrbitInfo, error) {
+			return &fleet.HostOrbitInfo{Version: "1.36.0", DesktopVersion: ptr.String("42")}, nil
+		}
+		ds.AssertHasNoEncryptionKeyStoredFunc = func(ctx context.Context, hostID uint) error {
+			return nil
+		}
+		host := &fleet.Host{ID: 1, Platform: "ubuntu", DiskEncryptionEnabled: ptr.Bool(true), OrbitVersion: ptr.String(fleet.MinOrbitLUKSVersion)}
+		ds.QueueEscrowFunc = func(ctx context.Context, hostID uint) error {
+			require.Equal(t, uint(1), hostID)
+			return nil
+		}
+
+		err := svc.TriggerLinuxDiskEncryptionEscrow(ctx, host)
+		require.NoError(t, err)
+		require.True(t, ds.QueueEscrowFuncInvoked)
+	})
+}
+
+func TestAuthenticateDeviceRejectsIOSIPadOS(t *testing.T) {
+	t.Run("error - iOS device attempting token auth", func(t *testing.T) {
+		ds := new(mock.Store)
+		svc, ctx := newTestService(t, ds, nil, nil, &TestServerOpts{SkipCreateTestUsers: true})
+
+		ds.AppConfigFunc = func(ctx context.Context) (*fleet.AppConfig, error) {
+			return &fleet.AppConfig{}, nil
+		}
+
+		ds.LoadHostByDeviceAuthTokenFunc = func(ctx context.Context, authToken string, tokenTTL time.Duration) (*fleet.Host, error) {
+			return &fleet.Host{
+				ID:       1,
+				UUID:     "ios-device-uuid",
+				Platform: "ios",
+			}, nil
+		}
+
+		host, debug, err := svc.AuthenticateDevice(ctx, "some-token")
+		require.Error(t, err)
+		require.Nil(t, host)
+		require.False(t, debug)
+		var authErr *fleet.AuthRequiredError
+		require.ErrorAs(t, err, &authErr)
+		require.Contains(t, authErr.Internal(), "iOS and iPadOS devices must use URL authentication")
+	})
+
+	t.Run("error - iPadOS device attempting token auth", func(t *testing.T) {
+		ds := new(mock.Store)
+		svc, ctx := newTestService(t, ds, nil, nil, &TestServerOpts{SkipCreateTestUsers: true})
+
+		ds.AppConfigFunc = func(ctx context.Context) (*fleet.AppConfig, error) {
+			return &fleet.AppConfig{}, nil
+		}
+
+		ds.LoadHostByDeviceAuthTokenFunc = func(ctx context.Context, authToken string, tokenTTL time.Duration) (*fleet.Host, error) {
+			return &fleet.Host{
+				ID:       2,
+				UUID:     "ipados-device-uuid",
+				Platform: "ipados",
+			}, nil
+		}
+
+		host, debug, err := svc.AuthenticateDevice(ctx, "some-token")
+		require.Error(t, err)
+		require.Nil(t, host)
+		require.False(t, debug)
+		var authErr *fleet.AuthRequiredError
+		require.ErrorAs(t, err, &authErr)
+		require.Contains(t, authErr.Internal(), "iOS and iPadOS devices must use URL authentication")
+	})
+
+	t.Run("success - macOS device with token auth", func(t *testing.T) {
+		ds := new(mock.Store)
+		svc, ctx := newTestService(t, ds, nil, nil, &TestServerOpts{SkipCreateTestUsers: true})
+
+		ds.AppConfigFunc = func(ctx context.Context) (*fleet.AppConfig, error) {
+			return &fleet.AppConfig{}, nil
+		}
+
+		ds.LoadHostByDeviceAuthTokenFunc = func(ctx context.Context, authToken string, tokenTTL time.Duration) (*fleet.Host, error) {
+			return &fleet.Host{
+				ID:       3,
+				UUID:     "macos-device-uuid",
+				Platform: "darwin",
+			}, nil
+		}
+
+		host, debug, err := svc.AuthenticateDevice(ctx, "some-token")
+		require.NoError(t, err)
+		require.NotNil(t, host)
+		require.Equal(t, uint(3), host.ID)
+		require.Equal(t, "darwin", host.Platform)
+		require.False(t, debug)
+	})
+
+	t.Run("success - Windows device with token auth", func(t *testing.T) {
+		ds := new(mock.Store)
+		svc, ctx := newTestService(t, ds, nil, nil, &TestServerOpts{SkipCreateTestUsers: true})
+
+		ds.AppConfigFunc = func(ctx context.Context) (*fleet.AppConfig, error) {
+			return &fleet.AppConfig{}, nil
+		}
+
+		ds.LoadHostByDeviceAuthTokenFunc = func(ctx context.Context, authToken string, tokenTTL time.Duration) (*fleet.Host, error) {
+			return &fleet.Host{
+				ID:       4,
+				UUID:     "windows-device-uuid",
+				Platform: "windows",
+			}, nil
+		}
+
+		host, debug, err := svc.AuthenticateDevice(ctx, "some-token")
+		require.NoError(t, err)
+		require.NotNil(t, host)
+		require.Equal(t, uint(4), host.ID)
+		require.Equal(t, "windows", host.Platform)
+		require.False(t, debug)
+	})
+
+	t.Run("success - Linux device with token auth", func(t *testing.T) {
+		ds := new(mock.Store)
+		svc, ctx := newTestService(t, ds, nil, nil, &TestServerOpts{SkipCreateTestUsers: true})
+
+		ds.AppConfigFunc = func(ctx context.Context) (*fleet.AppConfig, error) {
+			return &fleet.AppConfig{}, nil
+		}
+
+		ds.LoadHostByDeviceAuthTokenFunc = func(ctx context.Context, authToken string, tokenTTL time.Duration) (*fleet.Host, error) {
+			return &fleet.Host{
+				ID:       5,
+				UUID:     "linux-device-uuid",
+				Platform: "ubuntu",
+			}, nil
+		}
+
+		host, debug, err := svc.AuthenticateDevice(ctx, "some-token")
+		require.NoError(t, err)
+		require.NotNil(t, host)
+		require.Equal(t, uint(5), host.ID)
+		require.Equal(t, "ubuntu", host.Platform)
+		require.False(t, debug)
+	})
+}

@@ -1,0 +1,168 @@
+.input-icon-field {
+  position: relative;
+
+  &__icon {
+    position: absolute;
+    left: 12px;
+    top: 0;
+    height: 36px;
+    width: 16px;
+    flex-wrap: wrap;
+    align-content: center;
+    z-index: 1;
+    color: $core-fleet-black;
+
+    &--active {
+      color: $ui-fleet-black-75-down;
+    }
+
+    &--error {
+      border: 1px solid $core-vibrant-red;
+      box-sizing: border-box;
+      border-radius: $border-radius;
+    }
+  }
+
+  // Relative input wrapper with absolute icon corrects icon alignment on all browsers
+  &__input-wrapper {
+    position: relative;
+    height: 36px;
+    display: flex;
+    align-items: center;
+  }
+
+  &__input {
+    border: 1px solid $ui-fleet-black-10;
+    background-color: $core-fleet-white;
+    border-radius: $border-radius;
+    padding: 9.5px 12px 9.5px $pad-medium;
+    font-size: $x-small;
+    text-indent: 1px;
+    position: relative;
+    width: 100%;
+    box-sizing: border-box;
+    color: $core-fleet-black;
+    font-weight: $regular;
+    transition: border-color 100ms;
+
+    &.input-with-icon {
+      padding-left: 36px;
+    }
+
+    &::placeholder {
+      color: $ui-fleet-black-50;
+    }
+
+    &:focus {
+      outline: none;
+    }
+
+    &:disabled {
+      color: $ui-fleet-black-33;
+      cursor: not-allowed;
+
+      &::placeholder {
+        color: $ui-fleet-black-33;
+      }
+    }
+
+    &--error {
+      color: $core-vibrant-red;
+      border: 1px solid $core-vibrant-red;
+      box-sizing: border-box;
+      border-radius: $border-radius;
+    }
+  }
+
+  &__input-wrapper--disabled {
+    .input-icon-field__icon {
+      svg {
+        path {
+          fill: $ui-fleet-black-33;
+        }
+      }
+    }
+  }
+
+  &__input-wrapper:not(&__input-wrapper--disabled) {
+    .input-icon-field__input:hover {
+      border: 1px solid $ui-fleet-black-50;
+
+      &:focus {
+        border: 1px solid $core-fleet-black;
+      }
+    }
+
+    // Icon color matches border color on hover
+    .input-icon-field__icon {
+      svg {
+        path {
+          fill: $ui-fleet-black-75-over;
+        }
+      }
+    }
+  }
+
+  &__input-wrapper {
+    .input-icon-field__input:focus {
+      border: 1px solid $core-fleet-black;
+
+      // Icon color matches border color on focus
+      + .input-icon-field__icon {
+        svg {
+          path {
+            fill: $core-fleet-black;
+          }
+        }
+      }
+    }
+  }
+
+  &__label {
+    @include form-label;
+    display: block;
+
+    &[data-has-tooltip="true"] {
+      margin-bottom: $pad-small;
+    }
+
+    &--disabled {
+      color: $ui-fleet-black-50;
+    }
+  }
+
+  &__errors {
+    color: $core-vibrant-red;
+  }
+
+  /* removes the 'X' from IE input type=search */
+  input[type="search"]::-ms-clear {
+    display: none;
+    width: 0;
+    height: 0;
+  }
+  input[type="search"]::-ms-reveal {
+    display: none;
+    width: 0;
+    height: 0;
+  }
+
+  /* removes the 'X' from Chrome input type=search */
+  input[type="search"]::-webkit-search-decoration,
+  input[type="search"]::-webkit-search-cancel-button,
+  input[type="search"]::-webkit-search-results-button,
+  input[type="search"]::-webkit-search-results-decoration {
+    display: none;
+  }
+
+  &__clear-button {
+    position: absolute;
+    right: 12px;
+    top: 0;
+    height: 36px;
+    width: 16px;
+    flex-wrap: wrap;
+    align-content: center;
+    z-index: 1;
+  }
+}

@@ -1,0 +1,219 @@
+package main
+
+import (
+	"context"
+	"errors"
+	"fmt"
+	"log/slog"
+	"os"
+	"time"
+
+	"github.com/WatchBeam/clock"
+	"github.com/fleetdm/fleet/v4/server/config"
+	"github.com/fleetdm/fleet/v4/server/contexts/license"
+	"github.com/fleetdm/fleet/v4/server/datastore/mysql"
+	"github.com/fleetdm/fleet/v4/server/dev_mode"
+	"github.com/fleetdm/fleet/v4/server/fleet"
+	"github.com/spf13/cobra"
+)
+
+var (
+	devLicense        bool
+	devExpiredLicense bool
+	lockDuration      time.Duration
+)
+
+func createVulnProcessingCmd(configManager config.Manager) *cobra.Command {
+	vulnProcessingCmd := &cobra.Command{
+		Use:   "vuln_processing",
+		Short: "Run the vulnerability processing features of Fleet",
+		Long: `The vuln_processing command is intended for advanced configurations that want to externally manage
+vulnerability processing. By default the Fleet server command internally manages vulnerability processing via scheduled
+'cron' style jobs, but setting 'vulnerabilities.disable_schedule=true' or 'FLEET_VULNERABILITIES_DISABLE_SCHEDULE=true'
+will disable it on the server allowing the user configure their own 'cron' mechanism. Successful processing will be indicated
+by an exit code of zero.`,
+		RunE: func(cmd *cobra.Command, args []string) (err error) {
+			cfg := configManager.LoadConfig()
+			if dev_mode.IsEnabled {
+				applyDevFlags(&cfg)
+			}
+
+			logger := initLogger(cfg, nil).With("cron", fleet.CronVulnerabilities)
+
+			licenseInfo, err := initLicense(&cfg, devLicense, devExpiredLicense)
+			if err != nil {
+				return err
+			}
+
+			if licenseInfo != nil && licenseInfo.IsPremium() && licenseInfo.IsExpired() {
+				fleet.WriteExpiredLicenseBanner(os.Stderr)
+			}
+
+			ds, err := mysql.New(cfg.Mysql, clock.C, mysql.Logger(logger))
+			if err != nil {
+				return err
+			}
+
+			// we need to ensure this command isn't running with an out-of-date database
+			status, err := ds.MigrationStatus(cmd.Context())
+			if err != nil {
+				return err
+			}
+
+			var migrationError error
+			switch status.StatusCode {
+			case fleet.AllMigrationsCompleted:
+				// only continue if db is considered up-to-date
+			case fleet.NeedsFleetv4732Fix, fleet.UnknownFleetv4732State:
+				migrationError = errors.New("database has misnumbered migrations from v4.73.2")
+			case fleet.NoMigrationsCompleted:
+				migrationError = errors.New("no migrations completed")
+			case fleet.SomeMigrationsCompleted:
+				migrationError = errors.New("partial migrations completed")
+			case fleet.UnknownMigrations:
+				migrationError = errors.New("database migrations incompatible with current version")
+			}
+			if migrationError != nil {
+				return fmt.Errorf("refusing to continue processing vulnerabilities err: %w", migrationError)
+			}
+
+			ctx, cancel := context.WithTimeout(cmd.Context(), lockDuration)
+			defer cancel()
+			ctx = license.NewContext(ctx, licenseInfo)
+			// using the same lock name as the cron scheduled version of vuln processing, that way if we fail to obtain the lock
+			// it's most likely due to vulnerabilities.disable_schedule=false but still trying to run external vuln processing command
+			lock, err := ds.Lock(ctx, string(fleet.CronVulnerabilities), "vuln_processing_command", lockDuration)
+			if err != nil {
+				return fmt.Errorf("failed to obtain vuln processing lock: %w", err)
+			}
+			if !lock {
+				return errors.New("vulnerabilities processing locked")
+			}
+
+			defer func() {
+				uerr := ds.Unlock(ctx, string(fleet.CronVulnerabilities), "vuln_processing_command")
+				if uerr != nil {
+					err = fmt.Errorf("failed to release vulnerability processing lock: %w", uerr)
+				}
+			}()
+			appConfig, err := ds.AppConfig(ctx)
+			if err != nil {
+				return err
+			}
+			vulnConfig := cfg.Vulnerabilities
+			vulnPath := configureVulnPath(ctx, vulnConfig, appConfig, logger)
+			// this really shouldn't ever be empty string since it's defaulted, but could be due to some misconfiguration
+			// we'll throw an error here since the entire point of this command is to process vulnerabilities
+			if vulnPath == "" {
+				return errors.New("vuln path empty, check environment variables or app config yml")
+			}
+			logger.InfoContext(ctx, "scanning vulnerabilities")
+			start := time.Now()
+			vulnFuncs := getVulnFuncs(ds, logger, &vulnConfig)
+			for _, vulnFunc := range vulnFuncs {
+				if err := vulnFunc.VulnFunc(ctx); err != nil {
+					return err
+				}
+			}
+			logger.InfoContext(ctx, "vulnerability processing finished", "took", time.Since(start))
+
+			return
+		},
+	}
+	vulnProcessingCmd.PersistentFlags().BoolVar(&dev_mode.IsEnabled, "dev", false, "Enable developer options")
+	vulnProcessingCmd.PersistentFlags().BoolVar(&devLicense, "dev_license", false, "Enable development license")
+	vulnProcessingCmd.PersistentFlags().BoolVar(&devExpiredLicense, "dev_expired_license", false, "Enable expired development license")
+	vulnProcessingCmd.PersistentFlags().DurationVar(
+		&lockDuration,
+		"lock_duration",
+		time.Second*60*60,
+		"the duration (https://pkg.go.dev/time#ParseDuration) the lock should be obtained, ideally this duration is less than the interval in which the job runs (defaults to 60m). If vuln processing isn't finished before this duration the command will exit with a non-zero status code.")
+	vulnProcessingCmd.SilenceUsage = true
+
+	return vulnProcessingCmd
+}
+
+func configureVulnPath(ctx context.Context, vulnConfig config.VulnerabilitiesConfig, appConfig *fleet.AppConfig, logger *slog.Logger) (vulnPath string) {
+	switch {
+	case vulnConfig.DatabasesPath != "" && appConfig != nil && appConfig.VulnerabilitySettings.DatabasesPath != "":
+		vulnPath = vulnConfig.DatabasesPath
+		logger.InfoContext(ctx, "fleet config takes precedence over app config when both are configured",
+			"databases_path", vulnPath,
+		)
+	case vulnConfig.DatabasesPath != "":
+		vulnPath = vulnConfig.DatabasesPath
+	case appConfig != nil && appConfig.VulnerabilitySettings.DatabasesPath != "":
+		vulnPath = appConfig.VulnerabilitySettings.DatabasesPath
+	default:
+		logger.InfoContext(ctx, "vulnerability scanning not configured, vulnerabilities databases path is empty")
+	}
+	return vulnPath
+}
+
+type NamedVulnFunc struct {
+	Name     string
+	VulnFunc func(ctx context.Context) error
+}
+
+func getVulnFuncs(ds fleet.Datastore, logger *slog.Logger, config *config.VulnerabilitiesConfig) []NamedVulnFunc {
+	vulnFuncs := []NamedVulnFunc{
+		{
+			// Run first to ensure aggregated_stats has fresh OS version data
+			// before cronVulnerabilities scans for OS vulnerabilities.
+			Name: "update_os_versions",
+			VulnFunc: func(ctx context.Context) error {
+				ctx, span := tracer.Start(ctx, "vuln.update_os_versions")
+				defer span.End()
+				return ds.UpdateOSVersions(ctx)
+			},
+		},
+		{
+			Name: "cron_vulnerabilities",
+			VulnFunc: func(ctx context.Context) error {
+				return cronVulnerabilities(ctx, ds, logger, config)
+			},
+		},
+		{
+			Name: "cron_sync_host_software",
+			VulnFunc: func(ctx context.Context) error {
+				ctx, span := tracer.Start(ctx, "vuln.sync_host_software")
+				defer span.End()
+				return ds.SyncHostsSoftware(ctx, time.Now())
+			},
+		},
+		{
+			Name: "cron_cleanup_software_titles",
+			VulnFunc: func(ctx context.Context) error {
+				ctx, span := tracer.Start(ctx, "vuln.cleanup_software_titles")
+				defer span.End()
+				return ds.CleanupSoftwareTitles(ctx)
+			},
+		},
+		{
+			Name: "cron_sync_hosts_software_titles",
+			VulnFunc: func(ctx context.Context) error {
+				ctx, span := tracer.Start(ctx, "vuln.sync_host_software_titles")
+				defer span.End()
+				return ds.SyncHostsSoftwareTitles(ctx, time.Now())
+			},
+		},
+		{
+			Name: "update_host_issues_vulnerabilities_counts",
+			VulnFunc: func(ctx context.Context) error {
+				ctx, span := tracer.Start(ctx, "vuln.update_host_issues")
+				defer span.End()
+				return ds.UpdateHostIssuesVulnerabilities(ctx)
+			},
+		},
+		{
+			Name: "insert_kernel_software_mapping",
+			VulnFunc: func(ctx context.Context) error {
+				ctx, span := tracer.Start(ctx, "vuln.kernel_software_mapping")
+				defer span.End()
+				return ds.InsertKernelSoftwareMapping(ctx)
+			},
+		},
+	}
+
+	return vulnFuncs
+}

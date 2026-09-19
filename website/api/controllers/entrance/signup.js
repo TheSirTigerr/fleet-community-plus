@@ -1,0 +1,289 @@
+module.exports = {
+
+
+  friendlyName: 'Signup',
+
+
+  description: 'Sign up for a new user account.',
+
+
+  extendedDescription:
+`This creates a new user record in the database, signs in the requesting user agent
+by modifying its [session](https://sailsjs.com/documentation/concepts/sessions), and
+(if emailing with Mailgun is enabled) sends an account verification email.
+
+If a verification email is sent, the new user's account is put in an "unconfirmed" state
+until they confirm they are using a legitimate email address (by clicking the link in
+the account verification message.)`,
+
+
+  inputs: {
+
+    emailAddress: {
+      required: true,
+      type: 'string',
+      isEmail: true,
+      description: 'The email address for the new account, e.g. m@example.com.',
+      extendedDescription: 'Must be a valid email address.',
+    },
+
+    password: {
+      required: true,
+      type: 'string',
+      maxLength: 200,
+      example: 'passwordlol',
+      description: 'The unhashed (plain text) password to use for the new account.'
+    },
+
+    organization: {
+      type: 'string',
+      maxLength: 120,
+      example: 'The Sails company',
+      description: 'The organization the user works for',
+    },
+
+    firstName:  {
+      required: true,
+      type: 'string',
+      example: 'Frida',
+      description: 'The user\'s first name.',
+    },
+
+    lastName:  {
+      required: true,
+      type: 'string',
+      example: 'Rivera',
+      description: 'The user\'s last name.',
+    },
+
+    signupReason: {
+      type: 'string',
+      isIn: ['Buy a license', 'Try Fleet'],
+      defaultsTo: 'Buy a license',
+    },
+
+  },
+
+
+  exits: {
+
+    success: {
+      description: 'New user account was created successfully.'
+    },
+
+    invalid: {
+      responseType: 'badRequest',
+      description: 'The provided firstName, lastName, organization, password and/or email address are invalid.',
+      extendedDescription: 'If this request was sent from a graphical user interface, the request '+
+      'parameters should have been validated/coerced _before_ they were sent.'
+    },
+
+    emailAlreadyInUse: {
+      statusCode: 409,
+      description: 'The provided email address is already in use.',
+    },
+
+    invalidEmailDomain: {
+      description: 'This email address is on a denylist of domains and cannot be used to signup for a fleetdm.com account.',
+      responseType: 'badRequest'
+    },
+
+
+  },
+
+  fn: async function ({emailAddress, password, firstName, lastName, organization, signupReason}) {
+    // Note: in Oct. 2023, the Fleet Sandbox related code was removed from this action. For more details, see https://github.com/fleetdm/fleet/pull/14638/files
+
+    var newEmailAddress = emailAddress.toLowerCase();
+    // Checking if a user with this email address exists in our database before we send a request to the cloud provisioner.
+    if(await User.findOne({emailAddress: newEmailAddress})) {
+      throw 'emailAlreadyInUse';
+    }
+    // Check the user's email address and return an 'invalidEmailDomain' response if the domain is in the sails.config.custom.bannedEmailDomainsForWebsiteSubmissions array.
+    let emailDomain = newEmailAddress.split('@')[1];
+    if(_.includes(sails.config.custom.bannedEmailDomainsForWebsiteSubmissions, emailDomain)){
+      throw 'invalidEmailDomain';
+    }
+
+    // If organization was not provided (e.g., The user signed up with the signup modal), use their email domain as their organization.
+    if(!organization) {
+      organization = emailDomain;
+    }
+
+    let newUserRecord = await User.create(_.extend({
+      firstName,
+      lastName,
+      organization,
+      emailAddress: newEmailAddress,
+      signupReason,
+      password: await sails.helpers.passwords.hashPassword(password),
+      tosAcceptedByIp: this.req.ip
+    }, sails.config.custom.verifyEmailAddresses? {
+      emailProofToken: await sails.helpers.strings.random('url-friendly'),
+      emailProofTokenExpiresAt: Date.now() + sails.config.custom.emailProofTokenTTL,
+      emailStatus: 'unconfirmed'
+    }:{}))
+    .intercept('E_UNIQUE', 'emailAlreadyInUse')
+    .intercept({name: 'UsageError'}, 'invalid')
+    .fetch();
+
+
+    // Enrich the information provided.
+    let enrichmentInformation = await sails.helpers.iq.getEnriched.with({
+      firstName,
+      lastName,
+      emailAddress: newEmailAddress,
+    }).tolerate((err)=>{
+      sails.log.warn(`When a new user signed up for an account, enrichment information could not be obtained with the information provided. Full error: ${require('util').inspect(err)}`);
+      return { employer: undefined, person: undefined};
+    });
+
+    let isIcpUser = false;
+    let fleetPremiumTrialType = 'local trial';
+    if(enrichmentInformation.employer && enrichmentInformation.employer.numberOfEmployees > 700) {
+      fleetPremiumTrialType = 'render trial';
+      isIcpUser = true;
+    }//ﬁ
+
+    // if(emailDomain === 'fleetdm.com') {
+    //   fleetPremiumTrialType = 'render trial';
+    // }//ﬁ
+
+    let thirtyDaysFromNowAt = Date.now() + (1000 * 60 * 60 * 24 * 30);
+    let trialLicenseKeyForThisUser = await sails.helpers.createLicenseKey.with({
+      numberOfHosts: 10,
+      organization,
+      expiresAt: thirtyDaysFromNowAt,
+    });
+
+    await User.updateOne({id: newUserRecord.id}).set({
+      fleetPremiumTrialLicenseKeyExpiresAt: thirtyDaysFromNowAt,
+      fleetPremiumTrialLicenseKey: trialLicenseKeyForThisUser,
+      fleetPremiumTrialType,
+    });
+
+
+
+    if(fleetPremiumTrialType === 'render trial') {
+      // If this user is eligable for a Render POV, we'll
+      let renderInstancesThatCanBeAssignedToThisUser = await RenderProofOfValue.find({
+        where: {status: 'ready for assignment', user: null},
+        sort: 'createdAt ASC',
+        limit: 1,
+      });
+
+      if(renderInstancesThatCanBeAssignedToThisUser.length < 1){
+        throw new Error(`When a new user (email: ${newEmailAddress}) signed up, no Fleet premium trial instances in Render were available to assign to the user.`);
+      } else {
+        let instanceToAssign = renderInstancesThatCanBeAssignedToThisUser[0];
+
+        await RenderProofOfValue.updateOne({id: instanceToAssign.id}).set({
+          status: 'in use',
+          renderTrialEndsAt: thirtyDaysFromNowAt,
+          user: newUserRecord.id,
+        });
+
+        await sails.helpers.sendTemplateEmail.with({
+          to: newEmailAddress,
+          from: sails.config.custom.fromEmailAddress,
+          fromName: sails.config.custom.fromName,
+          subject: 'Your Fleet trial is ready',
+          template: 'email-fleet-premium-pov-trial-started',
+          layout: 'layout-nurture-email',
+          templateData: {
+            firstName,
+          }
+        });
+      }
+    } else {
+      await sails.helpers.sendTemplateEmail.with({
+        to: newEmailAddress,
+        from: sails.config.custom.fromEmailAddress,
+        fromName: sails.config.custom.fromName,
+        subject: 'Your 30-day Fleet Premium trial key',
+        template: 'email-fleet-premium-local-trial-started',
+        layout: 'layout-nurture-email',
+        templateData: {
+          firstName,
+        }
+      });
+    }
+
+
+
+
+
+    let psychologicalStageChangeReason;
+    if(this.req.session.adAttributionString && this.req.session.visitedSiteFromAdAt) {
+      let sevenDaysAgoAt = Date.now() - (1000 * 60 * 60 * 24 * 7);
+      // If this user visited the website from an ad, set the psychologicalStageChangeReason to be the adCampaignId stored in their session.
+      if(this.req.session.visitedSiteFromAdAt > sevenDaysAgoAt) {
+        psychologicalStageChangeReason = this.req.session.adAttributionString;
+      }
+    }
+
+    let attributionCookieOrUndefined = this.req.cookies.marketingAttribution;// Will be undefined if this is not set.
+
+
+    sails.helpers.flow.build(async ()=>{
+      let recordDetails = await sails.helpers.salesforce.updateOrCreateContactAndAccount.with({
+        emailAddress: newEmailAddress,
+        firstName: firstName,
+        lastName: lastName,
+        contactSource: 'Website - Sign up',
+        description: `Signed up for a fleetdm.com account and was given a 30-day ${fleetPremiumTrialType}`,
+        psychologicalStageChangeReason,
+        marketingAttributionCookie: attributionCookieOrUndefined
+      });
+
+      // Throw an error to stop the build() helper if a contact is missing a parent account record.
+      if(!recordDetails.salesforceAccountId) {
+        throw new Error(`Could not create historical event. The contact record (ID: ${recordDetails.salesforceContactId}) returned by the updateOrCreateContactAndAccount helper is missing a parent account record.`);
+      }
+
+      await sails.helpers.salesforce.createHistoricalEvent.with({
+        salesforceAccountId: recordDetails.salesforceAccountId,
+        salesforceContactId: recordDetails.salesforceContactId,
+        eventType: 'Intent signal',
+        intentSignal: 'Signed up for a fleetdm.com account',
+        relatedCampaign: recordDetails.mostRecentCampaign,
+        eventSource: 'Website - Sign up',
+      }).intercept((err)=>{
+        return new Error(`Could not create an historical event. Full error: ${require('util').inspect(err)}`);
+      });
+
+    }).exec((err)=>{
+      if(err){
+        sails.log.warn(`Background task failed: When a user (email: ${newEmailAddress} signed up for a fleetdm.com account, a Contact/Account/Historical event record could not be created/updated in the CRM.`, err);
+      }
+      return;
+    });//_∏_
+
+
+    // Store the user's new id in their session.
+    this.req.session.userId = newUserRecord.id;
+
+
+    if (sails.config.custom.verifyEmailAddresses) {
+      // Send "confirm account" email
+      await sails.helpers.sendTemplateEmail.with({
+        to: newEmailAddress,
+        from: sails.config.custom.fromEmailAddress,
+        fromName: sails.config.custom.fromName,
+        subject: 'Please confirm your account',
+        template: 'email-verify-account',
+        templateData: {
+          firstName,
+          token: newUserRecord.emailProofToken
+        }
+      });
+    } else {
+      sails.log.info('Skipping new account email verification... (since `verifyEmailAddresses` is disabled)');
+    }
+    return {
+      isIcpUser
+    };
+
+  }
+
+};

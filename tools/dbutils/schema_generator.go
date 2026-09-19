@@ -1,0 +1,93 @@
+package main
+
+import (
+	"bytes"
+	"context"
+	"database/sql"
+	"fmt"
+	"log/slog"
+	"os"
+	"os/exec"
+	"time"
+
+	"github.com/WatchBeam/clock"
+	"github.com/fleetdm/fleet/v4/server/config"
+	"github.com/fleetdm/fleet/v4/server/datastore/mysql"
+)
+
+const (
+	testUsername = "root"
+	testPassword = "toor"
+)
+
+var (
+	testAddress = getTestAddress()
+)
+
+func getTestAddress() string {
+	if port := os.Getenv("FLEET_MYSQL_TEST_PORT"); port != "" {
+		return "localhost:" + port
+	}
+	return "localhost:3307"
+}
+
+func panicif(err error) {
+	if err != nil {
+		panic(err)
+	}
+}
+
+// main requires 1 argument:
+// 1. Path to dumpfile
+func main() {
+	if len(os.Args) != 2 {
+		panic("not enough arguments")
+	}
+	fmt.Println("dumping schema to", os.Args[1])
+
+	// Create the database (must use raw MySQL client to do this)
+	db, err := sql.Open(
+		"mysql",
+		fmt.Sprintf("%s:%s@tcp(%s)/?multiStatements=true", testUsername, testPassword, testAddress),
+	)
+	panicif(err)
+	defer db.Close()
+	_, err = db.Exec("DROP DATABASE IF EXISTS schemadb; CREATE DATABASE schemadb;")
+	panicif(err)
+
+	// Create a datastore client in order to run migrations as usual
+	config := config.MysqlConfig{
+		Username: testUsername,
+		Password: testPassword,
+		Address:  testAddress,
+		Database: "schemadb",
+	}
+	ds, err := mysql.New(config, clock.NewMockClock(), mysql.Logger(slog.New(slog.DiscardHandler)), mysql.LimitAttempts(1))
+	panicif(err)
+	defer ds.Close()
+	panicif(ds.MigrateTables(context.Background()))
+
+	// Set created_at/updated_at for migrations and app_config_json to prevent the schema from being changed every time
+	// This schema is to test anyway
+	fixedDate := time.Date(2020, 01, 01, 01, 01, 01, 01, time.UTC)
+	_, err = db.Exec(`USE schemadb`)
+	panicif(err)
+	_, err = db.Exec(`UPDATE app_config_json SET created_at = ?, updated_at = ?`, fixedDate, fixedDate)
+	panicif(err)
+	_, err = db.Exec(`UPDATE migration_status_tables SET tstamp = ?`, fixedDate)
+	panicif(err)
+
+	// Dump schema to dumpfile
+	// --set-gtid-purged=OFF omits replication transaction IDs from the dump, making it
+	// portable across MySQL servers. This was the default behavior before MySQL 9.5.
+	cmd := exec.Command(
+		"docker", "compose", "exec", "-T", "mysql_test",
+		// Command run inside container
+		"mysqldump", "-u"+testUsername, "-p"+testPassword, "schemadb", "--compact", "--skip-comments", "--set-gtid-purged=OFF",
+	)
+	var stdoutBuf bytes.Buffer
+	cmd.Stdout = &stdoutBuf
+	panicif(cmd.Run())
+
+	panicif(os.WriteFile(os.Args[1], stdoutBuf.Bytes(), 0o655))
+}

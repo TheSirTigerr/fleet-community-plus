@@ -1,0 +1,35 @@
+.host-activity-card {
+  @include vertical-card-layout;
+
+  &__header {
+    display: flex;
+    justify-content: space-between;
+    align-items: baseline; // Aligns bottom of text
+  }
+
+  &__loading-overlay {
+    // this is to center the loading spinner in the card
+    display: flex;
+    align-items: center;
+    justify-content: center;
+
+    height: 100%;
+    width: 100%;
+    position: absolute;
+    top: 0;
+    left: 0;
+    z-index: 3;
+    border-radius: 16px;
+    background-color: $loading-overlay;
+  }
+
+  &__upcoming-tooltip {
+    font-size: $xx-small;
+  }
+
+  &__tab-panel {
+    display: flex;
+    flex-direction: column;
+    gap: $pad-large;
+  }
+}

@@ -1,0 +1,50 @@
+.windows-automatic-enrollment-page {
+  @include vertical-page-layout;
+
+  &__content-container {
+    display: flex;
+    flex-direction: column;
+    gap: $pad-xlarge;
+    max-width: $settings-form-max-width;
+  }
+
+  h2 {
+    font-size: $small;
+  }
+
+  p {
+    margin-top: 0;
+  }
+
+  &__mdm-urls-container,
+  &__tenants-container,
+  &__client-ids-container {
+    display: flex;
+    flex-direction: column;
+    gap: $pad-large;
+  }
+
+  &__url-inputs-wrapper {
+    display: flex;
+    flex-direction: column;
+    gap: $pad-icon;
+  }
+
+  &__url-input {
+    margin-bottom: 0;
+  }
+
+  &__cloud-customer-banner {
+    margin-top: $pad-large;
+  }
+
+  &__banner-content {
+    display: flex;
+    align-items: column;
+    gap: $pad-small;
+  }
+
+  .empty-table__container {
+    margin: $pad-small auto;
+  }
+}

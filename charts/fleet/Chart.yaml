@@ -1,0 +1,20 @@
+apiVersion: v2
+description: A Helm chart for Fleet
+name: fleet
+keywords:
+  - fleet
+  - osquery
+version: v7.0.19
+home: https://github.com/fleetdm/fleet
+sources:
+  - https://github.com/fleetdm/fleet.git
+appVersion: v4.91.1
+dependencies:
+  - name: mysql
+    condition: mysql.enabled
+    version: 1.0.0
+    repository: file://charts/mysql
+  - name: valkey
+    condition: redis.enabled
+    version: 0.9.3
+    repository: https://valkey.io/valkey-helm/

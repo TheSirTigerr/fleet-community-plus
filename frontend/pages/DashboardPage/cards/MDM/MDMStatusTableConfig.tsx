@@ -1,0 +1,93 @@
+import React from "react";
+import { CellProps, Column } from "react-table";
+
+import TextCell from "components/TableContainer/DataTable/TextCell";
+import TooltipWrapper from "components/TooltipWrapper";
+import ViewAllHostsLink from "components/ViewAllHostsLink";
+import { INumberCellProps } from "interfaces/datatable_config";
+import {
+  IMdmStatusCardData,
+  MDM_ENROLLMENT_STATUS_UI_MAP,
+} from "interfaces/mdm";
+import { MDM_STATUS_TOOLTIP } from "utilities/constants";
+
+type IMdmStatusTableConfig = Column<IMdmStatusCardData>;
+type IMdmStatusCellProps = CellProps<
+  IMdmStatusCardData,
+  IMdmStatusCardData["status"]
+>;
+type IHostCountCellProps = INumberCellProps<IMdmStatusCardData>;
+type IViewAllHostsLinkProps = CellProps<IMdmStatusCardData>;
+
+export const generateStatusTableHeaders = (
+  teamId?: number
+): IMdmStatusTableConfig[] => [
+  {
+    Header: "Status",
+    disableSortBy: true,
+    accessor: "status",
+    Cell: ({ cell: { value: status } }: IMdmStatusCellProps) =>
+      !MDM_STATUS_TOOLTIP[status] ? (
+        <TextCell value={status} />
+      ) : (
+        <TooltipWrapper
+          className="status-cell"
+          tipContent={MDM_STATUS_TOOLTIP[status]}
+        >
+          {MDM_ENROLLMENT_STATUS_UI_MAP[status].displayName}
+        </TooltipWrapper>
+      ),
+    sortType: "hasLength",
+  },
+  {
+    Header: "Hosts",
+    disableSortBy: true,
+    accessor: "hosts",
+    Cell: (cellProps: IHostCountCellProps) => (
+      <TextCell value={cellProps.cell.value} />
+    ),
+  },
+  {
+    Header: "",
+    id: "view-all-hosts",
+    disableSortBy: true,
+    disableGlobalFilter: true,
+    Cell: (cellProps: IViewAllHostsLinkProps) => {
+      return (
+        <ViewAllHostsLink
+          queryParams={{
+            mdm_enrollment_status:
+              MDM_ENROLLMENT_STATUS_UI_MAP[cellProps.row.original.status]
+                .filterValue,
+            fleet_id: teamId,
+          }}
+          className="mdm-solution-link"
+          platformLabelId={cellProps.row.original.selectedPlatformLabelId}
+          rowHover
+        />
+      );
+    },
+  },
+];
+
+const enhanceStatusData = (
+  statusData: IMdmStatusCardData[],
+  selectedPlatformLabelId?: number
+): IMdmStatusCardData[] => {
+  return Object.values(statusData).map((data) => {
+    return {
+      ...data,
+      selectedPlatformLabelId,
+    };
+  });
+};
+
+export const generateStatusDataSet = (
+  statusData: IMdmStatusCardData[] | null,
+  selectedPlatformLabelId?: number
+): IMdmStatusCardData[] => {
+  if (!statusData) {
+    return [];
+  }
+  return [...enhanceStatusData(statusData, selectedPlatformLabelId)];
+};

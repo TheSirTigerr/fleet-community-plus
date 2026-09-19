@@ -1,0 +1,29 @@
+.tooltip-truncated-text {
+  // we want this component to take up the full width of its parent container.
+  // This means the width where the truncation occurs must be defined in the
+  // parent that is using this component. This allows for maximum flexibility
+  // in different use cases.
+  max-width: 100%;
+
+  // we have to reach into the tooltip wrapper compoment and set the width to 100%
+  // for the tooltip element to be the same width as the parent
+  .component__tooltip-wrapper__element {
+    width: 100%;
+  }
+
+  &__text-value {
+    text-overflow: ellipsis;
+    overflow: hidden;
+    white-space: nowrap;
+  }
+
+  // When a supplemental tooltip is available, underline the value to signal it.
+  // The dashed border sits on the text value itself (not the wrapper element)
+  // so it isn't clipped by truncating (`overflow: hidden`) parents such as the
+  // DataSet `dd`.
+  &--underline &__text-value {
+    display: inline-block;
+    max-width: 100%;
+    border-bottom: 1px dashed $ui-fleet-black-50;
+  }
+}

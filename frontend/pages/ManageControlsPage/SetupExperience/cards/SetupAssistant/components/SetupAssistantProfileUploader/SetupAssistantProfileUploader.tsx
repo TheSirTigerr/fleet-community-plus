@@ -1,0 +1,76 @@
+import { AxiosResponse } from "axios";
+import React, { useState } from "react";
+
+import CustomLink from "components/CustomLink";
+import FileUploader from "components/FileUploader";
+import { notify } from "components/ToastNotification";
+import { IApiError } from "interfaces/errors";
+import mdmAPI from "services/entities/mdm";
+
+import { getErrorMessage } from "./helpers";
+
+const baseClass = "setup-assistant-profile-uploader";
+
+interface ISetupAssistantProfileUploaderProps {
+  currentTeamId: number;
+  onUpload: () => void;
+}
+
+const SetupAssistantProfileUploader = ({
+  currentTeamId,
+  onUpload,
+}: ISetupAssistantProfileUploaderProps) => {
+  const [showLoading, setShowLoading] = useState(false);
+
+  const onUploadFile = async (files: FileList | null) => {
+    setShowLoading(true);
+
+    if (!files || files.length === 0) {
+      setShowLoading(false);
+      return;
+    }
+
+    const file = files[0];
+
+    try {
+      await mdmAPI.uploadSetupEnrollmentProfile(file, currentTeamId);
+      notify.success("Successfully uploaded.");
+      onUpload();
+    } catch (e) {
+      const error = e as AxiosResponse<IApiError>;
+      const errMessage = getErrorMessage(error);
+      let errComponent = <>{errMessage}</>;
+      if (errMessage.includes("Couldn't add")) {
+        errComponent = (
+          <>
+            {errMessage}.{" "}
+            <CustomLink
+              url="https://fleetdm.com/learn-more-about/dep-profile"
+              text="Learn more"
+              className={`${baseClass}__new-tab`}
+              newTab
+              variant="flash-message-link"
+            />
+          </>
+        );
+      }
+      notify.error(errComponent, { response: e });
+    } finally {
+      setShowLoading(false);
+    }
+  };
+
+  return (
+    <FileUploader
+      message="Automatic enrollment profile (.json)"
+      graphicName="file-configuration-profile"
+      accept=".json"
+      buttonMessage="Add profile"
+      onFileUpload={onUploadFile}
+      isLoading={showLoading}
+      className={baseClass}
+    />
+  );
+};
+
+export default SetupAssistantProfileUploader;

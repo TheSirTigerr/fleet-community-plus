@@ -1,0 +1,22 @@
+<div id="terms">
+  <div purpose="page-container" class="container-fluid">
+    <div purpose="breadcrumbs-and-search" class="d-flex flex-lg-row flex-column justify-content-between align-items-lg-center align-items-start">
+    </div>
+    <div purpose="article-and-sidebar" class="d-flex flex-lg-row-reverse flex-column justify-content-lg-between">
+      <div purpose="sidebar-container">
+        <div purpose="right-sidebar" class="d-flex flex-column">
+          <div purpose="edit-link">
+            <a purpose="sidebar-link" :href="'https://github.com/fleetdm/fleet/edit/main/handbook/'+thisPage.sectionRelativeRepoPath"> <img src="/images/icon-edit-16x16@2x.png" alt="Suggest an edit">Suggest an edit</a>
+          </div>
+
+        </div>
+      </div>
+      <div purpose="article-container">
+        <div purpose="article-content" parasails-has-no-page-script>
+          <%- partial(path.relative(path.dirname(__filename), path.resolve( sails.config.appPath, path.join(sails.config.builtStaticContent.compiledPagePartialsAppPath, thisPage.htmlId)))) %>
+        </div>
+      </div>
+    </div>
+  </div>
+</div>
+<%- /* Expose locals as `window.SAILS_LOCALS` :: */ exposeLocalsToBrowser() %>

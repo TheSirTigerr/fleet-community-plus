@@ -1,0 +1,4818 @@
+package main
+
+import (
+	"bytes"
+	"compress/bzip2"
+	"context"
+	cryptorand "crypto/rand"
+	"crypto/sha1" // nolint:gosec
+	"crypto/sha256"
+	"crypto/tls"
+	"embed"
+	"encoding/base64"
+	"encoding/hex"
+	"encoding/json"
+	"encoding/xml"
+	"errors"
+	"flag"
+	"fmt"
+	"io"
+	"log"
+	"maps"
+	"math/rand"
+	"net/http"
+	_ "net/http/pprof"
+	"os"
+	"regexp"
+	"sort"
+	"strconv"
+	"strings"
+	"sync"
+	"sync/atomic"
+	"text/template"
+	"time"
+
+	fleetclient "github.com/fleetdm/fleet/v4/client"
+	"github.com/fleetdm/fleet/v4/cmd/osquery-perf/hostidentity"
+	"github.com/fleetdm/fleet/v4/cmd/osquery-perf/installer_cache"
+	"github.com/fleetdm/fleet/v4/cmd/osquery-perf/osquery_perf"
+	"github.com/fleetdm/fleet/v4/cmd/osquery-perf/softwaredb"
+	"github.com/fleetdm/fleet/v4/pkg/file"
+	"github.com/fleetdm/fleet/v4/pkg/mdm/apnsmock"
+	"github.com/fleetdm/fleet/v4/pkg/mdm/mdmtest"
+	"github.com/fleetdm/fleet/v4/server/fleet"
+	apple_mdm "github.com/fleetdm/fleet/v4/server/mdm/apple"
+	"github.com/fleetdm/fleet/v4/server/mdm/microsoft/syncml"
+	"github.com/fleetdm/fleet/v4/server/mdm/nanomdm/mdm"
+	"github.com/fleetdm/fleet/v4/server/ptr"
+	"github.com/fleetdm/fleet/v4/server/service"
+	"github.com/google/uuid"
+	micromdm "github.com/micromdm/micromdm/mdm/mdm"
+	"github.com/micromdm/plist"
+	"github.com/remitly-oss/httpsig-go"
+	"github.com/smallstep/pkcs7"
+)
+
+var (
+	//go:embed *.tmpl
+	templatesFS embed.FS
+
+	//go:embed macos_vulnerable-software.json.bz2
+	macOSVulnerableSoftwareFS embed.FS
+
+	//go:embed vscode_extensions_vulnerable.software
+	vsCodeExtensionsVulnerableSoftwareFS embed.FS
+
+	//go:embed ubuntu_2204-software.json.bz2
+	ubuntuSoftwareFS embed.FS
+	//go:embed ubuntu_2204-kernels.json
+	ubuntuKernelsFS embed.FS
+	//go:embed rhel_8-kernels.json
+	rhel8KernelsFS embed.FS
+	//go:embed rhel_9-kernels.json
+	rhel9KernelsFS embed.FS
+	//go:embed rhel_10-kernels.json
+	rhel10KernelsFS embed.FS
+	//go:embed windows_11-software.json.bz2
+	windowsSoftwareFS embed.FS
+	//go:embed macos_26x-software.json.bz2
+	macOSSoftwareFS embed.FS
+
+	macosVulnerableSoftware            []fleet.Software
+	vsCodeExtensionsVulnerableSoftware []fleet.Software
+	windowsSoftware                    []map[string]string
+	ubuntuSoftware                     []map[string]string
+	macOSSoftware                      []map[string]string
+	ubuntuKernels                      []map[string]string
+	rhel8Kernels                       []map[string]string
+	rhel9Kernels                       []map[string]string
+	rhel10Kernels                      []map[string]string
+
+	// softwareDBRPM caches a one-time filtered slice of softwareDB.Ubuntu where
+	// Source == "rpm_packages", reused by RHEL agents.
+	softwareDBRPMOnce sync.Once
+	softwareDBRPM     []softwaredb.UbuntuSoftware
+
+	// Software library database (loaded from SQLite if --software_db_path is specified)
+	softwareDB *softwaredb.DB
+
+	installerMetadataCache installer_cache.Metadata
+
+	linuxRandomBuildNumber = randomString(8)
+)
+
+func loadMacOSVulnerableSoftware() {
+	bz2, err := macOSVulnerableSoftwareFS.Open("macos_vulnerable-software.json.bz2")
+	if err != nil {
+		log.Fatal("open vulnerable macOS software file: ", err)
+	}
+
+	type vulnerableSoftware struct {
+		Software []fleet.Software `json:"software"`
+	}
+
+	var vs vulnerableSoftware
+	if err := json.NewDecoder(bzip2.NewReader(bz2)).Decode(&vs); err != nil { //nolint:gosec
+		log.Fatal("unmarshaling vulnerable macOS software: ", err)
+	}
+
+	macosVulnerableSoftware = vs.Software
+
+	log.Printf("Loaded %d vulnerable macOS software", len(macosVulnerableSoftware))
+}
+
+func loadExtraVulnerableSoftware() {
+	vsCodeExtensionsVulnerableSoftwareData, err := vsCodeExtensionsVulnerableSoftwareFS.ReadFile("vscode_extensions_vulnerable.software")
+	if err != nil {
+		log.Fatal("reading vulnerable vscode_extensions software file: ", err)
+	}
+	lines := bytes.Split(vsCodeExtensionsVulnerableSoftwareData, []byte("\n"))
+	for _, line := range lines {
+		parts := bytes.Split(line, []byte("##"))
+		if len(parts) < 3 {
+			log.Println("skipping", string(line))
+			continue
+		}
+		vsCodeExtensionsVulnerableSoftware = append(vsCodeExtensionsVulnerableSoftware, fleet.Software{
+			Vendor:  strings.TrimSpace(string(parts[0])),
+			Name:    strings.TrimSpace(string(parts[1])),
+			Version: strings.TrimSpace(string(parts[2])),
+			Source:  "vscode_extensions",
+		})
+	}
+	log.Printf("Loaded %d vulnerable vscode_extensions software", len(vsCodeExtensionsVulnerableSoftware))
+}
+
+func loadSoftwareItems(fs embed.FS, path string, source string) []map[string]string {
+	bz2, err := fs.Open(path)
+	if err != nil {
+		panic(err)
+	}
+
+	type softwareJSON struct {
+		Name        string `json:"name"`
+		Version     string `json:"version"`
+		UpgradeCode string `json:"upgrade_code"`
+		Release     string `json:"release,omitempty"`
+		Arch        string `json:"arch,omitempty"`
+		// macOS template fields.
+		BundleIdentifier string `json:"bundle_identifier,omitempty"`
+		InstalledPath    string `json:"installed_path,omitempty"`
+	}
+	var softwareList []softwareJSON
+	// ignoring "G110: Potential DoS vulnerability via decompression bomb", as this is test code.
+	if err := json.NewDecoder(bzip2.NewReader(bz2)).Decode(&softwareList); err != nil { //nolint:gosec
+		panic(err)
+	}
+
+	softwareRows := make([]map[string]string, 0, len(softwareList))
+	for _, s := range softwareList {
+		row := map[string]string{
+			"name":         s.Name,
+			"version":      s.Version,
+			"source":       source,
+			"upgrade_code": s.UpgradeCode,
+		}
+
+		if s.BundleIdentifier != "" {
+			row["bundle_identifier"] = s.BundleIdentifier
+		}
+		if s.InstalledPath != "" {
+			row["installed_path"] = s.InstalledPath
+		}
+		softwareRows = append(softwareRows, row)
+	}
+	return softwareRows
+}
+
+// loadDebKernelList reads a JSON array of deb-style kernel package names
+// (e.g., "linux-image-6.8.0-51-generic") and returns kernel records with
+// name, version (the suffix after "linux-image-"), and source="deb_packages".
+func loadDebKernelList(fs embed.FS, path string) []map[string]string {
+	data, err := fs.ReadFile(path)
+	if err != nil {
+		panic(err)
+	}
+
+	var names []string
+	if err := json.Unmarshal(data, &names); err != nil {
+		panic(err)
+	}
+
+	kernels := make([]map[string]string, 0, len(names))
+	for _, name := range names {
+		kernels = append(kernels, map[string]string{
+			"name":    name,
+			"version": strings.TrimPrefix(name, "linux-image-"),
+			"source":  "deb_packages",
+		})
+	}
+	return kernels
+}
+
+// loadSoftwareDBRPM returns a one-time filtered slice of softwareDB.Ubuntu
+// where Source == "rpm_packages". Returns nil if no software DB is loaded.
+func loadSoftwareDBRPM() []softwaredb.UbuntuSoftware {
+	if softwareDB == nil {
+		return nil
+	}
+	softwareDBRPMOnce.Do(func() {
+		filtered := make([]softwaredb.UbuntuSoftware, 0, len(softwareDB.Ubuntu)/4)
+		for _, s := range softwareDB.Ubuntu {
+			if s.Source == "rpm_packages" {
+				filtered = append(filtered, s)
+			}
+		}
+		softwareDBRPM = filtered
+	})
+	return softwareDBRPM
+}
+
+// rpmSliceToMaps converts UbuntuSoftware entries at the given indices to
+// osquery result maps. Mirrors softwaredb.DB.UbuntuToMaps but operates on a
+// caller-provided slice (the RPM-only filtered subset).
+func rpmSliceToMaps(pool []softwaredb.UbuntuSoftware, indices []uint32) []map[string]string {
+	results := make([]map[string]string, 0, len(indices))
+	for _, idx := range indices {
+		if int(idx) >= len(pool) {
+			continue
+		}
+		s := pool[idx]
+		m := map[string]string{
+			"name":    s.Name,
+			"source":  s.Source,
+			"version": s.Version,
+		}
+		if s.Vendor != nil {
+			m["vendor"] = *s.Vendor
+		}
+		if s.Arch != nil {
+			m["arch"] = *s.Arch
+		}
+		if s.Release != nil {
+			m["release"] = *s.Release
+		}
+		results = append(results, m)
+	}
+	return results
+}
+
+// loadRPMKernelList reads a JSON array of objects with name/version/release
+// (and optional vendor/arch) and returns kernel records stamped with
+// source="rpm_packages".
+func loadRPMKernelList(fs embed.FS, path string) []map[string]string {
+	data, err := fs.ReadFile(path)
+	if err != nil {
+		panic(err)
+	}
+
+	var entries []struct {
+		Name    string `json:"name"`
+		Version string `json:"version"`
+		Release string `json:"release"`
+		Vendor  string `json:"vendor"`
+		Arch    string `json:"arch"`
+	}
+	if err := json.Unmarshal(data, &entries); err != nil {
+		panic(err)
+	}
+
+	kernels := make([]map[string]string, 0, len(entries))
+	for _, e := range entries {
+		entry := map[string]string{
+			"name":    e.Name,
+			"version": e.Version,
+			"release": e.Release,
+			"source":  "rpm_packages",
+		}
+		if e.Vendor != "" {
+			entry["vendor"] = e.Vendor
+		}
+		if e.Arch != "" {
+			entry["arch"] = e.Arch
+		}
+		kernels = append(kernels, entry)
+	}
+	return kernels
+}
+
+func init() {
+	loadMacOSVulnerableSoftware()
+	loadExtraVulnerableSoftware()
+	windowsSoftware = loadSoftwareItems(windowsSoftwareFS, "windows_11-software.json.bz2", "programs")
+	ubuntuSoftware = loadSoftwareItems(ubuntuSoftwareFS, "ubuntu_2204-software.json.bz2", "deb_packages")
+	macOSSoftware = loadSoftwareItems(macOSSoftwareFS, "macos_26x-software.json.bz2", "apps")
+	ubuntuKernels = loadDebKernelList(ubuntuKernelsFS, "ubuntu_2204-kernels.json")
+	rhel8Kernels = loadRPMKernelList(rhel8KernelsFS, "rhel_8-kernels.json")
+	rhel9Kernels = loadRPMKernelList(rhel9KernelsFS, "rhel_9-kernels.json")
+	rhel10Kernels = loadRPMKernelList(rhel10KernelsFS, "rhel_10-kernels.json")
+}
+
+type nodeKeyManager struct {
+	filepath string
+
+	l        sync.Mutex
+	nodekeys []string
+}
+
+func (n *nodeKeyManager) LoadKeys() {
+	if n.filepath == "" {
+		return
+	}
+
+	n.l.Lock()
+	defer n.l.Unlock()
+
+	data, err := os.ReadFile(n.filepath)
+	if err != nil {
+		log.Println("WARNING (ignore if creating a new node key file): error loading nodekey file:", err)
+		return
+	}
+	n.nodekeys = strings.Split(string(data), "\n")
+	n.nodekeys = n.nodekeys[:len(n.nodekeys)-1] // remove last empty node key due to new line.
+	log.Printf("loaded %d node keys", len(n.nodekeys))
+}
+
+func (n *nodeKeyManager) Get(i int) string {
+	n.l.Lock()
+	defer n.l.Unlock()
+
+	if len(n.nodekeys) > i {
+		return n.nodekeys[i]
+	}
+	return ""
+}
+
+func (n *nodeKeyManager) Add(nodekey string) {
+	if n.filepath == "" {
+		return
+	}
+
+	// we lock just to make sure we write one at a time
+	n.l.Lock()
+	defer n.l.Unlock()
+
+	f, err := os.OpenFile(n.filepath, os.O_APPEND|os.O_CREATE|os.O_WRONLY, 0o600)
+	if err != nil {
+		log.Printf("error opening nodekey file: %s", err.Error())
+		return
+	}
+	defer f.Close()
+	if _, err := f.WriteString(nodekey + "\n"); err != nil {
+		log.Printf("error writing nodekey file: %s", err)
+	}
+}
+
+type mdmAgent struct {
+	agentIndex                 int
+	model                      string
+	serverAddress              string
+	softwareCount              softwareEntityCount
+	stats                      *osquery_perf.Stats
+	strings                    map[string]string
+	softwareVersionMap         map[rune]int // Maps first char to version option: 0=base, 1=alternate, 2-31=patch versions 0-29
+	mdmProfileFailureProb      float64
+	cancelableCmdAckDelay      time.Duration
+	osVersion                  string
+	supplementalOSVersionExtra string
+	isPersonalEnrollment       bool
+	apnsPushURL                string
+}
+
+// delayCancelableMDMAck holds the fetch→acknowledge window open for
+// cancelable MDM commands (lock, wipe, clear passcode, enable lost mode) so
+// that DELETE /api/v1/fleet/hosts/:id/commands/:command_uuid can be exercised
+// against a command the device has already fetched — Fleet cannot know a
+// command was delivered, so this window is the only way to test that race.
+// No-op when the delay is 0 or the command is not cancelable.
+func delayCancelableMDMAck(delay time.Duration, deviceDesc string, cmd *mdm.Command) {
+	if delay <= 0 || cmd == nil {
+		return
+	}
+	if _, ok := fleet.CancelableAppleMDMRequestTypes[cmd.Command.RequestType]; !ok {
+		return
+	}
+	log.Printf("%s: fetched %s command %s, waiting %s before acknowledging (cancel test window)",
+		deviceDesc, cmd.Command.RequestType, cmd.CommandUUID, delay)
+	time.Sleep(delay)
+}
+
+// stats, model, *serverURL, *mdmSCEPChallenge, *mdmCheckInInterval
+
+func (a *mdmAgent) CachedString(key string) string {
+	if val, ok := a.strings[key]; ok {
+		return val
+	}
+	val := randomString(12)
+	a.strings[key] = val
+	return val
+}
+
+// selectSoftwareVersion returns a consistent version for a software package based on its name.
+// Same implementation as agent.selectSoftwareVersion.
+func (a *mdmAgent) selectSoftwareVersion(softwareName, baseVersion, alternateVersion string) string {
+	if len(softwareName) == 0 {
+		return baseVersion
+	}
+
+	firstChar := rune(softwareName[0])
+	versionOption, exists := a.softwareVersionMap[firstChar]
+	if !exists {
+		r := rand.Float64()
+		switch {
+		case r < 0.99:
+			versionOption = 0
+		case r < 0.999:
+			versionOption = 1
+		default:
+			versionOption = 2 + rand.Intn(30)
+		}
+		a.softwareVersionMap[firstChar] = versionOption
+	}
+
+	switch versionOption {
+	case 0:
+		return baseVersion
+	case 1:
+		return alternateVersion
+	default:
+		patchNum := versionOption - 2
+		return fmt.Sprintf("%s.%d", baseVersion, patchNum)
+	}
+}
+
+// adamIDsToSoftware is the set of VPP apps that we support in our mock VPP install flow.
+var adamIDsToSoftware = map[int]*fleet.Software{
+	406056744: {
+		Name:             "Evernote",
+		BundleIdentifier: "com.evernote.Evernote",
+		Version:          "10.147.1",
+		Installed:        false,
+	},
+	1091189122: {
+		Name:             "Bear: Markdown Notes",
+		BundleIdentifier: "net.shinyfrog.bear",
+		Version:          "2.4.5",
+		Installed:        false,
+	},
+	1487937127: {
+		Name:             "Craft: Write docs, AI editing",
+		BundleIdentifier: "com.lukilabs.lukiapp",
+		Version:          "3.1.7",
+		Installed:        false,
+	},
+	1444383602: {
+		Name:             "Goodnotes 6: AI Notes & Docs",
+		BundleIdentifier: "com.goodnotesapp.x",
+		Version:          "6.7.2",
+		Installed:        false,
+	},
+}
+
+type agent struct {
+	agentIndex                    int
+	hostCount                     int
+	totalHostCount                int
+	hostIndexOffset               int
+	softwareCount                 softwareEntityCount
+	softwareVSCodeExtensionsCount softwareExtraEntityCount
+	softwareAdobePluginsCount     softwareExtraEntityCount
+	userCount                     entityCount
+	policyPassProb                float64
+	munkiIssueProb                float64
+	munkiIssueCount               int
+	liveQueryFailProb             float64
+	liveQueryNoResultsProb        float64
+	strings                       map[string]string
+	serverAddress                 string
+	stats                         *osquery_perf.Stats
+	nodeKeyManager                *nodeKeyManager
+	nodeKey                       string
+	templates                     *template.Template
+	os                            string
+	// deviceAuthToken holds Fleet Desktop device authentication token.
+	//
+	// Non-nil means the agent is identified as orbit osquery,
+	// nil means the agent is identified as vanilla osquery.
+	deviceAuthToken *string
+	orbitNodeKey    *string
+
+	// macMDMClient and winMDMClient simulate a device running the MDM protocol
+	// (client side) against Fleet MDM.
+	macMDMClient *mdmtest.TestAppleMDMClient
+	winMDMClient *mdmtest.TestWindowsMDMClient
+
+	mdmUserProb float64
+
+	mdmAPNSPushURL string
+
+	// winMDMWake signals the Windows MDM loop to start an OMA-DM session on demand (in response to the server's
+	// WindowsMDMSyncRequest notification), mirroring real fleetd waking the device. Buffered with capacity 1, sent
+	// non-blocking, so coalesced wakes never block the orbit config loop. Non-nil only for Windows MDM agents.
+	winMDMWake chan struct{}
+
+	// ws simulates orbit's WebSocket notification transport; non-nil only
+	// while the server's orbit-config directive has it enabled (see
+	// syncWSTransport). wsSupported gates which orbit agents follow the
+	// directive (-websocket_prob), simulating older fleetd versions that
+	// ignore it.
+	wsMu        sync.Mutex
+	ws          *wsTransport
+	wsSupported bool
+
+	// isEnrolledToMDM is true when the mdmDevice has enrolled.
+	isEnrolledToMDM bool
+	// isEnrolledToMDMMu protects isEnrolledToMDM.
+	isEnrolledToMDMMu sync.Mutex
+
+	isMDMUserEnrolled   bool
+	isMDMUserEnrolledMu sync.Mutex
+
+	// pssoDevice simulates the macOS Platform SSO extension. It is non-nil only
+	// for the subset of macOS MDM agents selected for PSSO (see pssoParams.prob)
+	// and rides on macMDMClient (sharing its UUID). pssoParams holds its config.
+	pssoDevice *mdmtest.TestApplePSSODevice
+	pssoParams pssoParams
+	// pssoTokenReady is closed (once) by the MDM loop when it extracts the
+	// Fleet-signed registration token from a delivered PSSO profile. The PSSO
+	// loop blocks on it before registering. Non-nil only when pssoDevice is set.
+	pssoTokenReady chan struct{}
+	// pssoTokenCaptured short-circuits token extraction once it has succeeded.
+	// Only the (single) MDM loop goroutine touches it.
+	pssoTokenCaptured atomic.Bool
+
+	// Note that the following ddm variables do not need a mutex because they are only
+	// accessed in the MDM goroutine (and then only in the DDM handling function), and never
+	// read/written concurrently.
+
+	// ddmGlobalToken is the cached global DeclarationsToken from the tokens endpoint.
+	ddmGlobalToken string
+	// ddmDeclTokens caches per-declaration tokens (identifier → serverToken).
+	ddmDeclTokens map[string]string
+
+	// ddmUserGlobalToken is the cached global DeclarationsToken from the tokens endpoint.
+	ddmUserGlobalToken string
+	// ddmUserDeclTokens caches per-declaration tokens (identifier → serverToken).
+	ddmUserDeclTokens map[string]string
+
+	// notNowProfiles tracks the profile identifiers (per channel) this agent has
+	// already responded NotNow to, so the redelivered command is acknowledged.
+	// The device and user check-in loops run concurrently and both record into
+	// it, hence the mutex.
+	notNowProfilesMu sync.Mutex
+	notNowProfiles   map[string]bool
+
+	// installedProfiles tracks the configuration profiles this agent has
+	// acknowledged installing, keyed by channel ("device" or "user") + "/" +
+	// payload identifier. The MDM loop goroutine writes it while the osquery
+	// query goroutines read it to answer profile verification queries (see
+	// mdmConfigProfilesMac), hence the mutex.
+	installedProfilesMu sync.Mutex
+	installedProfiles   map[string]installedMDMProfile
+
+	disableScriptExec   bool
+	disableFleetDesktop bool
+	loggerTLSMaxLines   int
+
+	// atomic boolean is set to true when executing scripts, so that only a
+	// single goroutine at a time can execute scripts.
+	scriptExecRunning atomic.Bool
+
+	softwareQueryFailureProb         float64
+	softwareVSCodeExtensionsFailProb float64
+	softwareAdobePluginsFailProb     float64
+
+	softwareInstaller softwareInstaller
+
+	linuxUniqueSoftwareVersion bool
+	linuxUniqueSoftwareTitle   bool
+
+	// Software installed on the host via Fleet. Key is the software name + version + bundle identifier.
+	installedSoftware sync.Map
+
+	// Cached software indices (pointers into global softwareDB array for this agent's platform)
+	cachedSoftwareIndices []uint32
+
+	// Cached last_opened_at timestamps per software (keyed by software name).
+	// Note that this requires a mutex because both the runLoop and the live
+	// query goroutines may call DistributedWrite (which calls processQuery
+	// which calls genLastOpenedAt).
+	cachedLastOpenedAtMutex sync.RWMutex
+	cachedLastOpenedAt      map[string]*time.Time
+
+	// Host identity client for HTTP message signatures
+	hostIdentityClient *hostidentity.Client
+
+	//
+	// The following are exported to be used by the templates.
+	//
+
+	EnrollSecret          string
+	UUID                  string
+	SerialNumber          string
+	defaultSerialProb     float64
+	ConfigInterval        time.Duration
+	LogInterval           time.Duration
+	QueryInterval         time.Duration
+	MDMCheckInInterval    time.Duration
+	DiskEncryptionEnabled bool
+	mdmProfileFailureProb float64
+	cancelableCmdAckDelay time.Duration
+	OSPatchLevel          int                 // For Linux patches
+	linuxKernels          []map[string]string // Pre-selected kernels for this agent
+	softwareVersionMap    map[rune]int        // Maps first char to version option: 0=base, 1=alternate, 2-31=patch versions 0-29
+
+	// Note that a sync.Map is safe for concurrent use, but we still need a mutex
+	// because we read and write the field itself (not data in the map) from
+	// different goroutines (the write is in a.config).
+	scheduledQueryMapMutex sync.RWMutex
+	scheduledQueryData     *sync.Map
+	// bufferedResults contains result logs that are buffered when
+	// /api/v1/osquery/log requests to the Fleet server fail.
+	//
+	// NOTE: We use a map instead of a slice to prevent the data structure to
+	// increase indefinitely (we sacrifice accuracy of logs but that's
+	// a-ok for osquery-perf and load testing).
+	bufferedResults map[resultLog]int
+
+	// cache of this host's per-host certificates (the certs unique to this host, excluding the shared certs every host
+	// reports). Note that this requires a mutex even though only used in a.processQuery, that's because both the runLoop
+	// and the live query goroutines may call DistributedWrite (which calls processQuery).
+	certificatesMutex sync.RWMutex
+	hostCertSpecs     []simulatedCert
+	// scepCertSpecs holds the certs issued to this host during Windows MDM SCEP exchanges, keyed by the SCEP CSP
+	// unique ID so a re-issued cert replaces its predecessor.
+	scepCertSpecs map[string]simulatedCert
+	// withholdSCEPCert marks ~5% of hosts that never report their issued SCEP certs, exercising the server's SCEP
+	// verification backstop (test-only failure).
+	withholdSCEPCert bool
+
+	commonSoftwareNameSuffix string
+
+	entraIDDeviceID          string
+	entraIDUserPrincipalName string
+	installedAdamIDs         []int
+
+	// configTLSETag enables the native osquery conditional config request
+	// behavior: the agent sends an "etag" field in the config request body
+	// and treats the constant {"etag":"ok"} response as "unchanged".
+	configTLSETag bool
+	// configETag holds the etag from the last config response RECEIVED
+	// (matching the real client, which stores the validator on receipt, not
+	// on successful apply). Opaque and server-assigned; echoed verbatim.
+	configETag string
+	// lastConfigBodyBytes is the size of the last received full config body.
+	// Used to estimate the body bytes avoided by a subsequent not-modified
+	// response for this host.
+	lastConfigBodyBytes int64
+}
+
+func (a *agent) GetSerialNumber() string {
+	if rand.Float64() <= a.defaultSerialProb {
+		return "-1"
+	}
+	return a.SerialNumber
+}
+
+type entityCount struct {
+	common int
+	unique int
+}
+
+type softwareEntityCount struct {
+	entityCount
+	vulnerable                        int
+	withLastOpened                    int
+	lastOpenedProb                    float64
+	commonSoftwareUninstallCount      int
+	commonSoftwareUninstallProb       float64
+	uniqueSoftwareUninstallCount      int
+	uniqueSoftwareUninstallProb       float64
+	duplicateBundleIdentifiersPercent int
+	softwareRenaming                  bool
+	embeddedBundlePaths               bool
+}
+type softwareExtraEntityCount struct {
+	entityCount
+	commonSoftwareUninstallCount int
+	commonSoftwareUninstallProb  float64
+	uniqueSoftwareUninstallCount int
+	uniqueSoftwareUninstallProb  float64
+}
+type softwareInstaller struct {
+	preInstallFailureProb  float64
+	installFailureProb     float64
+	postInstallFailureProb float64
+	mu                     *sync.Mutex
+}
+
+// pssoParams configures the Apple Platform SSO (PSSO) simulation for macOS MDM
+// agents. prob selects which subset of enrolled Macs exercise PSSO; the rest of
+// the fields drive the per-device state machine (see runMacosPSSOLoop).
+type pssoParams struct {
+	// prob is the fraction of macOS MDM agents that also simulate PSSO [0, 1].
+	prob float64
+	// clientID is the IdP/extension client ID. It must match the Fleet server's
+	// account provisioning config. Empty disables PSSO regardless of prob.
+	clientID string
+	// username and password are the IdP credentials used for logins. They must
+	// be accepted by the IdP the Fleet server proxies to.
+	username string
+	password string
+	// interval is the window over which initial registrations are staggered and
+	// recurring logins/key operations are spread and repeated.
+	interval time.Duration
+	// loginProb and keyProb gate a login and a key request/exchange,
+	// respectively, during each interval after the initial registration.
+	loginProb float64
+	keyProb   float64
+}
+
+func newAgent(
+	agentIndex int,
+	hostCount int,
+	totalHostCount int,
+	hostIndexOffset int,
+	serverAddress, enrollSecret string,
+	templates *template.Template,
+	configInterval, logInterval, queryInterval, mdmCheckInInterval time.Duration,
+	softwareQueryFailureProb float64,
+	softwareVSCodeExtensionsQueryFailureProb float64,
+	softwareAdobePluginsQueryFailureProb float64,
+	softwareInstaller softwareInstaller,
+	softwareCount softwareEntityCount,
+	softwareVSCodeExtensionsCount softwareExtraEntityCount,
+	softwareAdobePluginsCount softwareExtraEntityCount,
+	userCount entityCount,
+	policyPassProb float64,
+	orbitProb float64,
+	munkiIssueProb float64, munkiIssueCount int,
+	emptySerialProb float64,
+	defaultSerialProb float64,
+	mdmProb float64,
+	mdmUserProb float64,
+	mdmSCEPChallenge string,
+	liveQueryFailProb float64,
+	liveQueryNoResultsProb float64,
+	disableScriptExec bool,
+	disableFleetDesktop bool,
+	loggerTLSMaxLines int,
+	linuxUniqueSoftwareVersion bool,
+	linuxUniqueSoftwareTitle bool,
+	commonSoftwareNameSuffix string,
+	mdmProfileFailureProb float64,
+	cancelableCmdAckDelay time.Duration,
+	httpMessageSignatureProb float64,
+	httpMessageSignatureP384Prob float64,
+	configTLSETag bool,
+	psso pssoParams,
+	mdmAPNSPushURL string,
+	websocketProb float64,
+) *agent {
+	var deviceAuthToken *string
+	if rand.Float64() <= orbitProb {
+		deviceAuthToken = ptr.String(uuid.NewString())
+	}
+	serialNumber := mdmtest.RandSerialNumber()
+	if rand.Float64() <= emptySerialProb {
+		serialNumber = ""
+	}
+	hostUUID := strings.ToUpper(uuid.New().String())
+
+	// determine the simulated host's OS based on the template name (see
+	// validTemplateNames below for the list of possible names, the OS is always
+	// the part before the underscore). Note that it is the OS and not the
+	// "normalized" platform, so "ubuntu" and not "linux", "macos" and not
+	// "darwin". osVariant is the part after the underscore, e.g., "8" / "9" /
+	// "10" for RHEL templates, used to pick the right kernel list.
+	templateBase := strings.TrimSuffix(templates.Name(), ".tmpl")
+	agentOS, osVariant, _ := strings.Cut(templateBase, "_")
+
+	var (
+		macMDMClient *mdmtest.TestAppleMDMClient
+		winMDMClient *mdmtest.TestWindowsMDMClient
+	)
+	if rand.Float64() < mdmProb {
+		switch agentOS {
+		case "macos":
+			macMDMClient = mdmtest.NewTestMDMClientAppleDirect(mdmtest.AppleEnrollInfo{
+				SCEPChallenge: mdmSCEPChallenge,
+				SCEPURL:       serverAddress + apple_mdm.SCEPPath,
+				MDMURL:        serverAddress + apple_mdm.MDMPath,
+			}, "MacBookPro16,1")
+			// Have the osquery agent match the MDM device serial number and UUID.
+			serialNumber = macMDMClient.SerialNumber
+			hostUUID = macMDMClient.UUID
+
+		case "windows":
+			// windows MDM enrollment requires orbit enrollment
+			if deviceAuthToken == nil {
+				deviceAuthToken = ptr.String(uuid.NewString())
+			}
+			// creating the Windows MDM client requires the orbit node key, but we
+			// only get it after orbit enrollment. So here we just set the value to a
+			// placeholder (non-nil) client, the actual usable client will be created
+			// after orbit enrollment, and after receiving the enrollment
+			// notification.
+			winMDMClient = new(mdmtest.TestWindowsMDMClient)
+		}
+	}
+
+	// Determine if this agent should use HTTP message signatures
+	useHTTPSig := rand.Float64() < httpMessageSignatureProb // nolint:gosec // ignore weak randomizer
+
+	agent := &agent{
+		agentIndex:                    agentIndex,
+		hostCount:                     hostCount,
+		totalHostCount:                totalHostCount,
+		hostIndexOffset:               hostIndexOffset,
+		serverAddress:                 serverAddress,
+		softwareCount:                 softwareCount,
+		softwareVSCodeExtensionsCount: softwareVSCodeExtensionsCount,
+		softwareAdobePluginsCount:     softwareAdobePluginsCount,
+		userCount:                     userCount,
+		strings:                       make(map[string]string),
+		policyPassProb:                policyPassProb,
+		munkiIssueProb:                munkiIssueProb,
+		munkiIssueCount:               munkiIssueCount,
+		liveQueryFailProb:             liveQueryFailProb,
+		liveQueryNoResultsProb:        liveQueryNoResultsProb,
+		templates:                     templates,
+		deviceAuthToken:               deviceAuthToken,
+		os:                            agentOS,
+		EnrollSecret:                  enrollSecret,
+		ConfigInterval:                configInterval,
+		LogInterval:                   logInterval,
+		QueryInterval:                 queryInterval,
+		MDMCheckInInterval:            mdmCheckInInterval,
+		UUID:                          hostUUID,
+		SerialNumber:                  serialNumber,
+		defaultSerialProb:             defaultSerialProb,
+		OSPatchLevel:                  rand.Intn(25), // Random patch level 0-24
+
+		softwareQueryFailureProb:         softwareQueryFailureProb,
+		softwareVSCodeExtensionsFailProb: softwareVSCodeExtensionsQueryFailureProb,
+		softwareAdobePluginsFailProb:     softwareAdobePluginsQueryFailureProb,
+		softwareInstaller:                softwareInstaller,
+
+		linuxUniqueSoftwareVersion: linuxUniqueSoftwareVersion,
+		linuxUniqueSoftwareTitle:   linuxUniqueSoftwareTitle,
+
+		macMDMClient:   macMDMClient,
+		winMDMClient:   winMDMClient,
+		mdmUserProb:    mdmUserProb,
+		wsSupported:    rand.Float64() < websocketProb, // nolint:gosec // ignore weak randomizer
+		mdmAPNSPushURL: mdmAPNSPushURL,
+		ddmDeclTokens:  make(map[string]string),
+
+		disableScriptExec:        disableScriptExec,
+		disableFleetDesktop:      disableFleetDesktop,
+		loggerTLSMaxLines:        loggerTLSMaxLines,
+		bufferedResults:          make(map[resultLog]int),
+		scheduledQueryData:       new(sync.Map),
+		softwareVersionMap:       make(map[rune]int),
+		cachedLastOpenedAt:       make(map[string]*time.Time),
+		commonSoftwareNameSuffix: commonSoftwareNameSuffix,
+		mdmProfileFailureProb:    mdmProfileFailureProb,
+		cancelableCmdAckDelay:    cancelableCmdAckDelay,
+		// Every 20th host (5%) withholds its issued SCEP certs to exercise the server's verification backstop (test-only failure).
+		withholdSCEPCert: agentIndex%20 == 0,
+
+		entraIDDeviceID:          uuid.NewString(),
+		entraIDUserPrincipalName: fmt.Sprintf("fake-%s@example.com", randomString(5)),
+		configTLSETag:            configTLSETag,
+	}
+
+	// Windows MDM agents can be woken on demand by the server, so give them a wake channel for the MDM loop.
+	if winMDMClient != nil {
+		agent.winMDMWake = make(chan struct{}, 1)
+	}
+
+	// A subset of macOS MDM agents also simulate Platform SSO. The PSSO device
+	// rides on the MDM client (it reuses its UUID and reads the registration
+	// token out of an MDM-delivered profile), so it only makes sense when the
+	// agent is an enrolled Mac.
+	if macMDMClient != nil && psso.clientID != "" && rand.Float64() < psso.prob {
+		pssoDevice, err := mdmtest.NewApplePSSODevice(macMDMClient, serverAddress, psso.clientID)
+		if err != nil {
+			log.Printf("agent %d: creating PSSO device: %s", agentIndex, err)
+		} else {
+			agent.pssoDevice = pssoDevice
+			agent.pssoParams = psso
+			agent.pssoTokenReady = make(chan struct{})
+		}
+	}
+
+	// Initialize host identity client
+	agent.hostIdentityClient = hostidentity.NewClient(hostidentity.Config{
+		ServerAddress: serverAddress,
+		EnrollSecret:  enrollSecret,
+		HostUUID:      hostUUID,
+		AgentIndex:    agentIndex,
+	}, useHTTPSig, httpMessageSignatureP384Prob)
+
+	// Pre-select kernels for Linux agents to ensure consistency across queries
+	switch agentOS {
+	case "ubuntu":
+		agent.linuxKernels = selectKernels(ubuntuKernels)
+	case "rhel":
+		switch osVariant {
+		case "8":
+			agent.linuxKernels = selectKernels(rhel8Kernels)
+		case "9":
+			agent.linuxKernels = selectKernels(rhel9Kernels)
+		case "10":
+			agent.linuxKernels = selectKernels(rhel10Kernels)
+		}
+	}
+
+	return agent
+}
+
+type enrollResponse struct {
+	NodeKey string `json:"node_key"`
+}
+
+type distributedReadResponse struct {
+	Queries map[string]string `json:"queries"`
+}
+
+type scheduledQuery struct {
+	Query            string  `json:"query"`
+	Name             string  `json:"name"`
+	ScheduleInterval float64 `json:"interval"`
+	Platform         string  `json:"platform"`
+	Version          string  `json:"version"`
+	Snapshot         bool    `json:"snapshot"`
+
+	lastRun  int64
+	numRows  uint
+	packName string
+}
+
+func (a *agent) isOrbit() bool {
+	return a.deviceAuthToken != nil
+}
+
+func (a *agent) runLoop(i int, onlyAlreadyEnrolled bool) {
+	// Request host identity certificate if this agent uses HTTP message signatures
+	if a.hostIdentityClient.IsEnabled() && !onlyAlreadyEnrolled {
+		if err := a.hostIdentityClient.RequestCertificate(); err != nil {
+			log.Printf("Agent %d: Failed to request host identity certificate: %v", a.agentIndex, err)
+			return
+		}
+	}
+
+	if a.isOrbit() {
+		if err := a.orbitEnroll(); err != nil {
+			// clean-up any placeholder mdm client that depended on orbit enrollment
+			// - there's no concurrency yet for a given agent instance, runLoop is
+			// the place where the goroutines will be started later on.
+			a.winMDMClient = nil
+			return
+		}
+		if a.winMDMClient != nil {
+			a.winMDMClient = mdmtest.NewTestMDMClientWindowsProgramatic(a.serverAddress, *a.orbitNodeKey)
+		}
+	}
+
+	if err := a.enroll(i, onlyAlreadyEnrolled); err != nil {
+		return
+	}
+
+	_ = a.config()
+
+	// This startup read runs before runOrbitLoop, so it cannot race with the
+	// WebSocket transport (started only from that loop's config checks).
+	resp, err := a.DistributedRead()
+	if err == nil {
+		if len(resp.Queries) > 0 {
+			_ = a.DistributedWrite(resp.Queries)
+		}
+	}
+
+	if a.isOrbit() {
+		go a.runOrbitLoop()
+	}
+
+	// NOTE: the windows MDM client enrollment is only done after receiving a
+	// notification via the config in the runOrbitLoop.
+	if a.macMDMClient != nil {
+		mdmEnrollWithRetry("macOS", a.stats.IncrementMDMErrors, a.macMDMClient.Enroll)
+		a.setMDMEnrolled()
+		a.seedEnrollmentProfile()
+		a.stats.IncrementMDMEnrollments()
+
+		if rand.Float64() < a.mdmUserProb {
+			a.macMDMClient.GenerateUserIdentity()
+			mdmEnrollWithRetry("macOS user channel", a.stats.IncrementMDMUserErrors, a.macMDMClient.UserTokenUpdate)
+			a.setMDMUserEnrolled()
+			a.stats.IncrementMDMUserEnrollments()
+		}
+
+		go a.runMacosMDMLoop()
+		if a.pssoDevice != nil {
+			go a.runMacosPSSOLoop()
+		}
+	}
+
+	//
+	// osquery runs three separate independent threads,
+	//	- a thread for getting, running and submitting results for distributed queries (distributed).
+	// 	- a thread for getting configuration from a remote server (config).
+	//	- a thread for submitting log results (logger).
+	//
+	// Thus we try to simulate that as much as we can.
+
+	// (1) distributed thread:
+	go func() {
+		liveQueryTicker := time.NewTicker(a.QueryInterval)
+		defer liveQueryTicker.Stop()
+
+		for range liveQueryTicker.C {
+			// With the WebSocket transport running, the tick belongs to it
+			// (see wsPollTick).
+			if a.wsPollTick() {
+				continue
+			}
+			if resp, err := a.DistributedRead(); err == nil && len(resp.Queries) > 0 {
+				_ = a.DistributedWrite(resp.Queries)
+			}
+		}
+	}()
+
+	// (2) config thread:
+	go func() {
+		configTicker := time.NewTicker(a.ConfigInterval)
+		defer configTicker.Stop()
+
+		for range configTicker.C {
+			_ = a.config()
+		}
+	}()
+
+	// (3) logger thread:
+	logTicker := time.NewTicker(a.LogInterval)
+	defer logTicker.Stop()
+	for range logTicker.C {
+		// check if we have any scheduled queries that should be returning results
+		var results []resultLog
+		now := time.Now().Unix()
+		prevCount := a.countBuffered()
+
+		// NOTE The goroutine that pulls in new configurations
+		// MAY replace this map if it happens to run at the
+		// exact same time. The result would be. The result
+		// would be that the query lastRun does not get
+		// updated and cause the query to run more times than
+		// expected.
+		a.scheduledQueryMapMutex.RLock()
+		queryData := a.scheduledQueryData
+		a.scheduledQueryMapMutex.RUnlock()
+		queryData.Range(func(key, value any) bool {
+			queryName := key.(string)
+			query := value.(scheduledQuery)
+
+			if query.lastRun == 0 || now >= (query.lastRun+int64(query.ScheduleInterval)) {
+				results = append(results, resultLog{
+					packName:  query.packName,
+					queryName: query.Name,
+					numRows:   int(query.numRows),
+				})
+				// Update lastRun
+				query.lastRun = now
+				queryData.Store(queryName, query)
+			}
+
+			return true
+		})
+		if prevCount+len(results) < 1_000_000 { // osquery buffered_log_max is 1M
+			a.addToBuffer(results)
+		}
+		a.sendLogsBatch()
+		newBufferedCount := a.countBuffered() - prevCount
+		a.stats.UpdateBufferedLogs(newBufferedCount)
+	}
+}
+
+func (a *agent) countBuffered() int {
+	var total int
+	for _, count := range a.bufferedResults {
+		total += count
+	}
+	return total
+}
+
+func (a *agent) addToBuffer(results []resultLog) {
+	for _, result := range results {
+		a.bufferedResults[result] += 1
+	}
+}
+
+// getBatch returns a random set of logs from the buffered logs.
+// NOTE: We sacrifice some accuracy in the name of CPU and memory efficiency.
+func (a *agent) getBatch(batchSize int) []resultLog {
+	results := make([]resultLog, 0, batchSize)
+	for result, count := range a.bufferedResults {
+		left := batchSize - len(results)
+		if left <= 0 {
+			return results
+		}
+		if count > left {
+			count = left
+		}
+		for i := 0; i < count; i++ {
+			results = append(results, result)
+		}
+	}
+	return results
+}
+
+type resultLog struct {
+	packName  string
+	queryName string
+	numRows   int
+}
+
+func (r resultLog) emit() []byte {
+	return scheduledQueryResults(r.packName, r.queryName, r.numRows)
+}
+
+// sendLogsBatch sends up to loggerTLSMaxLines logs and updates the buffer.
+func (a *agent) sendLogsBatch() {
+	if len(a.bufferedResults) == 0 {
+		return
+	}
+
+	batchSize := a.loggerTLSMaxLines
+	if count := a.countBuffered(); count < batchSize {
+		batchSize = count
+	}
+	batch := a.getBatch(batchSize)
+	if err := a.submitLogs(batch); err != nil {
+		return
+	}
+	a.removeBuffered(batchSize)
+}
+
+// removeBuffered removes a random set of logs from the buffered logs.
+// NOTE: We sacrifice some accuracy in the name of CPU and memory efficiency.
+func (a *agent) removeBuffered(batchSize int) {
+	for b := batchSize; b > 0; {
+		for result, count := range a.bufferedResults {
+			if count > b {
+				a.bufferedResults[result] -= b
+				return
+			}
+			delete(a.bufferedResults, result)
+			b -= count
+		}
+	}
+}
+
+func (a *agent) runOrbitLoop() {
+	// Create signerWrapper if HTTP signatures are enabled
+	var signerWrapper func(*http.Client) *http.Client
+	if a.hostIdentityClient.IsEnabled() && a.hostIdentityClient.HasSigner() {
+		signer := a.hostIdentityClient.GetSigner()
+		signerWrapper = func(client *http.Client) *http.Client {
+			return httpsig.NewHTTPClient(client, signer, nil)
+		}
+	}
+
+	orbitClient, err := fleetclient.NewOrbitClient(
+		"",
+		a.serverAddress,
+		"",
+		true,
+		a.EnrollSecret,
+		nil,
+		fleet.OrbitHostInfo{
+			HardwareUUID:   a.UUID,
+			HardwareSerial: a.SerialNumber,
+			Hostname:       a.CachedString("hostname"),
+		},
+		nil,
+		signerWrapper,
+		"",
+		false,
+	)
+	if err != nil {
+		log.Println("creating orbit client: ", err)
+	}
+
+	orbitClient.TestNodeKey = *a.orbitNodeKey
+
+	// Simulated Windows MDM hosts advertise CapabilityWindowsMDMSync, like real Windows fleetd, so the server relaxes
+	// their DMClient poll schedule (via a Replace on the poll node) and wakes them on demand via WindowsMDMSyncRequest
+	// instead of relying on frequent polling. Real fleetd adds this at construction (GetOrbitClientCapabilities gates it
+	// on GOOS=windows); osquery-perf simulates Windows on a non-Windows GOOS, so we add it here. Mutating the map directly
+	// is safe: GetOrbitClientCapabilities returns a fresh per-client map (not shared), and this runs during setup before
+	// the first request or any concurrent goroutine, so there is no copy needed.
+	if a.winMDMClient != nil {
+		orbitClient.ClientCapabilities[fleet.CapabilityWindowsMDMSync] = struct{}{}
+	}
+
+	deviceClient, err := fleetclient.NewDeviceClient(a.serverAddress, true, "", nil, "")
+	if err != nil {
+		log.Fatal("creating device client: ", err)
+	}
+
+	// orbit does a config check when it starts
+	if cfg, err := orbitClient.GetConfig(); err != nil {
+		a.stats.IncrementOrbitErrors()
+	} else {
+		a.syncWSTransport(cfg.WebSocketTransport)
+	}
+
+	tokenRotationEnabled := false
+	if !a.disableFleetDesktop {
+		tokenRotationEnabled = orbitClient.GetServerCapabilities().Has(fleet.CapabilityOrbitEndpoints) &&
+			orbitClient.GetServerCapabilities().Has(fleet.CapabilityTokenRotation)
+
+		// it also writes and checks the device token
+		if tokenRotationEnabled {
+			if err := orbitClient.SetOrUpdateDeviceToken(*a.deviceAuthToken); err != nil {
+				a.stats.IncrementOrbitErrors()
+				log.Println("orbitClient.SetOrUpdateDeviceToken: ", err)
+			}
+
+			if err := deviceClient.CheckToken(*a.deviceAuthToken); err != nil {
+				a.stats.IncrementOrbitErrors()
+				log.Println("deviceClient.CheckToken: ", err)
+			}
+		}
+	}
+
+	// checkToken is used to simulate Fleet Desktop polling until a token is
+	// valid, we make a random number of requests to properly emulate what
+	// happens in the real world as there are delays that are not accounted by
+	// the way this simulation is arranged.
+	checkToken := func() {
+		minVal := 1
+		maxVal := 5
+		numberOfRequests := rand.Intn(maxVal-minVal+1) + minVal
+		ticker := time.NewTicker(5 * time.Second)
+		defer ticker.Stop()
+
+		for {
+			<-ticker.C
+			numberOfRequests--
+			if err := deviceClient.CheckToken(*a.deviceAuthToken); err != nil {
+				log.Println("deviceClient.CheckToken: ", err)
+			}
+			if numberOfRequests == 0 {
+				break
+			}
+		}
+	}
+
+	// Fleet Desktop performs a burst of check token requests when it's initialized
+	if !a.disableFleetDesktop {
+		checkToken()
+	}
+
+	// orbit makes a call to check the config and update the CLI flags every 30
+	// seconds
+	orbitConfigTicker := time.Tick(30 * time.Second)
+	// orbit makes a call every 5 minutes to check the validity of the device
+	// token on the server
+	orbitTokenRemoteCheckTicker := time.Tick(5 * time.Minute)
+	// orbit pings the server every 1 hour to rotate the device token
+	orbitTokenRotationTicker := time.Tick(1 * time.Hour)
+	// orbit polls the /orbit/ping endpoint every 5 minutes to check if the
+	// server capabilities have changed
+	capabilitiesCheckerTicker := time.Tick(5 * time.Minute)
+	// fleet desktop polls for policy compliance every 5 minutes
+	fleetDesktopPolicyTicker := time.Tick(5 * time.Minute)
+	// fleet desktop pings every 10s for connectivity check.
+	fleetDesktopConnectivityCheck := time.Tick(10 * time.Second)
+
+	const windowsMDMEnrollmentAttemptFrequency = time.Hour
+	var lastEnrollAttempt time.Time
+
+	for {
+		select {
+		case <-orbitConfigTicker:
+			cfg, err := orbitClient.GetConfig()
+			if err != nil {
+				a.stats.IncrementOrbitErrors()
+				continue
+			}
+			// Follow the server's WebSocket transport directive, like fleetd.
+			a.syncWSTransport(cfg.WebSocketTransport)
+			if len(cfg.Notifications.PendingScriptExecutionIDs) > 0 {
+				// there are pending scripts to execute on this host, start a goroutine
+				// that will simulate executing them.
+				go a.execScripts(cfg.Notifications.PendingScriptExecutionIDs, orbitClient)
+			}
+			if len(cfg.Notifications.PendingSoftwareInstallerIDs) > 0 {
+				// there are pending software installations on this host, start a
+				// goroutine that will download the software
+				go a.installSoftware(cfg.Notifications.PendingSoftwareInstallerIDs, orbitClient)
+			}
+			if cfg.Notifications.NeedsProgrammaticWindowsMDMEnrollment &&
+				!a.mdmEnrolled() &&
+				a.winMDMClient != nil &&
+				time.Since(lastEnrollAttempt) > windowsMDMEnrollmentAttemptFrequency {
+				lastEnrollAttempt = time.Now()
+				if err := a.winMDMClient.Enroll(); err != nil {
+					log.Printf("Windows MDM enroll failed: %s", err)
+					a.stats.IncrementMDMErrors()
+				} else {
+					a.setMDMEnrolled()
+					a.stats.IncrementMDMEnrollments()
+					go a.runWindowsMDMLoop()
+				}
+			}
+			if cfg.Notifications.WindowsMDMSyncRequest && a.mdmEnrolled() && a.winMDMWake != nil {
+				// The server has queued Windows MDM commands and asked this (relaxed-poll) host to start an OMA-DM
+				// session now.
+				select {
+				case a.winMDMWake <- struct{}{}:
+				default:
+				}
+			}
+		case <-orbitTokenRemoteCheckTicker:
+			if !a.disableFleetDesktop && tokenRotationEnabled {
+				if err := deviceClient.CheckToken(*a.deviceAuthToken); err != nil {
+					a.stats.IncrementOrbitErrors()
+					log.Println("deviceClient.CheckToken: ", err)
+					continue
+				}
+			}
+		case <-orbitTokenRotationTicker:
+			if !a.disableFleetDesktop && tokenRotationEnabled {
+				newToken := ptr.String(uuid.NewString())
+				if err := orbitClient.SetOrUpdateDeviceToken(*newToken); err != nil {
+					a.stats.IncrementOrbitErrors()
+					log.Println("orbitClient.SetOrUpdateDeviceToken: ", err)
+					continue
+				}
+				a.deviceAuthToken = newToken
+				// fleet desktop performs a burst of check token requests after a token is rotated
+				checkToken()
+			}
+		case <-capabilitiesCheckerTicker:
+			if err := orbitClient.Ping(); err != nil {
+				a.stats.IncrementOrbitErrors()
+				continue
+			}
+		case <-fleetDesktopPolicyTicker:
+			if !a.disableFleetDesktop {
+				if _, err := deviceClient.DesktopSummary(*a.deviceAuthToken); err != nil {
+					a.stats.IncrementDesktopErrors()
+					log.Println("deviceClient.NumberOfFailingPolicies: ", err)
+					continue
+				}
+			}
+		case <-fleetDesktopConnectivityCheck:
+			if !a.disableFleetDesktop {
+				if err := deviceClient.Ping(); err != nil {
+					a.stats.IncrementDesktopErrors()
+					log.Println("deviceClient.Ping: ", err)
+					continue
+				}
+			}
+		}
+	}
+}
+
+// installedMDMProfile is a configuration profile a simulated device has
+// acknowledged installing via MDM.
+type installedMDMProfile struct {
+	identifier  string
+	displayName string
+	installDate time.Time
+}
+
+// installProfilePayload returns the raw (unsigned) mobileconfig carried by a
+// delivered InstallProfile command, or nil if the command is not an
+// InstallProfile or cannot be parsed.
+func installProfilePayload(cmd *mdm.Command) []byte {
+	var full micromdm.CommandPayload
+	if err := plist.Unmarshal(cmd.Raw, &full); err != nil || full.Command.InstallProfile == nil {
+		return nil
+	}
+	profile := full.Command.InstallProfile.Payload
+	// The mobileconfig may be PKCS7-signed; unwrap to the raw XML plist.
+	if !bytes.HasPrefix(profile, []byte("<?xml")) {
+		p7, err := pkcs7.Parse(profile)
+		if err != nil {
+			return nil
+		}
+		profile = p7.Content
+	}
+	return profile
+}
+
+// parseInstallProfileCommand extracts the payload identifier and display name
+// of the profile carried by a delivered InstallProfile command.
+func parseInstallProfileCommand(cmd *mdm.Command) (identifier, displayName string, ok bool) {
+	profile := installProfilePayload(cmd)
+	if profile == nil {
+		return "", "", false
+	}
+	var parsed struct {
+		PayloadIdentifier  string `plist:"PayloadIdentifier"`
+		PayloadDisplayName string `plist:"PayloadDisplayName"`
+	}
+	if err := plist.Unmarshal(profile, &parsed); err != nil || parsed.PayloadIdentifier == "" {
+		return "", "", false
+	}
+	if parsed.PayloadDisplayName == "" {
+		parsed.PayloadDisplayName = parsed.PayloadIdentifier
+	}
+	return parsed.PayloadIdentifier, parsed.PayloadDisplayName, true
+}
+
+// removeProfileIdentifier returns the payload identifier targeted by a
+// delivered RemoveProfile command, or "" if the command cannot be parsed.
+func removeProfileIdentifier(cmd *mdm.Command) string {
+	var full micromdm.CommandPayload
+	if err := plist.Unmarshal(cmd.Raw, &full); err != nil || full.Command.RemoveProfile == nil {
+		return ""
+	}
+	return full.Command.RemoveProfile.Identifier
+}
+
+// profileNotFoundErrChain is the error a real Apple device reports when asked
+// to remove a profile that is not installed. The server treats it as a
+// successful removal (see apple_mdm.IsProfileNotFoundError).
+func profileNotFoundErrChain(identifier string) []mdm.ErrorChain {
+	return []mdm.ErrorChain{
+		{
+			ErrorCode:            89,
+			ErrorDomain:          "MDMClientError",
+			LocalizedDescription: fmt.Sprintf("Profile with identifier '%s' not found.", identifier),
+		},
+	}
+}
+
+// recordInstalledProfile tracks the profile carried by an acknowledged
+// InstallProfile command as installed on the given channel.
+func (a *agent) recordInstalledProfile(channel string, cmd *mdm.Command) {
+	identifier, displayName, ok := parseInstallProfileCommand(cmd)
+	if !ok {
+		return
+	}
+	a.installedProfilesMu.Lock()
+	defer a.installedProfilesMu.Unlock()
+	if a.installedProfiles == nil {
+		a.installedProfiles = make(map[string]installedMDMProfile)
+	}
+	a.installedProfiles[channel+"/"+identifier] = installedMDMProfile{
+		identifier:  identifier,
+		displayName: displayName,
+		installDate: time.Now(),
+	}
+}
+
+// removeInstalledProfile untracks the given profile identifier on the given
+// channel, reporting whether it was installed (i.e. whether a RemoveProfile
+// command for it should succeed).
+func (a *agent) removeInstalledProfile(channel, identifier string) bool {
+	a.installedProfilesMu.Lock()
+	defer a.installedProfilesMu.Unlock()
+	key := channel + "/" + identifier
+	if _, ok := a.installedProfiles[key]; !ok {
+		return false
+	}
+	delete(a.installedProfiles, key)
+	return true
+}
+
+// seedEnrollmentProfile tracks the Fleet enrollment profile as installed on
+// the device channel. It is installed during enrollment rather than via an
+// InstallProfile command, and the server sends a RemoveProfile for it when a
+// host is unenrolled, so it must be tracked for that removal to succeed.
+func (a *agent) seedEnrollmentProfile() {
+	a.installedProfilesMu.Lock()
+	defer a.installedProfilesMu.Unlock()
+	if a.installedProfiles == nil {
+		a.installedProfiles = make(map[string]installedMDMProfile)
+	}
+	a.installedProfiles["device/"+apple_mdm.FleetPayloadIdentifier] = installedMDMProfile{
+		identifier:  apple_mdm.FleetPayloadIdentifier,
+		displayName: "Enrollment Profile",
+		installDate: time.Now(),
+	}
+}
+
+// profileNotNowRequested reports whether the delivered InstallProfile command
+// carries a profile whose decoded content contains the marker string "NotNow"
+// and this agent has not yet responded NotNow to that profile identifier on
+// the given channel. When it returns true it records the identifier, so the
+// redelivered command is acknowledged. The device and user check-in loops call
+// it concurrently, so notNowProfiles is mutex-guarded.
+func (a *agent) profileNotNowRequested(cmd *mdm.Command, channel string) bool {
+	profile := installProfilePayload(cmd)
+	if profile == nil || !bytes.Contains(profile, []byte("NotNow")) {
+		return false
+	}
+	var parsed struct {
+		PayloadIdentifier string `plist:"PayloadIdentifier"`
+	}
+	if err := plist.Unmarshal(profile, &parsed); err != nil || parsed.PayloadIdentifier == "" {
+		return false
+	}
+	key := channel + "/" + parsed.PayloadIdentifier
+
+	a.notNowProfilesMu.Lock()
+	defer a.notNowProfilesMu.Unlock()
+
+	if a.notNowProfiles[key] {
+		return false
+	}
+	if a.notNowProfiles == nil {
+		a.notNowProfiles = make(map[string]bool)
+	}
+	a.notNowProfiles[key] = true
+	return true
+}
+
+func (a *agent) runMacosMDMLoop() {
+	// The user channel needs its own goroutine: the device loop below blocks on
+	// its APNS subscription forever, so anything sequenced after it never runs.
+	if a.mdmUserEnrolled() {
+		go a.runMacosMDMUserLoop()
+	}
+
+	hexToken := hex.EncodeToString([]byte(a.macMDMClient.GetToken()))
+	deviceAPNSClient := apnsmock.NewClient(a.mdmAPNSPushURL, hexToken, apnsmock.WithInitialJitter(time.Minute), apnsmock.WithLogf(log.Printf))
+	deviceAPNSClient.Start(context.Background())
+
+	for range deviceAPNSClient.Pings() {
+		mdmCommandPayload, err := a.macMDMClient.Idle()
+		if err != nil {
+			log.Printf("MDM Idle request failed: %s", err)
+			a.stats.IncrementMDMErrors()
+			continue
+		}
+		a.stats.IncrementMDMSessions()
+
+	INNER_FOR_LOOP:
+		for mdmCommandPayload != nil {
+			a.stats.IncrementMDMCommandsReceived()
+			delayCancelableMDMAck(a.cancelableCmdAckDelay,
+				fmt.Sprintf("macOS agent %s", a.macMDMClient.SerialNumber), mdmCommandPayload)
+
+			switch mdmCommandPayload.Command.RequestType {
+			case "InstallProfile":
+				if a.mdmProfileFailureProb > 0.0 && rand.Float64() <= a.mdmProfileFailureProb {
+					errChain := []mdm.ErrorChain{
+						{
+							ErrorCode:            89,
+							ErrorDomain:          "ErrorDomain",
+							LocalizedDescription: "The profile did not install",
+						},
+					}
+					mdmCommandPayload, err = a.macMDMClient.Err(mdmCommandPayload.CommandUUID, errChain)
+					if err != nil {
+						log.Printf("MDM Error request failed: %s", err)
+						a.stats.IncrementMDMErrors()
+						break INNER_FOR_LOOP
+					}
+				} else {
+					// A profile whose content carries the "NotNow" marker is
+					// rejected with NotNow on first delivery and installed on the
+					// redelivery, so check before treating it as installed.
+					if a.profileNotNowRequested(mdmCommandPayload, "device") {
+						mdmCommandPayload, err = a.macMDMClient.NotNow(mdmCommandPayload.CommandUUID)
+						if err != nil {
+							log.Printf("MDM NotNow request failed: %s", err)
+							a.stats.IncrementMDMErrors()
+							break INNER_FOR_LOOP
+						}
+						continue
+					}
+
+					// The profile installed successfully. If it's the PSSO
+					// profile, capture the Fleet-signed registration token it
+					// carries and unblock the PSSO loop — the token only reaches
+					// the device this way, so this is the trigger for device
+					// registration. Done before Acknowledge, which advances
+					// mdmCommandPayload to the next command. A profile the device
+					// reports as failed (above) must not trigger registration.
+					if a.pssoDevice != nil && !a.pssoTokenCaptured.Load() {
+						if tok, terr := a.pssoDevice.RegistrationTokenFromCommand(mdmCommandPayload); terr == nil && tok != "" {
+							a.pssoTokenCaptured.Store(true)
+							close(a.pssoTokenReady)
+						}
+					}
+
+					a.recordInstalledProfile("device", mdmCommandPayload)
+
+					mdmCommandPayload, err = a.macMDMClient.Acknowledge(mdmCommandPayload.CommandUUID)
+					if err != nil {
+						log.Printf("MDM Acknowledge request failed: %s", err)
+						a.stats.IncrementMDMErrors()
+						break INNER_FOR_LOOP
+					}
+				}
+
+			case "RemoveProfile":
+				identifier := removeProfileIdentifier(mdmCommandPayload)
+				if identifier != "" && a.removeInstalledProfile("device", identifier) {
+					mdmCommandPayload, err = a.macMDMClient.Acknowledge(mdmCommandPayload.CommandUUID)
+				} else {
+					mdmCommandPayload, err = a.macMDMClient.Err(mdmCommandPayload.CommandUUID, profileNotFoundErrChain(identifier))
+				}
+				if err != nil {
+					log.Printf("MDM RemoveProfile response failed: %s", err)
+					a.stats.IncrementMDMErrors()
+					break INNER_FOR_LOOP
+				}
+
+			case "DeclarativeManagement":
+				// Device immediately responds with Acknowledged status and then contacts the Declarations endpoints.
+				nextMdmCommandPayload, err := a.macMDMClient.Acknowledge(mdmCommandPayload.CommandUUID)
+				if err != nil {
+					log.Printf("MDM Acknowledge request failed: %s", err)
+					a.stats.IncrementMDMErrors()
+					break INNER_FOR_LOOP
+				}
+				// Note: Declarative management could happen async while other MDM commands proceed. This is a potential enhancement.
+				// (iff a real device does process DDM in parallel with traditional MDM commands).
+				a.doDeclarativeManagement(mdmCommandPayload, ddmMethods{
+					getGlobalToken: func() string {
+						return a.ddmGlobalToken
+					},
+					setGlobalToken: func(token string) {
+						a.ddmGlobalToken = token
+					},
+					getDeclTokens: func() map[string]string {
+						return a.ddmDeclTokens
+					},
+					setDeclTokens: func(tokens map[string]string) {
+						a.ddmDeclTokens = tokens
+					},
+					DeclarativeManagement:            a.macMDMClient.DeclarativeManagement,
+					IncrementTokensErrors:            a.stats.IncrementDDMTokensErrors,
+					IncrementTokensSuccess:           a.stats.IncrementDDMTokensSuccess,
+					IncrementDeclarationItemsErrors:  a.stats.IncrementDDMDeclarationItemsErrors,
+					IncrementDeclarationItemsSuccess: a.stats.IncrementDDMDeclarationItemsSuccess,
+					IncrementConfigurationErrors:     a.stats.IncrementDDMConfigurationErrors,
+					IncrementConfigurationSuccess:    a.stats.IncrementDDMConfigurationSuccess,
+					IncrementManagementErrors:        a.stats.IncrementDDMManagementErrors,
+					IncrementManagementSuccess:       a.stats.IncrementDDMManagementSuccess,
+					IncrementActivationErrors:        a.stats.IncrementDDMActivationErrors,
+					IncrementActivationSuccess:       a.stats.IncrementDDMActivationSuccess,
+					IncrementStatusErrors:            a.stats.IncrementDDMStatusErrors,
+					IncrementStatusSuccess:           a.stats.IncrementDDMStatusSuccess,
+					IncrementAssetErrors:             a.stats.IncrementDDMAssetErrors,
+					IncrementAssetSuccess:            a.stats.IncrementDDMAssetSuccess,
+				})
+				mdmCommandPayload = nextMdmCommandPayload
+
+			case "InstalledApplicationList":
+				var installedVPPSoftware []fleet.Software
+				// Our mock VPP apps start off as "not installed".
+				// The first time we get a verification command, we flip the flag to "installed",
+				// but don't include the software in the response.
+				// This ensures that 2 verification commands will be sent per VPP install.
+				for _, adamID := range a.installedAdamIDs {
+					if sw, ok := adamIDsToSoftware[adamID]; ok && sw != nil {
+						if sw.Installed {
+							installedVPPSoftware = append(installedVPPSoftware, *sw)
+						}
+
+						sw.Installed = true
+					}
+				}
+				nextMdmCommandPayload, err := a.macMDMClient.AcknowledgeInstalledApplicationList(
+					a.macMDMClient.UUID,
+					mdmCommandPayload.CommandUUID,
+					installedVPPSoftware,
+				)
+				if err != nil {
+					log.Printf("MDM Acknowledge InstalledApplicationList request failed: %s", err)
+					a.stats.IncrementMDMErrors()
+					break INNER_FOR_LOOP
+				}
+
+				mdmCommandPayload = nextMdmCommandPayload
+
+			case "InstallApplication":
+				var appRequest struct {
+					Command map[string]any `plist:"Command"`
+				}
+
+				err = plist.Unmarshal(mdmCommandPayload.Raw, &appRequest)
+				if err != nil {
+					log.Printf("parsing InstallApplication request: %s", err)
+					a.stats.IncrementMDMErrors()
+					break INNER_FOR_LOOP
+				}
+				log.Printf("got install application command for %d", appRequest.Command["iTunesStoreID"])
+
+				// The lowest valid iTunesStoreID we accept, anything below this will fail the MDM protocl with the same error code.
+				const failureThreshold = 100_000
+
+				var installedAdamID uint64
+				if adamID, ok := appRequest.Command["iTunesStoreID"].(uint64); ok {
+					if adamID >= failureThreshold {
+						a.installedAdamIDs = append(a.installedAdamIDs, int(adamID))
+					}
+					installedAdamID = adamID
+				}
+
+				if installedAdamID == 0 {
+					log.Printf("InstallApplication command missing iTunesStoreID or it was not a uint64")
+					a.stats.IncrementMDMErrors()
+					break INNER_FOR_LOOP
+				} else if installedAdamID < failureThreshold {
+					// Fail with the specific requested ID to simulate specific VPP app install error codes.
+					log.Printf("failing install application with error code %d", installedAdamID)
+					_, err = a.macMDMClient.Err(mdmCommandPayload.CommandUUID, []mdm.ErrorChain{
+						{
+							ErrorCode:            int(installedAdamID),
+							LocalizedDescription: "Failed to install VPP application (osquery-perf custom failure)",
+						},
+					})
+					if err != nil {
+						log.Printf("MDM Error request failed: %s", err)
+						a.stats.IncrementMDMErrors()
+						break INNER_FOR_LOOP
+					}
+					continue INNER_FOR_LOOP
+				}
+
+				mdmCommandPayload, err = a.macMDMClient.Acknowledge(mdmCommandPayload.CommandUUID)
+				if err != nil {
+					log.Printf("MDM Acknowledge request failed: %s", err)
+					a.stats.IncrementMDMErrors()
+					break INNER_FOR_LOOP
+				}
+
+			default:
+				mdmCommandPayload, err = a.macMDMClient.Acknowledge(mdmCommandPayload.CommandUUID)
+				if err != nil {
+					log.Printf("MDM Acknowledge request failed: %s", err)
+					a.stats.IncrementMDMErrors()
+					break INNER_FOR_LOOP
+				}
+			}
+		}
+	}
+}
+
+// runMacosMDMUserLoop runs the user-channel check-in loop. It is a separate
+// goroutine from the device loop because a real device is woken independently
+// on each channel, and because the device loop never returns (its APNS
+// subscription is only closed when the process exits).
+func (a *agent) runMacosMDMUserLoop() {
+	hexToken := hex.EncodeToString([]byte(a.macMDMClient.GetUserToken()))
+	userAPNSClient := apnsmock.NewClient(a.mdmAPNSPushURL, hexToken, apnsmock.WithInitialJitter(time.Minute), apnsmock.WithLogf(log.Printf))
+	userAPNSClient.Start(context.Background())
+
+	for range userAPNSClient.Pings() {
+		mdmCommandPayload, err := a.macMDMClient.UserIdle()
+		if err != nil {
+			log.Printf("MDM Idle request failed: %s", err)
+			a.stats.IncrementMDMUserErrors()
+			continue
+		}
+		a.stats.IncrementMDMUserSessions()
+
+	INNER_FOR_LOOP_USER:
+		for mdmCommandPayload != nil {
+			a.stats.IncrementMDMUserCommandsReceived()
+
+			switch mdmCommandPayload.Command.RequestType {
+			case "InstallProfile":
+				if a.mdmProfileFailureProb > 0.0 && rand.Float64() <= a.mdmProfileFailureProb {
+					errChain := []mdm.ErrorChain{
+						{
+							ErrorCode:            89,
+							ErrorDomain:          "ErrorDomain",
+							LocalizedDescription: "The profile did not install",
+						},
+					}
+					mdmCommandPayload, err = a.macMDMClient.UserChannelErr(mdmCommandPayload.CommandUUID, errChain)
+					if err != nil {
+						log.Printf("MDM Error request failed: %s", err)
+						a.stats.IncrementMDMUserErrors()
+						break INNER_FOR_LOOP_USER
+					}
+				} else {
+					if a.profileNotNowRequested(mdmCommandPayload, "user") {
+						mdmCommandPayload, err = a.macMDMClient.UserNotNow(mdmCommandPayload.CommandUUID)
+						if err != nil {
+							log.Printf("MDM NotNow request failed: %s", err)
+							a.stats.IncrementMDMUserErrors()
+							break INNER_FOR_LOOP_USER
+						}
+						continue
+					}
+
+					a.recordInstalledProfile("user", mdmCommandPayload)
+
+					mdmCommandPayload, err = a.macMDMClient.UserAcknowledge(mdmCommandPayload.CommandUUID)
+					if err != nil {
+						log.Printf("MDM Acknowledge request failed: %s", err)
+						a.stats.IncrementMDMUserErrors()
+						break INNER_FOR_LOOP_USER
+					}
+				}
+
+			case "RemoveProfile":
+				identifier := removeProfileIdentifier(mdmCommandPayload)
+				if identifier != "" && a.removeInstalledProfile("user", identifier) {
+					mdmCommandPayload, err = a.macMDMClient.UserAcknowledge(mdmCommandPayload.CommandUUID)
+				} else {
+					mdmCommandPayload, err = a.macMDMClient.UserChannelErr(mdmCommandPayload.CommandUUID, profileNotFoundErrChain(identifier))
+				}
+				if err != nil {
+					log.Printf("MDM RemoveProfile response failed: %s", err)
+					a.stats.IncrementMDMUserErrors()
+					break INNER_FOR_LOOP_USER
+				}
+
+			case "DeclarativeManagement":
+				// Device immediately responds with Acknowledged status and then contacts the Declarations endpoints.
+				nextMdmCommandPayload, err := a.macMDMClient.UserAcknowledge(mdmCommandPayload.CommandUUID)
+				if err != nil {
+					log.Printf("MDM Acknowledge request failed: %s", err)
+					a.stats.IncrementMDMUserErrors()
+					break INNER_FOR_LOOP_USER
+				}
+				// Note: Declarative management could happen async while other MDM commands proceed. This is a potential enhancement.
+				// (iff a real device does process DDM in parallel with traditional MDM commands).
+				a.doDeclarativeManagement(mdmCommandPayload, ddmMethods{
+					getGlobalToken: func() string {
+						return a.ddmUserGlobalToken
+					},
+					setGlobalToken: func(token string) {
+						a.ddmUserGlobalToken = token
+					},
+					getDeclTokens: func() map[string]string {
+						return a.ddmUserDeclTokens
+					},
+					setDeclTokens: func(tokens map[string]string) {
+						a.ddmUserDeclTokens = tokens
+					},
+					DeclarativeManagement:            a.macMDMClient.UserDeclarativeManagement,
+					IncrementTokensErrors:            a.stats.IncrementUserDDMTokensErrors,
+					IncrementTokensSuccess:           a.stats.IncrementUserDDMTokensSuccess,
+					IncrementDeclarationItemsErrors:  a.stats.IncrementUserDDMDeclarationItemsErrors,
+					IncrementDeclarationItemsSuccess: a.stats.IncrementUserDDMDeclarationItemsSuccess,
+					IncrementConfigurationErrors:     a.stats.IncrementUserDDMConfigurationErrors,
+					IncrementConfigurationSuccess:    a.stats.IncrementUserDDMConfigurationSuccess,
+					IncrementManagementErrors:        a.stats.IncrementDDMManagementErrors,
+					IncrementManagementSuccess:       a.stats.IncrementDDMManagementSuccess,
+					IncrementActivationErrors:        a.stats.IncrementUserDDMActivationErrors,
+					IncrementActivationSuccess:       a.stats.IncrementUserDDMActivationSuccess,
+					IncrementStatusErrors:            a.stats.IncrementUserDDMStatusErrors,
+					IncrementStatusSuccess:           a.stats.IncrementUserDDMStatusSuccess,
+					IncrementAssetErrors:             a.stats.IncrementUserDDMAssetErrors,
+					IncrementAssetSuccess:            a.stats.IncrementUserDDMAssetSuccess,
+				})
+				mdmCommandPayload = nextMdmCommandPayload
+
+			default:
+				mdmCommandPayload, err = a.macMDMClient.UserAcknowledge(mdmCommandPayload.CommandUUID)
+				if err != nil {
+					log.Printf("MDM Acknowledge request failed: %s", err)
+					a.stats.IncrementMDMUserErrors()
+					break INNER_FOR_LOOP_USER
+				}
+			}
+		}
+	}
+}
+
+// runMacosPSSOLoop simulates a macOS Platform SSO extension for the subset of
+// MDM agents selected for PSSO. It waits for the Fleet-signed registration token
+// to arrive in an MDM-delivered profile, registers the device once, then mimics
+// real macOS by spreading occasional logins and offline-unlock key operations
+// across a long interval rather than checking in every tick.
+func (a *agent) runMacosPSSOLoop() {
+	// The registration token only reaches the device inside an MDM-delivered
+	// PSSO profile. Until the operator uploads that profile and the server
+	// reconciles it onto this host, there is nothing to do.
+	<-a.pssoTokenReady
+
+	// Stagger initial device registrations across the interval so many agents
+	// coming online together don't register in lockstep.
+	time.Sleep(a.pssoJitter())
+
+	if err := a.pssoRegister(); err != nil {
+		return
+	}
+	// A freshly registered device does one login and one key request/exchange
+	// during setup ("one of each").
+	a.pssoLogin()
+	a.pssoKeyRequestExchange()
+
+	// With no interval configured there is no recurring activity to simulate.
+	if a.pssoParams.interval <= 0 {
+		return
+	}
+	for {
+		a.runMacosPSSOInterval()
+	}
+}
+
+// runMacosPSSOInterval performs at most one login and one key request/exchange,
+// each gated by its own probability and scheduled at an independent random
+// offset within the interval so traffic from many agents doesn't align on
+// interval boundaries. It always consumes ~one interval of wall-clock so the
+// effective rate stays close to once per interval.
+func (a *agent) runMacosPSSOInterval() {
+	start := time.Now()
+
+	type pssoStep struct {
+		at time.Duration
+		fn func()
+	}
+	var steps []pssoStep
+	if rand.Float64() < a.pssoParams.loginProb {
+		steps = append(steps, pssoStep{at: a.pssoJitter(), fn: a.pssoLogin})
+	}
+	if rand.Float64() < a.pssoParams.keyProb {
+		steps = append(steps, pssoStep{at: a.pssoJitter(), fn: a.pssoKeyRequestExchange})
+	}
+	sort.Slice(steps, func(i, j int) bool { return steps[i].at < steps[j].at })
+
+	for _, s := range steps {
+		if d := s.at - time.Since(start); d > 0 {
+			time.Sleep(d)
+		}
+		s.fn()
+	}
+	if d := a.pssoParams.interval - time.Since(start); d > 0 {
+		time.Sleep(d)
+	}
+}
+
+// pssoJitter returns a random offset in [0, interval).
+func (a *agent) pssoJitter() time.Duration {
+	if a.pssoParams.interval <= 0 {
+		return 0
+	}
+	return time.Duration(rand.Int63n(int64(a.pssoParams.interval)))
+}
+
+func (a *agent) pssoRegister() error {
+	if err := a.pssoDevice.Register(); err != nil {
+		log.Printf("PSSO registration failed: %s", err)
+		a.stats.IncrementPSSOErrors()
+		return err
+	}
+	a.stats.IncrementPSSORegistrations()
+	return nil
+}
+
+func (a *agent) pssoLogin() {
+	if _, err := a.pssoDevice.Login(a.pssoParams.username, a.pssoParams.password, mdmtest.PSSOLoginOptions{}); err != nil {
+		log.Printf("PSSO login failed: %s", err)
+		a.stats.IncrementPSSOErrors()
+		return
+	}
+	a.stats.IncrementPSSOLogins()
+}
+
+// pssoKeyRequestExchange runs a key request followed by the key exchange it
+// enables (the exchange echoes the context from the request), mirroring the
+// offline-unlock key provisioning a real device performs as a unit.
+func (a *agent) pssoKeyRequestExchange() {
+	if _, err := a.pssoDevice.KeyRequest(); err != nil {
+		log.Printf("PSSO key request failed: %s", err)
+		a.stats.IncrementPSSOErrors()
+		return
+	}
+	a.stats.IncrementPSSOKeyRequests()
+	if _, err := a.pssoDevice.KeyExchange(); err != nil {
+		log.Printf("PSSO key exchange failed: %s", err)
+		a.stats.IncrementPSSOErrors()
+		return
+	}
+	a.stats.IncrementPSSOKeyExchanges()
+}
+
+func (a *agent) runWindowsMDMLoop() {
+	pollInterval := a.MDMCheckInInterval
+	ticker := time.NewTicker(pollInterval)
+	defer ticker.Stop()
+
+	for {
+		onDemand := false
+		select {
+		case <-a.winMDMWake:
+			// The server asked us (via WindowsMDMSyncRequest) to start a session now, without waiting for the poll.
+			onDemand = true
+		case <-ticker.C:
+			// A wake may have arrived at almost the same time as this tick; select picks at random when both are ready,
+			// which could miscount a wake-triggered session as poll-triggered. Drain any buffered wake first so the
+			// on-demand metric is deterministic (and a coincident tick+wake collapses into a single on-demand session).
+			select {
+			case <-a.winMDMWake:
+				onDemand = true
+			default:
+			}
+		}
+
+		// If the server relaxed (or restored) our DMClient poll schedule via a Replace on the poll node, match it so our
+		// scheduled polling slows down. Steady-state command delivery is then driven by the on-demand wake rather than
+		// frequent polling, which is the behavior this load test exercises.
+		if relaxedInterval := a.doWindowsMDMCheckIn(onDemand); relaxedInterval > 0 && relaxedInterval != pollInterval {
+			pollInterval = relaxedInterval
+			ticker.Reset(pollInterval)
+			log.Printf("host %d: Windows MDM poll schedule set to %s", a.agentIndex, pollInterval)
+		}
+	}
+}
+
+// doWindowsMDMCheckIn runs a single OMA-DM management session: it starts the session, acknowledges every command the
+// server sends, and returns the new scheduled poll interval if the server sent a Replace on the DMClient poll node
+// (0 otherwise). onDemand reports whether the session was triggered by a WindowsMDMSyncRequest wake instead of the poll
+// ticker, for stats purposes.
+func (a *agent) doWindowsMDMCheckIn(onDemand bool) (newPollInterval time.Duration) {
+	cmds, err := a.winMDMClient.StartManagementSession()
+	if err != nil {
+		log.Printf("MDM check-in start session request failed: %s", err)
+		a.stats.IncrementMDMErrors()
+		return 0
+	}
+	a.stats.IncrementMDMSessions()
+	if onDemand {
+		a.stats.IncrementMDMOnDemandSyncs()
+	}
+
+	// send a successful ack for each command
+	msgID, err := a.winMDMClient.GetCurrentMsgID()
+	if err != nil {
+		log.Printf("MDM get current MsgID failed: %s", err)
+		a.stats.IncrementMDMErrors()
+		return 0
+	}
+
+	// Detect SCEP CertificateInstall CSPs and ACK them now while kicking off the SCEP exchange in the background.
+	scepCtx, cancelSCEP := context.WithTimeout(context.Background(), 2*a.MDMCheckInInterval)
+	handled, scepResults, hasWork := a.winMDMClient.AppendSCEPInstallResponses(scepCtx, cmds, msgID, nil)
+	if hasWork {
+		go func() {
+			defer cancelSCEP()
+			// One SCEPResult is emitted per CSP; increment per-result so the request counter
+			// matches the per-CSP success/error counters even when multiple CSPs ride one SyncML.
+			for res := range scepResults {
+				a.stats.IncrementMDMSCEPRequests()
+				if res.Err != nil {
+					log.Printf("MDM SCEP exchange failed: %s", res.Err)
+					a.stats.IncrementMDMSCEPErrors()
+					continue
+				}
+				a.stats.IncrementMDMSCEPSuccess()
+				if res.Cert == nil {
+					continue
+				}
+				// Report the issued cert via the certificates detail query so the server observes the
+				// fleet-<profileUUID> renewal-ID marker and marks the SCEP profile verified. The withheld ~5% never
+				// report theirs, so the server's verification backstop fails those profiles.
+				if a.withholdSCEPCert {
+					continue
+				}
+				a.storeSCEPCertSpec(res.UniqueID, res.Cert)
+			}
+		}()
+	} else {
+		cancelSCEP()
+	}
+
+	for _, c := range cmds {
+		// Skip the server's own <Status> entries. MS-MDM's "Status on a Status" is only for auth-renegotiation edge cases (see
+		// https://learn.microsoft.com/en-us/openspecs/windows_protocols/ms-mdm/36b1a4d9-fd93-48ce-b865-6a9d396c52a4
+		// "While this case is not usually encountered"); real Windows does not emit Status-on-Status during normal check-ins.
+		if c.Verb == fleet.CmdStatus {
+			continue
+		}
+		// When the server relaxes (or restores) our poll schedule it sends a Replace on the DMClient poll node. Honor it
+		// by adjusting our scheduled poll interval, mirroring how the real Windows DMClient applies the Replace. We still
+		// ACK it below like any other command.
+		if c.Verb == fleet.CmdReplace && c.Cmd.GetTargetURI() == syncml.DMClientPollIntervalLocURI {
+			if mins, err := strconv.Atoi(strings.TrimSpace(c.Cmd.GetTargetData())); err == nil && mins > 0 {
+				newPollInterval = time.Duration(mins) * time.Minute
+			}
+		}
+		if _, ok := handled[c.Cmd.CmdID.Value]; ok {
+			// Already ACKed by AppendSCEPInstallResponses.
+			a.stats.IncrementMDMCommandsReceived()
+			continue
+		}
+		a.stats.IncrementMDMCommandsReceived()
+
+		status := syncml.CmdStatusOK
+		if a.mdmProfileFailureProb > 0.0 && rand.Float64() <= a.mdmProfileFailureProb {
+			status = syncml.CmdStatusBadRequest
+		}
+		a.winMDMClient.AppendResponse(fleet.SyncMLCmd{
+			XMLName: xml.Name{Local: fleet.CmdStatus},
+			MsgRef:  &msgID,
+			CmdRef:  &c.Cmd.CmdID.Value,
+			Cmd:     ptr.String(c.Verb),
+			Data:    &status,
+			Items:   nil,
+			CmdID:   fleet.CmdID{Value: uuid.NewString()},
+		})
+	}
+	if _, err := a.winMDMClient.SendResponse(); err != nil {
+		log.Printf("MDM send response request failed: %s", err)
+		a.stats.IncrementMDMErrors()
+		return 0
+	}
+	return newPollInterval
+}
+
+func (a *agent) execScripts(execIDs []string, orbitClient *fleetclient.OrbitClient) {
+	if a.scriptExecRunning.Swap(true) {
+		// if Swap returns true, the goroutine was already running, exit
+		return
+	}
+	defer a.scriptExecRunning.Store(false)
+
+	log.Printf("running scripts: %v", execIDs)
+	for _, execID := range execIDs {
+		if a.disableScriptExec {
+			// send a no-op result without executing if script exec is disabled
+			if err := orbitClient.SaveHostScriptResult(&fleet.HostScriptResultPayload{
+				ExecutionID: execID,
+				Output:      "Scripts are disabled",
+				Runtime:     0,
+				ExitCode:    -2,
+			}); err != nil {
+				log.Println("save disabled host script result:", err)
+				return
+			}
+			log.Printf("did save disabled host script result: id=%s", execID)
+			continue
+		}
+
+		a.stats.IncrementScriptExecs()
+		script, err := orbitClient.GetHostScript(execID)
+		if err != nil {
+			log.Println("get host script:", err)
+			a.stats.IncrementScriptExecErrs()
+			return
+		}
+
+		// simulate script execution
+		outputLen := rand.Intn(11000) // base64 encoding will make the actual output a bit bigger
+		buf := make([]byte, outputLen)
+		n, _ := io.ReadFull(cryptorand.Reader, buf)
+		exitCode := rand.Intn(2)
+		runtime := rand.Intn(5)
+		time.Sleep(time.Duration(runtime) * time.Second)
+
+		if err := orbitClient.SaveHostScriptResult(&fleet.HostScriptResultPayload{
+			HostID:      script.HostID,
+			ExecutionID: script.ExecutionID,
+			Output:      base64.StdEncoding.EncodeToString(buf[:n]),
+			Runtime:     runtime,
+			ExitCode:    exitCode,
+		}); err != nil {
+			log.Println("save host script result:", err)
+			a.stats.IncrementScriptExecErrs()
+			return
+		}
+		log.Printf("did exec and save host script result: id=%s, output size=%d, runtime=%d, exit code=%d", execID, base64.StdEncoding.EncodedLen(n), runtime, exitCode)
+	}
+}
+
+func (a *agent) installSoftware(installerIDs []string, orbitClient *fleetclient.OrbitClient) {
+	// Only allow one software install to happen at a time.
+	if a.softwareInstaller.mu.TryLock() {
+		defer a.softwareInstaller.mu.Unlock()
+		for _, installerID := range installerIDs {
+			a.installSoftwareItem(installerID, orbitClient)
+		}
+	}
+}
+
+func (a *agent) installSoftwareItem(installerID string, orbitClient *fleetclient.OrbitClient) {
+	a.stats.IncrementSoftwareInstalls()
+
+	payload := &fleet.HostSoftwareInstallResultPayload{}
+	payload.InstallUUID = installerID
+	installer, err := orbitClient.GetInstallerDetails(installerID)
+	if err != nil {
+		log.Println("get installer details:", err)
+		a.stats.IncrementSoftwareInstallErrs()
+		return
+	}
+	failed := false
+	if installer.PreInstallCondition != "" {
+		time.Sleep(time.Duration(rand.Intn(1000)) * time.Millisecond)
+		if installer.PreInstallCondition == "select 1" { //nolint:gocritic // ignore ifElseChain
+			// Always pass
+			payload.PreInstallConditionOutput = ptr.String("1")
+		} else if installer.PreInstallCondition == "select 0" ||
+			a.softwareInstaller.preInstallFailureProb > 0.0 && rand.Float64() <= a.softwareInstaller.preInstallFailureProb {
+			// Fail
+			payload.PreInstallConditionOutput = ptr.String("")
+			failed = true
+		} else {
+			payload.PreInstallConditionOutput = ptr.String("1")
+		}
+	}
+
+	var meta *file.InstallerMetadata
+	if !failed {
+		var cacheMiss bool
+		// Download the file if needed to get its metadata
+		meta, cacheMiss, err = installerMetadataCache.Get(installer, orbitClient)
+		if err != nil {
+			a.stats.IncrementSoftwareInstallErrs()
+			return
+		}
+
+		if !cacheMiss && installer.SoftwareInstallerURL == nil {
+			// If we didn't download and analyze the file, AND we did not use a CDN URL to get the file,
+			// we do a download now and don't save the result. Doing this download adds realistic load on the server.
+			err = orbitClient.DownloadAndDiscardSoftwareInstaller(installer.InstallerID)
+			if err != nil {
+				log.Println("download and discard software installer:", err)
+				a.stats.IncrementSoftwareInstallErrs()
+				return
+			}
+		}
+
+		time.Sleep(time.Duration(rand.Intn(30)) * time.Second)
+		if installer.InstallScript == "exit 0" { //nolint:gocritic // ignore ifElseChain
+			// Always pass
+			payload.InstallScriptExitCode = ptr.Int(0)
+			payload.InstallScriptOutput = ptr.String("Installed on osquery-perf (always pass)")
+		} else if installer.InstallScript == "exit 1" {
+			payload.InstallScriptExitCode = ptr.Int(1)
+			payload.InstallScriptOutput = ptr.String("Installed on osquery-perf (always fail)")
+			failed = true
+		} else if a.softwareInstaller.installFailureProb > 0.0 && rand.Float64() <= a.softwareInstaller.installFailureProb {
+			payload.InstallScriptExitCode = ptr.Int(1)
+			payload.InstallScriptOutput = ptr.String("Installed on osquery-perf (fail)")
+			failed = true
+		} else {
+			payload.InstallScriptExitCode = ptr.Int(0)
+			payload.InstallScriptOutput = ptr.String("Installed on osquery-perf (pass)")
+		}
+	}
+	if !failed {
+		if meta.Name == "" {
+			log.Printf("WARNING: installer metadata is missing a name for installer:%d\n", installer.InstallerID)
+		} else {
+			key := meta.Name + "+" + meta.Version + "+" + meta.BundleIdentifier
+			if _, ok := a.installedSoftware.Load(key); !ok {
+				source := ""
+				switch a.os {
+				case "macos":
+					source = "apps"
+				case "windows":
+					source = "programs"
+				case "ubuntu":
+					source = "deb_packages"
+				default:
+					log.Printf("unknown OS to software installer: %s", a.os)
+					return
+				}
+				a.installedSoftware.Store(key, map[string]string{
+					"name":              meta.Name,
+					"version":           meta.Version,
+					"bundle_identifier": meta.BundleIdentifier,
+					"source":            source,
+					"installed_path":    os.DevNull,
+				})
+			}
+		}
+
+		if installer.PostInstallScript != "" {
+			time.Sleep(time.Duration(rand.Intn(1000)) * time.Millisecond)
+			if installer.PostInstallScript == "exit 0" { //nolint:gocritic // ignore ifElseChain
+				// Always pass
+				payload.PostInstallScriptExitCode = ptr.Int(0)
+				payload.PostInstallScriptOutput = ptr.String("PostInstall on osquery-perf (always pass)")
+			} else if installer.PostInstallScript == "exit 1" {
+				payload.PostInstallScriptExitCode = ptr.Int(1)
+				payload.PostInstallScriptOutput = ptr.String("PostInstall on osquery-perf (always fail)")
+			} else if a.softwareInstaller.postInstallFailureProb > 0.0 && rand.Float64() <= a.softwareInstaller.postInstallFailureProb {
+				payload.PostInstallScriptExitCode = ptr.Int(1)
+				payload.PostInstallScriptOutput = ptr.String("PostInstall on osquery-perf (fail)")
+			} else {
+				payload.PostInstallScriptExitCode = ptr.Int(0)
+				payload.PostInstallScriptOutput = ptr.String("PostInstall on osquery-perf (pass)")
+			}
+		}
+	}
+
+	err = orbitClient.SaveInstallerResult(payload)
+	if err != nil {
+		log.Println("save installer result:", err)
+		a.stats.IncrementSoftwareInstallErrs()
+		return
+	}
+}
+
+// shouldSignRequest determines if a request should be signed based on its path
+func (a *agent) shouldSignRequest(req *http.Request) bool {
+	// Don't sign if HTTP signatures are not enabled
+	if !a.hostIdentityClient.IsEnabled() || !a.hostIdentityClient.HasSigner() {
+		return false
+	}
+
+	// Exclude ping endpoint from signing
+	if strings.HasSuffix(req.URL.Path, "/api/fleet/orbit/ping") {
+		return false
+	}
+
+	// Only sign specific API paths
+	return strings.Contains(req.URL.Path, "/api/fleet/orbit/") || strings.Contains(req.URL.Path, "/osquery/")
+}
+
+// sign applies HTTP message signature to a request if needed
+func (a *agent) sign(req *http.Request) *http.Request {
+	// Apply HTTP message signature if this request should be signed
+	if a.shouldSignRequest(req) {
+		if err := a.hostIdentityClient.SignRequest(req); err != nil {
+			log.Printf("Agent %d: Failed to sign HTTP request: %v", a.agentIndex, err)
+		}
+	}
+	return req
+}
+
+func (a *agent) waitingDo(fn func() *http.Request) *http.Response {
+	response, err := http.DefaultClient.Do(a.sign(fn()))
+	for err != nil || response.StatusCode != http.StatusOK {
+		if err != nil {
+			log.Printf("failed to run request: %s", err)
+		} else { // res.StatusCode() != http.StatusOK
+			response.Body.Close()
+			log.Printf("request failed: %d", response.StatusCode)
+		}
+		a.stats.IncrementErrors(1)
+		<-time.Tick(time.Duration(rand.Intn(120)+1) * time.Second)
+		response, err = http.DefaultClient.Do(a.sign(fn()))
+	}
+	return response
+}
+
+// mdmEnrollWithRetry runs enroll until it succeeds, sleeping a random 1-120s
+// between attempts (same spread as waitingDo) so that agents starting at the
+// same time don't repeatedly hammer the server with simultaneous enrollments.
+func mdmEnrollWithRetry(deviceLabel string, incrementErrStat func(), enroll func() error) {
+	for {
+		err := enroll()
+		if err == nil {
+			return
+		}
+		log.Printf("%s MDM enroll failed, will retry: %s", deviceLabel, err)
+		incrementErrStat()
+		time.Sleep(time.Duration(rand.Intn(120)+1) * time.Second)
+	}
+}
+
+// TODO: add support to `alreadyEnrolled` akin to the `enroll` function.  for
+// now, we assume that the agent is not already enrolled, if you kill the agent
+// process then those Orbit node keys are gone.
+func (a *agent) orbitEnroll() error {
+	params := fleet.EnrollOrbitRequest{
+		EnrollSecret:   a.EnrollSecret,
+		HardwareUUID:   a.UUID,
+		HardwareSerial: a.SerialNumber,
+		Hostname:       a.CachedString("hostname"),
+	}
+	jsonBytes, err := json.Marshal(params)
+	if err != nil {
+		log.Println("orbit json marshall:", err)
+		return err
+	}
+
+	response := a.waitingDo(func() *http.Request {
+		request, err := http.NewRequest("POST", a.serverAddress+"/api/fleet/orbit/enroll", bytes.NewReader(jsonBytes))
+		if err != nil {
+			panic(err)
+		}
+		request.Header.Add("Content-type", "application/json")
+		return request
+	})
+	defer response.Body.Close()
+
+	var parsedResp fleet.EnrollOrbitResponse
+	if err := json.NewDecoder(response.Body).Decode(&parsedResp); err != nil {
+		log.Println("orbit json parse:", err)
+		return err
+	}
+
+	a.orbitNodeKey = &parsedResp.OrbitNodeKey
+	a.stats.IncrementOrbitEnrollments()
+	return nil
+}
+
+// This is an osquery enroll as opposed to an orbit enroll
+func (a *agent) enroll(i int, onlyAlreadyEnrolled bool) error {
+	a.nodeKey = a.nodeKeyManager.Get(i)
+	if a.nodeKey != "" {
+		a.stats.IncrementEnrollments()
+		return nil
+	}
+
+	if onlyAlreadyEnrolled {
+		return errors.New("not enrolled")
+	}
+
+	response := a.waitingDo(func() *http.Request {
+		var body bytes.Buffer
+		if err := a.templates.ExecuteTemplate(&body, "enroll", a); err != nil {
+			panic(err)
+		}
+		request, err := http.NewRequest("POST", a.serverAddress+"/api/osquery/enroll", &body)
+		if err != nil {
+			panic(err)
+		}
+		request.Header.Add("Content-type", "application/json")
+		return request
+	})
+	defer response.Body.Close()
+
+	if response.StatusCode != http.StatusOK {
+		log.Println("enroll status:", response.StatusCode)
+		return fmt.Errorf("status code: %d", response.StatusCode)
+	}
+
+	var parsedResp enrollResponse
+	if err := json.NewDecoder(response.Body).Decode(&parsedResp); err != nil {
+		log.Println("json parse:", err)
+		return err
+	}
+
+	a.nodeKey = parsedResp.NodeKey
+	a.stats.IncrementEnrollments()
+
+	a.nodeKeyManager.Add(a.nodeKey)
+
+	return nil
+}
+
+func (a *agent) config() error {
+	// The presence of the "etag" field — even empty — is the opt-in to
+	// conditional responses; its value is the etag from the last config
+	// response received (see the configETag field docs).
+	sentConditional := a.configTLSETag && a.configETag != ""
+	requestBody := []byte(`{"node_key": "` + a.nodeKey + `"}`)
+	if a.configTLSETag {
+		var err error
+		requestBody, err = json.Marshal(map[string]string{
+			"node_key": a.nodeKey,
+			"etag":     a.configETag,
+		})
+		if err != nil {
+			return err
+		}
+	}
+	request, err := http.NewRequest("POST", a.serverAddress+"/api/osquery/config", bytes.NewReader(requestBody))
+	if err != nil {
+		return err
+	}
+	request.Header.Add("Content-type", "application/json")
+
+	response, err := http.DefaultClient.Do(a.sign(request))
+	if err != nil {
+		return fmt.Errorf("config request failed to run: %w", err)
+	}
+	defer response.Body.Close()
+
+	a.stats.IncrementConfigRequests()
+
+	if response.StatusCode != http.StatusOK {
+		a.stats.IncrementConfigErrors()
+		return fmt.Errorf("config request failed: %d", response.StatusCode)
+	}
+
+	// Read the full body
+	body, err := io.ReadAll(response.Body)
+	if err != nil {
+		a.stats.IncrementConfigErrors()
+		return fmt.Errorf("read config body: %w", err)
+	}
+
+	// Extract the body-carried etag, if the server assigned one.
+	var envelope struct {
+		ETag *string `json:"etag"`
+	}
+	if err := json.Unmarshal(body, &envelope); err != nil {
+		a.stats.IncrementConfigErrors()
+		return fmt.Errorf("json parse at config: %w", err)
+	}
+
+	// The reserved value "ok" means the config is unchanged. The server may
+	// only say this to an agent that echoed one of its validators.
+	if envelope.ETag != nil && *envelope.ETag == "ok" {
+		if !sentConditional {
+			a.stats.IncrementConfigErrors()
+			return fmt.Errorf("invalid config unchanged response: sent_etag=%t", sentConditional)
+		}
+		a.stats.RecordConfigNotModified(int64(len(body)), a.lastConfigBodyBytes)
+		return nil
+	}
+
+	if a.configTLSETag {
+		if envelope.ETag != nil {
+			serverETag := *envelope.ETag
+			// Drift diagnostic only: the validator should be the SHA-256 of
+			// the canonical config — the body with the etag key stripped.
+			// The server value stays authoritative regardless.
+			if canonical, err := canonicalConfigBody(body); err == nil && serverETag != sha256Hex(canonical) {
+				a.stats.IncrementConfigETagDrift()
+			}
+			// Store on receive, BEFORE processing the config — the real
+			// client echoes the etag of the last config received, not
+			// applied, so a config the agent fails to process is confirmed
+			// unchanged instead of re-downloaded.
+			a.configETag = serverETag
+			a.lastConfigBodyBytes = int64(len(body))
+		} else {
+			// The server assigned no etag (it does not support conditional
+			// requests): hold no validator, keep opting in with an empty one.
+			a.configETag = ""
+		}
+	}
+
+	parsedResp := struct {
+		Packs map[string]struct {
+			Queries map[string]interface{} `json:"queries"`
+		} `json:"packs"`
+	}{}
+	if err := json.Unmarshal(body, &parsedResp); err != nil {
+		a.stats.IncrementConfigErrors()
+		return fmt.Errorf("json parse at config: %w", err)
+	}
+
+	existingLastRunData := make(map[string]int64)
+
+	a.scheduledQueryMapMutex.RLock()
+	queryData := a.scheduledQueryData
+	a.scheduledQueryMapMutex.RUnlock()
+	queryData.Range(func(key, value any) bool {
+		existingLastRunData[key.(string)] = value.(scheduledQuery).lastRun
+
+		return true
+	})
+
+	newScheduledQueryData := new(sync.Map)
+
+	for packName, pack := range parsedResp.Packs {
+		for queryName, query := range pack.Queries {
+			m, ok := query.(map[string]interface{})
+			if !ok {
+				return fmt.Errorf("processing scheduled query failed: %v", query)
+			}
+
+			q := scheduledQuery{}
+			q.packName = packName
+			q.Name = queryName
+
+			// This allows us to set the number of rows returned by the query
+			// by appending a number to the query name, e.g. "queryName_10"
+			q.numRows = 1
+			parts := strings.Split(q.Name, "_")
+			if len(parts) == 2 {
+				num, err := strconv.ParseInt(parts[1], 10, 32)
+				if err != nil {
+					num = 1
+				}
+				q.numRows = uint(num)
+			}
+
+			q.ScheduleInterval = m["interval"].(float64)
+			q.Query = m["query"].(string)
+
+			scheduledQueryName := packName + "_" + queryName
+			if lastRun, ok := existingLastRunData[scheduledQueryName]; ok {
+				q.lastRun = lastRun
+			}
+			newScheduledQueryData.Store(scheduledQueryName, q)
+		}
+	}
+
+	a.scheduledQueryMapMutex.Lock()
+	a.scheduledQueryData = newScheduledQueryData
+	a.scheduledQueryMapMutex.Unlock()
+
+	a.stats.RecordFullConfigResponse(int64(len(body)), sentConditional)
+
+	return nil
+}
+
+// canonicalConfigBody returns the config body with the top-level "etag" key
+// removed, re-marshaled the way the server marshals configs (two-space
+// indent, trailing newline) — the representation the validator covers.
+func canonicalConfigBody(body []byte) ([]byte, error) {
+	var config map[string]any
+	if err := json.Unmarshal(body, &config); err != nil {
+		return nil, err
+	}
+	delete(config, "etag")
+	var buf bytes.Buffer
+	enc := json.NewEncoder(&buf)
+	enc.SetIndent("", "  ")
+	if err := enc.Encode(config); err != nil {
+		return nil, err
+	}
+	return buf.Bytes(), nil
+}
+
+// sha256Hex returns the lowercase hex SHA-256 digest of the given bytes,
+// matching the server-assigned validator format.
+func sha256Hex(data []byte) string {
+	sum := sha256.Sum256(data)
+	return fmt.Sprintf("%x", sum)
+}
+
+const stringVals = "abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789-_."
+
+func randomString(n int) string {
+	sb := strings.Builder{}
+	sb.Grow(n)
+	for i := 0; i < n; i++ {
+		sb.WriteByte(stringVals[rand.Int63()%int64(len(stringVals))])
+	}
+	return sb.String()
+}
+
+// selectSoftwareVersion returns a consistent version for a software package based on its name.
+// Uses a per-agent map that assigns each first character to one of 32 version options:
+// - 0: base version (99% probability)
+// - 1: alternate version (0.9% probability)
+// - 2-31: patch versions (0.1% probability, split among 30 different patch numbers)
+// This ensures each agent consistently reports the same version for software with the same first letter.
+func (a *agent) selectSoftwareVersion(softwareName, baseVersion, alternateVersion string) string {
+	if len(softwareName) == 0 {
+		return baseVersion
+	}
+
+	// Get first character as a rune
+	firstChar := rune(softwareName[0])
+
+	// Check if we've already assigned a version option for this character
+	versionOption, exists := a.softwareVersionMap[firstChar]
+	if !exists {
+		// Randomly assign option with distribution matching original randomizeVersion:
+		// 99% base (0), 0.9% alternate (1), 0.1% patch versions (2-31)
+		r := rand.Float64()
+		switch {
+		case r < 0.99:
+			versionOption = 0 // base version
+		case r < 0.999:
+			versionOption = 1 // alternate version
+		default:
+			versionOption = 2 + rand.Intn(30) // patch version: 2-31 maps to patch 0-29
+		}
+		a.softwareVersionMap[firstChar] = versionOption
+	}
+
+	// Return the appropriate version based on the stored option
+	switch versionOption {
+	case 0:
+		return baseVersion
+	case 1:
+		return alternateVersion
+	default: // 2-31
+		patchNum := versionOption - 2 // 0-29
+		return fmt.Sprintf("%s.%d", baseVersion, patchNum)
+	}
+}
+
+func (a *agent) CachedString(key string) string {
+	if val, ok := a.strings[key]; ok {
+		return val
+	}
+	val := randomString(12)
+	a.strings[key] = val
+	return val
+}
+
+func (a *agent) hostUsers() []map[string]string {
+	groupNames := []string{"staff", "nobody", "wheel", "tty", "daemon"}
+	shells := []string{"/bin/zsh", "/bin/sh", "/usr/bin/false", "/bin/bash"}
+	commonUsers := make([]map[string]string, a.userCount.common)
+	for i := 0; i < len(commonUsers); i++ {
+		commonUsers[i] = map[string]string{
+			"uid":       fmt.Sprint(i),
+			"username":  fmt.Sprintf("Common_%d", i),
+			"type":      "", // Empty for macOS.
+			"groupname": groupNames[i%len(groupNames)],
+			"shell":     shells[i%len(shells)],
+		}
+	}
+	uniqueUsers := make([]map[string]string, a.userCount.unique)
+	for i := 0; i < len(uniqueUsers); i++ {
+		uniqueUsers[i] = map[string]string{
+			"uid":       fmt.Sprint(i),
+			"username":  fmt.Sprintf("Unique_%d_%d", a.agentIndex, i),
+			"type":      "", // Empty for macOS.
+			"groupname": groupNames[i%len(groupNames)],
+			"shell":     shells[i%len(shells)],
+		}
+	}
+	users := commonUsers
+	users = append(users, uniqueUsers...)
+	rand.Shuffle(len(users), func(i, j int) {
+		users[i], users[j] = users[j], users[i]
+	})
+	return users
+}
+
+func (a *agent) softwareMacOS() []map[string]string {
+	totalCommon := a.softwareCount.common
+	totalDuplicates := (a.softwareCount.common * a.softwareCount.duplicateBundleIdentifiersPercent) / 100
+	totalSoftware := totalCommon + totalDuplicates
+
+	var startIdx, endIdx int
+
+	if a.totalHostCount == 0 {
+		// non-distributed mode, all hosts get the same software count
+		startIdx = 0
+		endIdx = totalSoftware
+	} else {
+		// distributed mode, distribute software across hosts
+		globalAgentIndex := a.hostIndexOffset + (a.agentIndex - 1)
+
+		perHostCount := totalSoftware / a.totalHostCount
+		remainder := totalSoftware % a.totalHostCount
+
+		startIdx = globalAgentIndex * perHostCount
+		if globalAgentIndex < remainder {
+			startIdx += globalAgentIndex
+		} else {
+			startIdx += remainder
+		}
+
+		endIdx = startIdx + perHostCount
+		if globalAgentIndex < remainder {
+			endIdx++
+		}
+	}
+
+	// Template software is served identically to every macOS host, mirroring the
+	// Windows and Ubuntu templates. This is what makes a simulated Mac fleet
+	// homogeneous: every host reports the same titles, so concurrent ingest
+	// contends on the software_titles unique index the way a real corporate
+	// Mac fleet does. Unlike the "common" pool, it is never sliced per-host.
+	templateSoftware := make([]map[string]string, 0, len(macOSSoftware))
+	for _, s := range macOSSoftware {
+		var lastOpenedAt string
+		if l := a.genLastOpenedAt(s["name"]); l != nil {
+			lastOpenedAt = l.Format(time.UnixDate)
+		}
+		baseVersion := s["version"]
+		templateSoftware = append(templateSoftware, map[string]string{
+			"name":              s["name"],
+			"version":           a.selectSoftwareVersion(s["name"], baseVersion, baseVersion+".1"),
+			"bundle_identifier": s["bundle_identifier"],
+			"source":            s["source"],
+			"last_opened_at":    lastOpenedAt,
+			"installed_path":    s["installed_path"],
+		})
+	}
+
+	commonSoftware := make([]map[string]string, 0)
+	duplicateBundleSoftware := make([]map[string]string, 0)
+	groupSize := 4
+
+	for i := startIdx; i < endIdx; i++ {
+		if i < totalCommon {
+			name := fmt.Sprintf("Common_%d%s", i, a.commonSoftwareNameSuffix)
+			var lastOpenedAt string
+			if l := a.genLastOpenedAt(name); l != nil {
+				lastOpenedAt = fmt.Sprint(l.Unix())
+			}
+			commonSoftware = append(commonSoftware, map[string]string{
+				"name":              name,
+				"version":           a.selectSoftwareVersion(name, "0.0.1", "0.0.2"),
+				"bundle_identifier": fmt.Sprintf("com.fleetdm.osquery-perf.common_%d", i),
+				"source":            "apps",
+				"last_opened_at":    lastOpenedAt,
+				"installed_path":    fmt.Sprintf("/some/path/Common_%d.app", i),
+			})
+		} else {
+			duplicateIdx := i - totalCommon
+			bundleIDIndex := duplicateIdx / groupSize
+			parentIdx := bundleIDIndex % totalCommon
+			bundleID := fmt.Sprintf("com.fleetdm.osquery-perf.common_%d", parentIdx)
+
+			var name string
+			if a.softwareCount.softwareRenaming {
+				name = fmt.Sprintf("RENAMED_DuplicateBundle_%d", duplicateIdx)
+			} else {
+				name = fmt.Sprintf("DuplicateBundle_%d", duplicateIdx)
+			}
+
+			var installedPath string
+			if a.softwareCount.embeddedBundlePaths {
+				installedPath = fmt.Sprintf("/some/path/Common_%d.app/Contents/Library/LoginItems/%s.app", parentIdx, name)
+			} else {
+				installedPath = fmt.Sprintf("/some/path/DuplicateBundle_%d.app", duplicateIdx)
+			}
+
+			duplicateBundleSoftware = append(duplicateBundleSoftware, map[string]string{
+				"name":              name,
+				"version":           fmt.Sprintf("0.0.1%d", duplicateIdx),
+				"bundle_identifier": bundleID,
+				"source":            "apps",
+				"installed_path":    installedPath,
+			})
+		}
+	}
+
+	// Unique Software (always per-host, not distributed)
+	uniqueSoftware := make([]map[string]string, a.softwareCount.unique)
+	for i := 0; i < len(uniqueSoftware); i++ {
+		name := fmt.Sprintf("Unique_%s_%d", a.CachedString("hostname"), i)
+		var lastOpenedAt string
+		if l := a.genLastOpenedAt(name); l != nil {
+			lastOpenedAt = l.Format(time.UnixDate)
+		}
+		uniqueSoftware[i] = map[string]string{
+			"name":              name,
+			"version":           a.selectSoftwareVersion(name, "1.1.1", "1.1.2"),
+			"bundle_identifier": fmt.Sprintf("com.fleetdm.osquery-perf.unique_%s_%d", a.CachedString("hostname"), i),
+			"source":            "apps",
+			"last_opened_at":    lastOpenedAt,
+			"installed_path":    fmt.Sprintf("/some/path/Unique_%s_%d.app", a.CachedString("hostname"), i),
+		}
+	}
+	if a.softwareCount.uniqueSoftwareUninstallProb > 0.0 && rand.Float64() <= a.softwareCount.uniqueSoftwareUninstallProb {
+		rand.Shuffle(len(uniqueSoftware), func(i, j int) {
+			uniqueSoftware[i], uniqueSoftware[j] = uniqueSoftware[j], uniqueSoftware[i]
+		})
+		uniqueSoftware = uniqueSoftware[:a.softwareCount.unique-a.softwareCount.uniqueSoftwareUninstallCount]
+	}
+
+	// Use database software 80% of the time if available; otherwise use legacy vulnerable software.
+	var realSoftware []map[string]string
+	if softwareDB != nil && len(softwareDB.Darwin) > 0 && rand.Float64() < 0.8 { // nolint:gosec,G404 // load testing, not security-sensitive
+		// Initialize cached indices on first call, then mutate on subsequent calls
+		if a.cachedSoftwareIndices == nil {
+			// Select a random count between min-max, then pick that many random indices
+			count := softwaredb.RandomSoftwareCount("darwin")
+			perm := rand.Perm(len(softwareDB.Darwin))
+			a.cachedSoftwareIndices = make([]uint32, count)
+			for i := 0; i < count; i++ {
+				a.cachedSoftwareIndices[i] = uint32(perm[i])
+			}
+		} else {
+			a.cachedSoftwareIndices = softwaredb.MaybeMutateSoftware(a.cachedSoftwareIndices, len(softwareDB.Darwin))
+		}
+		realSoftware = softwareDB.DarwinToMaps(a.cachedSoftwareIndices)
+	} else {
+		// Vulnerable Software
+		var vCount int
+		if a.softwareCount.vulnerable < 0 {
+			vCount = len(macosVulnerableSoftware)
+		} else {
+			vCount = a.softwareCount.vulnerable
+		}
+
+		realSoftware = make([]map[string]string, 0, vCount)
+		randomIndices := rand.Perm(len(macosVulnerableSoftware)) // Randomize software selection
+		var softwareLimit int
+
+		switch {
+		case a.softwareCount.vulnerable < 0: // Sequential assignment
+			softwareLimit = len(macosVulnerableSoftware)
+		case a.softwareCount.vulnerable == 0: // No vulnerable software
+			softwareLimit = 0
+		default: // Random assignment
+			softwareLimit = min(a.softwareCount.vulnerable, len(macosVulnerableSoftware)) // Limit to available software
+		}
+
+		for i := range softwareLimit {
+			var sw fleet.Software
+
+			if a.softwareCount.vulnerable < 0 {
+				sw = macosVulnerableSoftware[i]
+			} else {
+				sw = macosVulnerableSoftware[randomIndices[i]]
+			}
+
+			var lastOpenedAt string
+			if l := a.genLastOpenedAt(sw.Name); l != nil {
+				lastOpenedAt = l.Format(time.UnixDate)
+			}
+
+			realSoftware = append(realSoftware, map[string]string{
+				"name":              sw.Name,
+				"version":           sw.Version,
+				"bundle_identifier": sw.BundleIdentifier,
+				"source":            sw.Source,
+				"last_opened_at":    lastOpenedAt,
+				"installed_path":    fmt.Sprintf("/some/path/%s", sw.Name),
+			})
+		}
+	}
+
+	// Combine all software
+	software := templateSoftware
+	software = append(software, commonSoftware...)
+	software = append(software, uniqueSoftware...)
+	software = append(software, realSoftware...)
+	software = append(software, duplicateBundleSoftware...)
+	a.installedSoftware.Range(func(key, value interface{}) bool {
+		software = append(software, value.(map[string]string))
+		return true
+	})
+	rand.Shuffle(len(software), func(i, j int) {
+		software[i], software[j] = software[j], software[i]
+	})
+
+	return software
+}
+
+func (a *mdmAgent) softwareIOSandIPadOS(source string) []fleet.Software {
+	commonSoftware := make([]map[string]string, a.softwareCount.common)
+	for i := 0; i < len(commonSoftware); i++ {
+		name := fmt.Sprintf("Common_%d", i)
+		commonSoftware[i] = map[string]string{
+			"name":              name,
+			"version":           a.selectSoftwareVersion(name, "0.0.1", "0.0.2"),
+			"bundle_identifier": fmt.Sprintf("com.fleetdm.osquery-perf.common_%d", i),
+			"source":            source,
+		}
+	}
+	if a.softwareCount.commonSoftwareUninstallProb > 0.0 && rand.Float64() <= a.softwareCount.commonSoftwareUninstallProb {
+		rand.Shuffle(len(commonSoftware), func(i, j int) {
+			commonSoftware[i], commonSoftware[j] = commonSoftware[j], commonSoftware[i]
+		})
+		commonSoftware = commonSoftware[:a.softwareCount.common-a.softwareCount.commonSoftwareUninstallCount]
+	}
+	uniqueSoftware := make([]map[string]string, a.softwareCount.unique)
+	for i := 0; i < len(uniqueSoftware); i++ {
+		name := fmt.Sprintf("Unique_%s_%d", a.CachedString("hostname"), i)
+		uniqueSoftware[i] = map[string]string{
+			"name":              name,
+			"version":           a.selectSoftwareVersion(name, "1.1.1", "1.1.2"),
+			"bundle_identifier": fmt.Sprintf("com.fleetdm.osquery-perf.unique_%s_%d", a.CachedString("hostname"), i),
+			"source":            source,
+		}
+	}
+	if a.softwareCount.uniqueSoftwareUninstallProb > 0.0 && rand.Float64() <= a.softwareCount.uniqueSoftwareUninstallProb {
+		rand.Shuffle(len(uniqueSoftware), func(i, j int) {
+			uniqueSoftware[i], uniqueSoftware[j] = uniqueSoftware[j], uniqueSoftware[i]
+		})
+		uniqueSoftware = uniqueSoftware[:a.softwareCount.unique-a.softwareCount.uniqueSoftwareUninstallCount]
+	}
+	software := commonSoftware
+	software = append(software, uniqueSoftware...)
+	rand.Shuffle(len(software), func(i, j int) {
+		software[i], software[j] = software[j], software[i]
+	})
+	fleetSoftware := make([]fleet.Software, len(software))
+	for i, s := range software {
+		fleetSoftware[i] = fleet.Software{
+			Name:             s["name"],
+			Version:          s["version"],
+			BundleIdentifier: s["bundle_identifier"],
+			Source:           s["source"],
+		}
+	}
+	return fleetSoftware
+}
+
+func (a *agent) softwareVSCodeExtensions() []map[string]string {
+	commonVSCodeExtensionsSoftware := make([]map[string]string, a.softwareVSCodeExtensionsCount.common)
+	for i := 0; i < len(commonVSCodeExtensionsSoftware); i++ {
+		name := fmt.Sprintf("common.extension_%d", i)
+		commonVSCodeExtensionsSoftware[i] = map[string]string{
+			"name":    name,
+			"version": a.selectSoftwareVersion(name, "0.0.1", "0.0.2"),
+			"source":  "vscode_extensions",
+		}
+	}
+	if a.softwareVSCodeExtensionsCount.commonSoftwareUninstallProb > 0.0 && rand.Float64() <= a.softwareCount.commonSoftwareUninstallProb {
+		rand.Shuffle(len(commonVSCodeExtensionsSoftware), func(i, j int) {
+			commonVSCodeExtensionsSoftware[i], commonVSCodeExtensionsSoftware[j] = commonVSCodeExtensionsSoftware[j], commonVSCodeExtensionsSoftware[i]
+		})
+		commonVSCodeExtensionsSoftware = commonVSCodeExtensionsSoftware[:a.softwareVSCodeExtensionsCount.common-a.softwareVSCodeExtensionsCount.commonSoftwareUninstallCount]
+	}
+	uniqueVSCodeExtensionsSoftware := make([]map[string]string, a.softwareVSCodeExtensionsCount.unique)
+	for i := 0; i < len(uniqueVSCodeExtensionsSoftware); i++ {
+		name := fmt.Sprintf("unique.extension_%s_%d", a.CachedString("hostname"), i)
+		uniqueVSCodeExtensionsSoftware[i] = map[string]string{
+			"name":    name,
+			"version": a.selectSoftwareVersion(name, "1.1.1", "1.1.2"),
+			"source":  "vscode_extensions",
+		}
+	}
+	if a.softwareVSCodeExtensionsCount.uniqueSoftwareUninstallProb > 0.0 && rand.Float64() <= a.softwareVSCodeExtensionsCount.uniqueSoftwareUninstallProb {
+		rand.Shuffle(len(uniqueVSCodeExtensionsSoftware), func(i, j int) {
+			uniqueVSCodeExtensionsSoftware[i], uniqueVSCodeExtensionsSoftware[j] = uniqueVSCodeExtensionsSoftware[j], uniqueVSCodeExtensionsSoftware[i]
+		})
+		uniqueVSCodeExtensionsSoftware = uniqueVSCodeExtensionsSoftware[:a.softwareVSCodeExtensionsCount.unique-a.softwareVSCodeExtensionsCount.uniqueSoftwareUninstallCount]
+	}
+	var vulnerableVSCodeExtensionsSoftware []map[string]string
+	for _, vsCodeExtension := range vsCodeExtensionsVulnerableSoftware {
+		vulnerableVSCodeExtensionsSoftware = append(vulnerableVSCodeExtensionsSoftware, map[string]string{
+			"name":    vsCodeExtension.Name,
+			"version": vsCodeExtension.Version,
+			"vendor":  vsCodeExtension.Vendor,
+			"source":  vsCodeExtension.Source,
+		})
+	}
+	software := commonVSCodeExtensionsSoftware
+	software = append(software, uniqueVSCodeExtensionsSoftware...)
+	software = append(software, vulnerableVSCodeExtensionsSoftware...)
+	rand.Shuffle(len(software), func(i, j int) {
+		software[i], software[j] = software[j], software[i]
+	})
+	return software
+}
+
+// adobePluginsExtensionsDir returns the directory Adobe plugins are reported from, for
+// the simulated host's platform (not the platform osquery-perf runs on).
+func (a *agent) adobePluginsExtensionsDir() string {
+	if a.os == "windows" {
+		return `C:\Program Files\Common Files\Adobe\CEP\extensions\`
+	}
+	return "/Library/Application Support/Adobe/CEP/extensions/"
+}
+
+// adobePlugin returns one plugin with a readable manifest, with the columns of the
+// software_adobe_plugins detail query. dirName is the extension's directory name, which is
+// also its bundle id. bundle_identifier and extension_for are always empty, and the bundle id
+// is reported as extension_id, as the detail query reports them.
+func (a *agent) adobePlugin(name, dirName, baseVersion, alternateVersion string) map[string]string {
+	return map[string]string{
+		"name":              name,
+		"version":           a.selectSoftwareVersion(name, baseVersion, alternateVersion),
+		"bundle_identifier": "",
+		"extension_id":      dirName,
+		"extension_for":     "",
+		"source":            "adobe_plugins",
+		"vendor":            "Fleet Test Vendor",
+		"last_opened_at":    "",
+		"installed_path":    a.adobePluginsExtensionsDir() + dirName,
+	}
+}
+
+// softwareAdobePlugins generates the Adobe plugins reported by fleetd's adobe_plugins
+// table.
+func (a *agent) softwareAdobePlugins() []map[string]string {
+	commonPlugins := make([]map[string]string, a.softwareAdobePluginsCount.common)
+	for i := range commonPlugins {
+		dirName := fmt.Sprintf("com.fleetdm.osquery-perf.adobe_plugin_%d", i)
+		commonPlugins[i] = a.adobePlugin(fmt.Sprintf("Common Adobe Plugin %d", i), dirName, "0.0.1", "0.0.2")
+
+		// Hosts also report plugins whose manifest is missing or unparseable: fleetd falls
+		// back to the extension's directory name and reports no version, vendor or bundle ID.
+		// Report the last common plugin that way so inventory covers those rows too.
+		if len(commonPlugins) > 1 && i == len(commonPlugins)-1 {
+			commonPlugins[i]["name"] = dirName
+			commonPlugins[i]["version"] = ""
+			commonPlugins[i]["vendor"] = ""
+			commonPlugins[i]["extension_id"] = ""
+		}
+	}
+	if a.softwareAdobePluginsCount.commonSoftwareUninstallProb > 0.0 && rand.Float64() <= a.softwareAdobePluginsCount.commonSoftwareUninstallProb {
+		rand.Shuffle(len(commonPlugins), func(i, j int) {
+			commonPlugins[i], commonPlugins[j] = commonPlugins[j], commonPlugins[i]
+		})
+		commonPlugins = commonPlugins[:max(0, a.softwareAdobePluginsCount.common-a.softwareAdobePluginsCount.commonSoftwareUninstallCount)]
+	}
+
+	uniquePlugins := make([]map[string]string, a.softwareAdobePluginsCount.unique)
+	for i := range uniquePlugins {
+		dirName := fmt.Sprintf("com.fleetdm.osquery-perf.adobe_plugin_%s_%d", a.CachedString("hostname"), i)
+		uniquePlugins[i] = a.adobePlugin(fmt.Sprintf("Unique Adobe Plugin %s %d", a.CachedString("hostname"), i), dirName, "1.1.1", "1.1.2")
+	}
+	if a.softwareAdobePluginsCount.uniqueSoftwareUninstallProb > 0.0 && rand.Float64() <= a.softwareAdobePluginsCount.uniqueSoftwareUninstallProb {
+		rand.Shuffle(len(uniquePlugins), func(i, j int) {
+			uniquePlugins[i], uniquePlugins[j] = uniquePlugins[j], uniquePlugins[i]
+		})
+		uniquePlugins = uniquePlugins[:max(0, a.softwareAdobePluginsCount.unique-a.softwareAdobePluginsCount.uniqueSoftwareUninstallCount)]
+	}
+
+	plugins := commonPlugins
+	plugins = append(plugins, uniquePlugins...)
+	rand.Shuffle(len(plugins), func(i, j int) {
+		plugins[i], plugins[j] = plugins[j], plugins[i]
+	})
+	return plugins
+}
+
+func selectKernels(kernelList []map[string]string) []map[string]string {
+	// Determine number of kernels based on probability distribution
+	r := rand.Float64()
+	var numKernels int
+	switch {
+	case r < 0.05:
+		numKernels = 0 // 5% - rare, fresh install
+	case r < 0.45:
+		numKernels = 1 // 40% - most common, single current kernel
+	case r < 0.75:
+		numKernels = 2 // 30% - common, current + previous
+	case r < 0.90:
+		numKernels = 3 // 15% - a few old kernels
+	case r < 0.95:
+		numKernels = 4 // 5% - rare
+	case r < 0.98:
+		numKernels = 5 // 3% - very rare
+	default:
+		numKernels = 6 // 2% - very rare, many old kernels not cleaned up
+	}
+
+	if numKernels == 0 || len(kernelList) == 0 {
+		return nil
+	}
+
+	// Randomly select unique kernels
+	indices := rand.Perm(len(kernelList))
+	kernels := make([]map[string]string, 0, numKernels)
+
+	for i := 0; i < numKernels && i < len(indices); i++ {
+		// Copy the map so callers cannot mutate the shared package-level slice.
+		src := kernelList[indices[i]]
+		entry := make(map[string]string, len(src))
+		maps.Copy(entry, src)
+		kernels = append(kernels, entry)
+	}
+
+	return kernels
+}
+
+func (a *agent) DistributedRead() (*distributedReadResponse, error) {
+	request, err := http.NewRequest("POST", a.serverAddress+a.distributedAPIPrefix()+"/distributed/read", bytes.NewReader([]byte(`{"node_key": "`+a.distributedNodeKey()+`"}`)))
+	if err != nil {
+		return nil, err
+	}
+	request.Header.Add("Content-type", "application/json")
+
+	response, err := http.DefaultClient.Do(a.sign(request))
+	if err != nil {
+		return nil, fmt.Errorf("distributed/read request failed to run: %w", err)
+	}
+	defer response.Body.Close()
+
+	a.stats.IncrementDistributedReads()
+
+	statusCode := response.StatusCode
+	if statusCode != http.StatusOK {
+		a.stats.IncrementDistributedReadErrors()
+		return nil, fmt.Errorf("distributed/read request failed: %d", statusCode)
+	}
+
+	var parsedResp distributedReadResponse
+	if err := json.NewDecoder(response.Body).Decode(&parsedResp); err != nil {
+		a.stats.IncrementDistributedReadErrors()
+		log.Printf("json parse: %s", err)
+		return nil, err
+	}
+
+	return &parsedResp, nil
+}
+
+var defaultQueryResult = []map[string]string{
+	{"foo": "bar"},
+}
+
+// genLastOpenedAt returns a cached last_opened_at timestamp for the given software.
+// On first call for a piece of software, it decides whether to assign a timestamp
+// (up to withLastOpened items total). On subsequent calls, it returns the cached
+// value, occasionally updating it based on lastOpenedProb to simulate the app
+// being reopened.
+func (a *agent) genLastOpenedAt(softwareName string) *time.Time {
+	a.cachedLastOpenedAtMutex.Lock()
+	defer a.cachedLastOpenedAtMutex.Unlock()
+
+	// Check if we already have a cached value for this software
+	if cached, exists := a.cachedLastOpenedAt[softwareName]; exists {
+		if cached == nil {
+			// This software was decided to not have last_opened_at
+			return nil
+		}
+		// Maybe update the timestamp (simulating the app being reopened)
+		if rand.Float64() <= a.softwareCount.lastOpenedProb {
+			now := time.Now()
+			a.cachedLastOpenedAt[softwareName] = &now
+			return &now
+		}
+		// Return the existing cached timestamp
+		return cached
+	}
+
+	// First time seeing this software - decide if it should have a last_opened_at
+	// Count how many software items already have a timestamp
+	countWithTimestamp := 0
+	for _, v := range a.cachedLastOpenedAt {
+		if v != nil {
+			countWithTimestamp++
+		}
+	}
+
+	if countWithTimestamp >= a.softwareCount.withLastOpened {
+		// We've reached the limit, this software won't have last_opened_at
+		a.cachedLastOpenedAt[softwareName] = nil
+		return nil
+	}
+
+	// Assign a timestamp to this software
+	now := time.Now()
+	a.cachedLastOpenedAt[softwareName] = &now
+	return &now
+}
+
+func (a *agent) runPolicy(query string) []map[string]string {
+	// Used to control the pass or fail of a policy
+	// in the UI by setting the query to "select 1"(pass)
+	// or "select 0"(fail)
+	query = strings.TrimRight(query, ";")
+	query = strings.ToLower(query)
+
+	switch query {
+	case "select 1":
+		return []map[string]string{
+			{"1": "1"},
+		}
+	case "select 0":
+		return []map[string]string{}
+	}
+
+	if rand.Float64() <= a.policyPassProb {
+		return []map[string]string{
+			{"1": "1"},
+		}
+	}
+	return []map[string]string{}
+}
+
+func (a *agent) randomQueryStats() []map[string]string {
+	var stats []map[string]string
+	a.scheduledQueryMapMutex.RLock()
+	queryData := a.scheduledQueryData
+	a.scheduledQueryMapMutex.RUnlock()
+
+	queryData.Range(func(key, value any) bool {
+		queryName := key.(string)
+
+		stats = append(stats, map[string]string{
+			"name":           queryName,
+			"delimiter":      "_",
+			"average_memory": fmt.Sprint(rand.Intn(200) + 10),
+			"denylisted":     "false",
+			"executions":     fmt.Sprint(rand.Intn(100) + 1),
+			"interval":       fmt.Sprint(rand.Intn(100) + 1),
+			"last_executed":  fmt.Sprint(time.Now().Unix()),
+			"output_size":    fmt.Sprint(rand.Intn(100) + 1),
+			"system_time":    fmt.Sprint(rand.Intn(4000) + 10),
+			"user_time":      fmt.Sprint(rand.Intn(4000) + 10),
+			"wall_time":      fmt.Sprint(rand.Intn(4) + 1),
+			"wall_time_ms":   fmt.Sprint(rand.Intn(4000) + 10),
+		})
+
+		return true
+	})
+	return stats
+}
+
+// mdmMac returns the results for the `mdm` table query.
+//
+// If the host is enrolled via MDM it will return installed_from_dep as false
+// (which means the host will be identified as manually enrolled).
+//
+// NOTE: To support proper DEP simulation in a loadtest environment
+// we may need to implement a mocked Apple DEP endpoint.
+func (a *agent) mdmMac() []map[string]string {
+	if !a.mdmEnrolled() {
+		return []map[string]string{
+			{"enrolled": "false", "server_url": "", "installed_from_dep": "false"},
+		}
+	}
+	return []map[string]string{
+		{
+			"enrolled":           "true",
+			"server_url":         a.macMDMClient.EnrollInfo.MDMURL,
+			"installed_from_dep": "false",
+			"payload_identifier": apple_mdm.FleetPayloadIdentifier,
+		},
+	}
+}
+
+// mdmConfigProfilesMac returns the profiles this agent has acknowledged
+// installing on the device and user channels, merged as the server's
+// mdm_config_profiles_darwin_with_user query does with the macos_profiles and
+// macos_user_profiles tables.
+func (a *agent) mdmConfigProfilesMac() []map[string]string {
+	a.installedProfilesMu.Lock()
+	defer a.installedProfilesMu.Unlock()
+
+	results := make([]map[string]string, 0, len(a.installedProfiles))
+	for _, profile := range a.installedProfiles {
+		results = append(results, map[string]string{
+			"identifier":   profile.identifier,
+			"display_name": profile.displayName,
+			"install_date": profile.installDate.Format("2006-01-02 15:04:05 -0700"),
+		})
+	}
+	return results
+}
+
+func (a *agent) entraConditionalAccess() []map[string]string {
+	return []map[string]string{
+		{
+			"device_id":           a.entraIDDeviceID,
+			"user_principal_name": a.entraIDUserPrincipalName,
+		},
+	}
+}
+
+func (a *agent) mdmEnrolled() bool {
+	a.isEnrolledToMDMMu.Lock()
+	defer a.isEnrolledToMDMMu.Unlock()
+
+	return a.isEnrolledToMDM
+}
+
+func (a *agent) setMDMEnrolled() {
+	a.isEnrolledToMDMMu.Lock()
+	defer a.isEnrolledToMDMMu.Unlock()
+
+	a.isEnrolledToMDM = true
+}
+
+func (a *agent) setMDMUserEnrolled() {
+	a.isMDMUserEnrolledMu.Lock()
+	defer a.isMDMUserEnrolledMu.Unlock()
+
+	a.isMDMUserEnrolled = true
+}
+
+func (a *agent) mdmUserEnrolled() bool {
+	a.isMDMUserEnrolledMu.Lock()
+	defer a.isMDMUserEnrolledMu.Unlock()
+
+	return a.isMDMUserEnrolled
+}
+
+func (a *agent) mdmWindows() []map[string]string {
+	if !a.mdmEnrolled() {
+		return []map[string]string{
+			// empty service url means not enrolled
+			{"aad_resource_id": "", "discovery_service_url": "", "provider_id": "", "installation_type": "Client"},
+		}
+	}
+	return []map[string]string{
+		{
+			"aad_resource_id":       "",
+			"discovery_service_url": a.serverAddress,
+			"provider_id":           fleet.WellKnownMDMFleet,
+			"installation_type":     "Client",
+		},
+	}
+}
+
+var munkiIssues = func() []string {
+	// generate a list of random munki issues (messages)
+	issues := make([]string, 1000)
+	for i := range issues {
+		// message size: between 60 and 200, with spaces between each 10-char word so
+		// that it can still make a bit of sense for UI tests.
+		numParts := rand.Intn(15) + 6 // number between 0-14, add 6 to get between 6-20
+		var sb strings.Builder
+		for j := 0; j < numParts; j++ {
+			if j > 0 {
+				sb.WriteString(" ")
+			}
+			sb.WriteString(randomString(10))
+		}
+		issues[i] = sb.String()
+	}
+	return issues
+}()
+
+func (a *agent) munkiInfo() []map[string]string {
+	var errors, warnings []string
+
+	if rand.Float64() <= a.munkiIssueProb {
+		for i := 0; i < a.munkiIssueCount; i++ {
+			if rand.Intn(2) == 1 {
+				errors = append(errors, munkiIssues[rand.Intn(len(munkiIssues))])
+			} else {
+				warnings = append(warnings, munkiIssues[rand.Intn(len(munkiIssues))])
+			}
+		}
+	}
+
+	errList := strings.Join(errors, ";")
+	warnList := strings.Join(warnings, ";")
+	return []map[string]string{
+		{"version": "1.2.3", "errors": errList, "warnings": warnList},
+	}
+}
+
+func (a *agent) googleChromeProfiles() []map[string]string {
+	count := rand.Intn(5) // return between 0 and 4 emails
+	result := make([]map[string]string, count)
+	for i := range result {
+		email := fmt.Sprintf("user%d@example.com", i)
+		if i == len(result)-1 {
+			// if the maximum number of emails is returned, set a random domain name
+			// so that we have email addresses that match a lot of hosts, and some
+			// that match few hosts.
+			domainRand := rand.Intn(10)
+			email = fmt.Sprintf("user%d@example%d.com", i, domainRand)
+		}
+		result[i] = map[string]string{"email": email}
+	}
+	return result
+}
+
+func (a *agent) batteries() []map[string]string {
+	count := rand.Intn(3) // return between 0 and 2 batteries
+	result := make([]map[string]string, count)
+	for i := range result {
+		max_capacity := 700 + rand.Intn(300) // between 700 and 1000 to ensure most batteries are healthy
+		cycleCount := rand.Intn(1200)
+
+		result[i] = map[string]string{
+			"serial_number":     fmt.Sprintf("%04d", i),
+			"cycle_count":       strconv.Itoa(cycleCount),
+			"max_capacity":      strconv.Itoa(max_capacity),
+			"designed_capacity": "1000",
+		}
+	}
+	return result
+}
+
+func (a *agent) diskSpace() []map[string]string {
+	// between 1-100 gigs, between 0-99 percentage available
+	gigs := rand.Intn(100)
+	gigs++
+	pct := rand.Intn(100)
+	available := gigs * pct / 100
+	return []map[string]string{
+		{
+			"percent_disk_space_available": strconv.Itoa(pct),
+			"gigs_disk_space_available":    strconv.Itoa(available),
+			"gigs_total_disk_space":        strconv.Itoa(gigs),
+		},
+	}
+}
+
+func (a *agent) diskEncryption() []map[string]string {
+	// 50% of results have encryption enabled
+	a.DiskEncryptionEnabled = rand.Intn(2) == 1
+	if a.DiskEncryptionEnabled {
+		return []map[string]string{{"1": "1"}}
+	}
+	return []map[string]string{}
+}
+
+func (a *agent) diskEncryptionWindows() []map[string]string {
+	// 50% of results have encryption enabled
+	a.DiskEncryptionEnabled = rand.Intn(2) == 1
+	if a.DiskEncryptionEnabled {
+		return []map[string]string{{
+			"protection_status": strconv.Itoa(fleet.BitLockerProtectionStatusOn),
+			"conversion_status": strconv.Itoa(fleet.BitLockerConversionStatusFullyEncrypted),
+		}}
+	}
+	return []map[string]string{{
+		"protection_status": strconv.Itoa(fleet.BitLockerProtectionStatusOff),
+		"conversion_status": strconv.Itoa(fleet.BitLockerConversionStatusFullyDecrypted),
+	}}
+}
+
+func (a *agent) diskEncryptionLinux() []map[string]string {
+	// 50% of results have encryption enabled
+	a.DiskEncryptionEnabled = rand.Intn(2) == 1
+	if a.DiskEncryptionEnabled {
+		return []map[string]string{
+			{"path": "/etc", "encrypted": "0"},
+			{"path": "/tmp", "encrypted": "0"},
+			{"path": "/", "encrypted": "1"},
+		}
+	}
+	return []map[string]string{
+		{"path": "/etc", "encrypted": "0"},
+		{"path": "/tmp", "encrypted": "0"},
+	}
+}
+
+func (a *agent) orbitInfo() []map[string]string {
+	version := "1.22.0"
+	desktopVersion := version
+	if a.disableFleetDesktop {
+		desktopVersion = ""
+	}
+	deviceAuthToken := ""
+	if a.deviceAuthToken != nil {
+		deviceAuthToken = *a.deviceAuthToken
+	}
+	return []map[string]string{
+		{
+			"version":             version,
+			"device_auth_token":   deviceAuthToken,
+			"enrolled":            "true",
+			"last_recorded_error": "",
+			"orbit_channel":       "stable",
+			"osqueryd_channel":    "stable",
+			"desktop_channel":     "stable",
+			"desktop_version":     desktopVersion,
+			"uptime":              "10000",
+			"scripts_enabled":     "1",
+		},
+	}
+}
+
+func (a *agent) runLiveQuery(query string) (results []map[string]string, status *fleet.OsqueryStatus, message *string, stats *fleet.Stats) {
+	if a.liveQueryFailProb > 0.0 && rand.Float64() <= a.liveQueryFailProb {
+		ss := fleet.OsqueryStatus(1)
+		return []map[string]string{}, &ss, ptr.String("live query failed with error foobar"), nil
+	}
+	if a.liveQueryNoResultsProb > 0.0 && rand.Float64() <= a.liveQueryNoResultsProb {
+		ss := fleet.OsqueryStatus(0)
+		return []map[string]string{}, &ss, nil, nil
+	}
+
+	// Switch based on contents of the query.
+	lcQuery := strings.ToLower(query)
+	switch {
+	case strings.Contains(lcQuery, "from yara") && strings.Contains(lcQuery, "sigurl"):
+		return a.runLiveYaraQuery(query)
+	default:
+		return a.runLiveMockQuery(query)
+	}
+}
+
+func (a *agent) runLiveYaraQuery(query string) (results []map[string]string, status *fleet.OsqueryStatus, message *string, stats *fleet.Stats) {
+	// Get the URL of the YARA rule to request (i.e. the sigurl).
+	urlRegex := regexp.MustCompile(`sigurl=(["'])([^"']*)["']`)
+	matches := urlRegex.FindStringSubmatch(query)
+	var url string
+	if len(matches) > 2 {
+		url = matches[2]
+	} else {
+		ss := fleet.OsqueryStatus(1)
+		return []map[string]string{}, &ss, ptr.String("live yara query failed because a valid sigurl could not be found"), nil
+	}
+
+	// Osquery validates that the sigurl is one of a configured set, so that it's not
+	// sending requests to just anywhere. We'll check that it's at least the same host
+	// as the Fleet server.
+	if !strings.HasPrefix(url, a.serverAddress) {
+		ss := fleet.OsqueryStatus(1)
+		return []map[string]string{}, &ss, ptr.String("live yara query failed because sigurl host did not match server address"), nil
+	}
+
+	// Make the request.
+	body := []byte(`{"node_key": "` + a.nodeKey + `"}`)
+	request, err := http.NewRequest("POST", url, bytes.NewReader(body))
+	if err != nil {
+		ss := fleet.OsqueryStatus(1)
+		return []map[string]string{}, &ss, ptr.String("live yara query failed due to error creating request"), nil
+	}
+	request.Header.Add("Content-type", "application/json")
+
+	// Make the request.
+	response, err := http.DefaultClient.Do(a.sign(request))
+	if err != nil {
+		ss := fleet.OsqueryStatus(1)
+		return []map[string]string{}, &ss, ptr.String(fmt.Sprintf("yara request failed to run: %v", err)), nil
+	}
+	defer response.Body.Close()
+
+	// For load testing purposes we don't actually care about the response, but check that we at least got one.
+	if _, err := io.Copy(io.Discard, response.Body); err != nil {
+		ss := fleet.OsqueryStatus(1)
+		return []map[string]string{}, &ss, ptr.String(fmt.Sprintf("error reading response from yara API: %v", err)), nil
+	}
+
+	// Return a response indicating that the file is clean.
+	ss := fleet.OsqueryStatus(0)
+	return []map[string]string{
+		{
+			"count":     "0",
+			"matches":   "",
+			"strings":   "",
+			"tags":      "",
+			"sig_group": "",
+			"sigfile":   "",
+			"sigrule":   "",
+			"sigurl":    url,
+			// Could pull this from the query, but not necessary for load testing.
+			"path": "/some/path",
+		},
+	}, &ss, nil, &fleet.Stats{
+		WallTimeMs: uint64(rand.Intn(1000) * 1000), //nolint:gosec // G115: rand.Intn(1000) is bounded, so this cannot overflow.
+		UserTime:   uint64(rand.Intn(1000)),        //nolint:gosec // G115: rand.Intn(1000) is bounded, so this cannot overflow.
+		SystemTime: uint64(rand.Intn(1000)),        //nolint:gosec // G115: rand.Intn(1000) is bounded, so this cannot overflow.
+		Memory:     uint64(rand.Intn(1000)),        //nolint:gosec // G115: rand.Intn(1000) is bounded, so this cannot overflow.
+	}
+}
+
+func (a *agent) runLiveMockQuery(query string) (results []map[string]string, status *fleet.OsqueryStatus, message *string, stats *fleet.Stats) {
+	ss := fleet.OsqueryStatus(0)
+	return []map[string]string{
+		{
+			"admindir":   "/var/lib/dpkg",
+			"arch":       "amd64",
+			"maintainer": "foobar",
+			"name":       "netconf",
+			"priority":   "optional",
+			"revision":   "",
+			"section":    "default",
+			"size":       "112594",
+			"source":     "",
+			"status":     "install ok installed",
+			"version":    "20230224000000",
+		},
+	}, &ss, nil, &fleet.Stats{
+		WallTimeMs: uint64(rand.Intn(1000) * 1000), //nolint:gosec // G115: rand.Intn(1000) is bounded, so this cannot overflow.
+		UserTime:   uint64(rand.Intn(1000)),        //nolint:gosec // G115: rand.Intn(1000) is bounded, so this cannot overflow.
+		SystemTime: uint64(rand.Intn(1000)),        //nolint:gosec // G115: rand.Intn(1000) is bounded, so this cannot overflow.
+		Memory:     uint64(rand.Intn(1000)),        //nolint:gosec // G115: rand.Intn(1000) is bounded, so this cannot overflow.
+	}
+}
+
+func (a *agent) processQuery(name, query string, cachedResults *cachedResults) (
+	handled bool, results []map[string]string,
+	status *fleet.OsqueryStatus, message *string, stats *fleet.Stats,
+) {
+	const (
+		hostPolicyQueryPrefix = "fleet_policy_query_"
+		hostDetailQueryPrefix = "fleet_detail_query_"
+		hostLabelQueryPrefix  = "fleet_label_query_"
+		liveQueryPrefix       = "fleet_distributed_query_"
+	)
+	statusOK := fleet.StatusOK
+	statusNotOK := fleet.OsqueryStatus(1)
+	results = []map[string]string{} // if a query fails, osquery returns empty results array
+
+	switch {
+	case strings.HasPrefix(name, liveQueryPrefix):
+		results, status, message, stats = a.runLiveQuery(query)
+		return true, results, status, message, stats
+	case strings.HasPrefix(name, hostPolicyQueryPrefix):
+		return true, a.runPolicy(query), &statusOK, nil, nil
+	case strings.HasPrefix(name, hostLabelQueryPrefix) &&
+		strings.ToLower(strings.TrimRight(strings.TrimSpace(query), ";")) == "select 1":
+		// "select 1;" is the "All hosts" builtin label query. Its label ID varies
+		// across deployments, so the per-ID template lookup below can't be relied
+		// on to match it; always report membership.
+		return true, []map[string]string{{"1": "1"}}, &statusOK, nil, nil
+	case name == hostDetailQueryPrefix+"scheduled_query_stats":
+		return true, a.randomQueryStats(), &statusOK, nil, nil
+	case name == hostDetailQueryPrefix+"mdm":
+		ss := statusOK
+		if rand.Intn(10) > 0 { // 90% success
+			results = a.mdmMac()
+		} else {
+			ss = statusNotOK
+		}
+		return true, results, &ss, nil, nil
+	case name == hostDetailQueryPrefix+"mdm_config_profiles_darwin":
+		// Simulated fleetd has the macos_user_profiles table, so this legacy
+		// query's discovery fails (it requires the table to NOT exist) and
+		// only mdm_config_profiles_darwin_with_user runs. Report no results
+		// and no status, as osquery does for queries whose discovery fails.
+		return true, nil, nil, nil, nil
+	case name == hostDetailQueryPrefix+"mdm_macos_software_update_id":
+		return true, []map[string]string{
+			{
+				"key":   "compatible",
+				"value": "VMA2MACOSAP", // report an osquery-perf host as a VM
+			},
+		}, &statusOK, nil, nil
+	case name == hostDetailQueryPrefix+"mdm_config_profiles_darwin_with_user":
+		ss := statusOK
+		if rand.Intn(10) > 0 { // 90% success
+			results = a.mdmConfigProfilesMac()
+		} else {
+			ss = statusNotOK
+		}
+		return true, results, &ss, nil, nil
+	case name == hostDetailQueryPrefix+"conditional_access_microsoft_device_id":
+		ss := statusOK
+		if rand.Intn(10) > 0 { // 90% success
+			results = a.entraConditionalAccess()
+		} else {
+			ss = statusNotOK
+		}
+		return true, results, &ss, nil, nil
+	case name == hostDetailQueryPrefix+"mdm_windows":
+		ss := statusOK
+		if rand.Intn(10) > 0 { // 90% success
+			results = a.mdmWindows()
+		} else {
+			ss = statusNotOK
+		}
+		return true, results, &ss, nil, nil
+	case name == hostDetailQueryPrefix+"munki_info":
+		ss := fleet.OsqueryStatus(rand.Intn(2))
+		if ss == fleet.StatusOK {
+			results = a.munkiInfo()
+		}
+		return true, results, &ss, nil, nil
+	case name == hostDetailQueryPrefix+"google_chrome_profiles":
+		ss := fleet.OsqueryStatus(rand.Intn(2))
+		if ss == fleet.StatusOK {
+			results = a.googleChromeProfiles()
+		}
+		return true, results, &ss, nil, nil
+	case name == hostDetailQueryPrefix+"battery":
+		ss := fleet.OsqueryStatus(rand.Intn(2))
+		if ss == fleet.StatusOK {
+			results = a.batteries()
+		}
+		return true, results, &ss, nil, nil
+	case name == hostDetailQueryPrefix+"users":
+		ss := fleet.OsqueryStatus(rand.Intn(2))
+		if ss == fleet.StatusOK {
+			results = a.hostUsers()
+		}
+		return true, results, &ss, nil, nil
+	case name == hostDetailQueryPrefix+"software_macos":
+		ss := fleet.StatusOK
+		if a.softwareQueryFailureProb > 0.0 && rand.Float64() <= a.softwareQueryFailureProb {
+			ss = fleet.OsqueryStatus(1)
+		}
+		if ss == fleet.StatusOK {
+			results = a.softwareMacOS()
+			cachedResults.software = results
+		}
+		return true, results, &ss, nil, nil
+	case name == hostDetailQueryPrefix+"software_macos_codesign":
+		// Given queries run in lexicographic order software_macos already run and
+		// cachedResults.software should have its results.
+		ss := fleet.StatusOK
+		if a.softwareQueryFailureProb > 0.0 && rand.Float64() <= a.softwareQueryFailureProb {
+			ss = fleet.OsqueryStatus(1)
+		}
+		if ss == fleet.StatusOK {
+			if len(cachedResults.software) > 0 {
+				for _, s := range cachedResults.software {
+					if s["source"] != "apps" {
+						continue
+					}
+					installedPath := s["installed_path"]
+					teamIdentifier := s["name"] // use name to be fixed (more realistic than changing often).
+					if len(teamIdentifier) > 10 {
+						teamIdentifier = teamIdentifier[:10]
+					}
+					cdhashSHA256 := fmt.Sprintf("%x", sha1.Sum([]byte(installedPath))) // cdhash returns 40 characters, matching the length of the sha1 here
+					results = append(results, map[string]string{
+						"path":            installedPath,
+						"team_identifier": teamIdentifier,
+						"cdhash_sha256":   cdhashSHA256,
+					})
+				}
+			}
+		}
+		return true, results, &ss, nil, nil
+	case name == hostDetailQueryPrefix+"software_macos_executable_sha256":
+		ss := fleet.StatusOK
+		if a.softwareQueryFailureProb > 0.0 && rand.Float64() <= a.softwareQueryFailureProb {
+			ss = fleet.OsqueryStatus(1)
+		}
+		if ss == fleet.StatusOK {
+			if len(cachedResults.software) > 0 {
+				for _, s := range cachedResults.software {
+					if s["source"] != "apps" {
+						continue
+					}
+					installedPath := s["installed_path"]
+					// Generate mock executable path
+					executablePath := installedPath + "/Contents/MacOS/" + strings.TrimSuffix(s["name"], ".app")
+					// Generate a mock sha256 hash based on the executable path for consistency
+					executableSHA256 := fmt.Sprintf("%x", sha256.Sum256([]byte(executablePath)))
+					results = append(results, map[string]string{
+						"path":              installedPath,
+						"executable_path":   executablePath,
+						"executable_sha256": executableSHA256,
+					})
+				}
+			}
+		}
+		return true, results, &ss, nil, nil
+	case name == hostDetailQueryPrefix+"software_windows":
+		ss := fleet.StatusOK
+		if a.softwareQueryFailureProb > 0.0 && rand.Float64() <= a.softwareQueryFailureProb {
+			ss = fleet.OsqueryStatus(1)
+		}
+		if ss == fleet.StatusOK {
+			// Use database software 80% of the time if available, otherwise use embedded data
+			if softwareDB != nil && len(softwareDB.Windows) > 0 && rand.Float64() < 0.8 { // nolint:gosec,G404 // load testing, not security-sensitive
+				// Initialize cached indices on first call, then mutate on subsequent calls
+				if a.cachedSoftwareIndices == nil {
+					// Select a random count between min-max, then pick that many random indices
+					count := softwaredb.RandomSoftwareCount("windows")
+					perm := rand.Perm(len(softwareDB.Windows))
+					a.cachedSoftwareIndices = make([]uint32, count)
+					for i := 0; i < count; i++ {
+						a.cachedSoftwareIndices[i] = uint32(perm[i])
+					}
+				} else {
+					a.cachedSoftwareIndices = softwaredb.MaybeMutateSoftware(a.cachedSoftwareIndices, len(softwareDB.Windows))
+				}
+				results = softwareDB.WindowsToMaps(a.cachedSoftwareIndices)
+			} else {
+				results = make([]map[string]string, 0, len(windowsSoftware))
+				for _, s := range windowsSoftware {
+					// Use consistent version based on software name's first character
+					baseVersion := s["version"]
+					alternateVersion := baseVersion + ".1"
+					m := map[string]string{
+						"name":         s["name"],
+						"source":       s["source"],
+						"version":      a.selectSoftwareVersion(s["name"], baseVersion, alternateVersion),
+						"upgrade_code": s["upgrade_code"],
+					}
+					results = append(results, m)
+				}
+			}
+			a.installedSoftware.Range(func(key, value interface{}) bool {
+				results = append(results, value.(map[string]string))
+				return true
+			})
+			cachedResults.software = results
+		}
+		return true, results, &ss, nil, nil
+	case name == hostDetailQueryPrefix+"software_windows_program_files_scan":
+		// Given queries run in lexicographic order, software_windows already ran and
+		// cachedResults.software should have its results.
+		ss := fleet.StatusOK
+		if a.softwareQueryFailureProb > 0.0 && rand.Float64() <= a.softwareQueryFailureProb {
+			ss = fleet.OsqueryStatus(1)
+		}
+		if ss == fleet.StatusOK {
+			// Generate file scan results: some duplicate entries (matching programs installed_paths)
+			// and some unique entries (new software not in programs).
+			if len(cachedResults.software) > 0 {
+				// Pick up to 3 programs entries to create duplicate file scan results
+				dupeCount := 0
+				for _, s := range cachedResults.software {
+					if dupeCount >= 3 {
+						break
+					}
+					if s["source"] != "programs" {
+						continue
+					}
+					installedPath := s["installed_path"]
+					if installedPath == "" {
+						continue
+					}
+					results = append(results, map[string]string{
+						"path":            installedPath + `\` + s["name"] + ".exe",
+						"filename":        s["name"] + ".exe",
+						"file_version":    s["version"],
+						"product_version": s["version"],
+						"size":            fmt.Sprintf("%d", rand.Intn(50000000)), //nolint:gosec // load testing
+					})
+					dupeCount++
+				}
+			}
+			// Add unique entries that won't be deduplicated
+			results = append(results,
+				map[string]string{
+					"path":            `C:\Program Files\Windows Defender\MsMpEng.exe`,
+					"filename":        "MsMpEng.exe",
+					"file_version":    "4.18.25030.2",
+					"product_version": "4.18.25030.2",
+					"size":            "12345678",
+				},
+				map[string]string{
+					"path":            `C:\Program Files\Adobe\DNG Converter\DNGConverter.exe`,
+					"filename":        "DNGConverter.exe",
+					"file_version":    "16.1.0.0",
+					"product_version": "16.1",
+					"size":            "98765432",
+				},
+				map[string]string{
+					"path":            `C:\Program Files\Custom App\Subfolder\customapp.exe`,
+					"filename":        "customapp.exe",
+					"file_version":    "2.5.0.0",
+					"product_version": "2.5.0",
+					"size":            "5432100",
+				},
+			)
+		}
+		return true, results, &ss, nil, nil
+	case name == hostDetailQueryPrefix+"software_linux":
+		ss := fleet.StatusOK
+		if a.softwareQueryFailureProb > 0.0 && rand.Float64() <= a.softwareQueryFailureProb {
+			ss = fleet.OsqueryStatus(1)
+		}
+		if ss == fleet.StatusOK {
+			switch a.os {
+			case "ubuntu":
+				// Use database software 80% of the time if available, otherwise use embedded data
+				if softwareDB != nil && len(softwareDB.Ubuntu) > 0 && rand.Float64() < 0.8 { // nolint:gosec,G404 // load testing, not security-sensitive
+					// Initialize cached indices on first call, then mutate on subsequent calls
+					if a.cachedSoftwareIndices == nil {
+						// Select a random count between min-max, then pick that many random indices
+						count := softwaredb.RandomSoftwareCount("ubuntu")
+						perm := rand.Perm(len(softwareDB.Ubuntu))
+						a.cachedSoftwareIndices = make([]uint32, count)
+						for i := 0; i < count; i++ {
+							a.cachedSoftwareIndices[i] = uint32(perm[i])
+						}
+					} else {
+						a.cachedSoftwareIndices = softwaredb.MaybeMutateSoftware(a.cachedSoftwareIndices, len(softwareDB.Ubuntu))
+					}
+					results = softwareDB.UbuntuToMaps(a.cachedSoftwareIndices)
+				} else {
+					results = make([]map[string]string, 0, len(ubuntuSoftware))
+					for _, s := range ubuntuSoftware {
+						softwareName := s["name"]
+						if a.linuxUniqueSoftwareTitle {
+							softwareName = fmt.Sprintf("%s-%d-%s", softwareName, a.agentIndex, linuxRandomBuildNumber)
+						}
+						var version string
+						if a.linuxUniqueSoftwareVersion {
+							version = fmt.Sprintf("1.2.%d-%s", a.agentIndex, linuxRandomBuildNumber)
+						} else {
+							// Use consistent version based on software name's first character
+							baseVersion := s["version"]
+							alternateVersion := baseVersion + ".1"
+							version = a.selectSoftwareVersion(softwareName, baseVersion, alternateVersion)
+						}
+						m := map[string]string{
+							"name":    softwareName,
+							"source":  s["source"],
+							"version": version,
+						}
+						results = append(results, m)
+					}
+				}
+
+				// Add pre-selected kernels for this agent
+				results = append(results, a.linuxKernels...)
+
+				a.installedSoftware.Range(func(key, value interface{}) bool {
+					results = append(results, value.(map[string]string))
+					return true
+				})
+
+			case "rhel":
+				// RHEL agents use the rpm_packages rows from the software DB
+				// (filtered once on first use). When the DB is unavailable, only
+				// kernels and per-host installed software are reported, which is
+				// sufficient for kernel-CVE load testing.
+				rpmPool := loadSoftwareDBRPM()
+				if len(rpmPool) > 0 {
+					if a.cachedSoftwareIndices == nil {
+						count := min(softwaredb.RandomSoftwareCount("ubuntu"), len(rpmPool))
+						perm := rand.Perm(len(rpmPool))
+						a.cachedSoftwareIndices = make([]uint32, count)
+						for i := range count {
+							a.cachedSoftwareIndices[i] = uint32(perm[i]) //nolint:gosec // perm[i] is bounded by len(rpmPool)
+						}
+					} else {
+						a.cachedSoftwareIndices = softwaredb.MaybeMutateSoftware(a.cachedSoftwareIndices, len(rpmPool))
+					}
+					results = rpmSliceToMaps(rpmPool, a.cachedSoftwareIndices)
+				}
+
+				// Add pre-selected kernels for this agent
+				results = append(results, a.linuxKernels...)
+
+				a.installedSoftware.Range(func(key, value any) bool {
+					results = append(results, value.(map[string]string))
+					return true
+				})
+			}
+		}
+		return true, results, &ss, nil, nil
+	case name == hostDetailQueryPrefix+"software_vscode_extensions":
+		ss := fleet.StatusOK
+		if a.softwareVSCodeExtensionsFailProb > 0.0 && rand.Float64() <= a.softwareVSCodeExtensionsFailProb {
+			ss = fleet.OsqueryStatus(1)
+		}
+		if ss == fleet.StatusOK {
+			results = a.softwareVSCodeExtensions()
+		}
+		return true, results, &ss, nil, nil
+	case name == hostDetailQueryPrefix+"software_adobe_plugins":
+		ss := fleet.StatusOK
+		if a.softwareAdobePluginsFailProb > 0.0 && rand.Float64() <= a.softwareAdobePluginsFailProb {
+			ss = fleet.OsqueryStatus(1)
+		}
+		if ss == fleet.StatusOK {
+			results = a.softwareAdobePlugins()
+		}
+		return true, results, &ss, nil, nil
+	case name == hostDetailQueryPrefix+"disk_space_unix" || name == hostDetailQueryPrefix+"disk_space_windows":
+		ss := fleet.OsqueryStatus(rand.Intn(2))
+		if ss == fleet.StatusOK {
+			results = a.diskSpace()
+		}
+		return true, results, &ss, nil, nil
+
+	case strings.HasPrefix(name, hostDetailQueryPrefix+"disk_encryption_linux"):
+		ss := fleet.OsqueryStatus(rand.Intn(2))
+		if ss == fleet.StatusOK {
+			results = a.diskEncryptionLinux()
+		}
+		return true, results, &ss, nil, nil
+	case name == hostDetailQueryPrefix+"disk_encryption_darwin":
+		ss := fleet.OsqueryStatus(rand.Intn(2))
+		if ss == fleet.StatusOK {
+			results = a.diskEncryption()
+		}
+		return true, results, &ss, nil, nil
+	case name == hostDetailQueryPrefix+"disk_encryption_windows":
+		ss := fleet.OsqueryStatus(rand.Intn(2))
+		if ss == fleet.StatusOK {
+			results = a.diskEncryptionWindows()
+		}
+		return true, results, &ss, nil, nil
+	case name == hostDetailQueryPrefix+"kubequery_info" && a.os != "kubequery":
+		// Real osquery running on hosts would return no results if it was not
+		// running kubequery (due to discovery query). Returning true here so that
+		// the caller knows it is handled, will not try to return lorem-ipsum-style
+		// results.
+		return true, nil, &statusNotOK, nil, nil
+	case name == hostDetailQueryPrefix+"orbit_info":
+		if a.orbitNodeKey == nil {
+			return true, nil, &statusNotOK, nil, nil
+		}
+		return true, a.orbitInfo(), &statusOK, nil, nil
+	case strings.HasPrefix(name, hostDetailQueryPrefix+"certificates_darwin"):
+		// NOTE: feels exaggerated to fail osquery 50% of the time but this is how
+		// most other osquery queries are handled.
+		ss := fleet.OsqueryStatus(rand.Intn(2))
+		if ss == fleet.StatusOK {
+			results = a.certificatesDarwin()
+		}
+		return true, results, &ss, nil, nil
+	case strings.HasPrefix(name, hostDetailQueryPrefix+"certificates_windows"):
+		// NOTE: feels exaggerated to fail osquery 50% of the time but this is how
+		// most other osquery queries are handled.
+		ss := fleet.OsqueryStatus(rand.Intn(2))
+		if ss == fleet.StatusOK {
+			results = a.certificatesWindows()
+		}
+		return true, results, &ss, nil, nil
+	default:
+		// Look for results in the template file.
+		if t := a.templates.Lookup(name); t == nil {
+			return false, nil, nil, nil, nil
+		}
+		var ni bytes.Buffer
+		err := a.templates.ExecuteTemplate(&ni, name, a)
+		if err != nil {
+			panic(err)
+		}
+		err = json.Unmarshal(ni.Bytes(), &results)
+		if err != nil {
+			panic(err)
+		}
+
+		return true, results, &statusOK, nil, nil
+	}
+}
+
+type cachedResults struct {
+	software []map[string]string
+}
+
+func (a *agent) DistributedWrite(queries map[string]string) error {
+	r := service.SubmitDistributedQueryResultsRequest{
+		Results:  make(fleet.OsqueryDistributedQueryResults),
+		Statuses: make(map[string]fleet.OsqueryStatus),
+		Messages: make(map[string]string),
+		Stats:    make(map[string]*fleet.Stats),
+	}
+	r.NodeKey = a.distributedNodeKey()
+
+	cachedResults := cachedResults{}
+
+	// Sort queries to be executed by lexicographic name order (for result processing
+	// to be more predictable). This aligns to how osquery executes the queries.
+	queryNames := make([]string, 0, len(queries))
+	for name := range queries {
+		queryNames = append(queryNames, name)
+	}
+	sort.Strings(queryNames)
+
+	for _, name := range queryNames {
+		query := queries[name]
+
+		handled, results, status, message, stats := a.processQuery(name, query, &cachedResults)
+		if !handled {
+			// If osquery-perf does not handle the incoming query,
+			// always return status OK and the default query result.
+			r.Results[name] = defaultQueryResult
+			r.Statuses[name] = fleet.StatusOK
+		} else {
+			if results != nil {
+				r.Results[name] = results
+			}
+			if status != nil {
+				r.Statuses[name] = *status
+			}
+			if message != nil {
+				r.Messages[name] = *message
+			}
+			if stats != nil {
+				r.Stats[name] = stats
+			}
+		}
+	}
+	body, err := json.Marshal(r)
+	if err != nil {
+		panic(err)
+	}
+
+	request, err := http.NewRequest("POST", a.serverAddress+a.distributedAPIPrefix()+"/distributed/write", bytes.NewReader(body))
+	if err != nil {
+		return err
+	}
+	request.Header.Add("Content-type", "application/json")
+
+	response, err := http.DefaultClient.Do(a.sign(request))
+	if err != nil {
+		return fmt.Errorf("distributed/write request failed to run: %w", err)
+	}
+	defer response.Body.Close()
+
+	a.stats.IncrementDistributedWrites()
+
+	statusCode := response.StatusCode
+	if statusCode != http.StatusOK {
+		a.stats.IncrementDistributedWriteErrors()
+		return fmt.Errorf("distributed/write request failed: %d", statusCode)
+	}
+
+	// No need to read the distributed write body
+	return nil
+}
+
+func scheduledQueryResults(packName, queryName string, numResults int) []byte {
+	return []byte(`{
+  "snapshot": [` + rows(numResults) + `
+  ],
+  "action": "snapshot",
+  "name": "pack/` + packName + `/` + queryName + `",
+  "hostIdentifier": "EF9595F0-CE81-493A-9B06-D8A9D2CCB952",
+  "calendarTime": "Fri Oct  6 18:13:04 2023 UTC",
+  "unixTime": 1696615984,
+  "epoch": 0,
+  "counter": 0,
+  "numerics": false,
+  "decorations": {
+    "host_uuid": "187c4d56-8e45-1a9d-8513-ac17efd2f0fd",
+    "hostname": "osquery-perf"
+  }
+}`)
+}
+
+func (a *agent) connCheck() error {
+	request, err := http.NewRequest("GET", a.serverAddress+"/version", nil)
+	if err != nil {
+		panic(err)
+	}
+	response, err := http.DefaultClient.Do(request)
+	if err != nil {
+		return err
+	}
+	defer response.Body.Close()
+	if response.StatusCode != http.StatusOK {
+		return errors.New(http.StatusText(response.StatusCode))
+	}
+	return nil
+}
+
+func (a *agent) submitLogs(results []resultLog) error {
+	// Connection check to prevent unnecessary JSON marshaling when the server is down.
+	if err := a.connCheck(); err != nil {
+		return fmt.Errorf("/version check failed: %w", err)
+	}
+
+	var resultLogs []byte
+	for i, result := range results {
+		if i > 0 {
+			resultLogs = append(resultLogs, ',')
+		}
+		resultLogs = append(resultLogs, result.emit()...)
+	}
+
+	body := []byte(`{"node_key": "` + a.nodeKey + `", "log_type": "result", "data": [` + string(resultLogs) + `]}`)
+	request, err := http.NewRequest("POST", a.serverAddress+"/api/osquery/log", bytes.NewReader(body))
+	if err != nil {
+		return err
+	}
+	request.Header.Add("Content-type", "application/json")
+
+	response, err := http.DefaultClient.Do(a.sign(request))
+	if err != nil {
+		return fmt.Errorf("log request failed to run: %w", err)
+	}
+	defer response.Body.Close()
+
+	a.stats.IncrementResultLogRequests()
+
+	statusCode := response.StatusCode
+	if statusCode != http.StatusOK {
+		a.stats.IncrementResultLogErrors()
+		return fmt.Errorf("log request failed: %d", statusCode)
+	}
+
+	return nil
+}
+
+func (a *mdmAgent) runAppleIDeviceMDMLoop(mdmSCEPChallenge string) {
+	udid := mdmtest.RandUDID()
+
+	mdmClient := mdmtest.NewTestMDMClientAppleDirect(mdmtest.AppleEnrollInfo{
+		SCEPChallenge: mdmSCEPChallenge,
+		SCEPURL:       a.serverAddress + apple_mdm.SCEPPath,
+		MDMURL:        a.serverAddress + apple_mdm.MDMPath,
+	}, a.model)
+	mdmClient.UUID = udid
+	mdmClient.SerialNumber = mdmtest.RandSerialNumber()
+	deviceName := fmt.Sprintf("%s-%d", a.model, a.agentIndex)
+	productName := a.model
+	softwareSource := "ios_apps"
+	if strings.HasPrefix(a.model, "iPad") {
+		softwareSource = "ipados_apps"
+	}
+
+	mdmEnrollWithRetry(a.model, a.stats.IncrementMDMErrors, mdmClient.Enroll)
+
+	a.stats.IncrementMDMEnrollments()
+
+	// installedProfiles tracks the profiles this device has acknowledged
+	// installing, so RemoveProfile commands succeed or fail like on a real
+	// device. Seeded with the enrollment profile, which is installed during
+	// enrollment rather than via an InstallProfile command. Only this
+	// goroutine touches it, so it needs no locking.
+	installedProfiles := map[string]struct{}{apple_mdm.FleetPayloadIdentifier: {}}
+
+	hexToken := hex.EncodeToString([]byte(mdmClient.GetToken()))
+	deviceAPNSClient := apnsmock.NewClient(a.apnsPushURL, hexToken, apnsmock.WithInitialJitter(time.Minute), apnsmock.WithLogf(log.Printf))
+	deviceAPNSClient.Start(context.Background())
+
+	for range deviceAPNSClient.Pings() {
+		mdmCommandPayload, err := mdmClient.Idle()
+		if err != nil {
+			log.Printf("MDM Idle request failed: %s: %s", a.model, err)
+			a.stats.IncrementMDMErrors()
+			continue
+		}
+		a.stats.IncrementMDMSessions()
+
+		for mdmCommandPayload != nil {
+			a.stats.IncrementMDMCommandsReceived()
+			delayCancelableMDMAck(a.cancelableCmdAckDelay, deviceName, mdmCommandPayload)
+			switch mdmCommandPayload.Command.RequestType {
+			case "DeviceInformation":
+				if a.isPersonalEnrollment {
+					// A personal (BYOD) enrollment doesn't get asked for the
+					// newer device vitals fields (see byodDeviceInformationQueryKeys
+					// in server/mdm/apple/commander.go), so it shouldn't report them.
+					mdmCommandPayload, err = mdmClient.AcknowledgeDeviceInformationWithExtra(udid, mdmCommandPayload.CommandUUID, deviceName,
+						productName, "America/Los_Angeles", a.osVersion, a.supplementalOSVersionExtra)
+				} else {
+					mdmCommandPayload, err = mdmClient.AcknowledgeDeviceInformationWithVitals(udid, mdmCommandPayload.CommandUUID, deviceName,
+						productName, "America/Los_Angeles", a.osVersion, a.supplementalOSVersionExtra)
+				}
+			case "InstalledApplicationList":
+				software := a.softwareIOSandIPadOS(softwareSource)
+				mdmCommandPayload, err = mdmClient.AcknowledgeInstalledApplicationList(udid, mdmCommandPayload.CommandUUID, software)
+			case "InstallProfile":
+				if a.mdmProfileFailureProb > 0.0 && rand.Float64() <= a.mdmProfileFailureProb {
+					errChain := []mdm.ErrorChain{
+						{
+							ErrorCode:            89,
+							ErrorDomain:          "ErrorDomain",
+							LocalizedDescription: "The profile did not install",
+						},
+					}
+					mdmCommandPayload, err = mdmClient.Err(mdmCommandPayload.CommandUUID, errChain)
+				} else {
+					if identifier, _, ok := parseInstallProfileCommand(mdmCommandPayload); ok {
+						installedProfiles[identifier] = struct{}{}
+					}
+					mdmCommandPayload, err = mdmClient.Acknowledge(mdmCommandPayload.CommandUUID)
+				}
+			case "RemoveProfile":
+				identifier := removeProfileIdentifier(mdmCommandPayload)
+				if _, ok := installedProfiles[identifier]; identifier != "" && ok {
+					delete(installedProfiles, identifier)
+					mdmCommandPayload, err = mdmClient.Acknowledge(mdmCommandPayload.CommandUUID)
+				} else {
+					mdmCommandPayload, err = mdmClient.Err(mdmCommandPayload.CommandUUID, profileNotFoundErrChain(identifier))
+				}
+
+			default:
+				mdmCommandPayload, err = mdmClient.Acknowledge(mdmCommandPayload.CommandUUID)
+			}
+			if err != nil {
+				log.Printf("MDM Acknowledge request failed: %s: %s", a.model, err)
+				a.stats.IncrementMDMErrors()
+				break
+			}
+		}
+	}
+}
+
+// rows returns a set of rows for use in tests for query results.
+func rows(num int) string {
+	b := strings.Builder{}
+	for i := 0; i < num; i++ {
+		b.WriteString(`    {
+      "build_distro": "centos7",
+      "build_platform": "linux",
+      "config_hash": "eed0d8296e5f90b790a23814a9db7a127b13498d",
+      "config_valid": "1",
+      "extensions": "active",
+      "instance_id": "e5799132-85ab-4cfa-89f3-03e0dd3c509a",
+      "pid": "3574",
+      "platform_mask": "9",
+      "start_time": "1696502961",
+      "uuid": "EF9595F0-CE81-493A-9B06-D8A9D2CCB95",
+      "version": "5.9.2",
+      "watcher": "3570"
+    }`)
+		if i != num-1 {
+			b.WriteString(",")
+		}
+	}
+
+	return b.String()
+}
+
+func main() {
+	// Start HTTP server for pprof. See https://pkg.go.dev/net/http/pprof.
+	go func() {
+		log.Println(http.ListenAndServe("localhost:6060", nil))
+	}()
+
+	// #nosec (osquery-perf is only used for testing)
+	tlsConfig := &tls.Config{
+		InsecureSkipVerify: true,
+	}
+	tr := http.DefaultTransport.(*http.Transport).Clone()
+	tr.TLSClientConfig = tlsConfig
+	http.DefaultClient.Transport = tr
+	http.DefaultClient.Timeout = 30 * time.Second
+
+	validTemplateNames := map[string]bool{
+		"macos_13.6.2.tmpl":         true,
+		"macos_14.1.2.tmpl":         true,
+		"windows_11.tmpl":           true,
+		"windows_11_22H2_2861.tmpl": true,
+		"windows_11_22H2_3007.tmpl": true,
+		"ubuntu_22.04.tmpl":         true,
+		"rhel_8.tmpl":               true,
+		"rhel_9.tmpl":               true,
+		"rhel_10.tmpl":              true,
+		"iphone_14.6.tmpl":          true,
+		"ipad_13.18.tmpl":           true,
+		"iphone_17.tmpl":            true,
+		"android.tmpl":              true,
+	}
+	allowedTemplateNames := make([]string, 0, len(validTemplateNames))
+	for k := range validTemplateNames {
+		allowedTemplateNames = append(allowedTemplateNames, k)
+	}
+
+	var (
+		serverURL       = flag.String("server_url", "https://localhost:8080", "URL (with protocol and port of osquery server)")
+		enrollSecret    = flag.String("enroll_secret", "", "Enroll secret to authenticate enrollment")
+		hostCount       = flag.Int("host_count", 10, "Number of hosts to start (default 10)")
+		totalHostCount  = flag.Int("total_host_count", 0, "Total number of hosts across all containers (if 0, uses host_count)")
+		hostIndexOffset = flag.Int("host_index_offset", 0, "Starting index offset for this container's hosts (default 0)")
+		randSeed        = flag.Int64("seed", time.Now().UnixNano(), "Seed for random generator (default current time)")
+		startPeriod     = flag.Duration("start_period", 10*time.Second, "Duration to spread start of hosts over")
+		configInterval  = flag.Duration("config_interval", 1*time.Minute, "Interval for config requests")
+		// Flag logger_tls_period defines how often to check for sending scheduled query results.
+		// osquery-perf will send log requests with results only if there are scheduled queries configured AND it's their time to run.
+		logInterval         = flag.Duration("logger_tls_period", 10*time.Second, "Interval for scheduled queries log requests")
+		queryInterval       = flag.Duration("query_interval", 10*time.Second, "Interval for distributed query requests")
+		websocketProb       = flag.Float64("websocket_prob", 1.0, "Probability of an orbit agent supporting the WebSocket notification transport when the server's orbit config directive enables it (older fleetd versions ignore the directive)")
+		mdmCheckInInterval  = flag.Duration("mdm_check_in_interval", 1*time.Minute, "Interval for performing MDM check-ins (applies only to Windows)")
+		onlyAlreadyEnrolled = flag.Bool("only_already_enrolled", false, "Only start agents that are already enrolled")
+		nodeKeyFile         = flag.String("node_key_file", "", "File with node keys to use")
+
+		httpMessageSignatureProb     = flag.Float64("http_message_signature_prob", 0.1, "Probability of hosts using HTTP message signatures")
+		httpMessageSignatureP384Prob = flag.Float64("http_message_signature_p384_prob", 0.5,
+			"Probability of hosts using P384 elliptic curve (as opposed to P256) for HTTP message signatures")
+
+		// 50% failure probability is not realistic but this is our current baseline for the osquery-perf setup.
+		// We tried setting this to a more realistic value like 5% but it overloaded the MySQL Writer instance
+		// during hosts enroll.
+		softwareQueryFailureProb                 = flag.Float64("software_query_fail_prob", 0.5, "Probability of the software query failing")
+		softwareVSCodeExtensionsQueryFailureProb = flag.Float64("software_vscode_extensions_query_fail_prob", 0.0, "Probability of the software vscode_extensions query failing")
+		softwareAdobePluginsQueryFailureProb     = flag.Float64("software_adobe_plugins_query_fail_prob", 0.0, "Probability of the software adobe_plugins query failing")
+
+		softwareInstallerPreInstallFailureProb = flag.Float64("software_installer_pre_install_fail_prob", 0.05,
+			"Probability of the pre-install query failing")
+		softwareInstallerInstallFailureProb = flag.Float64("software_installer_install_fail_prob", 0.05,
+			"Probability of the install script failing")
+		softwareInstallerPostInstallFailureProb = flag.Float64("software_installer_post_install_fail_prob", 0.05,
+			"Probability of the post-install script failing")
+
+		commonSoftwareCount                          = flag.Int("common_software_count", 10, "Number of common installed applications reported to fleet")
+		commonVSCodeExtensionsSoftwareCount          = flag.Int("common_vscode_extensions_software_count", 5, "Number of common vscode_extensions installed applications reported to fleet")
+		commonAdobePluginsSoftwareCount              = flag.Int("common_adobe_plugins_software_count", 5, "Number of common adobe_plugins installed plugins reported to fleet")
+		commonAdobePluginsSoftwareUninstallCount     = flag.Int("common_adobe_plugins_software_uninstall_count", 1, "Number of common adobe_plugins plugins to uninstall")
+		commonAdobePluginsSoftwareUninstallProb      = flag.Float64("common_adobe_plugins_software_uninstall_prob", 0.1, "Probability of uninstalling common_adobe_plugins_software_uninstall_count common plugin/s")
+		commonSoftwareUninstallCount                 = flag.Int("common_software_uninstall_count", 1, "Number of common software to uninstall")
+		commonVSCodeExtensionsSoftwareUninstallCount = flag.Int("common_vscode_extensions_software_uninstall_count", 1, "Number of common vscode_extensions software to uninstall")
+		commonSoftwareUninstallProb                  = flag.Float64("common_software_uninstall_prob", 0.1, "Probability of uninstalling common_software_uninstall_count unique software/s")
+		commonVSCodeExtensionsSoftwareUninstallProb  = flag.Float64("common_vscode_extensions_software_uninstall_prob", 0.1, "Probability of uninstalling vscode_extensions common_software_uninstall_count unique software/s")
+
+		uniqueSoftwareCount                          = flag.Int("unique_software_count", 1, "Number of unique software installed on each host")
+		uniqueVSCodeExtensionsSoftwareCount          = flag.Int("unique_vscode_extensions_software_count", 1, "Number of unique vscode_extensions software installed on each host")
+		uniqueAdobePluginsSoftwareCount              = flag.Int("unique_adobe_plugins_software_count", 1, "Number of unique adobe_plugins plugins installed on each host")
+		uniqueAdobePluginsSoftwareUninstallCount     = flag.Int("unique_adobe_plugins_software_uninstall_count", 1, "Number of unique adobe_plugins plugins to uninstall")
+		uniqueAdobePluginsSoftwareUninstallProb      = flag.Float64("unique_adobe_plugins_software_uninstall_prob", 0.1, "Probability of uninstalling unique_adobe_plugins_software_uninstall_count unique plugin/s")
+		uniqueSoftwareUninstallCount                 = flag.Int("unique_software_uninstall_count", 1, "Number of unique software to uninstall")
+		uniqueVSCodeExtensionsSoftwareUninstallCount = flag.Int("unique_vscode_extensions_software_uninstall_count", 1, "Number of unique vscode_extensions software to uninstall")
+		uniqueSoftwareUninstallProb                  = flag.Float64("unique_software_uninstall_prob", 0.1, "Probability of uninstalling unique_software_uninstall_count common software/s")
+		uniqueVSCodeExtensionsSoftwareUninstallProb  = flag.Float64("unique_vscode_extensions_software_uninstall_prob", 0.1, "Probability of uninstalling unique_vscode_extensions_software_uninstall_count common software/s")
+
+		duplicateBundleIdentifiersPercent = flag.Int("duplicate_bundle_identifiers_percent", 0, "Percentage of software with duplicate bundle identifiers (0-100)")
+		softwareRenaming                  = flag.Bool("software_renaming", false, "Enable software renaming for duplicate bundle identifiers")
+		embeddedBundlePaths               = flag.Bool("embedded_bundle_paths", false, "Nest duplicate-bundle paths under their parent .app/Contents/Library/LoginItems/")
+		// WARNING: This will generate massive amounts of entries in the software table,
+		// because linux devices report many individual software items, ~1600, compared to Windows around ~100s or macOS around ~500s.
+		//
+		// This flag can be used to load test software ingestion for Linux during enrollment (during enrollment all devices
+		// report software to Fleet, so the initial reads/inserts can be expensive).
+		linuxUniqueSoftwareVersion = flag.Bool("linux_unique_software_version", false, "Make version of software items on linux hosts unique. WARNING: This will generate massive amounts of entries in the software table, because linux devices report many individual software items (compared to Windows/macOS).")
+		// WARNING: This will generate massive amounts of entries in the software and software_titles tables,
+		//
+		// This flag can be used to load test software ingestion for Linux during enrollment (during enrollment all devices
+		// report software to Fleet, so the initial reads/inserts can be expensive).
+		linuxUniqueSoftwareTitle = flag.Bool("linux_unique_software_title", false, "Make name of software items on linux hosts unique. WARNING: This will generate massive amounts of titles which is not realistic but serves to test performance of software ingestion when processing large number of titles.")
+
+		// This flag can be used to set the number of vulnerable software items reported by each host picked randomly from the
+		// list of vulnerable software.  Use -1 to load all vulnerable software.
+		vulnerableSoftwareCount     = flag.Int("vulnerable_software_count", 10, "Number of vulnerable installed applications reported to fleet.  Use -1 to load all vulnerable software.")
+		withLastOpenedSoftwareCount = flag.Int("with_last_opened_software_count", 50, "Number of applications that may report a last opened timestamp to fleet")
+		lastOpenedChangeProb        = flag.Float64("last_opened_change_prob", 0.5, "Probability of last opened timestamp to be reported as changed [0, 1]")
+		commonUserCount             = flag.Int("common_user_count", 10, "Number of common host users reported to fleet")
+		uniqueUserCount             = flag.Int("unique_user_count", 10, "Number of unique host users reported to fleet")
+		policyPassProb              = flag.Float64("policy_pass_prob", 1.0, "Probability of policies to pass [0, 1]")
+		orbitProb                   = flag.Float64("orbit_prob", 0.5, "Probability of a host being identified as orbit install [0, 1]")
+		munkiIssueProb              = flag.Float64("munki_issue_prob", 0.5, "Probability of a host having munki issues (note that ~50% of hosts have munki installed) [0, 1]")
+		munkiIssueCount             = flag.Int("munki_issue_count", 10, "Number of munki issues reported by hosts identified to have munki issues")
+		// E.g. when running with `-host_count=10`, you can set host count for each template the following way:
+		// `-os_templates=windows_11.tmpl:3,macos_14.1.2.tmpl:4,ubuntu_22.04.tmpl:3`
+		osTemplates       = flag.String("os_templates", "macos_14.1.2", fmt.Sprintf("Comma-separated list of host OS templates to use and optionally their host count separated by ':' (any of %v, with or without the .tmpl extension)", allowedTemplateNames))
+		emptySerialProb   = flag.Float64("empty_serial_prob", 0.1, "Probability of a host having no serial number [0, 1]")
+		defaultSerialProb = flag.Float64("default_serial_prob", 0.05,
+			"Probability of osquery returning a default (-1) serial number. See: #19789")
+
+		mdmProb                      = flag.Float64("mdm_prob", 0.0, "Probability of a host enrolling via Fleet MDM (applies for macOS and Windows hosts, implies orbit enrollment on Windows) [0, 1]")
+		mdmUserProb                  = flag.Float64("mdm_user_prob", 0.0, "Probability of a host having an MDM user enrollment (compounds on mdm_prob) [0, 1]")
+		mdmAPNSURL                   = flag.String("mdm_apns_url", "", "APNS URL to check for MDM push notifications (e.g., http://localhost:8378) - required for Apple (macOS/iOS/iPadOS) MDM enrollments.")
+		mdmSCEPChallenge             = flag.String("mdm_scep_challenge", "", "SCEP challenge to use when running macOS MDM enroll")
+		mdmProfileFailureProb        = flag.Float64("mdm_profile_failure_prob", 0.0, "Probability of an MDM profile to fail install [0, 1]")
+		mdmCancelableCommandAckDelay = flag.Duration("mdm_cancelable_command_ack_delay", 0, "Delay between fetching a cancelable MDM command (lock, wipe, clear passcode, enable lost mode) and acknowledging it, opening a window to test command cancellation")
+		mdmIOSBYODProb               = flag.Float64("mdm_ios_byod_prob", 0.0, "Probability of a simulated iOS/iPadOS device (os_templates iphone_14.6/ipad_13.18/iphone_17) reporting as a personal (BYOD) enrollment, which omits the newer device vitals fields from its DeviceInformation ack [0, 1]")
+
+		mdmPSSOProb      = flag.Float64("mdm_psso_prob", 0.0, "Probability of an MDM-enrolled macOS host also simulating Apple Platform SSO [0, 1]. Requires the Fleet server to have account provisioning configured and the PSSO profile assigned to the host")
+		mdmPSSOClientID  = flag.String("mdm_psso_client_id", "", "Apple Platform SSO IdP/extension client ID. Must match the Fleet server's account provisioning config; PSSO is skipped when empty")
+		mdmPSSOUsername  = flag.String("mdm_psso_username", "", "Username used for Platform SSO logins (must be accepted by the IdP the Fleet server proxies to)")
+		mdmPSSOPassword  = flag.String("mdm_psso_password", "", "Password used for Platform SSO logins")
+		mdmPSSOInterval  = flag.Duration("mdm_psso_interval", 4*time.Hour, "Interval over which Platform SSO device registrations are staggered and, afterwards, logins/key operations recur (spread within each interval)")
+		mdmPSSOLoginProb = flag.Float64("mdm_psso_login_prob", 1.0, "Probability of a Platform SSO login during each interval after the initial registration [0, 1]")
+		mdmPSSOKeyProb   = flag.Float64("mdm_psso_key_prob", 0.1, "Probability of a Platform SSO key request/exchange during each interval after the initial registration [0, 1]")
+
+		liveQueryFailProb      = flag.Float64("live_query_fail_prob", 0.0, "Probability of a live query failing execution in the host")
+		liveQueryNoResultsProb = flag.Float64("live_query_no_results_prob", 0.2, "Probability of a live query returning no results")
+
+		disableScriptExec = flag.Bool("disable_script_exec", false, "Disable script execution support")
+
+		disableFleetDesktop = flag.Bool("disable_fleet_desktop", false, "Disable Fleet Desktop")
+		// logger_tls_max_lines is simulating the osquery setting with the same name.
+		loggerTLSMaxLines = flag.Int("logger_tls_max_lines", 1024,
+			"Maximum number of buffered result log lines to send on every log request")
+		commonSoftwareNameSuffix = flag.String("common_software_name_suffix", "", "Suffix to add to generated common software names")
+		softwareDatabasePath     = flag.String("software_db_path", "software-library/software.db",
+			"Path to software.db (SQLite database with realistic software data). Auto-generates from software.sql if missing.")
+
+		configTLSETag = flag.Bool("config_tls_etag", false,
+			"Enable native osquery conditional config requests (sends an \"etag\" field in the request body, treats the {\"etag\":\"ok\"} response as unchanged). Default false — opt in to measure bandwidth savings.")
+
+		// Android load testing flags
+		androidPubSubToken       = flag.String("android_pubsub_token", "", "PubSub token for authenticating fake Android device messages to Fleet")
+		androidProxyAddress      = flag.String("android_proxy_address", "", "Address of the mock AMAPI proxy (e.g., http://localhost:9999)")
+		androidEnterpriseID      = flag.String("android_enterprise_id", "", "Android enterprise ID (e.g., LC03k6enk8)")
+		androidStatusInterval    = flag.Duration("android_status_interval", 5*time.Minute, "Interval between Android STATUS_REPORT messages (real devices report ~every 24h; lower values stress test Fleet harder)")
+		androidAppCount          = flag.Int("android_app_count", 50, "Number of installed apps each Android device reports")
+		androidNonComplianceProb = flag.Float64("android_non_compliance_prob", 0.05, "Probability of an Android STATUS_REPORT including non-compliance details [0, 1]")
+		androidVitalsChurnProb   = flag.Float64("android_vitals_churn_prob", defaultVitalsChurnProb, "Probability of an Android STATUS_REPORT reporting changed host vitals; 0 reports identical vitals forever, which MySQL stores without writing a row [0, 1]")
+	)
+
+	flag.Parse()
+	rand.Seed(*randSeed)
+
+	// Load software from database if path provided. macOS / Windows / Ubuntu
+	// have embedded fallback fixtures, and RHEL kernels are embedded too — the
+	// DB only adds non-kernel RPM/DEB variety. Treat load failure as a warning
+	// rather than fatal so running from the repo root (where the default
+	// relative path doesn't resolve) still works.
+	if *softwareDatabasePath != "" {
+		db, err := softwaredb.LoadFromDatabase(*softwareDatabasePath)
+		if err != nil {
+			log.Printf("WARNING: failed to load software database (%v); falling back to embedded software data", err)
+		} else {
+			softwareDB = db
+		}
+	} else {
+		log.Println("No software database specified (--software_db_path). Using embedded software data.")
+	}
+
+	// There are two modes for osquery-perf:
+	// 1. Non distributed mode (old behavior). All agents get all software specified. This is done when specifying --host_count and --common_software_count
+	// Example --host_count 500 --common_software_count 1000 -> means 500 hosts each with 1000 pieces of software
+	// 2. Distributed mode. All agents get a subset of the total software specified. This is done when specifying --total_host_count and --host_index_offset along with other params.
+	// Example --host_count 500 --common_software_count 1000 --total_host_count 5000 --host_index_offset [0...N...1000]
+	// This example means that each container will run 500 hosts, but each host will only get a subset of the total 5000 software requested.
+	if *totalHostCount > 0 && *totalHostCount > *hostCount {
+		log.Printf("WARNING: total_host_count (%d) > host_count (%d). You are trying to use distributed mode, ensure you have --host_index_offset specified for each container", *totalHostCount, *hostCount)
+		log.Printf("         Container 0 should use: --host_index_offset 0")
+		log.Printf("         Container 1 should use: --host_index_offset %d", *hostCount)
+		log.Printf("         Container 2 should use: --host_index_offset %d", *hostCount*2)
+		log.Printf("         Container N should use: --host_index_offset Y")
+	}
+
+	if *onlyAlreadyEnrolled {
+		// Orbit enrollment does not support the "already enrolled" mode at the
+		// moment (see TODO in this file).
+		*orbitProb = 0
+	}
+
+	if *commonSoftwareUninstallCount > *commonSoftwareCount {
+		log.Fatalf("Argument common_software_uninstall_count cannot be bigger than common_software_count")
+	}
+	if *uniqueSoftwareUninstallCount > *uniqueSoftwareCount {
+		log.Fatalf("Argument unique_software_uninstall_count cannot be bigger than unique_software_count")
+	}
+	if *commonAdobePluginsSoftwareCount < 0 {
+		log.Fatalf("Argument common_adobe_plugins_software_count cannot be negative, got %d", *commonAdobePluginsSoftwareCount)
+	}
+	if *uniqueAdobePluginsSoftwareCount < 0 {
+		log.Fatalf("Argument unique_adobe_plugins_software_count cannot be negative, got %d", *uniqueAdobePluginsSoftwareCount)
+	}
+	if *commonAdobePluginsSoftwareUninstallCount > *commonAdobePluginsSoftwareCount {
+		log.Fatalf("Argument common_adobe_plugins_software_uninstall_count cannot be bigger than common_adobe_plugins_software_count")
+	}
+	if *uniqueAdobePluginsSoftwareUninstallCount > *uniqueAdobePluginsSoftwareCount {
+		log.Fatalf("Argument unique_adobe_plugins_software_uninstall_count cannot be bigger than unique_adobe_plugins_software_count")
+	}
+	if *androidNonComplianceProb < 0 || *androidNonComplianceProb > 1 {
+		log.Fatalf("Argument android_non_compliance_prob must be between 0 and 1, got %f", *androidNonComplianceProb)
+	}
+	if *androidVitalsChurnProb < 0 || *androidVitalsChurnProb > 1 {
+		log.Fatalf("Argument android_vitals_churn_prob must be between 0 and 1, got %f", *androidVitalsChurnProb)
+	}
+
+	// only fail if mdm is turned on for macOS devices and the mdm_apns_url is not specified.
+	if *mdmProb > 0 &&
+		strings.Contains(*osTemplates, "macos") &&
+		*mdmAPNSURL == "" {
+		log.Fatalf("Argument mdm_apns_url must be specified when mdm_prob is greater than 0")
+	}
+
+	tmplsm := make(map[*template.Template]int)
+	requestedTemplates := strings.Split(*osTemplates, ",")
+	tmplsTotalHostCount := 0
+	for _, nm := range requestedTemplates {
+		numberOfHosts := 0
+		if strings.Contains(nm, ":") {
+			parts := strings.Split(nm, ":")
+			nm = parts[0]
+			hc, err := strconv.ParseInt(parts[1], 10, 64)
+			if err != nil {
+				log.Fatalf("Invalid template host count: %s", parts[1])
+			}
+			numberOfHosts = int(hc)
+		}
+		if !strings.HasSuffix(nm, ".tmpl") {
+			nm += ".tmpl"
+		}
+		if !validTemplateNames[nm] {
+			log.Fatalf("Invalid template name: %s (accepted values: %v)", nm, allowedTemplateNames)
+		}
+
+		tmpl, err := template.ParseFS(templatesFS, nm)
+		if err != nil {
+			log.Fatal("parse templates: ", err)
+		}
+		tmplsm[tmpl] = numberOfHosts
+		tmplsTotalHostCount += numberOfHosts
+	}
+	if tmplsTotalHostCount != 0 && tmplsTotalHostCount != *hostCount {
+		log.Fatalf("Invalid host count in templates: total=%d vs host_count=%d", tmplsTotalHostCount, *hostCount)
+	}
+
+	// Spread starts over the interval to prevent thundering herd
+	sleepTime := *startPeriod / time.Duration(*hostCount)
+
+	stats := &osquery_perf.Stats{
+		StartTime: time.Now(),
+	}
+	go stats.RunLoop()
+	installerMetadataCache.Stats = stats
+
+	nodeKeyManager := &nodeKeyManager{}
+	if nodeKeyFile != nil {
+		nodeKeyManager.filepath = *nodeKeyFile
+		nodeKeyManager.LoadKeys()
+	}
+
+	var tmplss []*template.Template
+	for tmpl := range tmplsm {
+		tmplss = append(tmplss, tmpl)
+	}
+
+	for i := 0; i < *hostCount; i++ {
+		var tmpl *template.Template
+		if tmplsTotalHostCount > 0 {
+			for tmpl_, hostCount := range tmplsm {
+				if hostCount > 0 {
+					tmpl = tmpl_
+					tmplsm[tmpl_]--
+					break
+				}
+			}
+			if tmpl == nil {
+				log.Fatalf("Failed to determine template for host: %d", i)
+			}
+		} else {
+			tmpl = tmplss[i%len(tmplss)]
+		}
+
+		if tmpl.Name() == "iphone_14.6.tmpl" || tmpl.Name() == "ipad_13.18.tmpl" || tmpl.Name() == "iphone_17.tmpl" {
+			if *mdmAPNSURL == "" {
+				log.Fatalf("Argument mdm_apns_url must be specified when iOS/iPadOS templates are used.")
+			}
+			model := "iPhone 14,6"
+			var osVersion, supplementalOSVersionExtra string
+			// iphone_17 simulates a device with a Rapid Security Response (RSR) installed,
+			// which adds a SupplementalOSVersionExtra suffix to the OS version (e.g. "26.3.1 (a)").
+			switch tmpl.Name() {
+			case "ipad_13.18.tmpl":
+				model = "iPad 13,18"
+			case "iphone_17.tmpl":
+				model = "iPhone 17"
+				osVersion = "26.3.1"
+				supplementalOSVersionExtra = "(a)"
+			}
+			mobileDevice := mdmAgent{
+				agentIndex:                 i + 1,
+				model:                      model,
+				serverAddress:              *serverURL,
+				osVersion:                  osVersion,
+				supplementalOSVersionExtra: supplementalOSVersionExtra,
+				isPersonalEnrollment:       rand.Float64() < *mdmIOSBYODProb, // nolint:gosec,G404 // load testing, not security-sensitive
+				softwareCount: softwareEntityCount{
+					entityCount: entityCount{
+						common: *commonSoftwareCount,
+						unique: *uniqueSoftwareCount,
+					},
+					vulnerable:                   *vulnerableSoftwareCount,
+					commonSoftwareUninstallCount: *commonSoftwareUninstallCount,
+					commonSoftwareUninstallProb:  *commonSoftwareUninstallProb,
+					uniqueSoftwareUninstallCount: *uniqueSoftwareUninstallCount,
+					uniqueSoftwareUninstallProb:  *uniqueSoftwareUninstallProb,
+				},
+				stats:                 stats,
+				strings:               make(map[string]string),
+				softwareVersionMap:    make(map[rune]int),
+				mdmProfileFailureProb: *mdmProfileFailureProb,
+				cancelableCmdAckDelay: *mdmCancelableCommandAckDelay,
+				apnsPushURL:           *mdmAPNSURL,
+			}
+			go mobileDevice.runAppleIDeviceMDMLoop(*mdmSCEPChallenge)
+			time.Sleep(sleepTime)
+			continue
+		}
+
+		if tmpl.Name() == "android.tmpl" {
+			if *androidPubSubToken == "" || *androidProxyAddress == "" || *androidEnterpriseID == "" {
+				log.Fatalf("Android template requires --android_pubsub_token, --android_proxy_address, and --android_enterprise_id flags")
+			}
+			androidDevice := newAndroidAgent(
+				i+1,
+				*serverURL,
+				*enrollSecret,
+				*androidPubSubToken,
+				*androidProxyAddress,
+				*androidEnterpriseID,
+				*androidStatusInterval,
+				*androidAppCount,
+				*androidNonComplianceProb,
+				*androidVitalsChurnProb,
+				stats,
+			)
+			go androidDevice.runLoop()
+			time.Sleep(sleepTime)
+			continue
+		}
+
+		a := newAgent(i+1,
+			*hostCount,
+			*totalHostCount,
+			*hostIndexOffset,
+			*serverURL,
+			*enrollSecret,
+			tmpl,
+			*configInterval,
+			*logInterval,
+			*queryInterval,
+			*mdmCheckInInterval,
+			*softwareQueryFailureProb,
+			*softwareVSCodeExtensionsQueryFailureProb,
+			*softwareAdobePluginsQueryFailureProb,
+			softwareInstaller{
+				preInstallFailureProb:  *softwareInstallerPreInstallFailureProb,
+				installFailureProb:     *softwareInstallerInstallFailureProb,
+				postInstallFailureProb: *softwareInstallerPostInstallFailureProb,
+				mu:                     new(sync.Mutex),
+			},
+			softwareEntityCount{
+				entityCount: entityCount{
+					common: *commonSoftwareCount,
+					unique: *uniqueSoftwareCount,
+				},
+				vulnerable:                        *vulnerableSoftwareCount,
+				withLastOpened:                    *withLastOpenedSoftwareCount,
+				lastOpenedProb:                    *lastOpenedChangeProb,
+				commonSoftwareUninstallCount:      *commonSoftwareUninstallCount,
+				commonSoftwareUninstallProb:       *commonSoftwareUninstallProb,
+				uniqueSoftwareUninstallCount:      *uniqueSoftwareUninstallCount,
+				uniqueSoftwareUninstallProb:       *uniqueSoftwareUninstallProb,
+				duplicateBundleIdentifiersPercent: *duplicateBundleIdentifiersPercent,
+				softwareRenaming:                  *softwareRenaming,
+				embeddedBundlePaths:               *embeddedBundlePaths,
+			},
+			softwareExtraEntityCount{
+				entityCount: entityCount{
+					common: *commonVSCodeExtensionsSoftwareCount,
+					unique: *uniqueVSCodeExtensionsSoftwareCount,
+				},
+				commonSoftwareUninstallCount: *commonVSCodeExtensionsSoftwareUninstallCount,
+				commonSoftwareUninstallProb:  *commonVSCodeExtensionsSoftwareUninstallProb,
+				uniqueSoftwareUninstallCount: *uniqueVSCodeExtensionsSoftwareUninstallCount,
+				uniqueSoftwareUninstallProb:  *uniqueVSCodeExtensionsSoftwareUninstallProb,
+			},
+			softwareExtraEntityCount{
+				entityCount: entityCount{
+					common: *commonAdobePluginsSoftwareCount,
+					unique: *uniqueAdobePluginsSoftwareCount,
+				},
+				commonSoftwareUninstallCount: *commonAdobePluginsSoftwareUninstallCount,
+				commonSoftwareUninstallProb:  *commonAdobePluginsSoftwareUninstallProb,
+				uniqueSoftwareUninstallCount: *uniqueAdobePluginsSoftwareUninstallCount,
+				uniqueSoftwareUninstallProb:  *uniqueAdobePluginsSoftwareUninstallProb,
+			},
+			entityCount{
+				common: *commonUserCount,
+				unique: *uniqueUserCount,
+			},
+			*policyPassProb,
+			*orbitProb,
+			*munkiIssueProb,
+			*munkiIssueCount,
+			*emptySerialProb,
+			*defaultSerialProb,
+			*mdmProb,
+			*mdmUserProb,
+			*mdmSCEPChallenge,
+			*liveQueryFailProb,
+			*liveQueryNoResultsProb,
+			*disableScriptExec,
+			*disableFleetDesktop,
+			*loggerTLSMaxLines,
+			*linuxUniqueSoftwareVersion,
+			*linuxUniqueSoftwareTitle,
+			*commonSoftwareNameSuffix,
+			*mdmProfileFailureProb,
+			*mdmCancelableCommandAckDelay,
+			*httpMessageSignatureProb,
+			*httpMessageSignatureP384Prob,
+			*configTLSETag,
+			pssoParams{
+				prob:      *mdmPSSOProb,
+				clientID:  *mdmPSSOClientID,
+				username:  *mdmPSSOUsername,
+				password:  *mdmPSSOPassword,
+				interval:  *mdmPSSOInterval,
+				loginProb: *mdmPSSOLoginProb,
+				keyProb:   *mdmPSSOKeyProb,
+			},
+			*mdmAPNSURL,
+			*websocketProb,
+		)
+		a.stats = stats
+		a.nodeKeyManager = nodeKeyManager
+		go a.runLoop(i, *onlyAlreadyEnrolled)
+		time.Sleep(sleepTime)
+	}
+
+	log.Println("Agents running. Kill with C-c.")
+	<-make(chan struct{})
+}

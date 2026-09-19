@@ -1,0 +1,125 @@
+import classNames from "classnames";
+import React from "react";
+
+import CustomLink from "components/CustomLink";
+import Checkbox from "components/forms/fields/Checkbox";
+import TooltipWrapper from "components/TooltipWrapper";
+import { IPolicySoftwareToInstall } from "interfaces/policy";
+import { getDisplayedSoftwareName } from "pages/SoftwarePage/helpers";
+import paths from "router/paths";
+import { getPathWithQueryParams } from "utilities/url";
+
+interface IPlatformSelectorProps {
+  baseClass?: string;
+  checkDarwin: boolean;
+  checkWindows: boolean;
+  checkLinux: boolean;
+  checkChrome: boolean;
+  setCheckDarwin: (val: boolean) => void;
+  setCheckWindows: (val: boolean) => void;
+  setCheckLinux: (val: boolean) => void;
+  setCheckChrome: (val: boolean) => void;
+  disabled?: boolean;
+  installSoftware?: IPolicySoftwareToInstall;
+  currentTeamId?: number;
+}
+
+export const PlatformSelector = ({
+  baseClass: parentClass,
+  checkDarwin,
+  checkWindows,
+  checkLinux,
+  checkChrome,
+  setCheckDarwin,
+  setCheckWindows,
+  setCheckLinux,
+  setCheckChrome,
+  disabled = false,
+  installSoftware,
+  currentTeamId,
+}: IPlatformSelectorProps): JSX.Element => {
+  const baseClass = "platform-selector";
+
+  const labelClasses = classNames("form-field__label", {
+    [`form-field__label--disabled`]: disabled,
+  });
+
+  const renderInstallSoftwareHelpText = () => {
+    if (!installSoftware) {
+      return null;
+    }
+    const softwareName = getDisplayedSoftwareName(
+      installSoftware.name,
+      installSoftware.display_name
+    );
+    const softwareId = installSoftware.software_title_id.toString();
+    const softwareLink = getPathWithQueryParams(
+      paths.SOFTWARE_TITLE_DETAILS(softwareId),
+      { fleet_id: currentTeamId }
+    );
+
+    return (
+      <div className="form-field__help-text">
+        <span className={`${baseClass}__install-software`}>
+          <CustomLink text={softwareName} url={softwareLink} /> will only
+          install on{" "}
+          <TooltipWrapper
+            tipContent={
+              <>
+                To see targets, select{" "}
+                <b>{softwareName} &gt; Actions &gt; Edit</b>. Currently, hosts
+                that aren&apos;t targeted show an empty (---) policy status.
+              </>
+            }
+          >
+            targeted hosts
+          </TooltipWrapper>
+          .
+        </span>
+      </div>
+    );
+  };
+
+  return (
+    <div className={`${parentClass}__${baseClass} ${baseClass} form-field`}>
+      <span className={labelClasses}>Target</span>
+      <span className={`${baseClass}__checkboxes`}>
+        <Checkbox
+          value={checkDarwin}
+          onChange={(value: boolean) => setCheckDarwin(value)}
+          wrapperClassName={`${baseClass}__platform-checkbox-wrapper`}
+          disabled={disabled}
+        >
+          macOS
+        </Checkbox>
+        <Checkbox
+          value={checkWindows}
+          onChange={(value: boolean) => setCheckWindows(value)}
+          wrapperClassName={`${baseClass}__platform-checkbox-wrapper`}
+          disabled={disabled}
+        >
+          Windows
+        </Checkbox>
+        <Checkbox
+          value={checkLinux}
+          onChange={(value: boolean) => setCheckLinux(value)}
+          wrapperClassName={`${baseClass}__platform-checkbox-wrapper`}
+          disabled={disabled}
+        >
+          Linux
+        </Checkbox>
+        <Checkbox
+          value={checkChrome}
+          onChange={(value: boolean) => setCheckChrome(value)}
+          wrapperClassName={`${baseClass}__platform-checkbox-wrapper`}
+          disabled={disabled}
+        >
+          ChromeOS
+        </Checkbox>
+      </span>
+      {renderInstallSoftwareHelpText()}
+    </div>
+  );
+};
+
+export default PlatformSelector;

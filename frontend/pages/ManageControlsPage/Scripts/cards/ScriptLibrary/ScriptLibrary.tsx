@@ -1,0 +1,274 @@
+import { AxiosError } from "axios";
+import React, {
+  useCallback,
+  useContext,
+  useEffect,
+  useRef,
+  useState,
+} from "react";
+import { useQuery } from "react-query";
+
+import Button from "components/buttons/Button";
+import DataError from "components/DataError";
+import EmptyState from "components/EmptyState";
+import GitOpsModeTooltipWrapper from "components/GitOpsModeTooltipWrapper";
+import InfoBanner from "components/InfoBanner";
+import PageDescription from "components/PageDescription";
+import Pagination from "components/Pagination";
+import SectionHeader from "components/SectionHeader";
+import Spinner from "components/Spinner";
+import { AppContext } from "context/app";
+import { IScript } from "interfaces/script";
+import PATHS from "router/paths";
+import scriptAPI, {
+  IListScriptsQueryKey,
+  IScriptsResponse,
+} from "services/entities/scripts";
+import { DEFAULT_USE_QUERY_OPTIONS } from "utilities/constants";
+
+import UploadList from "../../../../../components/UploadList";
+import DeleteScriptModal from "../../components/DeleteScriptModal";
+import EditScriptModal from "../../components/EditScriptModal";
+import ScriptListItem from "../../components/ScriptListItem";
+import ScriptUploadModal from "../../components/ScriptUploadModal";
+import { SCRIPT_UPLOADER_EMPTY_STATE_TEXT } from "../../helpers";
+import { IScriptsCommonProps } from "../../ScriptsNavItems";
+
+const baseClass = "script-library";
+
+const SCRIPTS_PER_PAGE = 10;
+const DEFAULT_PAGE = 0;
+
+export type IScriptLibraryProps = IScriptsCommonProps;
+
+const ScriptLibrary = ({ router, teamId, location }: IScriptLibraryProps) => {
+  const currentPage = location.query.page
+    ? parseInt(location.query.page, 10)
+    : DEFAULT_PAGE;
+
+  const { isPremiumTier, isGlobalTechnician, isTeamTechnician } = useContext(
+    AppContext
+  );
+
+  const isTechnician = isGlobalTechnician || isTeamTechnician;
+
+  const [showDeleteScriptModal, setShowDeleteScriptModal] = useState(false);
+  const [showEditScriptModal, setShowEditScriptModal] = useState(false);
+  const [showAddScriptModal, setShowAddScriptModal] = useState(false);
+
+  // Open the add-script modal when arriving from the command palette
+  // with `?add_script=1`. Cleans the param so a refresh doesn't reopen
+  // the modal. Technicians never see the "Add script" button on this
+  // page, so don't honor the deep-link for them either.
+  useEffect(() => {
+    if (location.query.add_script !== "1") return;
+    if (!isTechnician) {
+      setShowAddScriptModal(true);
+    }
+    const { add_script, ...rest } = location.query;
+    router.replace({ pathname: location.pathname, query: rest });
+  }, [location.query, location.pathname, router, isTechnician]);
+
+  const selectedScript = useRef<IScript | null>(null);
+
+  const {
+    data: { scripts, meta } = {},
+    isLoading,
+    isError,
+    refetch: refetchScripts,
+  } = useQuery<
+    IScriptsResponse,
+    AxiosError,
+    IScriptsResponse,
+    IListScriptsQueryKey[]
+  >(
+    [
+      {
+        scope: "scripts",
+        fleet_id: teamId,
+        page: currentPage,
+        per_page: SCRIPTS_PER_PAGE,
+      },
+    ],
+    ({ queryKey: [{ fleet_id, page, per_page }] }) =>
+      scriptAPI.getScripts({ fleet_id, page, per_page }),
+    {
+      ...DEFAULT_USE_QUERY_OPTIONS,
+      staleTime: 3000,
+    }
+  );
+
+  // pagination controls
+  const path = PATHS.CONTROLS_SCRIPTS_LIBRARY;
+  const queryString = isPremiumTier ? `?fleet_id=${teamId}&` : "?";
+  const onPrevPage = useCallback(() => {
+    router.push(path.concat(`${queryString}page=${currentPage - 1}`));
+  }, [router, path, currentPage, queryString]);
+  const onNextPage = useCallback(() => {
+    router.push(path.concat(`${queryString}page=${currentPage + 1}`));
+  }, [router, path, currentPage, queryString]);
+
+  const { config } = useContext(AppContext);
+  if (!config) return null;
+
+  const onClickScript = (script: IScript) => {
+    selectedScript.current = script;
+    setShowEditScriptModal(true);
+  };
+
+  const onEditScript = (script: IScript) => {
+    selectedScript.current = script;
+    setShowEditScriptModal(true);
+  };
+
+  const onExitEditScript = () => {
+    selectedScript.current = null;
+    setShowEditScriptModal(false);
+  };
+
+  const onClickDelete = (script: IScript) => {
+    selectedScript.current = script;
+    setShowDeleteScriptModal(true);
+  };
+
+  const onCancelDelete = () => {
+    setShowDeleteScriptModal(false);
+    selectedScript.current = null;
+  };
+
+  const onDeleteScript = () => {
+    selectedScript.current = null;
+    setShowDeleteScriptModal(false);
+    refetchScripts();
+  };
+
+  const renderScriptsList = () => {
+    if (isLoading) {
+      return <Spinner />;
+    }
+
+    if (isError) {
+      return <DataError />;
+    }
+
+    if (currentPage === 0 && !scripts?.length) {
+      return null;
+    }
+
+    return (
+      <>
+        <UploadList
+          keyAttribute="id"
+          listItems={scripts || []}
+          ListItemComponent={({ listItem }) => (
+            <ScriptListItem
+              script={listItem}
+              onDelete={onClickDelete}
+              onClickScript={onClickScript}
+              onEdit={onEditScript}
+              isTechnician={isTechnician}
+            />
+          )}
+        />
+        <Pagination
+          disablePrev={isLoading || !meta?.has_previous_results}
+          disableNext={isLoading || !meta?.has_next_results}
+          hidePagination={
+            !isLoading && !meta?.has_previous_results && !meta?.has_next_results
+          }
+          onPrevPage={onPrevPage}
+          onNextPage={onNextPage}
+        />
+      </>
+    );
+  };
+
+  const renderScriptsDisabledBanner = () => (
+    <InfoBanner color="yellow">
+      <div>
+        <b>Running scripts is disabled in organization settings.</b> You can
+        still manage your library of macOS and Windows scripts below.
+      </div>
+    </InfoBanner>
+  );
+
+  const canUploadScripts = !isTechnician;
+
+  return (
+    <div className={baseClass}>
+      <SectionHeader title="Library" alignLeftHeaderVertically />
+      <div className={`${baseClass}__tab-header`}>
+        <PageDescription
+          variant="right-panel"
+          content="A collection of scripts for configuring and remediating hosts."
+        />
+        {canUploadScripts && (
+          <GitOpsModeTooltipWrapper
+            position="left"
+            renderChildren={(disableChildren) => (
+              <Button
+                variant="secondary"
+                size="small"
+                onClick={() => setShowAddScriptModal(true)}
+                disabled={disableChildren}
+                icon="plus"
+              >
+                Add script
+              </Button>
+            )}
+          />
+        )}
+      </div>
+      {config.server_settings.scripts_disabled && renderScriptsDisabledBanner()}
+      {renderScriptsList()}
+      {!isLoading && !isError && currentPage === 0 && !scripts?.length && (
+        <EmptyState
+          variant="header-list"
+          header="No scripts"
+          info={canUploadScripts ? SCRIPT_UPLOADER_EMPTY_STATE_TEXT : undefined}
+          primaryButton={
+            canUploadScripts ? (
+              <GitOpsModeTooltipWrapper
+                renderChildren={(disableChildren) => (
+                  <Button
+                    onClick={() => setShowAddScriptModal(true)}
+                    disabled={disableChildren}
+                  >
+                    Upload
+                  </Button>
+                )}
+              />
+            ) : undefined
+          }
+        />
+      )}
+      {showDeleteScriptModal && selectedScript.current && (
+        <DeleteScriptModal
+          scriptName={selectedScript.current?.name}
+          scriptId={selectedScript.current?.id}
+          onCancel={onCancelDelete}
+          afterDelete={onDeleteScript}
+        />
+      )}
+      {showEditScriptModal && selectedScript.current && (
+        <EditScriptModal
+          scriptId={selectedScript.current.id}
+          scriptName={selectedScript.current.name}
+          onExit={onExitEditScript}
+        />
+      )}
+      {showAddScriptModal && (
+        <ScriptUploadModal
+          currentTeamId={teamId}
+          onExit={() => setShowAddScriptModal(false)}
+          onSubmit={() => {
+            setShowAddScriptModal(false);
+            refetchScripts();
+          }}
+        />
+      )}
+    </div>
+  );
+};
+
+export default ScriptLibrary;

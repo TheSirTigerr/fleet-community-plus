@@ -1,0 +1,64 @@
+.apple-business-manager-table {
+  .data-table-block .data-table {
+    td.macos_team__cell,
+    td.ios_team__cell,
+    td.ipados_team__cell,
+    td.byod_team__cell {
+      max-width: 150px;
+    }
+
+    td.id__cell {
+      .abm-actions-wrapper {
+        display: flex;
+        align-items: center;
+      }
+    }
+
+    th.id__header {
+      border: none;
+    }
+  }
+
+  // The desired behavior is to hide the header and team cell one by one
+  // as the viewport gets smaller. This is achieved by using the max-width
+  // media query with the breakpoint values taken from when the table content
+  // starts to overflow.
+  @media (max-width: $break-lg) {
+    .byod_team__header,
+    .byod_team__cell {
+      display: none;
+    }
+  }
+
+  @media (max-width: 1230px) {
+    .ipados_team__header,
+    .ipados_team__cell {
+      display: none;
+    }
+  }
+
+  @media (max-width: $break-md) {
+    .ios_team__header,
+    .ios_team__cell {
+      display: none;
+    }
+  }
+
+  // this is a special case where the org name cell is too long at smaller widths.
+  // We dont want to remove any more columns so we need to reduce the width of
+  // the org name cell content to prevent table content overflow.
+  @media (max-width: $break-sm) {
+    .org-name-cell {
+      width: 140px;
+    }
+  }
+
+  .disabled-by-gitops-mode {
+    @include disabled;
+
+    .actions-dropdown-select__control--is-disabled {
+      min-height: 0;
+      padding: 0;
+    }
+  }
+}

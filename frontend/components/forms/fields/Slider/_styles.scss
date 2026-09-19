@@ -1,0 +1,66 @@
+.fleet-slider {
+  transition: background-color 150ms ease-in-out;
+  background-color: $ui-fleet-black-50;
+  border-radius: 12px;
+  cursor: pointer;
+  display: inline-block;
+  height: 20px;
+  min-width: 35px;
+  position: relative;
+  width: 35px;
+
+  &:hover {
+    background-color: $ui-fleet-black-50;
+  }
+
+  &--active {
+    background-color: $core-fleet-green;
+
+    &:hover {
+      background-color: $core-fleet-green;
+    }
+  }
+
+  &__wrapper {
+    display: flex;
+    gap: $pad-small;
+    align-items: center;
+    height: 24px; // Noticeable with help text below slider
+
+    &--disabled {
+      .fleet-slider {
+        @include disabled;
+      }
+
+      .fleet-slider__label {
+        @include disabled;
+        pointer-events: initial; // Allow label interaction when slider is disabled to view tooltip
+      }
+    }
+  }
+
+  &__dot {
+    @include size(16px);
+    @include position(absolute, 2px null null 2px);
+    transition: left 150ms ease-in-out;
+    border-radius: 50%;
+    background-color: $core-fleet-white;
+
+    &--active {
+      left: 17px;
+    }
+  }
+
+  &__label {
+    display: flex;
+    vertical-align: middle;
+    gap: $pad-small; // For supporting icons
+    font-size: $x-small;
+    font-weight: $regular;
+    text-align: left;
+  }
+
+  &__help-text {
+    @include help-text;
+  }
+}

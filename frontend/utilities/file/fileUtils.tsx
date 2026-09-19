@@ -1,0 +1,153 @@
+import React from "react";
+
+import TooltipWrapper from "components/TooltipWrapper";
+import { PackageType } from "interfaces/package_type";
+
+type IPlatformDisplayName =
+  | "macOS"
+  | "Windows"
+  | "Linux"
+  | "iOS/iPadOS"
+  | "macOS & Linux";
+
+export const FILE_EXTENSIONS_TO_PLATFORM_DISPLAY_NAME: Record<
+  string,
+  IPlatformDisplayName
+> = {
+  json: "macOS",
+  pkg: "macOS",
+  mobileconfig: "macOS",
+  exe: "Windows",
+  msi: "Windows",
+  xml: "Windows",
+  deb: "Linux",
+  rpm: "Linux",
+  "tar.gz": "Linux",
+  sh: "macOS & Linux",
+  ps1: "Windows",
+  py: "macOS & Linux",
+  ipa: "iOS/iPadOS",
+};
+
+/** Currently only using tar.gz, but keeping the others for future use
+ *  and to avoid breaking changes. */
+const compoundExtensions = ["tar.gz", "tar.xz", "tar.bz2", "tar.zst"];
+
+/**  Currently only using tgz, but keeping the others for future use
+ * and to avoid breaking changes. */
+const extensionAliases: Record<string, string> = {
+  tgz: "tar.gz",
+  tbz2: "tar.bz2",
+  tzst: "tar.zst",
+  txz: "tar.xz",
+};
+
+/** Extract the extension, considering compound extensions like .tar.gz;
+ * Aliases like .tgz will be converted to compound extensions like .tar.gz
+ */
+export const getExtensionFromFileName = (fileName: string) => {
+  const lower = fileName.toLowerCase();
+  const parts = lower.split(".");
+
+  // Find compound extension
+  const compound = compoundExtensions.find((ext) => {
+    const extParts = ext.split(".");
+    return parts.slice(-extParts.length).join(".") === ext;
+  });
+
+  // Choose extension: compound or simple
+  let ext: string | undefined;
+  if (compound) {
+    ext = compound;
+  } else if (parts.length > 1) {
+    ext = parts.pop();
+  }
+
+  // Map aliases if needed
+  if (ext && extensionAliases[ext]) {
+    ext = extensionAliases[ext];
+  }
+
+  return ext as PackageType | undefined;
+};
+
+/** This gets the platform display name from the file.
+ * Script packages (.sh, .py) map to "macOS & Linux" since they run on both;
+ * .ipa maps to iOS/iPadOS with a tooltip noting it covers both.
+ */
+export const getPlatformDisplayName = (file: File) => {
+  const fileExt = getExtensionFromFileName(file.name);
+  if (!fileExt) {
+    return undefined;
+  }
+  if (fileExt === "ipa") {
+    return (
+      <TooltipWrapper tipContent="Software will be added for both platforms.">
+        {FILE_EXTENSIONS_TO_PLATFORM_DISPLAY_NAME[fileExt]}
+      </TooltipWrapper>
+    );
+  }
+
+  return FILE_EXTENSIONS_TO_PLATFORM_DISPLAY_NAME[fileExt];
+};
+
+/** This gets the file details from the file. */
+export const getFileDetails = (file: File) => {
+  return {
+    name: file.name,
+    description: getPlatformDisplayName(file),
+  };
+};
+
+export interface IFileDetails {
+  name: string;
+  description?: React.ReactNode;
+}
+
+// Both tables match the ones go-units gives the server, so the two agree at
+// every magnitude rather than only up to terabytes.
+const DECIMAL_ABBREVIATIONS = [
+  "B",
+  "kB",
+  "MB",
+  "GB",
+  "TB",
+  "PB",
+  "EB",
+  "ZB",
+  "YB",
+];
+const BINARY_ABBREVIATIONS = [
+  "B",
+  "KiB",
+  "MiB",
+  "GiB",
+  "TiB",
+  "PiB",
+  "EiB",
+  "ZiB",
+  "YiB",
+];
+
+const formatWithBase = (
+  bytes: number,
+  base: number,
+  abbreviations: string[]
+) => {
+  let size = bytes;
+  let abbreviationIndex = 0;
+  while (size >= base && abbreviationIndex < abbreviations.length - 1) {
+    size /= base;
+    abbreviationIndex += 1;
+  }
+  // 4 significant digits with trailing zeros dropped, matching Go's "%.4g"
+  return `${Number(size.toPrecision(4))}${abbreviations[abbreviationIndex]}`;
+};
+
+// Returns a human readable size, like the server's installersize.Human function
+export const formatFileSize = (bytes: number) => {
+  const decimal = formatWithBase(bytes, 1000, DECIMAL_ABBREVIATIONS);
+  const binary = formatWithBase(bytes, 1024, BINARY_ABBREVIATIONS);
+
+  return binary.length < decimal.length ? binary : decimal;
+};

@@ -1,0 +1,18 @@
+.setup-script-status-cell {
+  display: flex;
+  align-items: center;
+  gap: $gap-icon-text;
+  font-size: $x-small; // Already applied but on component level for storybook
+
+  &__icon {
+    display: flex;
+    align-items: center;
+    justify-content: center;
+    width: $pad-medium;
+    height: $pad-medium;
+  }
+
+  &__label {
+    min-width: 14ch; // 14 characters — Prevents jitter, fits longest label ("Installing")
+  }
+}

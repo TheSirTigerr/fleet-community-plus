@@ -1,0 +1,317 @@
+import { AxiosResponse } from "axios";
+import { Location } from "history";
+import React, { useContext, useState } from "react";
+import { useErrorHandler } from "react-error-boundary";
+import { useQuery, useQueryClient } from "react-query";
+import { InjectedRouter } from "react-router";
+
+import BackButton from "components/BackButton";
+import Button from "components/buttons/Button";
+import Card from "components/Card";
+import DataError from "components/DataError";
+import MainContent from "components/MainContent";
+import PageDescription from "components/PageDescription";
+import PremiumFeatureMessage from "components/PremiumFeatureMessage";
+import SidePanelPage from "components/SidePanelPage";
+import Spinner from "components/Spinner";
+import { notify } from "components/ToastNotification";
+import { AppContext } from "context/app";
+import { Platform, PLATFORM_DISPLAY_NAMES } from "interfaces/platform";
+import { getPatchPolicyFlags } from "pages/SoftwarePage/components/forms/SoftwareDeploySelector";
+import SoftwareIcon from "pages/SoftwarePage/components/icons/SoftwareIcon";
+import PATHS from "router/paths";
+import softwareAPI from "services/entities/software";
+import teamPoliciesAPI from "services/entities/team_policies";
+import { DEFAULT_USE_QUERY_OPTIONS } from "utilities/constants";
+import { getPathWithQueryParams } from "utilities/url";
+
+import TooltipWrapper from "../../../../../components/TooltipWrapper";
+
+import AddFleetAppSoftwareModal from "./AddFleetAppSoftwareModal";
+import FleetAppDetailsForm from "./FleetAppDetailsForm";
+import { IFleetMaintainedAppFormData } from "./FleetAppDetailsForm/FleetAppDetailsForm";
+import FleetAppDetailsModal from "./FleetAppDetailsModal";
+import { getErrorMessage } from "./helpers";
+
+const baseClass = "fleet-maintained-app-details-page";
+
+interface IFleetAppSummaryProps {
+  name: string;
+  platform: string;
+  version: string;
+  onClickShowAppDetails: (event: MouseEvent) => void;
+}
+
+const FleetAppSummary = ({
+  name,
+  platform,
+  version,
+  onClickShowAppDetails,
+}: IFleetAppSummaryProps) => {
+  let versionElement = <>{version}</>;
+
+  if (version === "latest") {
+    versionElement = (
+      <TooltipWrapper
+        tipContent={
+          <>
+            To preview the version, select <strong>Show details</strong> and
+            download {name} using the URL.
+          </>
+        }
+      >
+        Latest
+      </TooltipWrapper>
+    );
+  }
+
+  return (
+    <Card
+      className={`${baseClass}__fleet-app-summary`}
+      borderRadiusSize="medium"
+    >
+      <div className={`${baseClass}__fleet-app-summary--left`}>
+        <SoftwareIcon name={name} size="medium" />
+        <div className={`${baseClass}__fleet-app-summary--details`}>
+          <div className={`${baseClass}__fleet-app-summary--title`}>{name}</div>
+          <div className={`${baseClass}__fleet-app-summary--info`}>
+            <div
+              className={`${baseClass}__fleet-app-summary--details--platform`}
+            >
+              {PLATFORM_DISPLAY_NAMES[platform as Platform]}
+            </div>
+            &bull;
+            <div
+              className={`${baseClass}__fleet-app-summary--details--version`}
+            >
+              {versionElement}
+            </div>
+          </div>
+        </div>
+      </div>
+      <div className={`${baseClass}__fleet-app-summary--show-details`}>
+        <Button variant="subdued" onClick={onClickShowAppDetails} icon="info">
+          Show details
+        </Button>
+      </div>
+    </Card>
+  );
+};
+
+export interface IFleetMaintainedAppDetailsQueryParams {
+  fleet_id?: string;
+}
+
+interface IFleetMaintainedAppDetailsRouteParams {
+  id: string;
+}
+
+interface IFleetMaintainedAppDetailsPageProps {
+  location: Location<IFleetMaintainedAppDetailsQueryParams>;
+  router: InjectedRouter;
+  routeParams: IFleetMaintainedAppDetailsRouteParams;
+}
+
+/** This type includes the editable form data as well as the fleet maintained
+ * app id */
+export type IAddFleetMaintainedData = IFleetMaintainedAppFormData & {
+  appId: number;
+};
+
+const FleetMaintainedAppDetailsPage = ({
+  location,
+  router,
+  routeParams,
+}: IFleetMaintainedAppDetailsPageProps) => {
+  const teamId = location.query.fleet_id;
+  const appId = parseInt(routeParams.id, 10);
+  if (isNaN(appId)) {
+    router.push(PATHS.SOFTWARE_ADD_FLEET_MAINTAINED);
+  }
+
+  const queryClient = useQueryClient();
+
+  const handlePageError = useErrorHandler();
+  const { isPremiumTier } = useContext(AppContext);
+
+  const [
+    showAddFleetAppSoftwareModal,
+    setShowAddFleetAppSoftwareModal,
+  ] = useState(false);
+  const [showAppDetailsModal, setShowAppDetailsModal] = useState(false);
+
+  const {
+    data: fleetApp,
+    isLoading: isLoadingFleetApp,
+    isError: isErrorFleetApp,
+  } = useQuery(
+    ["fleet-maintained-app", appId],
+    () => softwareAPI.getFleetMaintainedApp(appId, teamId),
+    {
+      ...DEFAULT_USE_QUERY_OPTIONS,
+      enabled: isPremiumTier,
+      retry: false,
+      select: (res) => res.fleet_maintained_app,
+      onError: (error) => handlePageError(error),
+    }
+  );
+
+  const onClickShowAppDetails = () => {
+    setShowAppDetailsModal(true);
+  };
+
+  const backToAddSoftwareUrl = getPathWithQueryParams(
+    PATHS.SOFTWARE_ADD_FLEET_MAINTAINED,
+    { fleet_id: teamId }
+  );
+
+  const onCancel = () => {
+    router.push(backToAddSoftwareUrl);
+  };
+
+  const onSubmit = async (formData: IFleetMaintainedAppFormData) => {
+    // this should not happen but we need to handle the type correctly
+    if (!teamId) return;
+
+    setShowAddFleetAppSoftwareModal(true);
+
+    // Refresh the software caches and land on the new title's details. Shared
+    // by the success path and the partial-success path (title added, but the
+    // patch policy failed) so the two can't drift apart.
+    const refreshAndGoToTitle = (titleId: number) => {
+      queryClient.invalidateQueries({
+        queryKey: [{ scope: "software-titles" }],
+      });
+      queryClient.invalidateQueries({
+        queryKey: [{ scope: "software-library" }],
+      });
+      queryClient.invalidateQueries({
+        queryKey: [{ scope: "fleet-maintained-apps" }],
+      });
+      router.push(
+        getPathWithQueryParams(
+          PATHS.SOFTWARE_TITLE_DETAILS(titleId.toString()),
+          { fleet_id: teamId }
+        )
+      );
+    };
+
+    let softwareFmaTitleId: number | undefined;
+    try {
+      const response = await softwareAPI.addFleetMaintainedApp(
+        parseInt(teamId, 10),
+        {
+          ...formData,
+          appId,
+        }
+      );
+      const addedSoftwareTitleId = response.software_title_id;
+      softwareFmaTitleId = addedSoftwareTitleId;
+
+      if (formData.patch) {
+        await teamPoliciesAPI.create({
+          team_id: parseInt(teamId, 10),
+          type: "patch",
+          patch_software_title_id: addedSoftwareTitleId,
+          ...(formData.patchOption !== "manual" && {
+            software_title_id: addedSoftwareTitleId,
+          }),
+          ...getPatchPolicyFlags(formData.patchOption),
+        });
+      }
+
+      refreshAndGoToTitle(addedSoftwareTitleId);
+
+      notify.success(
+        <>
+          <b>{fleetApp?.name}</b> successfully added.
+        </>
+      );
+    } catch (error) {
+      const ae = (typeof error === "object" ? error : {}) as AxiosResponse;
+
+      if (softwareFmaTitleId) {
+        refreshAndGoToTitle(softwareFmaTitleId);
+        notify.error(
+          "Software was added, but the deployment settings couldn't be saved. Try again from Actions > Deploy.",
+          { response: error }
+        );
+      } else {
+        notify.error(getErrorMessage(ae), { response: error });
+      }
+    }
+
+    setShowAddFleetAppSoftwareModal(false);
+  };
+
+  const renderContent = () => {
+    if (!isPremiumTier) {
+      return <PremiumFeatureMessage />;
+    }
+
+    if (isLoadingFleetApp) {
+      return <Spinner />;
+    }
+
+    if (isErrorFleetApp) {
+      return <DataError verticalPaddingSize="pad-xxxlarge" />;
+    }
+
+    if (fleetApp) {
+      return (
+        <>
+          <BackButton
+            text="Back to add software"
+            path={backToAddSoftwareUrl}
+            className={`${baseClass}__back-to-add-software`}
+          />
+          <h1>{fleetApp.name}</h1>
+          <PageDescription content="Add software to your library." />
+          <div className={`${baseClass}__page-content`}>
+            <FleetAppSummary
+              name={fleetApp.name}
+              platform={fleetApp.platform}
+              version={fleetApp.version}
+              onClickShowAppDetails={onClickShowAppDetails}
+            />
+            <FleetAppDetailsForm
+              categories={fleetApp.categories}
+              defaultInstallScript={fleetApp.install_script}
+              defaultPostInstallScript={fleetApp.post_install_script}
+              defaultUninstallScript={fleetApp.uninstall_script}
+              teamId={teamId}
+              onCancel={onCancel}
+              onSubmit={onSubmit}
+              softwareTitleId={fleetApp.software_title_id}
+            />
+          </div>
+        </>
+      );
+    }
+
+    return null;
+  };
+
+  return (
+    <SidePanelPage>
+      <>
+        <MainContent className={baseClass}>
+          <>{renderContent()}</>
+        </MainContent>
+        {showAddFleetAppSoftwareModal && <AddFleetAppSoftwareModal />}
+        {showAppDetailsModal && fleetApp && (
+          <FleetAppDetailsModal
+            name={fleetApp.name}
+            platform={fleetApp.platform}
+            version={fleetApp.version}
+            slug={fleetApp.slug}
+            url={fleetApp.url}
+            onCancel={() => setShowAppDetailsModal(false)}
+          />
+        )}
+      </>
+    </SidePanelPage>
+  );
+};
+
+export default FleetMaintainedAppDetailsPage;

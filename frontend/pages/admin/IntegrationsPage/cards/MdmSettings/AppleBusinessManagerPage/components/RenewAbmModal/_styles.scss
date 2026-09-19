@@ -1,0 +1,22 @@
+.renew-abm-modal {
+
+  &__setup-content {
+    display: flex;
+    flex-direction: column;
+    gap: $pad-medium;
+    color: $core-fleet-black;
+
+    p {
+      margin: 0;
+    }
+  }
+
+  &__button-wrap {
+    display: flex;
+    justify-content: flex-end;
+
+    .renew-token-modal__submit-button.uploading.button--disabled {
+      opacity: 1;
+    }
+  }
+}

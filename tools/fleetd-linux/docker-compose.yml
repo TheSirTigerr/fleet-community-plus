@@ -1,0 +1,40 @@
+---
+x-default-settings:
+  environment: &default-environment
+    ENROLL_SECRET: "${ENROLL_SECRET:?ENROLL_SECRET must be set for server authentication}"
+  platform: &default-platform linux/amd64
+  cap_add: &default-caps
+    - SYS_PTRACE
+
+#
+# SYS_PTRACE is granted so osquery can read /proc/<pid>/io for processes it
+# doesn't own (otherwise: `[... processes.cpp:510] Cannot read /proc/50/io`).
+# We avoid `privileged: true` because running multiple privileged services
+# at once breaks Docker Desktop for Mac.
+#
+
+services:
+  ubuntu24.04-fleetd:
+    image: "fleetd-ubuntu-24.04"
+    platform: *default-platform
+    environment: *default-environment
+    cap_add: *default-caps
+    restart: unless-stopped
+  fedora43-fleetd:
+    image: "fleetd-fedora-43"
+    platform: *default-platform
+    environment: *default-environment
+    cap_add: *default-caps
+    restart: unless-stopped
+  debian13.4-fleetd:
+    image: "fleetd-debian-13.4"
+    platform: *default-platform
+    environment: *default-environment
+    cap_add: *default-caps
+    restart: unless-stopped
+  cachyos-fleetd:
+    image: "fleetd-cachyos"
+    platform: *default-platform
+    environment: *default-environment
+    cap_add: *default-caps
+    restart: unless-stopped

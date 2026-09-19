@@ -1,0 +1,32 @@
+.software-name-cell {
+  // TODO: we do not want to use !important but have to for now. We need to pull
+  // the .link-cell styles into the LinkCell component in order to
+  // decrease the specificity of the styles. This will allow us to remove the
+  // !important from here.
+  display: flex !important;
+  align-items: center;
+  gap: $pad-small;
+
+  .software-icon {
+    width: 24px;
+    height: 24px;
+  }
+
+  &__install-icon-with-tooltip {
+    display: inline-flex;
+    align-items: center;
+
+    // TooltipWrapper renders its child inside a span that defaults to
+    // text-baseline alignment. Re-center so the icon sits in the row's
+    // vertical middle wherever this component is used.
+    .component__tooltip-wrapper__element {
+      display: inline-flex;
+      align-items: center;
+    }
+  }
+
+  &__install-tooltip-text {
+    font-weight: $regular;
+    font-size: $xx-small;
+  }
+}

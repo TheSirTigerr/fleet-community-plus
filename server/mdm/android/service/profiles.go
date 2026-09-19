@@ -1,0 +1,751 @@
+package service
+
+import (
+	"cmp"
+	"context"
+	"encoding/json"
+	"errors"
+	"fmt"
+	"log/slog"
+	"maps"
+	"net/http"
+	"slices"
+	"strings"
+
+	"github.com/fleetdm/fleet/v4/server/config"
+	"github.com/fleetdm/fleet/v4/server/contexts/ctxerr"
+	"github.com/fleetdm/fleet/v4/server/fleet"
+	"github.com/fleetdm/fleet/v4/server/mdm/android"
+	"github.com/fleetdm/fleet/v4/server/mdm/android/service/androidmgmt"
+	"github.com/fleetdm/fleet/v4/server/mdm/profiles"
+	"google.golang.org/api/androidmanagement/v1"
+)
+
+func ReconcileProfiles(ctx context.Context, ds fleet.Datastore, logger *slog.Logger, licenseKey string, androidAgentConfig config.AndroidAgentConfig, batchSize int) error {
+	return ReconcileProfilesWithClient(ctx, ds, logger, licenseKey, nil, androidAgentConfig, batchSize)
+}
+
+// ReconcileProfilesWithClient is like ReconcileProfiles but allows injecting a custom client for testing.
+// If client is nil, a new AMAPI client will be created.
+func ReconcileProfilesWithClient(ctx context.Context, ds fleet.Datastore, logger *slog.Logger, licenseKey string, client androidmgmt.Client, androidAgentConfig config.AndroidAgentConfig, batchSize int) (err error) {
+	appConfig, err := ds.AppConfig(ctx)
+	if err != nil {
+		return ctxerr.Wrap(ctx, err, "get app config")
+	}
+	if !appConfig.MDM.AndroidEnabledAndConfigured {
+		return nil
+	}
+
+	// get the one-and-only Android enterprise, which is treated as an error if
+	// not present, since the appconfig tells us Android MDM is enabled and
+	// configured.
+	enterprise, err := ds.GetEnterprise(ctx)
+	if err != nil {
+		return ctxerr.Wrap(ctx, err, "get android enterprise")
+	}
+
+	if client == nil {
+		client = newAMAPIClient(ctx, logger, licenseKey)
+		authSecret, err := getClientAuthenticationSecret(ctx, ds)
+		if err != nil {
+			return ctxerr.Wrap(ctx, err, "getting Android client authentication secret for profile reconciler")
+		}
+		err = client.SetAuthenticationSecret(authSecret)
+		if err != nil {
+			return ctxerr.Wrap(ctx, err, "setting Android client authentication secret for profile reconciler")
+		}
+	}
+
+	// Read the cursor; on error, treat as start-of-pass and continue.
+	cursor, cursorErr := ds.GetMDMAndroidReconcileCursor(ctx)
+	if cursorErr != nil {
+		logger.WarnContext(ctx, "failed to read android MDM reconcile cursor; starting from beginning",
+			"err", cursorErr)
+		cursor = ""
+	}
+
+	reconciler := &profileReconciler{
+		DS:                 ds,
+		Enterprise:         enterprise,
+		Client:             client,
+		AndroidAgentConfig: androidAgentConfig,
+		Logger:             logger,
+	}
+	hostCount, err := reconciler.ReconcileProfiles(ctx, cursor, batchSize)
+
+	var nextCursor string
+	if batchSize > 0 && hostCount >= batchSize {
+		// reconciler returns hostCount matching the number of distinct
+		// host UUIDs it processed; advance past them.
+		nextCursor = reconciler.lastHostUUID
+	}
+
+	// On success, advance the cursor. On failure, leave it where it was
+	// so the next tick retries the same host window.
+	if err == nil && cursor != nextCursor {
+		if cerr := ds.SetMDMAndroidReconcileCursor(ctx, nextCursor); cerr != nil {
+			logger.WarnContext(ctx, "failed to advance android MDM reconcile cursor", "err", cerr)
+		}
+	}
+
+	return err
+}
+
+// profileReconciler is a struct to facilitate testability, it should not be
+// used outside of tests.
+type profileReconciler struct {
+	DS                 fleet.Datastore
+	Enterprise         *android.Enterprise
+	Client             androidmgmt.Client
+	AndroidAgentConfig config.AndroidAgentConfig
+	Logger             *slog.Logger
+	lastHostUUID       string
+}
+
+func getClientAuthenticationSecret(ctx context.Context, ds fleet.Datastore) (string, error) {
+	assets, err := ds.GetAllMDMConfigAssetsByName(ctx, []fleet.MDMAssetName{fleet.MDMAssetAndroidFleetServerSecret}, nil)
+	switch {
+	case fleet.IsNotFound(err):
+		return "", nil
+	case err != nil:
+		return "", ctxerr.Wrap(ctx, err, "getting Android authentication secret")
+	}
+	return string(assets[fleet.MDMAssetAndroidFleetServerSecret].Value), nil
+}
+
+func (r *profileReconciler) ReconcileProfiles(ctx context.Context, cursor string, batchSize int) (int, error) {
+	if err := r.reconcileCertificateTemplates(ctx); err != nil {
+		return 0, ctxerr.Wrap(ctx, err, "reconcile certificate templates")
+	}
+
+	// get the list of hosts that need to have their profiles applied
+	hostsApplicableProfiles, hostsProfsToRemove, err := r.DS.ListMDMAndroidProfilesToSend(ctx, cursor, batchSize)
+	if err != nil {
+		return 0, ctxerr.Wrap(ctx, err, "identify android profiles to send")
+	}
+
+	profilesByHostUUID := make(map[string][]*fleet.MDMAndroidProfilePayload)
+	profilesToLoad := make(map[string]struct{})
+	for _, hostProf := range hostsApplicableProfiles {
+		profilesByHostUUID[hostProf.HostUUID] = append(profilesByHostUUID[hostProf.HostUUID], hostProf)
+
+		// keep a deduplicated list of profiles to load the JSON only once for each
+		// distinct one
+		profilesToLoad[hostProf.ProfileUUID] = struct{}{}
+	}
+
+	profilesContents, err := r.DS.GetMDMAndroidProfilesContents(ctx, slices.Collect(maps.Keys(profilesToLoad)))
+	if err != nil {
+		return 0, ctxerr.Wrap(ctx, err, "load android profiles content")
+	}
+
+	// index the to-remove profiles by host so we can pass them to sendHostProfiles
+	toRemoveByHostUUID := make(map[string][]*fleet.MDMAndroidProfilePayload)
+	for _, prof := range hostsProfsToRemove {
+		toRemoveByHostUUID[prof.HostUUID] = append(toRemoveByHostUUID[prof.HostUUID], prof)
+	}
+
+	// Collect all distinct host UUIDs for cursor advancement.
+	allHostUUIDs := make(map[string]struct{}, len(profilesByHostUUID)+len(toRemoveByHostUUID))
+	for uuid := range profilesByHostUUID {
+		allHostUUIDs[uuid] = struct{}{}
+	}
+	for uuid := range toRemoveByHostUUID {
+		allHostUUIDs[uuid] = struct{}{}
+	}
+	hostCount := len(allHostUUIDs)
+
+	// Track the last (lexicographically greatest) host UUID for cursor.
+	if hostCount > 0 {
+		r.lastHostUUID = slices.Max(slices.Collect(maps.Keys(allHostUUIDs)))
+	}
+
+	// Extract ONC cert aliases once for all hosts (profile contents are shared),
+	// then batch-fetch cert statuses for all hosts in a single DB query.
+	certAliases := extractProfileCertAliases(ctx, r.Logger, profilesContents)
+	var allCertStatuses map[string]map[string]fleet.CertificateTemplateStatus
+	if len(certAliases) > 0 {
+		allCertStatuses, err = r.DS.GetCertificateTemplateStatusesByNameForHosts(ctx, slices.Collect(maps.Keys(profilesByHostUUID)))
+		if err != nil {
+			return 0, ctxerr.Wrap(ctx, err, "batch get certificate template statuses")
+		}
+	}
+
+	var bulkHostProfs []*fleet.MDMAndroidProfilePayload
+	for hostUUID, toInstallProfs := range profilesByHostUUID {
+		toRemove := toRemoveByHostUUID[hostUUID]
+		bulkProfs, err := r.sendHostProfiles(ctx, hostUUID, toInstallProfs, toRemove, profilesContents, certAliases, allCertStatuses[hostUUID])
+		if err != nil {
+			return 0, ctxerr.Wrapf(ctx, err, "send profiles for host %s", hostUUID)
+		}
+		bulkHostProfs = append(bulkHostProfs, bulkProfs...)
+		delete(toRemoveByHostUUID, hostUUID)
+	}
+
+	// if there are hosts with only profiles to remove, process them too
+	for hostUUID, toRemove := range toRemoveByHostUUID {
+		bulkProfs, err := r.sendHostProfiles(ctx, hostUUID, nil, toRemove, nil, nil, nil)
+		if err != nil {
+			return 0, ctxerr.Wrapf(ctx, err, "send profiles for host %s", hostUUID)
+		}
+		bulkHostProfs = append(bulkHostProfs, bulkProfs...)
+	}
+
+	if hostCount > 0 {
+		r.Logger.DebugContext(ctx, "android profile reconciler processed hosts", "host_count", hostCount, "profile_count", len(bulkHostProfs))
+	}
+
+	if err := r.DS.BulkUpsertMDMAndroidHostProfiles(ctx, bulkHostProfs); err != nil {
+		return 0, ctxerr.Wrap(ctx, err, "bulk upsert android host profiles")
+	}
+	return hostCount, nil
+}
+
+func (r *profileReconciler) sendHostProfiles(
+	ctx context.Context,
+	hostUUID string,
+	profilesToMerge []*fleet.MDMAndroidProfilePayload,
+	profilesToRemove []*fleet.MDMAndroidProfilePayload,
+	profilesContents map[string]json.RawMessage,
+	certAliases map[string][]string,
+	certStatuses map[string]fleet.CertificateTemplateStatus,
+) ([]*fleet.MDMAndroidProfilePayload, error) {
+	const maxRequestFailures = 3
+
+	// We need a deterministic order to merge the profiles, and I opted to go by
+	// name, alphabetically ascending, as it's simple, deterministic (names are
+	// unique) and the ordering can be viewed by the user in the UI. We had also
+	// discussed upload time of the profile but it may not be deterministic for
+	// batch-set profiles (same timestamp when inserted in a transaction) and is
+	// not readily visible in the UI.
+	slices.SortFunc(profilesToMerge, func(a, b *fleet.MDMAndroidProfilePayload) int {
+		return cmp.Compare(a.ProfileName, b.ProfileName)
+	})
+
+	// Withhold profiles whose openNetworkConfiguration references certificates
+	// that are not yet verified or terminally failed on this host.
+	var withheldProfiles []*fleet.MDMAndroidProfilePayload
+	if len(certAliases) > 0 {
+		profilesToMerge, withheldProfiles = filterProfilesWithPendingCerts(profilesToMerge, certAliases, certStatuses)
+	}
+
+	// map of the bulk struct keyed by profile UUID
+	bulkProfilesByUUID := make(map[string]*fleet.MDMAndroidProfilePayload, len(profilesToMerge)+len(profilesToRemove)+len(withheldProfiles))
+
+	// appendWithheld adds withheld profiles to the result. Called before every return
+	// so they're always persisted, but after the policy patch loop so they don't get
+	// policy request metadata set on them.
+	appendWithheld := func() {
+		for _, prof := range withheldProfiles {
+			status := fleet.MDMDeliveryPending
+			bulkProfilesByUUID[prof.ProfileUUID] = &fleet.MDMAndroidProfilePayload{
+				HostUUID:      hostUUID,
+				Status:        &status,
+				OperationType: fleet.MDMOperationTypeInstall,
+				ProfileUUID:   prof.ProfileUUID,
+				ProfileName:   prof.ProfileName,
+				Detail:        prof.Detail,
+				// Checksum intentionally omitted: withheld profiles were not
+				// actually sent, so they must retain a zero checksum to trigger
+				// re-send once the blocking certificate is verified.
+			}
+		}
+	}
+
+	// if every profile to install has > max failures, mark all as failed and done.
+	setFailCount := initRequestFailCountForSetOfProfiles(profilesToMerge, profilesToRemove)
+	if setFailCount >= maxRequestFailures {
+		// try to get the Google error from the last failed request
+		var googleErr string
+		for _, prof := range profilesToMerge {
+			if prof.LastErrorDetails != "" {
+				googleErr = prof.LastErrorDetails
+				break
+			}
+		}
+		if googleErr == "" {
+			for _, prof := range profilesToRemove {
+				if prof.LastErrorDetails != "" {
+					googleErr = prof.LastErrorDetails
+					break
+				}
+			}
+		}
+
+		var detail string
+		if googleErr != "" {
+			detail = fmt.Sprintf("Couldn't apply profile. Google returned error: %s. Please re-add the profile and try again.", googleErr)
+		} else {
+			detail = "Couldn't apply profile. Google returned error. Please re-add the profile and try again."
+		}
+		for _, prof := range profilesToMerge {
+			bulkProfilesByUUID[prof.ProfileUUID] = &fleet.MDMAndroidProfilePayload{
+				HostUUID:      hostUUID,
+				Status:        &fleet.MDMDeliveryFailed,
+				OperationType: fleet.MDMOperationTypeInstall,
+				ProfileUUID:   prof.ProfileUUID,
+				ProfileName:   prof.ProfileName,
+				Checksum:      prof.Checksum,
+				Detail:        detail,
+			}
+		}
+		for _, prof := range profilesToRemove {
+			bulkProfilesByUUID[prof.ProfileUUID] = &fleet.MDMAndroidProfilePayload{
+				HostUUID:      hostUUID,
+				Status:        &fleet.MDMDeliveryFailed,
+				OperationType: fleet.MDMOperationTypeRemove,
+				ProfileUUID:   prof.ProfileUUID,
+				ProfileName:   prof.ProfileName,
+				Checksum:      prof.Checksum,
+				Detail:        detail,
+			}
+		}
+		appendWithheld()
+		return slices.Collect(maps.Values(bulkProfilesByUUID)), nil
+	}
+
+	hostProfilesContents, varSubErr := substituteProfileVarsForHost(ctx, r.DS, hostUUID, profilesContents)
+	if varSubErr != nil {
+		detail, ok := androidVarSubstitutionFailureDetail(varSubErr)
+		if !ok {
+			return nil, ctxerr.Wrapf(ctx, varSubErr, "substitute fleet vars for host %s", hostUUID)
+		}
+		for _, prof := range profilesToMerge {
+			bulkProfilesByUUID[prof.ProfileUUID] = &fleet.MDMAndroidProfilePayload{
+				HostUUID:      hostUUID,
+				Status:        &fleet.MDMDeliveryFailed,
+				OperationType: fleet.MDMOperationTypeInstall,
+				ProfileUUID:   prof.ProfileUUID,
+				ProfileName:   prof.ProfileName,
+				Checksum:      prof.Checksum,
+				Detail:        detail,
+			}
+		}
+		for _, prof := range profilesToRemove {
+			status := fleet.MDMDeliveryPending
+			bulkProfilesByUUID[prof.ProfileUUID] = &fleet.MDMAndroidProfilePayload{
+				HostUUID:         hostUUID,
+				Status:           &status,
+				OperationType:    fleet.MDMOperationTypeRemove,
+				ProfileUUID:      prof.ProfileUUID,
+				ProfileName:      prof.ProfileName,
+				Checksum:         prof.Checksum,
+				RequestFailCount: setFailCount,
+			}
+		}
+		appendWithheld()
+		return slices.Collect(maps.Values(bulkProfilesByUUID)), nil
+	}
+
+	// merge the profiles in order, keeping track of what profile overrides what
+	// other one.
+	settingFromProfile := make(map[string]string)   // setting name -> "winning" profile UUID
+	overriddenSettings := make(map[string][]string) // profile UUID -> overridden setting names
+	var finalJSON map[string]json.RawMessage
+	for _, prof := range profilesToMerge {
+		content, ok := hostProfilesContents[prof.ProfileUUID]
+		if !ok {
+			// should never happen
+			return nil, ctxerr.Errorf(ctx, "missing content for profile %s", prof.ProfileUUID)
+		}
+
+		var profJSON map[string]json.RawMessage
+		if err := json.Unmarshal(content, &profJSON); err != nil {
+			return nil, ctxerr.Wrapf(ctx, err, "unmarshal profile %s content", prof.ProfileUUID)
+		}
+
+		if finalJSON == nil {
+			finalJSON = profJSON
+			for k := range profJSON {
+				settingFromProfile[k] = prof.ProfileUUID
+			}
+		} else {
+			for k, v := range profJSON {
+				if _, alreadySet := finalJSON[k]; alreadySet {
+					failedProfUUID := settingFromProfile[k]
+					overriddenSettings[failedProfUUID] = append(overriddenSettings[failedProfUUID], k)
+				}
+				finalJSON[k] = v
+				settingFromProfile[k] = prof.ProfileUUID
+			}
+		}
+
+		status := fleet.MDMDeliveryPending
+		bulkProfilesByUUID[prof.ProfileUUID] = &fleet.MDMAndroidProfilePayload{
+			HostUUID:         hostUUID,
+			Status:           &status,
+			OperationType:    fleet.MDMOperationTypeInstall,
+			ProfileUUID:      prof.ProfileUUID,
+			ProfileName:      prof.ProfileName,
+			Checksum:         prof.Checksum,
+			RequestFailCount: setFailCount,
+		}
+	}
+
+	// mark overridden profiles as failed
+	for profUUID, overridden := range overriddenSettings {
+		if len(overridden) > 0 {
+			bulk := bulkProfilesByUUID[profUUID]
+			bulk.Status = &fleet.MDMDeliveryFailed
+			bulk.Detail = buildPolicyFieldsOverriddenErrorMessage(overridden)
+		}
+	}
+
+	for _, prof := range profilesToRemove {
+		status := fleet.MDMDeliveryPending
+		bulkProfilesByUUID[prof.ProfileUUID] = &fleet.MDMAndroidProfilePayload{
+			HostUUID:         hostUUID,
+			Status:           &status,
+			OperationType:    fleet.MDMOperationTypeRemove,
+			ProfileUUID:      prof.ProfileUUID,
+			ProfileName:      prof.ProfileName,
+			Checksum:         prof.Checksum,
+			RequestFailCount: setFailCount,
+		}
+	}
+
+	// unmarshal the final JSON into the AMAPI policy struct
+	var policy androidmanagement.Policy
+	if finalJSON != nil {
+		b, err := json.Marshal(finalJSON)
+		if err != nil {
+			return nil, ctxerr.Wrapf(ctx, err, "marshal generic map of merged json")
+		}
+		if err := json.Unmarshal(b, &policy); err != nil {
+			return nil, ctxerr.Wrapf(ctx, err, "unmarshal merged json into policy struct")
+		}
+	}
+
+	// for every policy (even empty), we want to enforce some settings
+	applyFleetEnforcedSettings(&policy)
+
+	// using the host uuid as policy id, so we don't need to track the id mapping
+	// to the host.
+	policyName := fmt.Sprintf("%s/policies/%s", r.Enterprise.Name(), hostUUID)
+	policyReq, skip, err := r.patchPolicy(ctx, hostUUID, policyName, &policy, settingFromProfile)
+	if err != nil {
+		return nil, ctxerr.Wrapf(ctx, err, "patch policy for host %s", hostUUID)
+	}
+
+	// set the policy request information on every profile that was part of it
+	patchPolicyReqFailed := !skip && policyReq.StatusCode != http.StatusOK
+	for _, prof := range bulkProfilesByUUID {
+		prof.PolicyRequestUUID = &policyReq.RequestUUID
+		if patchPolicyReqFailed {
+			prof.RequestFailCount++
+			prof.Status = nil // stays nil so it gets retried
+		} else {
+			prof.RequestFailCount = 0
+			if policyReq.PolicyVersion.Valid {
+				v := int(policyReq.PolicyVersion.V)
+				prof.IncludedInPolicyVersion = &v
+			}
+		}
+	}
+
+	if skip && !policyReq.PolicyVersion.Valid {
+		r.Logger.WarnContext(ctx, "android policy patch returned not-modified without a version; profiles will have nil IncludedInPolicyVersion",
+			"host_uuid", hostUUID, "policy_request_uuid", policyReq.RequestUUID, "status_code", policyReq.StatusCode,
+			"profile_count", len(bulkProfilesByUUID))
+	}
+	if patchPolicyReqFailed {
+		appendWithheld()
+		return slices.Collect(maps.Values(bulkProfilesByUUID)), nil
+	}
+
+	// skip indicates that there was no change in the policy
+	var androidHost *fleet.AndroidHost
+	if !skip {
+		// check if we need to patch the device too (if that policy name is not already
+		// associated with the device)
+		androidHost, err = r.DS.AndroidHostLiteByHostUUID(ctx, hostUUID)
+		if err != nil {
+			return nil, ctxerr.Wrapf(ctx, err, "get android host by host UUID %s", hostUUID)
+		}
+		if androidHost.AppliedPolicyID != nil && *androidHost.AppliedPolicyID == hostUUID {
+			skip = true
+		}
+	}
+
+	if !skip {
+		// we need to associate the device with that policy
+		deviceName := fmt.Sprintf("%s/devices/%s", r.Enterprise.Name(), androidHost.DeviceID)
+		device := &androidmanagement.Device{
+			PolicyName: policyName,
+			// State must be specified when updating a device, otherwise it fails with
+			// "Illegal state transition from ACTIVE to DEVICE_STATE_UNSPECIFIED"
+			//
+			// > Note that when calling enterprises.devices.patch, ACTIVE and
+			// > DISABLED are the only allowable values.
+
+			// TODO(ap): should we send whatever the previous state was? If it was DISABLED,
+			// we probably don't want to re-enable it by accident. Those are the only
+			// 2 valid states when patching a device.
+			State: "ACTIVE",
+		}
+		deviceReq, skip, err := r.patchDevice(ctx, hostUUID, deviceName, device)
+		if err != nil {
+			return nil, ctxerr.Wrapf(ctx, err, "patch device for host %s", hostUUID)
+		}
+
+		// set the device request information on every profile that was part of it
+		deviceReqFailed := !skip && deviceReq.StatusCode != http.StatusOK
+		for _, prof := range bulkProfilesByUUID {
+			prof.DeviceRequestUUID = &deviceReq.RequestUUID
+			if deviceReqFailed {
+				prof.RequestFailCount++
+				prof.Status = nil // stays nil so it gets retried
+			} else {
+				prof.RequestFailCount = 0
+			}
+		}
+	}
+
+	appendWithheld()
+	return slices.Collect(maps.Values(bulkProfilesByUUID)), nil
+}
+
+func initRequestFailCountForSetOfProfiles(toInstall, toRemove []*fleet.MDMAndroidProfilePayload) int {
+	// Use the smallest fail count as the starting point for the new profiles
+	// (because it should be reset whenever the merged profile is different).
+	count := -1
+	for _, prof := range toInstall {
+		if count == -1 || prof.RequestFailCount < count {
+			count = prof.RequestFailCount
+		}
+	}
+	for _, prof := range toRemove {
+		if count == -1 || prof.RequestFailCount < count {
+			count = prof.RequestFailCount
+		}
+	}
+	if count == -1 {
+		// should never happen, but just in case
+		count = 0
+	}
+	return count
+}
+
+func buildPolicyFieldsOverriddenErrorMessage(overriddenFields []string) string {
+	slices.Sort(overriddenFields)
+
+	var sb strings.Builder
+	for range len(overriddenFields) - 1 {
+		sb.WriteString("%q, ")
+	}
+	if len(overriddenFields) > 1 {
+		sb.WriteString("and ")
+	}
+	sb.WriteString("%q")
+	if len(overriddenFields) > 1 {
+		sb.WriteString(" aren't applied. They are overridden by other configuration profiles.")
+	} else {
+		sb.WriteString(" isn't applied. It's overridden by another configuration profile.")
+	}
+
+	args := make([]any, len(overriddenFields))
+	for i, s := range overriddenFields {
+		args[i] = s
+	}
+	return fmt.Sprintf(sb.String(), args...)
+}
+
+// profileCertAliases holds the extracted cert aliases (or parse error) for a profile.
+// extractProfileCertAliases parses ONC cert aliases from all profile contents upfront.
+// Returns a non-empty map only if at least one profile has aliases.
+func extractProfileCertAliases(ctx context.Context, logger *slog.Logger, profilesContents map[string]json.RawMessage) map[string][]string {
+	result := make(map[string][]string)
+	for profileUUID, content := range profilesContents {
+		aliases, err := android.ExtractCertAliasesFromProfileJSON(content)
+		if err != nil {
+			// Should not happen since profiles are validated on upload.
+			logger.ErrorContext(ctx, "failed to extract ONC cert aliases from profile", "profile.uuid", profileUUID, "err", err)
+			ctxerr.Handle(ctx, err)
+			continue
+		}
+		if len(aliases) > 0 {
+			result[profileUUID] = aliases
+		}
+	}
+	return result
+}
+
+// filterProfilesWithPendingCerts separates profiles into those ready to merge
+// and those that should be withheld because they contain openNetworkConfiguration
+// with ClientCertKeyPairAlias references to certificates not yet in a terminal
+// state (verified or failed) on the host.
+func filterProfilesWithPendingCerts(
+	profiles []*fleet.MDMAndroidProfilePayload,
+	profileAliases map[string][]string,
+	certStatuses map[string]fleet.CertificateTemplateStatus,
+) (ready, withheld []*fleet.MDMAndroidProfilePayload) {
+	for _, prof := range profiles {
+		aliases, ok := profileAliases[prof.ProfileUUID]
+		if !ok {
+			ready = append(ready, prof)
+			continue
+		}
+
+		shouldWithhold := false
+		var pendingCertName string
+		for _, alias := range aliases {
+			status, exists := certStatuses[alias]
+			if !exists {
+				// No cert template with this name assigned to host.
+				// Admin may be referencing a pre-installed cert.
+				continue
+			}
+			if status != fleet.CertificateTemplateVerified &&
+				status != fleet.CertificateTemplateFailed {
+				shouldWithhold = true
+				pendingCertName = alias
+				break
+			}
+		}
+
+		if shouldWithhold {
+			prof.Detail = fmt.Sprintf(
+				fleet.ONCProfileWithheldDetailPrefix+" %q to be installed on the host before applying this profile.",
+				pendingCertName,
+			)
+			withheld = append(withheld, prof)
+		} else {
+			ready = append(ready, prof)
+		}
+	}
+	return ready, withheld
+}
+
+func (r *profileReconciler) patchPolicy(ctx context.Context, policyID, policyName string,
+	policy *androidmanagement.Policy, metadata map[string]string,
+) (req *android.MDMAndroidPolicyRequest, skip bool, err error) {
+	policyRequest, err := newAndroidPolicyRequest(policyID, policyName, policy, metadata)
+	if err != nil {
+		return nil, false, ctxerr.Wrapf(ctx, err, "prepare policy request %s", policyName)
+	}
+
+	applied, apiErr := r.Client.EnterprisesPoliciesPatch(ctx, policyName, policy, androidmgmt.PoliciesPatchOpts{ExcludeApps: true})
+	if skip, err = recordAndroidRequestResult(ctx, r.DS, policyRequest, applied, nil, apiErr); err != nil {
+		return nil, false, ctxerr.Wrap(ctx, err, "record android request")
+	}
+	return policyRequest, skip, nil
+}
+
+func (r *profileReconciler) patchDevice(ctx context.Context, policyID, deviceName string,
+	device *androidmanagement.Device,
+) (req *android.MDMAndroidPolicyRequest, skip bool, apiErr error) {
+	deviceRequest, err := newAndroidDeviceRequest(policyID, deviceName, device)
+	if err != nil {
+		return nil, false, ctxerr.Wrapf(ctx, err, "prepare device request %s", deviceName)
+	}
+
+	applied, apiErr := r.Client.EnterprisesDevicesPatch(ctx, deviceName, device)
+	if skip, err = recordAndroidRequestResult(ctx, r.DS, deviceRequest, nil, applied, apiErr); err != nil {
+		return nil, false, ctxerr.Wrap(ctx, err, "record android request")
+	}
+	return deviceRequest, skip, nil
+}
+
+// reconcileCertificateTemplates processes certificate templates for Android hosts
+// that have templates in 'pending' status.
+func (r *profileReconciler) reconcileCertificateTemplates(ctx context.Context) error {
+	const batchSize = 1000
+	offset := 0
+
+	for {
+		// Get hosts with PENDING certificates
+		hostUUIDs, err := r.DS.ListAndroidHostUUIDsWithPendingCertificateTemplates(ctx, offset, batchSize)
+		if err != nil {
+			return ctxerr.Wrap(ctx, err, "list android host uuids with pending certificate templates")
+		}
+
+		if len(hostUUIDs) == 0 {
+			break
+		}
+
+		// Process this batch - BuildAndSendFleetAgentConfig handles the state transitions
+		svc := &Service{
+			logger:             r.Logger,
+			ds:                 r.DS,
+			fleetDS:            r.DS,
+			androidAPIClient:   r.Client,
+			androidAgentConfig: r.AndroidAgentConfig,
+		}
+		if err := svc.BuildAndSendFleetAgentConfig(ctx, r.Enterprise.Name(), hostUUIDs, true); err != nil {
+			return ctxerr.Wrap(ctx, err, "build and send fleet agent config with certificates")
+		}
+
+		if len(hostUUIDs) < batchSize {
+			break
+		}
+		offset += batchSize
+	}
+
+	return nil
+}
+
+// androidVarSubstitutionFailureDetail returns a user-facing detail message and
+// true if err represents a substitution failure that should fail the host's
+// profiles (an unresolvable $FLEET_VAR_* or a $FLEET_HOST_VITAL_<id> with no
+// value set for this host); ok is false for any other (unexpected) error.
+func androidVarSubstitutionFailureDetail(err error) (detail string, ok bool) {
+	if missingVital, isMissingVital := errors.AsType[*fleet.MissingCustomHostVitalValueError](err); isMissingVital {
+		return missingVital.Error(), true
+	}
+	if errors.Is(err, profiles.ErrUnresolvableAndroidAppConfigVar) {
+		detail = err.Error()
+		var varErr *profiles.UnresolvableAndroidAppConfigVarError
+		if errors.As(err, &varErr) && varErr.Detail != "" {
+			detail = varErr.Detail
+		}
+		return detail, true
+	}
+	return "", false
+}
+
+func substituteProfileVarsForHost(
+	ctx context.Context,
+	ds fleet.Datastore,
+	hostUUID string,
+	profilesContents map[string]json.RawMessage,
+) (map[string]json.RawMessage, error) {
+	if len(profilesContents) == 0 {
+		return profilesContents, nil
+	}
+
+	hasVars := false
+	for _, content := range profilesContents {
+		if profiles.ContainsFleetVarOrCustomHostVital(content) {
+			hasVars = true
+			break
+		}
+	}
+	if !hasVars {
+		return profilesContents, nil
+	}
+
+	androidHost, err := ds.AndroidHostLiteByHostUUID(ctx, hostUUID)
+	if err != nil {
+		return nil, ctxerr.Wrapf(ctx, err, "get android host for variable substitution (host %s)", hostUUID)
+	}
+	subHost := profiles.AndroidAppConfigSubstitutionHost{
+		HostID:         androidHost.Host.ID,
+		UUID:           androidHost.Host.UUID,
+		HardwareSerial: androidHost.Host.HardwareSerial,
+		Platform:       androidHost.Host.Platform,
+	}
+
+	result := make(map[string]json.RawMessage, len(profilesContents))
+	for profUUID, content := range profilesContents {
+		if !profiles.ContainsFleetVarOrCustomHostVital(content) {
+			result[profUUID] = content
+			continue
+		}
+		substituted, err := profiles.SubstituteFleetVarsAndVitalsInAndroidAppConfig(ctx, ds, content, subHost)
+		if err != nil {
+			return nil, err
+		}
+		result[profUUID] = substituted
+	}
+	return result, nil
+}

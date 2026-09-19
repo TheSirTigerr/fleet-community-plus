@@ -1,0 +1,68 @@
+import React, { useState } from "react";
+
+import { notify } from "components/ToastNotification";
+import SettingsSection from "pages/admin/components/SettingsSection";
+import mdmAPI, { IEulaMetadataResponse } from "services/entities/mdm";
+
+import DeleteEulaModal from "./components/DeleteEulaModal/DeleteEulaModal";
+import EulaUploader from "./components/EulaUploader/EulaUploader";
+import UploadedEulaView from "./components/UploadedEulaView/UploadedEulaView";
+
+const baseClass = "eula-section";
+
+interface IEulaSectionProps {
+  eulaMetadata?: IEulaMetadataResponse;
+  isEulaUploaded: boolean;
+  onUpload: () => void;
+  onDelete: () => void;
+}
+
+const EulaSection = ({
+  eulaMetadata,
+  isEulaUploaded,
+  onUpload,
+  onDelete,
+}: IEulaSectionProps) => {
+  const [showDeleteEulaModal, setShowDeleteEulaModal] = useState(false);
+
+  const onDeleteEula = async () => {
+    if (!eulaMetadata) return;
+
+    try {
+      await mdmAPI.deleteEULA(eulaMetadata.token);
+      notify.success("Successfully deleted.");
+    } catch (e) {
+      notify.error("Couldn’t delete. Please try again.", { response: e });
+    } finally {
+      setShowDeleteEulaModal(false);
+      onDelete();
+    }
+  };
+
+  return (
+    <SettingsSection
+      className={baseClass}
+      title="End user license agreement (EULA)"
+      id="end-user-license-agreement"
+    >
+      <div className={`${baseClass}__content`}>
+        {!isEulaUploaded || !eulaMetadata ? (
+          <EulaUploader onUpload={onUpload} />
+        ) : (
+          <UploadedEulaView
+            eulaMetadata={eulaMetadata}
+            onDelete={() => setShowDeleteEulaModal(true)}
+          />
+        )}
+      </div>
+      {showDeleteEulaModal && (
+        <DeleteEulaModal
+          onDelete={onDeleteEula}
+          onCancel={() => setShowDeleteEulaModal(false)}
+        />
+      )}
+    </SettingsSection>
+  );
+};
+
+export default EulaSection;

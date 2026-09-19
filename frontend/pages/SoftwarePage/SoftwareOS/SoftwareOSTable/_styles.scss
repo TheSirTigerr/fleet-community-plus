@@ -1,0 +1,57 @@
+.software-os-table {
+  &__platform-dropdown {
+    width: 200px;
+
+    .Select-menu-outer {
+      width: 160px;
+      max-height: min-content;
+
+      .Select-menu {
+        max-height: none;
+      }
+    }
+  }
+
+  .hosts-cell__wrapper {
+    display: flex;
+    align-items: center;
+    justify-content: space-between;
+  }
+
+  .os-hosts-link {
+    opacity: 0;
+    transition: 250ms;
+  }
+
+  tr:hover {
+    .os-hosts-link {
+      opacity: 1;
+    }
+  }
+
+  .table-container {
+    &__data-table-block {
+      .data-table-block {
+        .data-table {
+          &__table {
+            tbody {
+              .name_only__cell {
+                max-width: $col-md;
+
+                // Tooltip does not get cut off
+                .children-wrapper {
+                  overflow: initial;
+                }
+              }
+              .link-cell {
+                display: flex;
+                align-items: center;
+                gap: $pad-small;
+              }
+            }
+          }
+        }
+      }
+    }
+  }
+}

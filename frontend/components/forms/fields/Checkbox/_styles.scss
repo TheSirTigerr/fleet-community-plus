@@ -1,0 +1,160 @@
+.fleet-checkbox {
+  @include clearfix;
+  position: relative;
+  // inline-flex would prevents clickable white space right of the checkbox,
+  // but we need that clickable in some "rows" using checkbox
+  display: flex;
+  align-items: center;
+
+  &:hover {
+    // Using selectors to avoid pointer cursor on  clickable white space right of checkbox
+    .fleet-checkbox__label,
+    .fleet-checkbox__icon,
+    .fleet-checkbox__label-tooltip {
+      cursor: pointer;
+    }
+  }
+
+  &:hover:not(.fleet-checkbox__label--disabled) {
+    svg {
+      .checkbox-state {
+        stroke: $core-fleet-green-over;
+        fill: $core-fleet-green-over;
+      }
+      .checkbox-unchecked-state {
+        stroke: $core-fleet-green-over;
+      }
+    }
+  }
+
+  // During click only
+  &:active:not(.fleet-checkbox__label--disabled) {
+    svg {
+      .checkbox-state {
+        stroke: $core-fleet-green-down;
+        fill: $core-fleet-green-down;
+      }
+      .checkbox-unchecked-state {
+        stroke: $core-fleet-green-down;
+      }
+    }
+  }
+
+  &--danger {
+
+    svg {
+      .checkbox-state {
+        stroke: $core-vibrant-red;
+        fill: $core-vibrant-red;
+      }
+    }
+
+    &:hover:not(.fleet-checkbox__label--disabled) {
+      svg {
+        .checkbox-state {
+          stroke: $core-vibrant-red-over;
+          fill: $core-vibrant-red-over;
+        }
+        .checkbox-unchecked-state {
+          stroke: $core-vibrant-red-over;
+        }
+      }
+    }
+
+    // During click only
+    &:active:not(.fleet-checkbox__label--disabled) {
+      svg {
+        .checkbox-state {
+          stroke: $core-vibrant-red-down;
+          fill: $core-vibrant-red-down;
+        }
+
+        .checkbox-unchecked-state {
+          stroke: $core-vibrant-red-down;
+        }
+      }
+    }
+  }
+
+  // When tabbing
+  &:focus-visible:not(.fleet-checkbox__label--disabled) {
+    outline: none;
+
+    svg {
+      outline: 2px solid $ui-fleet-black-75;
+      outline-offset: -2px;
+      border-radius: $border-radius;
+    }
+  }
+
+  &--disabled {
+    svg {
+      .checkbox-state {
+        stroke: $ui-fleet-black-25;
+        fill: $ui-fleet-black-25;
+      }
+      .checkbox-unchecked-state {
+        stroke: $ui-fleet-black-25;
+      }
+    }
+  }
+
+  &__label {
+    font-size: $x-small;
+    padding-left: $pad-small;
+    display: inline-block;
+    vertical-align: top;
+
+    &--disabled {
+      color: $ui-fleet-black-50;
+
+      svg {
+        .checkbox-state {
+          stroke: $ui-fleet-black-25;
+          fill: $ui-fleet-black-25;
+        }
+        .checkbox-unchecked-state {
+          stroke: $ui-fleet-black-25;
+          fill: $ui-fleet-black-25;
+        }
+      }
+
+      &:hover {
+        // Using selectors to avoid not allowed cursor on  clickable white space right of checkbox
+        .fleet-checkbox__label,
+        .fleet-checkbox__icon,
+        .fleet-checkbox__label-tooltip {
+          cursor: not-allowed;
+        }
+      }
+    }
+  }
+
+  &__label-tooltip {
+    font-size: $x-small;
+    padding-left: $pad-small;
+    display: inherit;
+    vertical-align: top;
+  }
+
+  &__help-text {
+    @include help-text;
+  }
+}
+
+.inverse {
+  flex-direction: row-reverse; // Switches the text to the left side of checkbox as all checkboxes are now display flex
+
+  .fleet-checkbox {
+    &__icon {
+      padding-left: $pad-small;
+    }
+
+    &__label {
+      float: left;
+      padding-left: 0;
+      font-weight: $bold;
+      font-size: $x-small;
+    }
+  }
+}

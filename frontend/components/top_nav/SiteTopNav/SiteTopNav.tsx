@@ -1,0 +1,300 @@
+import classnames from "classnames";
+import React, { useContext, useState, useEffect } from "react";
+import { Link } from "react-router";
+
+import CustomLink from "components/CustomLink";
+import Icon from "components/Icon";
+// @ts-ignore
+import OrgLogoIcon from "components/icons/OrgLogoIcon";
+import LinkWithContext from "components/LinkWithContext";
+import TooltipWrapper from "components/TooltipWrapper";
+import { AppContext } from "context/app";
+import { IConfig } from "interfaces/config";
+import { API_ALL_TEAMS_ID, APP_CONTEXT_ALL_TEAMS_ID } from "interfaces/team";
+import { IUser } from "interfaces/user";
+import PATHS from "router/paths";
+import { LEARN_MORE_ABOUT_BASE_LINK } from "utilities/constants";
+import { isDarkMode } from "utilities/theme";
+import { getPathWithQueryParams, QueryParams } from "utilities/url";
+
+import UserMenu from "../UserMenu";
+
+import getNavItems, { INavItem } from "./navItems";
+
+interface ISiteTopNavProps {
+  config: IConfig;
+  currentUser: IUser;
+  location: {
+    pathname: string;
+    query: QueryParams;
+  };
+  onLogoutUser: () => void;
+  onUserMenuItemClick: (path: string) => void;
+}
+
+// TODO(sarah): Build RegExps for other routes that need to be differentiated in order to build
+// top nav links that match the expected UX.
+
+const REGEX_DETAIL_PAGES = {
+  HOST_DETAILS: /\/hosts\/\d+/i,
+  LABEL_EDIT: /\/labels\/\d+/i,
+  LABEL_NEW: /\/labels\/new/i,
+  PACK_EDIT: /\/packs\/\d+/i,
+  PACK_NEW: /\/packs\/new/i,
+  QUERIES_EDIT: /\/queries\/\d+/i,
+  QUERIES_NEW: /\/queries\/new/i,
+  POLICY_EDIT: /\/policies\/\d+/i,
+  POLICY_NEW: /\/policies\/new/i,
+  SOFTWARE_TITLES_DETAILS: /\/software\/titles\/\d+/i,
+  SOFTWARE_VERSIONS_DETAILS: /\/software\/versions\/\d+/i,
+};
+
+const REGEX_GLOBAL_PAGES = {
+  MANAGE_PACKS: /\/packs\/manage/i,
+  ORGANIZATION: /\/settings\/organization/i,
+  USERS: /\/settings\/users/i,
+  INTEGRATIONS: /\/settings\/integrations/i,
+  TEAMS: /\/settings\/teams$/i, // Note: we want this to only match if it is the end of the path
+  PROFILE: /\/profile/i,
+};
+
+const testDetailPage = (path: string, re: RegExp) => {
+  if (re === REGEX_DETAIL_PAGES.LABEL_EDIT) {
+    // we want to match "/labels/10" but not "/hosts/manage/labels/10"
+    return path.match(re) && !path.match(/\/hosts\/manage\/labels\/\d+/); // we're using this approach because some browsers don't support regexp negative lookbehind
+  }
+  return path.match(re);
+};
+
+const isDetailPage = (path: string) => {
+  return Object.values(REGEX_DETAIL_PAGES).some((re) =>
+    testDetailPage(path, re)
+  );
+};
+
+const isGlobalPage = (path: string) => {
+  return Object.values(REGEX_GLOBAL_PAGES).some((re) => path.match(re));
+};
+
+const GitOpsModeIndicator = ({
+  isGlobalAdmin,
+}: {
+  isGlobalAdmin?: boolean;
+}) => {
+  const baseClass = "gitops-mode-indicator";
+  const tipContent = (
+    <>
+      Items managed in YAML are read-only.
+      <br />
+      <CustomLink
+        newTab
+        text="Learn more"
+        variant="tooltip-link"
+        url={`${LEARN_MORE_ABOUT_BASE_LINK}/ui-gitops-mode`}
+      />
+    </>
+  );
+  const content = (
+    <div className={`${baseClass}__content`}>
+      <Icon name="gitops-mode" />
+      GitOps mode
+    </div>
+  );
+  return (
+    <TooltipWrapper
+      position="bottom"
+      underline={false}
+      showArrow
+      tipContent={tipContent}
+      tipOffset={2}
+    >
+      {isGlobalAdmin ? (
+        <Link
+          className={`${baseClass}__link`}
+          to={PATHS.ADMIN_INTEGRATIONS_CHANGE_MANAGEMENT}
+        >
+          {content}
+        </Link>
+      ) : (
+        content
+      )}
+    </TooltipWrapper>
+  );
+};
+
+const SiteTopNav = ({
+  config,
+  currentUser,
+  location: { pathname: currentPath, query },
+  onLogoutUser,
+  onUserMenuItemClick,
+}: ISiteTopNavProps): JSX.Element => {
+  const {
+    currentTeam,
+    isAnyTeamAdmin,
+    isGlobalAdmin,
+    isGlobalMaintainer,
+    isAnyTeamMaintainer,
+    isGlobalTechnician,
+    isAnyTeamTechnician,
+    isNoAccess,
+  } = useContext(AppContext);
+
+  const [darkMode, setDarkMode] = useState(() => isDarkMode());
+
+  useEffect(() => {
+    const onThemeChange = (e: Event) => {
+      setDarkMode((e as CustomEvent).detail.dark);
+    };
+    window.addEventListener("fleet-theme-change", onThemeChange);
+    return () =>
+      window.removeEventListener("fleet-theme-change", onThemeChange);
+  }, []);
+
+  const isActiveDetailPage = isDetailPage(currentPath);
+  const isActiveGlobalPage = isGlobalPage(currentPath);
+
+  const currentQueryParams = { ...query };
+  if (isActiveGlobalPage || isActiveDetailPage) {
+    // detail pages (e.g., host details) and some manage pages (e.g., queries) aren't guaranteed to
+    // have a fleet_id in the URL that we can simply append to the top nav links so instead we need grab the team
+    // id from context
+    currentQueryParams.fleet_id =
+      currentTeam?.id === APP_CONTEXT_ALL_TEAMS_ID
+        ? API_ALL_TEAMS_ID
+        : currentTeam?.id;
+  }
+
+  const renderNavItem = (navItem: INavItem) => {
+    const { name, iconName, withParams } = navItem;
+    const darkLogoURL =
+      config.org_info.org_logo_url_dark_mode || config.org_info.org_logo_url;
+    const lightLogoURL =
+      config.org_info.org_logo_url_light_mode ||
+      config.org_info.org_logo_url_light_background;
+    const orgLogoURL = darkMode ? darkLogoURL : lightLogoURL;
+    const active = navItem.location.regex.test(currentPath);
+
+    const navItemBaseClass = "site-nav-item";
+
+    const navItemClasses = classnames(`${navItemBaseClass}`, {
+      [`${navItemBaseClass}--active`]: active,
+    });
+
+    if (iconName && iconName === "logo") {
+      return (
+        <li className={navItemClasses} key={`nav-item-${name}`}>
+          <Link
+            className={`${navItemBaseClass}__logo-wrapper`}
+            to={navItem.location.pathname}
+          >
+            <div className={`${navItemBaseClass}__logo`}>
+              <OrgLogoIcon className="logo" src={orgLogoURL} />
+            </div>
+          </Link>
+        </li>
+      );
+    }
+
+    if (active && !isActiveDetailPage) {
+      let path = navItem.alwaysToPathname
+        ? navItem.location.pathname
+        : currentPath;
+
+      if (currentQueryParams.fleet_id !== API_ALL_TEAMS_ID) {
+        path = getPathWithQueryParams(path, {
+          fleet_id: currentQueryParams.fleet_id,
+        });
+      }
+
+      // Clicking an active link returns user to default page
+      // Resetting all filters except team ID
+      // TODO: Find best pattern(one that doesn't dispatch a
+      // replace to the same url, which triggers a re-render)
+      return (
+        <li className={navItemClasses} key={`nav-item-${name}`}>
+          <Link to={path} className={`${navItemBaseClass}__link`}>
+            <span
+              className={`${navItemBaseClass}__name`}
+              data-text={navItem.name}
+            >
+              {name}
+            </span>
+          </Link>
+        </li>
+      );
+    }
+
+    return (
+      <li className={navItemClasses} key={`nav-item-${name}`}>
+        {withParams ? (
+          <LinkWithContext
+            className={`${navItemBaseClass}__link`}
+            withParams={withParams}
+            currentQueryParams={{ fleet_id: currentQueryParams.fleet_id }}
+            to={navItem.location.pathname}
+          >
+            <span
+              className={`${navItemBaseClass}__name`}
+              data-text={navItem.name}
+            >
+              {name}
+            </span>
+          </LinkWithContext>
+        ) : (
+          <Link
+            className={`${navItemBaseClass}__link`}
+            to={navItem.location.pathname}
+          >
+            <span
+              className={`${navItemBaseClass}__name`}
+              data-text={navItem.name}
+            >
+              {name}
+            </span>
+          </Link>
+        )}
+      </li>
+    );
+  };
+
+  const userNavItems = getNavItems(
+    currentUser,
+    isGlobalAdmin,
+    isAnyTeamAdmin,
+    isAnyTeamMaintainer,
+    isGlobalMaintainer,
+    isNoAccess,
+    isGlobalTechnician,
+    isAnyTeamTechnician
+  );
+
+  const renderNavItems = () => {
+    return (
+      <div className="site-nav-content">
+        <ul className="site-nav-left">
+          {userNavItems.map((navItem) => {
+            return renderNavItem(navItem);
+          })}
+        </ul>
+        <div className="site-nav-right">
+          {config.gitops.gitops_mode_enabled && (
+            <GitOpsModeIndicator isGlobalAdmin={isGlobalAdmin} />
+          )}
+          <UserMenu
+            onLogout={onLogoutUser}
+            onUserMenuItemClick={onUserMenuItemClick}
+            currentUser={currentUser}
+            currentTeam={currentTeam}
+            isAnyTeamAdmin={isAnyTeamAdmin}
+            isGlobalAdmin={isGlobalAdmin}
+          />
+        </div>
+      </div>
+    );
+  };
+
+  return renderNavItems();
+};
+
+export default SiteTopNav;

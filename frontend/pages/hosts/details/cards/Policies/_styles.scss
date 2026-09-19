@@ -1,0 +1,20 @@
+.host-policies-card {
+  @include vertical-page-tab-panel-layout;
+
+
+  .data-table-block {
+    .data-table__table {
+      thead {
+        .name__header {
+          min-width: $col-md;
+        }
+        .response__header {
+          width: 0;
+        }
+        .linkToFilteredHosts__header {
+          width: 125px;
+        }
+      }
+    }
+  }
+}

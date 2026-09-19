@@ -1,0 +1,19 @@
+.agent-options-card {
+  @include vertical-card-layout;
+
+  .component__tooltip-wrapper__tip-text {
+    max-width: 326px;
+  }
+
+  &__data {
+    display: flex;
+    flex-direction: column;
+    gap: $pad-medium;
+  }
+
+  &__chrome-os {
+    dd {
+      color: $ui-fleet-black-75;
+    }
+  }
+}

@@ -1,0 +1,41 @@
+.header-cell {
+  display: flex;
+  justify-content: flex-start;
+  align-items: center;
+  font-size: $xx-small;
+
+  .sort-arrows {
+    height: 12px;
+    padding-left: $pad-small;
+    display: flex;
+    flex-direction: column;
+    justify-content: space-between;
+  }
+
+  .ascending-arrow {
+    width: 0;
+    height: 0;
+    border-left: 4px solid transparent;
+    border-right: 4px solid transparent;
+    border-bottom: 5px solid $ui-fleet-black-50;
+  }
+  .descending-arrow {
+    width: 0;
+    height: 0;
+    border-left: 4px solid transparent;
+    border-right: 4px solid transparent;
+    border-top: 5px solid $ui-fleet-black-50;
+  }
+
+  &.ascending {
+    .ascending-arrow {
+      border-bottom-color: $core-fleet-black;
+    }
+  }
+
+  &.descending {
+    .descending-arrow {
+      border-top-color: $core-fleet-black;
+    }
+  }
+}

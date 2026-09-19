@@ -1,0 +1,32 @@
+.os-updates-current-version-section {
+  @include vertical-page-layout;
+
+  &__title {
+    display: flex;
+    align-items: center;
+    gap: $pad-small;
+    padding-bottom: $pad-medium;
+    border-bottom: 1px solid $ui-fleet-black-10;
+    margin-bottom: $pad-xxlarge;
+  }
+
+  &__error {
+    padding: $pad-xxlarge;
+  }
+
+  .linkToFilteredHosts__header {
+    width: auto;
+    max-width: 120px;
+  }
+
+  td {
+    width: 100%;
+    max-width: $col-lg;
+  }
+
+  @media (max-width: $break-md) {
+    td {
+      max-width: $col-md !important;
+    }
+  }
+}

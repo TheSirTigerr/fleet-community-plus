@@ -1,0 +1,36 @@
+{{- $serviceName := include "fleet.servicename" . -}}
+apiVersion: v1
+kind: Service
+metadata:
+  labels:
+    app: fleet
+    chart: fleet
+    heritage: {{ .Release.Service }}
+    release: {{ .Release.Name }}
+{{- if .Values.serviceAnnotations }}
+  annotations:
+  {{- with .Values.serviceAnnotations}}
+  {{- toYaml . | trim | nindent 4}}
+  {{- end }}
+{{- end }}
+  name: {{ $serviceName }}
+  namespace: {{ .Release.Namespace }}
+spec:
+  {{- if .Values.gke.ingress.useGKEIngress }}
+  type: NodePort
+  {{- end }}
+  selector:
+    app: fleet
+    chart: fleet
+    component: fleet-server
+    heritage: {{ .Release.Service }}
+    release: {{ .Release.Name }}
+  ports:
+  - name: fleet
+    port: {{ ternary .Values.fleet.listenPort .Values.fleet.servicePort (eq .Values.fleet.servicePort nil) }}
+    targetPort: {{ .Values.fleet.listenPort }}
+    {{- if .Values.gke.ingress.useGKEIngress }}
+    {{- if .Values.gke.ingress.nodePort }}
+    nodePort: {{ .Values.gke.ingress.nodePort }}
+    {{- end }}
+    {{- end }}

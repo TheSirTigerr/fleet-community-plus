@@ -1,0 +1,143 @@
+import { AxiosError } from "axios";
+import React, { useCallback, useContext, useState } from "react";
+import { useQuery, useQueryClient } from "react-query";
+import { InjectedRouter } from "react-router";
+
+import BackButton from "components/BackButton";
+import DataError from "components/DataError";
+import MainContent from "components/MainContent";
+import Spinner from "components/Spinner";
+import { notify } from "components/ToastNotification";
+import { AppContext } from "context/app";
+import { IMdmApple, getMdmServerUrl } from "interfaces/mdm";
+import PATHS from "router/paths";
+import mdmAppleAPI from "services/entities/mdm_apple";
+
+import ApplePushCertInfo from "./components/content/ApplePushCertInfo";
+import ApplePushCertSetup from "./components/content/ApplePushCertSetup";
+import RenewCertModal from "./components/modals/RenewCertModal";
+import TurnOffAppleMdmModal from "./components/modals/TurnOffAppleMdmModal";
+
+export const baseClass = "apple-mdm-page";
+
+const AppleMdmPage = ({ router }: { router: InjectedRouter }) => {
+  const queryClient = useQueryClient();
+  const { config } = useContext(AppContext);
+
+  const [isUpdating, setIsUpdating] = useState(false);
+  const [showRenewCertModal, setShowRenewCertModal] = useState(false);
+  const [showTurnOffMdmModal, setShowTurnOffMdmModal] = useState(false);
+
+  // Currently the status of this API call is what determines various UI states on
+  // this page. Because of this we will not render any of this components UI until this API
+  // call has completed.
+  const {
+    data: appleAPNInfo,
+    isLoading,
+    isRefetching,
+    refetch,
+    error: errorMdmApple,
+  } = useQuery<IMdmApple, AxiosError, IMdmApple>(
+    [
+      "apppleMDMPage-appleAPNInfo",
+      { isMdmEnabled: config?.mdm.enabled_and_configured ?? false },
+    ],
+    () => mdmAppleAPI.getAppleAPNInfo(),
+    {
+      retry: (tries, error) => error.status !== 404 && tries <= 3,
+      enabled: config?.mdm.enabled_and_configured,
+      staleTime: 5000,
+      refetchOnWindowFocus: false,
+      onSettled: () => setIsUpdating(false),
+    }
+  );
+
+  const toggleRenewCertModal = () => {
+    setShowRenewCertModal((prevState) => !prevState);
+  };
+
+  const toggleTurnOffMdmModal = () => {
+    setShowTurnOffMdmModal((prevState) => !prevState);
+  };
+
+  const turnOffMdm = useCallback(async () => {
+    setIsUpdating(true);
+    toggleTurnOffMdmModal();
+    try {
+      await mdmAppleAPI.deleteApplePushCertificate();
+      await queryClient.invalidateQueries(["config"]);
+      notify.success("MDM turned off successfully.");
+      router.push(PATHS.ADMIN_INTEGRATIONS_MDM);
+    } catch (e) {
+      notify.error("Couldn't turn off MDM. Please try again.", {
+        response: e,
+      });
+      setIsUpdating(false);
+    }
+  }, [queryClient, router]);
+
+  const onRenewCert = useCallback(() => {
+    refetch();
+    toggleRenewCertModal();
+  }, [refetch]);
+
+  const onSetupSuccess = useCallback(() => {
+    router.push(PATHS.ADMIN_INTEGRATIONS_MDM);
+  }, [router]);
+
+  // The API returns a 404 error if APNs is not configured yet, in that case we
+  // want to prompt the user to configure the server instead of the default error message.
+  const isMdmNotConfigured = errorMdmApple && errorMdmApple.status !== 404;
+
+  const showSpinner = isLoading || isUpdating || isRefetching;
+  const showError = !config || isMdmNotConfigured;
+  const showContent = !showSpinner && !showError;
+
+  return (
+    <MainContent className={baseClass}>
+      <>
+        <div className={`${baseClass}__header-links`}>
+          <BackButton
+            text="Back to MDM"
+            path={PATHS.ADMIN_INTEGRATIONS_MDM}
+            className={`${baseClass}__back-to-mdm`}
+          />
+        </div>
+        <h1>Apple Push Certificate Portal</h1>
+        {showSpinner && <Spinner />}
+        {showError && <DataError verticalPaddingSize="pad-xxxlarge" />}
+        {showContent &&
+          (!appleAPNInfo ? (
+            <ApplePushCertSetup
+              baseClass={baseClass}
+              onSetupSuccess={onSetupSuccess}
+            />
+          ) : (
+            <ApplePushCertInfo
+              baseClass={baseClass}
+              appleAPNInfo={appleAPNInfo}
+              orgName={config.org_info.org_name}
+              serverUrl={getMdmServerUrl(config.server_settings)}
+              onClickRenew={toggleRenewCertModal}
+              onClickTurnOff={toggleTurnOffMdmModal}
+            />
+          ))}
+        {showRenewCertModal && (
+          <RenewCertModal
+            onCancel={toggleRenewCertModal}
+            onRenew={onRenewCert}
+          />
+        )}
+        {showTurnOffMdmModal && config && (
+          <TurnOffAppleMdmModal
+            serverUrl={config.server_settings.server_url}
+            onCancel={toggleTurnOffMdmModal}
+            onConfirm={turnOffMdm}
+          />
+        )}
+      </>
+    </MainContent>
+  );
+};
+
+export default AppleMdmPage;

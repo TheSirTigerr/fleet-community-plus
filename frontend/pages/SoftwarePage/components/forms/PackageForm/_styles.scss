@@ -1,0 +1,69 @@
+.package-form {
+  // TODO: Refactor InfoBanner to not have default margin so we don't have to override it
+  // Flex gaps should be handling spacing around all InfoBanner
+  .info-banner {
+    margin: 0;
+  }
+
+  &__form-frame {
+    display: flex;
+    align-items: flex-start;
+    flex-direction: column;
+    gap: 20px;
+    align-self: stretch;
+
+    .card {
+      display: flex;
+      align-items: flex-start;
+
+      gap: 12px;
+      flex: 1 0 0;
+      align-self: stretch;
+    }
+  }
+
+  &__uploading-message {
+    display: flex;
+    align-items: center;
+    flex-direction: column;
+    gap: $pad-large;
+
+    p {
+      margin: 0;
+    }
+  }
+
+  &__form {
+    display: flex;
+    flex-direction: column;
+    gap: $pad-large;
+
+    fieldset {
+      border: none;
+      padding: 0;
+      margin: 0;
+
+      legend {
+        margin-bottom: $pad-small;
+        font-size: $x-small;
+        font-weight: $bold;
+      }
+    }
+  }
+
+  &__file-uploader {
+    box-sizing: border-box;
+  }
+
+  &__form-fields {
+    &--gitops-disabled {
+      @include disabled;
+    }
+  }
+
+  &__action-buttons {
+    display: flex;
+    flex-direction: row-reverse;
+    gap: $gap-action-elements;
+  }
+}

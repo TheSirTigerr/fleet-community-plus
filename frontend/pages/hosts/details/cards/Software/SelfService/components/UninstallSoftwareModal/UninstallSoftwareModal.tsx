@@ -1,0 +1,71 @@
+import React, { useCallback, useState } from "react";
+
+import Button from "components/buttons/Button";
+import Modal from "components/Modal";
+import { notify } from "components/ToastNotification";
+import deviceUserAPI from "services/entities/device_user";
+
+const baseClass = "uninstall-software-modal";
+
+interface IUninstallSoftwareModalProps {
+  softwareId: number;
+  softwareName?: string;
+  token: string;
+  onExit: () => void;
+  onSuccess: () => void;
+}
+
+const UninstallSoftwareModal = ({
+  softwareId,
+  softwareName,
+  token,
+  onExit,
+  onSuccess,
+}: IUninstallSoftwareModalProps) => {
+  const [isUninstalling, setIsUninstalling] = useState(false);
+
+  const onUninstallSoftware = useCallback(async () => {
+    setIsUninstalling(true);
+    try {
+      await deviceUserAPI.uninstallSelfServiceSoftware(token, softwareId);
+      onSuccess();
+    } catch (error) {
+      // We only show toast message to end user if API returns an error
+      notify.error("Couldn't uninstall. Please try again.", {
+        response: error,
+      });
+    }
+    setIsUninstalling(false);
+    onExit();
+  }, [softwareId, onSuccess, onExit]);
+
+  const displaySoftwareName = softwareName || "software";
+
+  return (
+    <Modal
+      className={baseClass}
+      title={`Uninstall ${displaySoftwareName}`}
+      onExit={onExit}
+      isContentDisabled={isUninstalling}
+    >
+      <p>
+        Uninstalling this software will remove it and may remove {softwareName}{" "}
+        data from your device. You can always reinstall it again later.
+      </p>
+      <div className="modal-cta-wrap">
+        <Button
+          variant="alert"
+          onClick={onUninstallSoftware}
+          isLoading={isUninstalling}
+        >
+          Uninstall
+        </Button>
+        <Button variant="secondary" onClick={onExit}>
+          Cancel
+        </Button>
+      </div>
+    </Modal>
+  );
+};
+
+export default UninstallSoftwareModal;

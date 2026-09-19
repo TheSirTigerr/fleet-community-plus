@@ -1,0 +1,32 @@
+.edit-software-modal {
+  &__form-inputs {
+    display: flex;
+    flex-direction: column;
+    gap: $pad-large;
+  }
+
+  &__input-field {
+    display: flex;
+    flex-direction: column;
+    gap: $pad-medium;
+  }
+
+  &__package-form {
+    &--disabled {
+      // We don't want to disable entire form or we can't get into the advanced options dropdown
+      .advanced-options-fields {
+        @include disabled(
+          true
+        ); // True allows pointer events to copy/scroll fields
+      }
+    }
+  }
+
+  &--hidden {
+    display: none;
+  }
+
+  .software-vpp-form__form-frame {
+    flex-direction: column;
+  }
+}

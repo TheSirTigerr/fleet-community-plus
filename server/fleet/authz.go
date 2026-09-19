@@ -1,0 +1,63 @@
+package fleet
+
+const (
+	// ActionRead refers to reading an entity.
+	ActionRead = "read"
+	// ActionList refers to listing an entity.
+	ActionList = "list"
+	// ActionWrite refers to writing (CRUD operations) an entity.
+	ActionWrite = "write"
+	// ActionWriteHostLabel refers to writing labels on hosts.
+	ActionWriteHostLabel = "write_host_label"
+	// ActionCreate refers to creating an entity when permissions differ from standard writes (e.g. global labels)
+	ActionCreate = "create"
+	// ActionCancelHostActivity refers to canceling an upcoming activity on a host.
+	ActionCancelHostActivity = "cancel_host_activity"
+	// ActionTransferHost refers to transferring a host between fleets (teams).
+	// This action is permitted for technicians in addition to admin/maintainer/gitops,
+	// so transferring does not require the broader ActionWrite permission.
+	ActionTransferHost  = "transfer_host"
+	ActionClearPasscode = "clear_passcode"
+	// ActionResend refers to resending an entity on a single host (currently used for configuration profiles).
+	ActionResend = "resend"
+	// ActionReadSecrets refers to reading secrets/credentials of an entity (e.g. CA private keys, API tokens).
+	ActionReadSecrets = "read_secrets"
+	// ActionWriteMembers refers to adding/removing members of a team.
+	// This is more restrictive than ActionWrite to prevent non-admin roles from managing team membership.
+	ActionWriteMembers = "write_members"
+
+	//
+	// User specific actions
+	//
+
+	// ActionWriteRole is a write to a user's global roles and teams.
+	//
+	// While the Write action allows setting the role on creation of a user, the
+	// ActionWriteRole action is required to modify an existing user's password.
+	ActionWriteRole = "write_role"
+	// ActionChangePassword is the permission to change a user's password.
+	//
+	// While the Write action allows setting the password on creation of a user, the
+	// ActionChangePassword action is required to modify an existing user's password.
+	ActionChangePassword = "change_password"
+
+	//
+	// Query specific actions
+	//
+
+	// ActionRun is the action for running a live query.
+	ActionRun = "run"
+	// ActionRunNew is the action for running a new live query.
+	ActionRunNew = "run_new"
+
+	//
+	// Selective prefixes over actions mean that they can be allowed in
+	// specific cases for roles that usually aren't allowed to perform
+	// them.
+	//
+
+	// ActionSelectiveRead allows targeted read access of an entity.
+	ActionSelectiveRead = "selective_read"
+	// ActionSelectiveList allows targeted list access of an entity.
+	ActionSelectiveList = "selective_list"
+)

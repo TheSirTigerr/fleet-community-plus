@@ -1,0 +1,121 @@
+import { max } from "lodash";
+import React, { useContext, useState, useEffect } from "react";
+import { InjectedRouter } from "react-router";
+
+import AuthenticationFormWrapper from "components/AuthenticationFormWrapper";
+// @ts-ignore
+import RegistrationForm from "components/forms/RegistrationForm";
+import { notify } from "components/ToastNotification";
+import { AppContext } from "context/app";
+import type { IRegistrationFormData } from "interfaces/registration_form_data";
+import paths from "router/paths";
+import logoAPI from "services/entities/logo";
+import usersAPI from "services/entities/users";
+import authToken from "utilities/auth_token";
+
+// @ts-ignore
+import Breadcrumbs from "./Breadcrumbs";
+
+const SETUP_ERROR_MESSAGE =
+  "We were unable to configure Fleet. If your Fleet server is behind a proxy, please ensure the server can be reached.";
+
+interface IRegistrationPageProps {
+  router: InjectedRouter;
+}
+
+const baseClass = "registration-page";
+
+const RegistrationPage = ({ router }: IRegistrationPageProps) => {
+  const {
+    currentUser,
+    setCurrentUser,
+    setAvailableTeams,
+    setUserSettings,
+  } = useContext(AppContext);
+  const [page, setPage] = useState(1);
+  const [pageProgress, setPageProgress] = useState(1);
+  const [isLoading, setIsLoading] = useState(false);
+
+  useEffect(() => {
+    const { DASHBOARD } = paths;
+
+    if (currentUser) {
+      return router.push(DASHBOARD);
+    }
+  }, [currentUser]);
+
+  const onNextPage = () => {
+    const nextPage = page + 1;
+    setPage(nextPage);
+    setPageProgress(max([nextPage, pageProgress]) || 1);
+  };
+
+  const onRegistrationFormSubmit = async (formData: IRegistrationFormData) => {
+    const { DASHBOARD } = paths;
+
+    setIsLoading(true);
+    try {
+      const { token } = await usersAPI.setup(formData);
+      authToken.save(token);
+
+      if (formData?.org_logo_file instanceof File) {
+        try {
+          await logoAPI.upload(formData.org_logo_file, "all");
+        } catch (logoErr) {
+          console.error("Failed to upload organization logo:", logoErr);
+        }
+      }
+
+      const { user, available_teams, settings } = await usersAPI.me();
+      setCurrentUser(user);
+      setAvailableTeams(user, available_teams);
+      setUserSettings(settings);
+      router.push(DASHBOARD);
+      window.location.reload();
+    } catch (error) {
+      setIsLoading(false);
+      setPage(1);
+      setPageProgress(1);
+      notify.error(SETUP_ERROR_MESSAGE, { response: error });
+    }
+  };
+
+  const onSetPage = (pageNum: number) => {
+    if (pageNum > pageProgress) {
+      return;
+    }
+
+    setPage(pageNum);
+  };
+
+  const REGISTRATION_HEADERS: Record<number, string> = {
+    1: "Set up user",
+    2: "Organization details",
+    3: "Set Fleet URL",
+    4: "Confirm configuration",
+  };
+  const header = REGISTRATION_HEADERS[page];
+
+  return (
+    <AuthenticationFormWrapper
+      className={baseClass}
+      header={header}
+      breadcrumbs={
+        <Breadcrumbs
+          currentPage={page}
+          onSetPage={onSetPage}
+          pageProgress={pageProgress}
+        />
+      }
+    >
+      <RegistrationForm
+        page={page}
+        onNextPage={onNextPage}
+        onSubmit={onRegistrationFormSubmit}
+        isLoading={isLoading}
+      />
+    </AuthenticationFormWrapper>
+  );
+};
+
+export default RegistrationPage;

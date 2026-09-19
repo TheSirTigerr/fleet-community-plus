@@ -1,0 +1,85 @@
+import { uniqueId } from "lodash";
+import React from "react";
+
+import Button from "components/buttons/Button";
+import InputFieldHiddenContent from "components/forms/fields/InputFieldHiddenContent";
+import GitOpsModeTooltipWrapper from "components/GitOpsModeTooltipWrapper";
+import { IEnrollSecret } from "interfaces/enroll_secret";
+
+const baseClass = "enroll-secrets";
+
+interface IEnrollSecretRowProps {
+  secret: IEnrollSecret;
+  toggleSecretEditorModal?: () => void;
+  toggleDeleteSecretModal?: () => void;
+  setSelectedSecret?: React.Dispatch<
+    React.SetStateAction<IEnrollSecret | undefined>
+  >;
+}
+const EnrollSecretRow = ({
+  secret,
+  toggleSecretEditorModal,
+  toggleDeleteSecretModal,
+  setSelectedSecret,
+}: IEnrollSecretRowProps): JSX.Element | null => {
+  const onEditSecretClick = (evt: React.MouseEvent<HTMLButtonElement>) => {
+    evt.preventDefault();
+    if (toggleSecretEditorModal && setSelectedSecret) {
+      setSelectedSecret(secret);
+      toggleSecretEditorModal();
+    }
+  };
+
+  const onDeleteSecretClick = (evt: React.MouseEvent<HTMLButtonElement>) => {
+    evt.preventDefault();
+    if (toggleDeleteSecretModal && setSelectedSecret) {
+      setSelectedSecret(secret);
+      toggleDeleteSecretModal();
+    }
+  };
+
+  const renderEditDeleteButtons = () => (
+    <GitOpsModeTooltipWrapper
+      entityType="secrets"
+      tipOffset={8}
+      renderChildren={(disableChildren) => (
+        <div className={`${baseClass}__edit-delete-btns`}>
+          <Button
+            disabled={disableChildren}
+            onClick={onEditSecretClick}
+            className={`${baseClass}__edit-secret-icon`}
+            variant="secondary"
+            icon="pencil"
+            ariaLabel="Edit enroll secret"
+          />
+          <Button
+            onClick={onDeleteSecretClick}
+            disabled={disableChildren}
+            className={`${baseClass}__delete-secret-icon`}
+            variant="secondary"
+            icon="trash"
+            ariaLabel="Delete enroll secret"
+          />
+        </div>
+      )}
+    />
+  );
+
+  return (
+    <div
+      className={`${baseClass}__secret`}
+      key={uniqueId()}
+      data-testid="osquery-secret"
+    >
+      <InputFieldHiddenContent
+        name={`osqueryd-secret-${uniqueId()}`}
+        value={secret.secret}
+      />
+      {toggleSecretEditorModal &&
+        toggleDeleteSecretModal &&
+        renderEditDeleteButtons()}
+    </div>
+  );
+};
+
+export default EnrollSecretRow;

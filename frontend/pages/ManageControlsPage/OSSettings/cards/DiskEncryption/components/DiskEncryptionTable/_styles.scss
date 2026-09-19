@@ -1,0 +1,23 @@
+.disk-encryption-table {
+  .data-table-block .data-table tbody td .w250 {
+    min-width: auto;
+  }
+
+  .linkToFilteredHosts__header {
+    width: auto;
+    max-width: 120px;
+    padding-left: 0 !important; // Removes 24px of unnecessary table scroll
+  }
+
+  .linkToFilteredHosts__cell {
+    width: auto;
+    max-width: 120px;
+    padding-left: 0 !important; // Removes 24px of unnecessary table scroll
+  }
+
+  @media (max-width: 768px) {
+    .linkToFilteredHosts__cell {
+      padding-right: 0 !important;
+    }
+  }
+}

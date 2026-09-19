@@ -1,0 +1,258 @@
+// Package logging provides logger "plugins" for various destinations.
+package logging
+
+import (
+	"context"
+	"fmt"
+	"log/slog"
+	"time"
+
+	"github.com/fleetdm/fleet/v4/server/fleet"
+)
+
+type FilesystemConfig struct {
+	LogFile string
+
+	EnableLogRotation    bool
+	EnableLogCompression bool
+	MaxSize              int
+	MaxAge               int
+	MaxBackups           int
+}
+
+type WebhookConfig struct {
+	URL string
+}
+
+type FirehoseConfig struct {
+	StreamName string
+
+	Region           string
+	EndpointURL      string
+	AccessKeyID      string
+	SecretAccessKey  string
+	StsAssumeRoleArn string
+	StsExternalID    string
+}
+
+type KinesisConfig struct {
+	StreamName string
+
+	Region           string
+	EndpointURL      string
+	AccessKeyID      string
+	SecretAccessKey  string
+	StsAssumeRoleArn string
+	StsExternalID    string
+}
+
+type LambdaConfig struct {
+	Function string
+
+	Region           string
+	AccessKeyID      string
+	SecretAccessKey  string
+	StsAssumeRoleArn string
+	StsExternalID    string
+}
+
+type PubSubConfig struct {
+	Topic string
+
+	Project       string
+	AddAttributes bool
+}
+
+type KafkaRESTConfig struct {
+	Topic string
+
+	ProxyHost        string
+	ContentTypeValue string
+	Timeout          int
+}
+
+type NatsConfig struct {
+	Server  string
+	Subject string
+
+	CredFile string
+	NKeyFile string
+
+	TLSClientCertFile string
+	TLSClientKeyFile  string
+	CACertFile        string
+
+	Compression string
+	JetStream   bool
+
+	Timeout time.Duration
+}
+
+type SplunkConfig struct {
+	URL                string
+	Token              string
+	Index              string
+	Source             string
+	SourceType         string
+	InsecureSkipVerify bool
+}
+
+type Config struct {
+	Plugin string
+
+	Filesystem FilesystemConfig
+	Webhook    WebhookConfig
+	Firehose   FirehoseConfig
+	Kinesis    KinesisConfig
+	Lambda     LambdaConfig
+	PubSub     PubSubConfig
+	KafkaREST  KafkaRESTConfig
+	Nats       NatsConfig
+	Splunk     SplunkConfig
+}
+
+func NewJSONLogger(ctx context.Context, name string, config Config, logger *slog.Logger) (fleet.JSONLogger, error) {
+	switch config.Plugin {
+	case "":
+		// Allow "" to mean filesystem for backwards compatibility
+		logger.InfoContext(ctx, fmt.Sprintf("plugin for %s not explicitly specified. Assuming 'filesystem'", name))
+		fallthrough
+	case "filesystem":
+		writer, err := NewFilesystemLogWriter(
+			ctx,
+			config.Filesystem.LogFile,
+			logger,
+			config.Filesystem.EnableLogRotation,
+			config.Filesystem.EnableLogCompression,
+			config.Filesystem.MaxSize,
+			config.Filesystem.MaxAge,
+			config.Filesystem.MaxBackups,
+		)
+		if err != nil {
+			return nil, fmt.Errorf("create filesystem %s logger: %w", name, err)
+		}
+		return fleet.JSONLogger(writer), nil
+	case "webhook":
+		writer, err := NewWebhookLogWriter(config.Webhook.URL, logger)
+		if err != nil {
+			return nil, fmt.Errorf("create webhook %s logger: %w", name, err)
+		}
+		return fleet.JSONLogger(writer), nil
+	case "firehose":
+		writer, err := NewFirehoseLogWriter(
+			config.Firehose.Region,
+			config.Firehose.EndpointURL,
+			config.Firehose.AccessKeyID,
+			config.Firehose.SecretAccessKey,
+			config.Firehose.StsAssumeRoleArn,
+			config.Firehose.StsExternalID,
+			config.Firehose.StreamName,
+			logger,
+		)
+		if err != nil {
+			return nil, fmt.Errorf("create firehose %s logger: %w", name, err)
+		}
+		return fleet.JSONLogger(writer), nil
+	case "kinesis":
+		writer, err := NewKinesisLogWriter(
+			config.Kinesis.Region,
+			config.Kinesis.EndpointURL,
+			config.Kinesis.AccessKeyID,
+			config.Kinesis.SecretAccessKey,
+			config.Kinesis.StsAssumeRoleArn,
+			config.Kinesis.StsExternalID,
+			config.Kinesis.StreamName,
+			logger,
+		)
+		if err != nil {
+			return nil, fmt.Errorf("create kinesis %s logger: %w", name, err)
+		}
+		return fleet.JSONLogger(writer), nil
+	case "lambda":
+		writer, err := NewLambdaLogWriter(
+			config.Lambda.Region,
+			config.Lambda.AccessKeyID,
+			config.Lambda.SecretAccessKey,
+			config.Lambda.StsAssumeRoleArn,
+			config.Lambda.StsExternalID,
+			config.Lambda.Function,
+			logger,
+		)
+		if err != nil {
+			return nil, fmt.Errorf("create lambda %s logger: %w", name, err)
+		}
+		return fleet.JSONLogger(writer), nil
+	case "pubsub":
+		writer, err := NewPubSubLogWriter(
+			ctx,
+			config.PubSub.Project,
+			config.PubSub.Topic,
+			config.PubSub.AddAttributes,
+			logger,
+		)
+		if err != nil {
+			return nil, fmt.Errorf("create pubsub %s logger: %w", name, err)
+		}
+		return fleet.JSONLogger(writer), nil
+	case "stdout":
+		writer, err := NewStdoutLogWriter()
+		if err != nil {
+			return nil, fmt.Errorf("create stdout %s logger: %w", name, err)
+		}
+		return fleet.JSONLogger(writer), nil
+	case "kafkarest":
+		writer, err := NewKafkaRESTWriter(&KafkaRESTParams{
+			KafkaProxyHost:        config.KafkaREST.ProxyHost,
+			KafkaTopic:            config.KafkaREST.Topic,
+			KafkaContentTypeValue: config.KafkaREST.ContentTypeValue,
+			KafkaTimeout:          config.KafkaREST.Timeout,
+		})
+		if err != nil {
+			return nil, fmt.Errorf("create kafka rest %s logger: %w", name, err)
+		}
+		return fleet.JSONLogger(writer), nil
+	case "nats":
+		writer, err := NewNatsLogWriter(
+			ctx,
+			config.Nats.Server,
+			config.Nats.Subject,
+			config.Nats.CredFile,
+			config.Nats.NKeyFile,
+			config.Nats.TLSClientCertFile,
+			config.Nats.TLSClientKeyFile,
+			config.Nats.CACertFile,
+			config.Nats.Compression,
+			config.Nats.JetStream,
+			config.Nats.Timeout,
+			logger,
+		)
+		if err != nil {
+			return nil, fmt.Errorf("create nats %s logger: %w", name, err)
+		}
+		return fleet.JSONLogger(writer), nil
+	case "splunk":
+		if config.Splunk.URL == "" {
+			return nil, fmt.Errorf("splunk %s logger: URL must not be empty", name)
+		}
+		if config.Splunk.Token == "" {
+			return nil, fmt.Errorf("splunk %s logger: HEC token must not be empty", name)
+		}
+		writer, err := NewSplunkLogWriter(
+			config.Splunk.URL,
+			config.Splunk.Token,
+			config.Splunk.Index,
+			config.Splunk.Source,
+			config.Splunk.SourceType,
+			config.Splunk.InsecureSkipVerify,
+			logger,
+		)
+		if err != nil {
+			return nil, fmt.Errorf("create splunk %s logger: %w", name, err)
+		}
+		return fleet.JSONLogger(writer), nil
+	default:
+		return nil, fmt.Errorf(
+			"unknown %s log plugin: %s", name, config.Plugin,
+		)
+	}
+}

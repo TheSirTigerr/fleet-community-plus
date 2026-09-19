@@ -1,0 +1,38 @@
+.disk-encryption {
+  @include vertical-card-layout;
+
+  > p {
+    margin: 0;
+  }
+
+  .section-header__sub-title a {
+    font-size: inherit;
+    color: inherit;
+  }
+
+  &__tab-panel {
+    @include vertical-page-tab-panel-layout;
+
+    p {
+      margin: 0;
+    }
+  }
+
+  &__settings-card {
+    display: flex;
+    align-items: center;
+    justify-content: space-between;
+    gap: $pad-large;
+  }
+
+  &__form-fields {
+    @include flex-column-16px-gap;
+  }
+
+  .data-table {
+    &__wrapper {
+      // Prevent border from causing .side-nav__card-container horizontal scroll
+      box-sizing: border-box;
+    }
+  }
+}

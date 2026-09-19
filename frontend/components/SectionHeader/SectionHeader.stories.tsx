@@ -1,0 +1,33 @@
+import { Meta, StoryObj } from "@storybook/react";
+import React from "react";
+
+import LastUpdatedText from "components/LastUpdatedText";
+
+import SectionHeader from ".";
+
+const meta: Meta<typeof SectionHeader> = {
+  title: "Components/SectionHeader",
+  component: SectionHeader,
+  args: {
+    title: "Section header title",
+    subTitle: "This is a subtitle",
+    details: <>These are details</>,
+  },
+};
+
+export default meta;
+
+type Story = StoryObj<typeof SectionHeader>;
+
+export const Basic: Story = {};
+
+export const WithSubTitle: Story = {
+  args: {
+    subTitle: (
+      <LastUpdatedText
+        lastUpdatedAt={new Date().toISOString()}
+        whatToRetrieve="operating systems"
+      />
+    ),
+  },
+};

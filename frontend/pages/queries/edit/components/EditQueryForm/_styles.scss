@@ -1,0 +1,100 @@
+.edit-query-form {
+  position: relative;
+  font-size: $x-small;
+
+  .form-field--input {
+    margin: 0;
+  }
+
+  &__page-header {
+    display: flex;
+    flex-direction: column;
+    gap: $pad-small;
+  }
+
+  &__page-title {
+    font-size: $large;
+    font-weight: $bold;
+    margin: 0;
+  }
+
+  &__page-subtitle {
+    font-size: $x-small;
+    color: $ui-fleet-black-75;
+    margin: 0;
+  }
+
+  &__query-description {
+    p {
+      white-space: pre-wrap;
+    }
+  }
+
+  &__query-name-fleet-name {
+    display: flex;
+    flex-direction: column;
+    gap: $pad-small;
+  }
+
+  .form-field {
+    margin-bottom: 0px;
+  }
+
+  .input-field__textarea {
+    min-width: 100%;
+    resize: vertical;
+  }
+
+  /* Hide scrollbar for Chrome, Safari and Opera */
+  .input-field::-webkit-scrollbar {
+    display: none;
+  }
+
+  /* Hide scrollbar for IE, Edge and Firefox */
+  .input-field {
+    -ms-overflow-style: none; /* IE and Edge */
+    scrollbar-width: none; /* Firefox */
+  }
+
+  // Author section
+  &__author {
+    align-items: flex-end;
+
+    img,
+    dd {
+      display: flex;
+      align-items: center;
+      gap: $pad-small;
+    }
+  }
+
+  &__button-wrap {
+    &--new-query {
+      display: flex;
+      align-items: center;
+    }
+  }
+
+  &__title {
+    color: $core-fleet-black;
+    display: inline-block;
+    font-size: $large;
+  }
+
+  &__loading-overlay {
+    display: flex;
+    flex-grow: 1;
+    position: absolute;
+    top: 0;
+    bottom: 0;
+    left: 0;
+    right: 0;
+    background-color: $loading-overlay;
+    z-index: 1;
+    align-items: center;
+  }
+
+  .disabled-by-gitops-mode {
+    @include disabled;
+  }
+}

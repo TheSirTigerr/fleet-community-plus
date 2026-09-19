@@ -1,0 +1,504 @@
+import { screen, waitFor } from "@testing-library/react";
+import React from "react";
+
+import createMockQuery from "__mocks__/queryMock";
+import createMockUser from "__mocks__/userMock";
+import { ISchedulableQuery } from "interfaces/schedulable_query";
+import { createCustomRenderer } from "test/test-utils";
+
+import { enhanceQuery } from "../../ManageQueriesPage";
+
+import QueriesTable, { IQueriesTableProps } from "./QueriesTable";
+
+const testRawGlobalQueries: ISchedulableQuery[] = [
+  {
+    created_at: "2024-03-22T19:01:20Z",
+    updated_at: "2024-03-22T19:01:20Z",
+    id: 1,
+    team_id: null,
+    interval: 0,
+    platform: "linux",
+    min_osquery_version: "",
+    automations_enabled: false,
+    logging: "snapshot",
+    name: "Global query 1",
+    description: "Retrieves the OpenSSL version.",
+    query:
+      "SELECT name AS name, version AS version, 'deb_packages' AS source FROM deb_packages WHERE name LIKE 'openssl%' UNION SELECT name AS name, version AS version, 'apt_sources' AS source FROM apt_sources WHERE name LIKE 'openssl%' UNION SELECT name AS name, version AS version, 'rpm_packages' AS source FROM rpm_packages WHERE name LIKE 'openssl%';",
+    saved: true,
+    observer_can_run: true,
+    author_id: 1,
+    author_name: "Tess Tuser",
+    author_email: "tess@fake.com",
+    packs: [],
+    stats: {
+      system_time_p50: null,
+      system_time_p95: null,
+      user_time_p50: null,
+      user_time_p95: null,
+      total_executions: 0,
+    },
+    discard_data: false,
+  },
+  {
+    created_at: "2024-03-22T19:01:20Z",
+    updated_at: "2024-03-22T19:01:20Z",
+    id: 2,
+    team_id: null,
+    interval: 0,
+    platform: "linux",
+    min_osquery_version: "",
+    automations_enabled: false,
+    logging: "snapshot",
+    name: "Global query 2",
+    description: "Retrieves the OpenSSL version.",
+    query:
+      "SELECT name AS name, version AS version, 'deb_packages' AS source FROM deb_packages WHERE name LIKE 'openssl%' UNION SELECT name AS name, version AS version, 'apt_sources' AS source FROM apt_sources WHERE name LIKE 'openssl%' UNION SELECT name AS name, version AS version, 'rpm_packages' AS source FROM rpm_packages WHERE name LIKE 'openssl%';",
+    saved: true,
+    observer_can_run: true,
+    author_id: 1,
+    author_name: "Tess Tuser",
+    author_email: "tess@fake.com",
+    packs: [],
+    stats: {
+      system_time_p50: null,
+      system_time_p95: null,
+      user_time_p50: null,
+      user_time_p95: null,
+      total_executions: 0,
+    },
+    discard_data: false,
+  },
+];
+
+const testRawTeamQueries: ISchedulableQuery[] = [
+  {
+    created_at: "2024-04-25T04:16:09Z",
+    updated_at: "2024-04-25T04:16:09Z",
+    id: 3,
+    team_id: 1,
+    interval: 3600,
+    platform: "",
+    min_osquery_version: "",
+    automations_enabled: false,
+    logging: "snapshot",
+    name: "Team query 1",
+    description: "",
+    query: "SELECT * FROM osquery_info;",
+    saved: true,
+    observer_can_run: false,
+    author_id: 1,
+    author_name: "Tess Tuser",
+    author_email: "tess@fake.com",
+    packs: [],
+    stats: {
+      system_time_p50: null,
+      system_time_p95: null,
+      user_time_p50: null,
+      user_time_p95: null,
+      total_executions: 0,
+    },
+    discard_data: false,
+  },
+  {
+    created_at: "2024-04-25T04:16:09Z",
+    updated_at: "2024-04-25T04:16:09Z",
+    id: 4,
+    team_id: 1,
+    interval: 3600,
+    platform: "",
+    min_osquery_version: "",
+    automations_enabled: false,
+    logging: "snapshot",
+    name: "Team query 2",
+    description: "",
+    query: "SELECT * FROM osquery_info;",
+    saved: true,
+    observer_can_run: true,
+    author_id: 1,
+    author_name: "Tess Tuser",
+    author_email: "tess@fake.com",
+    packs: [],
+    stats: {
+      system_time_p50: null,
+      system_time_p95: null,
+      user_time_p50: null,
+      user_time_p95: null,
+      total_executions: 0,
+    },
+    discard_data: false,
+  },
+];
+
+const testGlobalQueries = testRawGlobalQueries.map(enhanceQuery);
+const testTeamQueries = testRawTeamQueries.map(enhanceQuery);
+
+const renderAsPremiumGlobalAdmin = createCustomRenderer({
+  context: {
+    app: {
+      isPremiumTier: true,
+      isGlobalAdmin: true,
+      currentUser: createMockUser(),
+    },
+  },
+});
+describe("QueriesTable", () => {
+  it("Renders the page-wide empty state when no reports are present (free tier)", () => {
+    const render = createCustomRenderer({
+      context: {
+        app: {
+          isGlobalAdmin: true,
+          currentUser: createMockUser(),
+        },
+      },
+    });
+
+    const testData: IQueriesTableProps[] = [
+      {
+        queries: [],
+        totalQueriesCount: 0,
+        hasNextResults: false,
+        curTeamScopeQueriesPresent: true,
+        isLoading: false,
+        onDeleteQueryClick: jest.fn(),
+        isOnlyObserver: false,
+        isObserverPlus: false,
+        isAnyTeamObserverPlus: false,
+        currentTeamId: undefined,
+      },
+    ];
+
+    testData.forEach((tableProps) => {
+      render(<QueriesTable {...tableProps} />);
+      expect(screen.getByText("No reports yet")).toBeInTheDocument();
+      expect(screen.queryByText("Interval")).toBeNull();
+      expect(screen.getByPlaceholderText("Search by name")).toBeDisabled();
+    });
+  });
+
+  it("Renders the page-wide empty state when no reports are present (all teams)", () => {
+    const testData: IQueriesTableProps[] = [
+      {
+        queries: [],
+        totalQueriesCount: 0,
+        hasNextResults: false,
+        curTeamScopeQueriesPresent: true,
+        isLoading: false,
+        onDeleteQueryClick: jest.fn(),
+        isOnlyObserver: false,
+        isObserverPlus: false,
+        isAnyTeamObserverPlus: false,
+        currentTeamId: undefined,
+        isPremiumTier: true,
+      },
+    ];
+
+    testData.forEach((tableProps) => {
+      renderAsPremiumGlobalAdmin(<QueriesTable {...tableProps} />);
+      expect(
+        screen.getByText("No reports apply to all fleets")
+      ).toBeInTheDocument();
+      expect(screen.queryByText("Interval")).toBeNull();
+      expect(screen.getByPlaceholderText("Search by name")).toBeDisabled();
+    });
+  });
+
+  it("Renders the page-wide empty state when no reports are present (specific team)", () => {
+    const testData: IQueriesTableProps[] = [
+      {
+        queries: [],
+        totalQueriesCount: 0,
+        hasNextResults: false,
+        curTeamScopeQueriesPresent: true,
+        isLoading: false,
+        onDeleteQueryClick: jest.fn(),
+        isOnlyObserver: false,
+        isObserverPlus: false,
+        isAnyTeamObserverPlus: false,
+        isPremiumTier: true,
+        currentTeamId: 1,
+      },
+    ];
+
+    testData.forEach((tableProps) => {
+      renderAsPremiumGlobalAdmin(<QueriesTable {...tableProps} />);
+      expect(screen.getByText("No reports for this fleet")).toBeInTheDocument();
+      expect(screen.queryByText("Interval")).toBeNull();
+      expect(screen.getByPlaceholderText("Search by name")).toBeDisabled();
+    });
+  });
+
+  it("Renders generic empty state header in Primo mode (all fleets)", () => {
+    const render = createCustomRenderer({
+      context: {
+        app: {
+          isPremiumTier: true,
+          isGlobalAdmin: true,
+          currentUser: createMockUser(),
+          config: { partnerships: { enable_primo: true } },
+        },
+      },
+    });
+
+    render(
+      <QueriesTable
+        queries={[]}
+        totalQueriesCount={0}
+        hasNextResults={false}
+        curTeamScopeQueriesPresent
+        isLoading={false}
+        onDeleteQueryClick={jest.fn()}
+        isOnlyObserver={false}
+        isObserverPlus={false}
+        isAnyTeamObserverPlus={false}
+        currentTeamId={undefined}
+        isPremiumTier
+      />
+    );
+
+    expect(screen.getByText("No reports yet")).toBeInTheDocument();
+    expect(
+      screen.queryByText("No reports apply to all fleets")
+    ).not.toBeInTheDocument();
+  });
+
+  it("Renders generic empty state header in Primo mode (specific team)", () => {
+    const render = createCustomRenderer({
+      context: {
+        app: {
+          isPremiumTier: true,
+          isGlobalAdmin: true,
+          currentUser: createMockUser(),
+          config: { partnerships: { enable_primo: true } },
+        },
+      },
+    });
+
+    render(
+      <QueriesTable
+        queries={[]}
+        totalQueriesCount={0}
+        hasNextResults={false}
+        curTeamScopeQueriesPresent
+        isLoading={false}
+        onDeleteQueryClick={jest.fn()}
+        isOnlyObserver={false}
+        isObserverPlus={false}
+        isAnyTeamObserverPlus={false}
+        currentTeamId={1}
+        isPremiumTier
+      />
+    );
+
+    expect(screen.getByText("No reports yet")).toBeInTheDocument();
+    expect(
+      screen.queryByText("No reports for this fleet")
+    ).not.toBeInTheDocument();
+  });
+
+  it("Renders inherited global queries and team queries when viewing a team", async () => {
+    const testData: IQueriesTableProps[] = [
+      {
+        queries: [...testGlobalQueries, ...testTeamQueries],
+        totalQueriesCount: 4,
+        hasNextResults: false,
+        curTeamScopeQueriesPresent: true,
+        isLoading: false,
+        onDeleteQueryClick: jest.fn(),
+        isOnlyObserver: false,
+        isObserverPlus: false,
+        isAnyTeamObserverPlus: false,
+        currentTeamId: 1,
+      },
+    ];
+    const dataStrings = [
+      "Global query 1",
+      "Global query 2",
+      "Inherited",
+      "Interval",
+      "Team query 1",
+      "Team query 2",
+    ];
+
+    // will have no context to get current user from
+    renderAsPremiumGlobalAdmin(<QueriesTable {...testData[0]} />);
+    dataStrings.forEach((val) => {
+      expect(screen.getAllByText(val)[0]).toBeInTheDocument();
+    });
+  });
+
+  it("renders the 'no-matching' empty state when a search string is entered that matches no reports", async () => {
+    const testData: IQueriesTableProps = {
+      queries: [],
+      totalQueriesCount: 0,
+      hasNextResults: false,
+      curTeamScopeQueriesPresent: true,
+      isLoading: false,
+      onDeleteQueryClick: jest.fn(),
+      isOnlyObserver: false,
+      isObserverPlus: false,
+      isAnyTeamObserverPlus: false,
+      currentTeamId: 1,
+      queryParams: {
+        query: "dont match me bro",
+      },
+    };
+    // will have no context to get current user from
+    renderAsPremiumGlobalAdmin(<QueriesTable {...testData} />);
+    expect(screen.getByText("No matching reports")).toBeInTheDocument();
+  });
+
+  it("Renders an observer can run badge and tooltip for a observer can run query", async () => {
+    const render = createCustomRenderer({
+      context: {
+        app: {
+          isGlobalAdmin: true,
+          currentUser: createMockUser(),
+        },
+      },
+    });
+
+    const testObserverCanRunQuery = [
+      createMockQuery({
+        observer_can_run: true,
+      }),
+    ];
+    const testQueries = testObserverCanRunQuery.map(enhanceQuery);
+
+    const { user } = render(
+      <QueriesTable
+        queries={testQueries}
+        totalQueriesCount={1}
+        hasNextResults={false}
+        curTeamScopeQueriesPresent
+        isLoading={false}
+        onDeleteQueryClick={jest.fn()}
+        isOnlyObserver={false}
+        isObserverPlus={false}
+        isAnyTeamObserverPlus={false}
+        currentTeamId={1}
+      />
+    );
+
+    await waitFor(() => {
+      waitFor(() => {
+        user.hover(screen.getByTestId("query-icon"));
+      });
+
+      expect(
+        screen.getByText("Observers can run this report.")
+      ).toBeInTheDocument();
+    });
+  });
+
+  it("Renders an inherited badge and tooltip for inherited query on a team's queries page", async () => {
+    const render = createCustomRenderer({
+      context: {
+        app: {
+          isGlobalAdmin: true,
+          currentUser: createMockUser(),
+        },
+      },
+    });
+
+    const testInheritedQuery = [createMockQuery()];
+
+    const testQueries = testInheritedQuery.map(enhanceQuery);
+
+    const { user } = render(
+      <QueriesTable
+        queries={testQueries}
+        totalQueriesCount={1}
+        hasNextResults={false}
+        curTeamScopeQueriesPresent
+        isLoading={false}
+        onDeleteQueryClick={jest.fn()}
+        isOnlyObserver={false}
+        isObserverPlus={false}
+        isAnyTeamObserverPlus={false}
+        currentTeamId={1}
+      />
+    );
+
+    await waitFor(() => {
+      waitFor(() => {
+        user.hover(screen.getByText("Inherited"));
+      });
+
+      expect(
+        screen.getByText("This report runs on all hosts.")
+      ).toBeInTheDocument();
+    });
+  });
+
+  it("Does not render an inherited badge and tooltip for global query on the All team's queries page", () => {
+    const render = createCustomRenderer({
+      context: {
+        app: {
+          isGlobalAdmin: true,
+          currentUser: createMockUser(),
+        },
+      },
+    });
+
+    const testGlobalQuery = [createMockQuery()];
+    const testQueries = testGlobalQuery.map(enhanceQuery);
+
+    render(
+      <QueriesTable
+        queries={testQueries}
+        totalQueriesCount={1}
+        hasNextResults={false}
+        curTeamScopeQueriesPresent
+        isLoading={false}
+        onDeleteQueryClick={jest.fn()}
+        isOnlyObserver={false}
+        isObserverPlus={false}
+        isAnyTeamObserverPlus={false}
+        currentTeamId={undefined}
+      />
+    );
+
+    expect(screen.queryByText("Inherited")).not.toBeInTheDocument();
+  });
+
+  it("Renders the correct number of checkboxes for team queries and not inherited queries on a team's queries page and can check select all box", async () => {
+    const render = createCustomRenderer({
+      context: {
+        app: {
+          isGlobalAdmin: true,
+          currentUser: createMockUser(),
+        },
+      },
+    });
+
+    const { user } = render(
+      <QueriesTable
+        queries={[...testTeamQueries, ...testGlobalQueries]}
+        totalQueriesCount={4}
+        hasNextResults={false}
+        curTeamScopeQueriesPresent
+        isLoading={false}
+        onDeleteQueryClick={jest.fn()}
+        isOnlyObserver={false}
+        isObserverPlus={false}
+        isAnyTeamObserverPlus={false}
+        currentTeamId={1}
+      />
+    );
+
+    const numberOfCheckboxes = screen.queryAllByRole("checkbox").length;
+
+    expect(numberOfCheckboxes).toBe(
+      testTeamQueries.length + 1 // +1 for Select all checkbox
+    );
+
+    const checkbox = screen.queryAllByRole("checkbox")[0];
+
+    await waitFor(async () => {
+      await user.click(checkbox);
+    });
+
+    expect(checkbox).toBeChecked();
+  });
+});

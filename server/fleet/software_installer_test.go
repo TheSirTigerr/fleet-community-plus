@@ -1,0 +1,507 @@
+package fleet
+
+import (
+	"fmt"
+	"io"
+	"os"
+	"strings"
+	"testing"
+
+	"github.com/fleetdm/fleet/v4/server/ptr"
+	"github.com/stretchr/testify/require"
+)
+
+func TestTempFileReader(t *testing.T) {
+	content1And2 := "Hello, World!"
+	tfr1, err := NewTempFileReader(strings.NewReader(content1And2), t.TempDir)
+	require.NoError(t, err)
+	tfr2, err := NewTempFileReader(strings.NewReader(content1And2), t.TempDir)
+	require.NoError(t, err)
+
+	content3 := "Hello, Temp!"
+	keepFile, err := os.CreateTemp(t.TempDir(), "test")
+	require.NoError(t, err)
+	_, err = io.Copy(keepFile, strings.NewReader(content3))
+	require.NoError(t, err)
+	err = keepFile.Close()
+	require.NoError(t, err)
+	tfr3, err := NewKeepFileReader(keepFile.Name())
+	require.NoError(t, err)
+
+	b, err := io.ReadAll(tfr1)
+	require.NoError(t, err)
+	require.Equal(t, content1And2, string(b))
+	b, err = io.ReadAll(tfr2)
+	require.NoError(t, err)
+	require.Equal(t, content1And2, string(b))
+
+	// rewind and read again gets the same content
+	err = tfr1.Rewind()
+	require.NoError(t, err)
+	b, err = io.ReadAll(tfr1)
+	require.NoError(t, err)
+	require.Equal(t, content1And2, string(b))
+
+	// tfr2 is at EOF, so it reads nothing
+	b, err = io.ReadAll(tfr2)
+	require.NoError(t, err)
+	require.Equal(t, "", string(b))
+
+	b, err = io.ReadAll(tfr3)
+	require.NoError(t, err)
+	require.Equal(t, content3, string(b))
+
+	// closing deletes the file
+	err = tfr1.Close()
+	require.NoError(t, err)
+	_, err = os.Stat(tfr1.Name())
+	require.True(t, os.IsNotExist(err))
+
+	// tfr2 still exists
+	_, err = os.Stat(tfr2.Name())
+	require.False(t, os.IsNotExist(err))
+
+	// tfr3 still exists even after Close
+	err = tfr3.Close()
+	require.NoError(t, err)
+	_, err = os.Stat(tfr3.Name())
+	require.False(t, os.IsNotExist(err))
+}
+
+func TestForMyDevicePage(t *testing.T) {
+	var iconUrl *string
+	var hostSoftwareInstaller HostSoftwareWithInstaller
+
+	testCases := []struct {
+		name     string
+		before   func()
+		testFunc func(*testing.T)
+	}{
+		{
+			name: "no icon",
+			before: func() {
+				iconUrl = nil
+				hostSoftwareInstaller = HostSoftwareWithInstaller{
+					IconUrl: iconUrl,
+					ID:      1,
+				}
+			},
+			testFunc: func(t *testing.T) {
+				hostSoftwareInstaller.ForMyDevicePage("token")
+				require.Nil(t, hostSoftwareInstaller.IconUrl)
+			},
+		},
+		{
+			name: "not fleet custom icon url",
+			before: func() {
+				iconUrl = ptr.String("https://example.com/icon.png")
+				hostSoftwareInstaller = HostSoftwareWithInstaller{
+					IconUrl: iconUrl,
+					ID:      1,
+				}
+			},
+			testFunc: func(t *testing.T) {
+				hostSoftwareInstaller.ForMyDevicePage("token")
+				require.NotNil(t, hostSoftwareInstaller.IconUrl)
+				require.Equal(t, *iconUrl, *hostSoftwareInstaller.IconUrl)
+			},
+		},
+		{
+			name: "matching custom icon url",
+			before: func() {
+				iconUrl = ptr.String("/api/latest/fleet/software/titles/42/icon?fleet_id=7")
+				hostSoftwareInstaller = HostSoftwareWithInstaller{
+					IconUrl: iconUrl,
+					ID:      1,
+				}
+			},
+			testFunc: func(t *testing.T) {
+				auth := "71f0c624-497c-4dc4-aedf-6cedddcc643d"
+				expectedIconUrl := fmt.Sprintf("/api/latest/fleet/device/%s/software/titles/%d/icon", auth, hostSoftwareInstaller.ID)
+				hostSoftwareInstaller.ForMyDevicePage(auth)
+				require.NotNil(t, hostSoftwareInstaller.IconUrl)
+				require.Equal(t, expectedIconUrl, *hostSoftwareInstaller.IconUrl)
+			},
+		},
+	}
+
+	for _, tc := range testCases {
+		t.Run(tc.name, func(t *testing.T) {
+			tc.before()
+			tc.testFunc(t)
+		})
+	}
+}
+
+func TestSoftwareInstallerPlatformFromExtension(t *testing.T) {
+	testCases := []struct {
+		ext      string
+		expected string
+		wantErr  bool
+	}{
+		// Existing supported extensions
+		{".pkg", "darwin", false},
+		{"pkg", "darwin", false},
+		{".deb", "linux", false},
+		{"deb", "linux", false},
+		{".rpm", "linux", false},
+		{"rpm", "linux", false},
+		{".tar.gz", "linux", false},
+		{"tar.gz", "linux", false},
+		{".exe", "windows", false},
+		{"exe", "windows", false},
+		{".msi", "windows", false},
+		{"msi", "windows", false},
+		{".zip", "windows", false},
+		{"zip", "windows", false},
+
+		// New script extensions
+		{".sh", "linux", false},
+		{"sh", "linux", false},
+		{".ps1", "windows", false},
+		{"ps1", "windows", false},
+		{".py", "linux", false},
+		{"py", "linux", false},
+
+		// Unsupported extensions (msix is fleet-maintained only, not custom upload)
+		{".msix", "", true},
+		{"msix", "", true},
+		{".txt", "", true},
+		{"", "", true},
+	}
+
+	for _, tc := range testCases {
+		t.Run(tc.ext, func(t *testing.T) {
+			result, err := SoftwareInstallerPlatformFromExtension(tc.ext)
+			if tc.wantErr {
+				require.Error(t, err)
+				require.Contains(t, err.Error(), "unsupported file type")
+			} else {
+				require.NoError(t, err)
+				require.Equal(t, tc.expected, result)
+			}
+		})
+	}
+}
+
+func TestAllowedSetupExperiencePlatformsForExtension(t *testing.T) {
+	testCases := []struct {
+		ext      string
+		expected []string
+	}{
+		{".py", []string{"darwin", "linux"}},
+		{"py", []string{"darwin", "linux"}},
+		{".sh", []string{"darwin", "linux"}},
+		{"sh", []string{"darwin", "linux"}},
+		{".ps1", nil},
+		{"ps1", nil},
+		{".exe", nil},
+		{"exe", nil},
+		{"", nil},
+	}
+
+	for _, tc := range testCases {
+		t.Run(tc.ext, func(t *testing.T) {
+			result := AllowedSetupExperiencePlatformsForExtension(tc.ext)
+			require.Equal(t, tc.expected, result)
+		})
+	}
+}
+
+func TestSofwareInstallerSourceFromExtensionAndName(t *testing.T) {
+	testCases := []struct {
+		ext      string
+		name     string
+		expected string
+		wantErr  bool
+	}{
+		// Existing supported extensions
+		{".deb", "package.deb", "deb_packages", false},
+		{"deb", "package.deb", "deb_packages", false},
+		{".rpm", "package.rpm", "rpm_packages", false},
+		{"rpm", "package.rpm", "rpm_packages", false},
+		{".exe", "installer.exe", "programs", false},
+		{"exe", "installer.exe", "programs", false},
+		{".msi", "installer.msi", "programs", false},
+		{"msi", "installer.msi", "programs", false},
+		{".zip", "installer.zip", "programs", false},
+		{"zip", "installer.zip", "programs", false},
+		{".pkg", "package.pkg", "pkg_packages", false},
+		{"pkg", "package.pkg", "pkg_packages", false},
+		{".pkg", "app.app", "apps", false},
+		{"pkg", "application.app", "apps", false},
+		{".tar.gz", "archive.tar.gz", "tgz_packages", false},
+		{"tar.gz", "archive.tar.gz", "tgz_packages", false},
+
+		// New script extensions
+		{".sh", "script.sh", "sh_packages", false},
+		{"sh", "setup.sh", "sh_packages", false},
+		{".ps1", "script.ps1", "ps1_packages", false},
+		{"ps1", "setup.ps1", "ps1_packages", false},
+		{".py", "script.py", "py_packages", false},
+		{"py", "setup.py", "py_packages", false},
+
+		// Unsupported extensions (msix is fleet-maintained only, not custom upload)
+		{".msix", "app.msix", "", true},
+		{"msix", "app.msix", "", true},
+		{".txt", "readme.txt", "", true},
+		{"", "noext", "", true},
+	}
+
+	for _, tc := range testCases {
+		t.Run(fmt.Sprintf("%s_%s", tc.ext, tc.name), func(t *testing.T) {
+			result, err := SofwareInstallerSourceFromExtensionAndName(tc.ext, tc.name)
+			if tc.wantErr {
+				require.Error(t, err)
+				require.Contains(t, err.Error(), "unsupported file type")
+			} else {
+				require.NoError(t, err)
+				require.Equal(t, tc.expected, result)
+			}
+		})
+	}
+}
+
+func TestIsScriptPackage(t *testing.T) {
+	testCases := []struct {
+		ext      string
+		expected bool
+	}{
+		// Script extensions - should return true
+		{".sh", true},
+		{"sh", true},
+		{".ps1", true},
+		{"ps1", true},
+		{".py", true},
+		{"py", true},
+
+		// Non-script extensions - should return false
+		{".pkg", false},
+		{"pkg", false},
+		{".deb", false},
+		{"deb", false},
+		{".rpm", false},
+		{"rpm", false},
+		{".exe", false},
+		{"exe", false},
+		{".msi", false},
+		{"msi", false},
+		{".tar.gz", false},
+		{"tar.gz", false},
+
+		// Edge cases
+		{"", false},
+		{".SH", false},   // Case sensitive
+		{".PS1", false},  // Case sensitive
+		{".PY", false},   // Case sensitive
+		{".bash", false}, // Not recognized
+	}
+
+	for _, tc := range testCases {
+		t.Run(tc.ext, func(t *testing.T) {
+			result := IsScriptPackage(tc.ext)
+			require.Equal(t, tc.expected, result)
+		})
+	}
+}
+
+func TestIconChangesDedupesDuplicateTitleRows(t *testing.T) {
+	titleID := uint(100)
+	hash := "abc123"
+	localPath := "/tmp/icon.png"
+
+	packages := []SoftwarePackageResponse{
+		{
+			TeamID:        ptr.Uint(1),
+			TitleID:       &titleID,
+			HashSHA256:    "active-pkg-sha",
+			IconHash:      hash,
+			IconFilename:  "icon.png",
+			LocalIconHash: hash,
+			LocalIconPath: localPath,
+		},
+		{
+			TeamID:       ptr.Uint(1),
+			TitleID:      &titleID,
+			HashSHA256:   "inactive-pkg-sha",
+			IconHash:     hash,
+			IconFilename: "icon.png",
+		},
+	}
+
+	changes := IconChanges{}.WithSoftware(packages, nil)
+
+	require.Empty(t, changes.TitleIDsToRemoveIconsFrom)
+	require.Empty(t, changes.IconsToUpload)
+	require.Empty(t, changes.IconsToUpdate)
+}
+
+func TestIconChangesDedupPrefersPopulatedRow(t *testing.T) {
+	titleID := uint(100)
+	hash := "abc123"
+	localPath := "/tmp/icon.png"
+
+	packages := []SoftwarePackageResponse{
+		{
+			TeamID:       ptr.Uint(1),
+			TitleID:      &titleID,
+			HashSHA256:   "inactive-pkg-sha",
+			IconHash:     hash,
+			IconFilename: "icon.png",
+		},
+		{
+			TeamID:        ptr.Uint(1),
+			TitleID:       &titleID,
+			HashSHA256:    "active-pkg-sha",
+			IconHash:      hash,
+			IconFilename:  "icon.png",
+			LocalIconHash: hash,
+			LocalIconPath: localPath,
+		},
+	}
+
+	changes := IconChanges{}.WithSoftware(packages, nil)
+	require.Empty(t, changes.TitleIDsToRemoveIconsFrom)
+	require.Empty(t, changes.IconsToUpload)
+	require.Empty(t, changes.IconsToUpdate)
+}
+
+func TestHostSoftwareInstallResultPayloadStatus(t *testing.T) {
+	cases := []struct {
+		name    string
+		payload HostSoftwareInstallResultPayload
+		want    SoftwareInstallerStatus
+	}{
+		{
+			// fleetd runs the post-install script regardless of the install
+			// script's outcome, so a succeeding post-install must not mask a
+			// failed install.
+			name:    "install failed, post-install succeeded",
+			payload: HostSoftwareInstallResultPayload{InstallScriptExitCode: new(1), PostInstallScriptExitCode: new(0)},
+			want:    SoftwareInstallFailed,
+		},
+		{
+			name:    "install failed, no post-install",
+			payload: HostSoftwareInstallResultPayload{InstallScriptExitCode: new(1)},
+			want:    SoftwareInstallFailed,
+		},
+		{
+			name:    "install and post-install succeeded",
+			payload: HostSoftwareInstallResultPayload{InstallScriptExitCode: new(0), PostInstallScriptExitCode: new(0)},
+			want:    SoftwareInstalled,
+		},
+		{
+			name:    "install succeeded, post-install failed",
+			payload: HostSoftwareInstallResultPayload{InstallScriptExitCode: new(0), PostInstallScriptExitCode: new(1)},
+			want:    SoftwareInstallFailed,
+		},
+		{
+			name:    "install succeeded, no post-install",
+			payload: HostSoftwareInstallResultPayload{InstallScriptExitCode: new(0)},
+			want:    SoftwareInstalled,
+		},
+		{
+			name:    "scripts disabled is a failure",
+			payload: HostSoftwareInstallResultPayload{InstallScriptExitCode: new(ExitCodeScriptsDisabled)},
+			want:    SoftwareInstallFailed,
+		},
+		{
+			name:    "empty pre-install condition is a failure",
+			payload: HostSoftwareInstallResultPayload{PreInstallConditionOutput: new("")},
+			want:    SoftwareInstallFailed,
+		},
+		{
+			name:    "nothing reported yet is pending",
+			payload: HostSoftwareInstallResultPayload{},
+			want:    SoftwareInstallPending,
+		},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			require.Equal(t, tc.want, tc.payload.Status())
+		})
+	}
+}
+
+func TestValidateTitlePackages(t *testing.T) {
+	fma := func(appID uint, title string) *UploadSoftwareInstallerPayload {
+		return &UploadSoftwareInstallerPayload{Title: title, FleetMaintainedAppID: new(appID)}
+	}
+	custom := func(title, storage string) *UploadSoftwareInstallerPayload {
+		return &UploadSoftwareInstallerPayload{Title: title, StorageID: storage, Filename: storage}
+	}
+
+	cases := []struct {
+		name     string
+		payloads []*UploadSoftwareInstallerPayload
+		wantErr  string
+	}{
+		{
+			name:     "two different FMAs on one title is rejected",
+			payloads: []*UploadSoftwareInstallerPayload{fma(1, "Mozilla Firefox"), fma(2, "Mozilla Firefox ESR")},
+			wantErr:  "Only one of Mozilla Firefox or Mozilla Firefox ESR can be added to the same fleet",
+		},
+		{
+			name: "two Windows FMAs sharing a DisplayName title are rejected by catalog name",
+			payloads: []*UploadSoftwareInstallerPayload{
+				{Title: "Firefox Nightly", FleetMaintainedAppID: new(uint(1)), FMAName: "Mozilla Firefox Nightly"},
+				{Title: "Firefox Nightly", FleetMaintainedAppID: new(uint(2)), FMAName: "Mozilla Firefox Nightly (ARM64)"},
+			},
+			wantErr: "Only one of Mozilla Firefox Nightly or Mozilla Firefox Nightly (ARM64) can be added to the same fleet",
+		},
+		{
+			name:     "same FMA across multiple versions is allowed",
+			payloads: []*UploadSoftwareInstallerPayload{fma(1, "Mozilla Firefox"), fma(1, "Mozilla Firefox")},
+		},
+		{
+			name:     "single FMA is allowed",
+			payloads: []*UploadSoftwareInstallerPayload{fma(1, "Mozilla Firefox")},
+		},
+		{
+			name:     "mixing an FMA with a custom package is rejected",
+			payloads: []*UploadSoftwareInstallerPayload{fma(1, "Mozilla Firefox"), custom("Mozilla Firefox", "hash-1")},
+			wantErr:  "Fleet-maintained app",
+		},
+		{
+			name:     "duplicate custom-package hash is rejected",
+			payloads: []*UploadSoftwareInstallerPayload{custom("App", "same-hash"), custom("App", "same-hash")},
+			wantErr:  "same SHA-256 hash",
+		},
+		{
+			name:     "distinct custom packages are allowed",
+			payloads: []*UploadSoftwareInstallerPayload{custom("App", "hash-a"), custom("App", "hash-b")},
+		},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			err := ValidateTitlePackages(tc.payloads, "Workstations")
+			if tc.wantErr == "" {
+				require.NoError(t, err)
+				return
+			}
+			require.ErrorContains(t, err, tc.wantErr)
+		})
+	}
+}
+
+func TestHostSoftwareInstallOptionsIsFleetInitiated(t *testing.T) {
+	t.Parallel()
+
+	cases := []struct {
+		desc string
+		opts HostSoftwareInstallOptions
+		want bool
+	}{
+		{"user-initiated", HostSoftwareInstallOptions{}, false},
+		{"self-service", HostSoftwareInstallOptions{SelfService: true}, false},
+		{"policy automation", HostSoftwareInstallOptions{PolicyID: new(uint(1))}, true},
+		{"scheduled updates", HostSoftwareInstallOptions{ForScheduledUpdates: true}, true},
+		{"setup experience", HostSoftwareInstallOptions{ForSetupExperience: true}, true},
+		{"self-service wins over setup experience", HostSoftwareInstallOptions{ForSetupExperience: true, SelfService: true}, false},
+	}
+	for _, c := range cases {
+		t.Run(c.desc, func(t *testing.T) {
+			require.Equal(t, c.want, c.opts.IsFleetInitiated())
+		})
+	}
+}

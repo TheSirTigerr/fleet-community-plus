@@ -1,0 +1,242 @@
+import { IHostCertificate } from "interfaces/certificates";
+import { ICommandResult } from "interfaces/command";
+import { IDUPDetails } from "interfaces/host";
+import { IListOptions } from "interfaces/list_options";
+import { ISetupStep } from "interfaces/setup";
+import { IDeviceSoftware } from "interfaces/software";
+import sendRequest from "services";
+import endpoints from "utilities/endpoints";
+import {
+  buildQueryStringFromParams,
+  getPathWithQueryParams,
+} from "utilities/url";
+
+import { IHostSoftwareQueryParams } from "./hosts";
+
+export type ILoadHostDetailsExtension = "macadmins";
+
+export interface IDeviceSoftwareQueryKey extends IHostSoftwareQueryParams {
+  scope: "device_software";
+  id: string;
+  softwareUpdatedAt?: string;
+}
+
+export interface IGetDeviceSoftwareResponse {
+  software: IDeviceSoftware[];
+  count: number;
+  meta: {
+    has_next_results: boolean;
+    has_previous_results: boolean;
+  };
+}
+
+interface IGetDeviceDetailsApiParams {
+  token: string;
+  exclude_software?: boolean;
+}
+
+export interface IGetDeviceCertificatesResponse {
+  certificates: IHostCertificate[];
+  meta: {
+    has_next_results: boolean;
+    has_previous_results: boolean;
+  };
+  count: number;
+}
+
+export interface IGetDeviceCertsApiParams extends IListOptions {
+  token: string;
+}
+
+export interface IGetVppInstallCommandResultsResponse {
+  results: ICommandResult[];
+}
+export interface IGetSetupExperienceStatusesResponse {
+  setup_experience_results: {
+    software: ISetupStep[];
+    scripts: ISetupStep[];
+  };
+}
+
+export interface IGetSetupExperienceStatusesParams {
+  token: string;
+}
+
+export interface IInitiateDeviceSSOResponse {
+  /** The IdP URL the browser must navigate to in order to sign in. */
+  url: string;
+}
+
+export default {
+  loadHostDetails: ({
+    token,
+    exclude_software,
+  }: IGetDeviceDetailsApiParams): Promise<IDUPDetails> => {
+    const { DEVICE_USER_DETAILS } = endpoints;
+    let path = `${DEVICE_USER_DETAILS}/${token}`;
+    if (exclude_software) {
+      path += "?exclude_software=true";
+    }
+    return sendRequest("GET", path);
+  },
+  loadHostDetailsExtension: (
+    deviceAuthToken: string,
+    extension: ILoadHostDetailsExtension
+  ) => {
+    const { DEVICE_USER_DETAILS } = endpoints;
+    const path = `${DEVICE_USER_DETAILS}/${deviceAuthToken}/${extension}`;
+
+    return sendRequest("GET", path);
+  },
+  refetch: (deviceAuthToken: string) => {
+    const { DEVICE_USER_DETAILS } = endpoints;
+    const path = `${DEVICE_USER_DETAILS}/${deviceAuthToken}/refetch`;
+
+    return sendRequest("POST", path);
+  },
+  apnsPing: (deviceAuthToken: string) => {
+    const { DEVICE_USER_APNS_PING } = endpoints;
+    const path = DEVICE_USER_APNS_PING(deviceAuthToken);
+
+    return sendRequest("POST", path);
+  },
+
+  /** Starts the Fleet Desktop SSO flow. Sets the SSO handshake cookie and
+   * returns the IdP URL to navigate to; the session cookie is set server-side
+   * when the IdP calls back. */
+  initiateDeviceSSO: (
+    deviceAuthToken: string
+  ): Promise<IInitiateDeviceSSOResponse> => {
+    const { DEVICE_USER_DETAILS } = endpoints;
+    const path = `${DEVICE_USER_DETAILS}/${deviceAuthToken}/sso`;
+
+    return sendRequest("POST", path);
+  },
+
+  getDeviceSoftware: (
+    params: IDeviceSoftwareQueryKey
+  ): Promise<IGetDeviceSoftwareResponse> => {
+    const { DEVICE_SOFTWARE } = endpoints;
+    // eslint-disable-next-line @typescript-eslint/no-unused-vars
+    const { id, scope, ...rest } = params;
+
+    const path = getPathWithQueryParams(DEVICE_SOFTWARE(id), rest);
+    return sendRequest("GET", path);
+  },
+
+  // getSoftwareIcon doesn't need its own service function because the logic is encapsulated in
+  // softwareAPI.getSoftwareIconFromApiUrl in /entities/software.ts
+
+  installSelfServiceSoftware: (
+    deviceToken: string,
+    softwareTitleId: number
+  ) => {
+    const { DEVICE_SOFTWARE_INSTALL } = endpoints;
+    const path = DEVICE_SOFTWARE_INSTALL(deviceToken, softwareTitleId);
+
+    return sendRequest("POST", path);
+  },
+
+  installAllSelfServiceSoftwareInCategory: (
+    deviceToken: string,
+    categoryId?: number,
+    query?: string
+  ) => {
+    const { DEVICE_SOFTWARE_INSTALL_ALL } = endpoints;
+    // `getPathWithQueryParams` drops undefined values, so an omitted
+    // `categoryId` means "install all categories" and an omitted `query`
+    // means "no name filter" — matching the endpoint's optional semantics.
+    // Callers are expected to hand a trimmed query (or an empty string).
+    const path = getPathWithQueryParams(
+      DEVICE_SOFTWARE_INSTALL_ALL(deviceToken),
+      { category_id: categoryId, query: query || undefined }
+    );
+    return sendRequest("POST", path);
+  },
+
+  uninstallSelfServiceSoftware: (
+    deviceToken: string,
+    softwareTitleId: number
+  ) => {
+    const { DEVICE_SOFTWARE_UNINSTALL } = endpoints;
+    return sendRequest(
+      "POST",
+      DEVICE_SOFTWARE_UNINSTALL(deviceToken, softwareTitleId)
+    );
+  },
+
+  /** Gets more info on FMA/custom package install for device user */
+  getSoftwareInstallResult: (deviceToken: string, uuid: string) => {
+    const { DEVICE_SOFTWARE_INSTALL_RESULTS } = endpoints;
+    const path = DEVICE_SOFTWARE_INSTALL_RESULTS(deviceToken, uuid);
+
+    return sendRequest("GET", path);
+  },
+
+  /** Gets more info on FMA/custom package uninstall for device user */
+  getSoftwareUninstallResult: (
+    deviceToken: string,
+    scriptExecutionId: string
+  ) => {
+    const { DEVICE_SOFTWARE_UNINSTALL_RESULTS } = endpoints;
+    const path = DEVICE_SOFTWARE_UNINSTALL_RESULTS(
+      deviceToken,
+      scriptExecutionId
+    );
+
+    return sendRequest("GET", path);
+  },
+
+  /** Gets more info on VPP install for device user */
+  getVppCommandResult: (
+    deviceToken: string,
+    uuid: string
+  ): Promise<IGetVppInstallCommandResultsResponse> => {
+    const { DEVICE_VPP_COMMAND_RESULTS } = endpoints;
+    const path = DEVICE_VPP_COMMAND_RESULTS(deviceToken, uuid);
+
+    return sendRequest("GET", path);
+  },
+
+  getDeviceCertificates: ({
+    token,
+    page,
+    per_page,
+    order_key,
+    order_direction,
+  }: IGetDeviceCertsApiParams): Promise<IGetDeviceCertificatesResponse> => {
+    const { DEVICE_CERTIFICATES } = endpoints;
+    const path = `${DEVICE_CERTIFICATES(token)}?${buildQueryStringFromParams({
+      page,
+      per_page,
+      order_key,
+      order_direction,
+    })}`;
+
+    return sendRequest("GET", path);
+  },
+
+  getSetupExperienceStatuses: ({
+    token,
+  }: IGetSetupExperienceStatusesParams): Promise<IGetSetupExperienceStatusesResponse> => {
+    const { DEVICE_SETUP_EXPERIENCE_STATUSES } = endpoints;
+    const path = DEVICE_SETUP_EXPERIENCE_STATUSES(token);
+    return sendRequest("POST", path);
+  },
+
+  resendProfile: (deviceToken: string, profileUUID: string) => {
+    const { DEVICE_RESEND_PROFILE } = endpoints;
+    const path = DEVICE_RESEND_PROFILE(deviceToken, profileUUID);
+    return sendRequest("POST", path);
+  },
+
+  getMdmManualEnrollUrl: (token: string) => {
+    const { DEVICE_USER_MDM_ENROLLMENT_PROFILE } = endpoints;
+    return sendRequest("GET", DEVICE_USER_MDM_ENROLLMENT_PROFILE(token));
+  },
+
+  bypassConditionalAccess: (token: string) => {
+    const { DEVICE_BYPASS_CONDITIONAL_ACCESS } = endpoints;
+    return sendRequest("POST", DEVICE_BYPASS_CONDITIONAL_ACCESS(token));
+  },
+};

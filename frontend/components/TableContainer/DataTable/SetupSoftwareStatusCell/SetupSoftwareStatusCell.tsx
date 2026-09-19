@@ -1,0 +1,48 @@
+import React from "react";
+
+import Icon from "components/Icon";
+import { IconNames } from "components/icons";
+import Spinner from "components/Spinner";
+import { SetupStepStatus } from "interfaces/setup";
+
+const baseClass = "setup-software-status-cell";
+
+interface ISetupSoftwareStatusCell {
+  status: SetupStepStatus;
+}
+
+const serverToUiStatus = (
+  status: SetupStepStatus
+): { label: string; icon: IconNames | "spinner" } => {
+  switch (status) {
+    case "pending":
+      return { label: "Pending", icon: "pending-outline" };
+    case "running":
+      return { label: "Installing", icon: "spinner" };
+    case "success":
+      return { label: "Installed", icon: "success" };
+    case "failure":
+    case "cancelled":
+      return { label: "Failed", icon: "error" };
+    default:
+      return { label: "Pending", icon: "pending-outline" };
+  }
+};
+
+const SetupSoftwareStatusCell = ({ status }: ISetupSoftwareStatusCell) => {
+  const { label, icon } = serverToUiStatus(status);
+  return (
+    <div className={baseClass}>
+      <div className={`${baseClass}__icon`}>
+        {icon === "spinner" ? (
+          <Spinner size="x-small" delay={0} />
+        ) : (
+          <Icon name={icon} />
+        )}
+      </div>
+      <span className={`${baseClass}__label`}>{label}</span>
+    </div>
+  );
+};
+
+export default SetupSoftwareStatusCell;
