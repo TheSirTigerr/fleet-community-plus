@@ -85,7 +85,7 @@ jobs:
           Premium-equivalent functionality in this repository must be implemented
           independently and must not copy Fleet's restricted Enterprise Edition backend.
           EOF
-          sed -i "s/UPSTREAM_COMMIT_PLACEHOLDER/Upstream commit: `${upstream_sha}`/" COMMUNITY_PLUS_UPSTREAM.md
+          sed -i "s/UPSTREAM_COMMIT_PLACEHOLDER/Upstream commit: ${upstream_sha}/" COMMUNITY_PLUS_UPSTREAM.md
 
       - name: Verify import boundaries
         shell: bash
