@@ -24,6 +24,7 @@ The initial foundation lives in `server/communityplus`:
 - `automation.go` — scoped event/rule engine for remediation and orchestration.
 - `sqlstore.go` — MySQL persistence for audit events and automation rules.
 - `httpapi.go` — authenticated, scope-aware REST API for capabilities, audit and automation management.
+- `hostidentity/` — ECDSA host certificate serialization and HTTP message-signature verification used by agent authentication.
 
 This layer intentionally has no dependency on Fleet's datastore or service packages. Integration is
 performed through adapters so Community+ remains testable and upstream Fleet changes remain mergeable.
@@ -91,6 +92,10 @@ The initial bootstrap removed upstream's complete `ee/` directory, but the impor
 contains production imports of packages below that path. As a result, the full Fleet server is not buildable
 until those imports are replaced with independently implemented Community+ adapters. Restricted upstream EE
 implementations must not be copied back to repair the build.
+
+Small compatibility facades may remain at an old import path while callers are migrated. Such a facade must
+only delegate to code under `server/communityplus`, contain no copied EE implementation and have focused tests
+on the Community+ implementation.
 
 The Community+ package is deliberately isolated and independently testable while this compatibility work is
 completed. An HTTP API being implemented here is not considered integrated until the complete Fleet server

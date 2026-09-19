@@ -3,7 +3,7 @@ package fleet
 import (
 	"encoding/json"
 
-	"github.com/fleetdm/fleet/v4/ee/pkg/hostidentity/types"
+	"github.com/fleetdm/fleet/v4/server/communityplus/hostidentity/types"
 )
 
 // OrbitConfigNotifications are notifications that the fleet server sends to

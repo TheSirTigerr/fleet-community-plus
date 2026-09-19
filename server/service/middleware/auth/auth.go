@@ -7,7 +7,7 @@ import (
 
 	kithttp "github.com/go-kit/kit/transport/http"
 
-	"github.com/fleetdm/fleet/v4/ee/server/service/hostidentity/httpsig"
+	"github.com/fleetdm/fleet/v4/server/communityplus/hostidentity/httpsig"
 	"github.com/fleetdm/fleet/v4/server/contexts/authz"
 	"github.com/fleetdm/fleet/v4/server/contexts/ctxerr"
 	"github.com/fleetdm/fleet/v4/server/contexts/logging"

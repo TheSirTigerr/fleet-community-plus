@@ -7,10 +7,14 @@ on:
       - 'community-plus/**'
     paths:
       - 'server/communityplus/**'
+      - 'ee/pkg/hostidentity/types/**'
+      - 'ee/server/service/hostidentity/httpsig/**'
       - '.github/workflows/community-plus-tests.yml'
   pull_request:
     paths:
       - 'server/communityplus/**'
+      - 'ee/pkg/hostidentity/types/**'
+      - 'ee/server/service/hostidentity/httpsig/**'
       - '.github/workflows/community-plus-tests.yml'
   workflow_dispatch:
 
@@ -34,7 +38,7 @@ jobs:
         shell: bash
         run: |
           set -euo pipefail
-          files="$(find server/communityplus -name '*.go' -type f -print)"
+          files="$(find server/communityplus ee/pkg/hostidentity/types ee/server/service/hostidentity/httpsig -name '*.go' -type f -print)"
           test -n "$files"
           unformatted="$(gofmt -l $files)"
           if [ -n "$unformatted" ]; then
@@ -44,4 +48,8 @@ jobs:
           fi
 
       - name: Test Community+
-        run: go test -race ./server/communityplus/...
+        run: >-
+          go test -race
+          ./server/communityplus/...
+          ./ee/pkg/hostidentity/types
+          ./ee/server/service/hostidentity/httpsig
