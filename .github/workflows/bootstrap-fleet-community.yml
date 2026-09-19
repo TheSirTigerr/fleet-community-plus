@@ -1,6 +1,10 @@
 name: Bootstrap Fleet Community base
 
 on:
+  push:
+    branches: [main]
+    paths:
+      - '.github/workflows/bootstrap-fleet-community.yml'
   workflow_dispatch:
 
 permissions:
@@ -12,6 +16,7 @@ concurrency:
 
 jobs:
   import-community-base:
+    if: github.actor != 'github-actions[bot]'
     runs-on: ubuntu-latest
     steps:
       - name: Check out target repository
@@ -31,8 +36,6 @@ jobs:
         run: |
           set -euo pipefail
 
-          # Preserve Fleet Community Plus project-owned files before replacing
-          # the rest of the worktree with the current Fleet upstream tree.
           preserve_dir="$(mktemp -d)"
           cp README.md "$preserve_dir/README.md"
           mkdir -p "$preserve_dir/docs" "$preserve_dir/.github/workflows"
@@ -41,9 +44,6 @@ jobs:
           cp .github/workflows/bootstrap-fleet-community.yml \
             "$preserve_dir/.github/workflows/bootstrap-fleet-community.yml"
 
-          # Import upstream while excluding Enterprise Edition code and all
-          # upstream Actions workflows. The target repository's own bootstrap
-          # workflow is restored afterwards.
           rsync -a --delete \
             --exclude='.git/' \
             --exclude='ee/' \
@@ -53,8 +53,6 @@ jobs:
             --exclude='docs/FEATURE_PARITY.md' \
             /tmp/fleet-upstream/ ./
 
-          # Restore project-owned files in case their parent directories were
-          # changed by rsync.
           cp "$preserve_dir/README.md" README.md
           mkdir -p docs .github/workflows
           cp "$preserve_dir/docs/CLEAN_ROOM.md" docs/CLEAN_ROOM.md
@@ -62,8 +60,6 @@ jobs:
           cp "$preserve_dir/.github/workflows/bootstrap-fleet-community.yml" \
             .github/workflows/bootstrap-fleet-community.yml
 
-          # Defense in depth: Enterprise Edition code must never remain in the
-          # imported worktree.
           rm -rf ee
           if [ -e ee ]; then
             echo 'ERROR: ee/ still exists after import.' >&2
