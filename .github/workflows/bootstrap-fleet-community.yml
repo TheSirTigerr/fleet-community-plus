@@ -1,10 +1,6 @@
 name: Bootstrap Fleet Community base
 
 on:
-  push:
-    branches: [main]
-    paths:
-      - '.github/workflows/bootstrap-fleet-community.yml'
   workflow_dispatch:
 
 permissions:
@@ -16,7 +12,6 @@ concurrency:
 
 jobs:
   import-community-base:
-    if: github.actor != 'github-actions[bot]'
     runs-on: ubuntu-latest
     steps:
       - name: Check out target repository
