@@ -1,0 +1,47 @@
+name: Community+ tests
+
+on:
+  push:
+    branches:
+      - main
+      - 'community-plus/**'
+    paths:
+      - 'server/communityplus/**'
+      - '.github/workflows/community-plus-tests.yml'
+  pull_request:
+    paths:
+      - 'server/communityplus/**'
+      - '.github/workflows/community-plus-tests.yml'
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  test:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Check out repository
+        uses: actions/checkout@v4
+
+      - name: Set up Go
+        uses: actions/setup-go@v5
+        with:
+          go-version-file: go.mod
+          cache: true
+
+      - name: Format check
+        shell: bash
+        run: |
+          set -euo pipefail
+          files="$(find server/communityplus -name '*.go' -type f -print)"
+          test -n "$files"
+          unformatted="$(gofmt -l $files)"
+          if [ -n "$unformatted" ]; then
+            echo 'The following files need gofmt:'
+            echo "$unformatted"
+            exit 1
+          fi
+
+      - name: Test Community+
+        run: go test -race ./server/communityplus/...
