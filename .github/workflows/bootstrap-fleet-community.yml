@@ -1,10 +1,6 @@
 name: Bootstrap Fleet Community base
 
 on:
-  push:
-    branches: [main]
-    paths:
-      - '.github/workflows/bootstrap-fleet-community.yml'
   workflow_dispatch:
 
 permissions:
@@ -16,7 +12,6 @@ concurrency:
 
 jobs:
   import-community-base:
-    if: github.actor != 'github-actions[bot]'
     runs-on: ubuntu-latest
     steps:
       - name: Check out target repository
@@ -25,7 +20,9 @@ jobs:
           fetch-depth: 0
 
       - name: Clone Fleet upstream
+        shell: bash
         run: |
+          set -euo pipefail
           git clone --depth 1 https://github.com/fleetdm/fleet.git /tmp/fleet-upstream
           git -C /tmp/fleet-upstream rev-parse HEAD > /tmp/fleet-upstream-sha
 
@@ -34,24 +31,52 @@ jobs:
         run: |
           set -euo pipefail
 
-          # Keep this bootstrap workflow, but replace the rest of the worktree
-          # with Fleet upstream. Enterprise Edition server code under ee/ is
-          # deliberately excluded because it is not licensed for unlicensed
-          # production use.
+          # Preserve Fleet Community Plus project-owned files before replacing
+          # the rest of the worktree with the current Fleet upstream tree.
+          preserve_dir="$(mktemp -d)"
+          cp README.md "$preserve_dir/README.md"
+          mkdir -p "$preserve_dir/docs" "$preserve_dir/.github/workflows"
+          cp docs/CLEAN_ROOM.md "$preserve_dir/docs/CLEAN_ROOM.md"
+          cp docs/FEATURE_PARITY.md "$preserve_dir/docs/FEATURE_PARITY.md"
+          cp .github/workflows/bootstrap-fleet-community.yml \
+            "$preserve_dir/.github/workflows/bootstrap-fleet-community.yml"
+
+          # Import upstream while excluding Enterprise Edition code and all
+          # upstream Actions workflows. The target repository's own bootstrap
+          # workflow is restored afterwards.
           rsync -a --delete \
             --exclude='.git/' \
             --exclude='ee/' \
-            --exclude='.github/workflows/bootstrap-fleet-community.yml' \
+            --exclude='.github/workflows/' \
+            --exclude='README.md' \
+            --exclude='docs/CLEAN_ROOM.md' \
+            --exclude='docs/FEATURE_PARITY.md' \
             /tmp/fleet-upstream/ ./
 
-          rm -rf ee
+          # Restore project-owned files in case their parent directories were
+          # changed by rsync.
+          cp "$preserve_dir/README.md" README.md
+          mkdir -p docs .github/workflows
+          cp "$preserve_dir/docs/CLEAN_ROOM.md" docs/CLEAN_ROOM.md
+          cp "$preserve_dir/docs/FEATURE_PARITY.md" docs/FEATURE_PARITY.md
+          cp "$preserve_dir/.github/workflows/bootstrap-fleet-community.yml" \
+            .github/workflows/bootstrap-fleet-community.yml
 
-          cat > COMMUNITY_PLUS_UPSTREAM.md <<EOF
+          # Defense in depth: Enterprise Edition code must never remain in the
+          # imported worktree.
+          rm -rf ee
+          if [ -e ee ]; then
+            echo 'ERROR: ee/ still exists after import.' >&2
+            exit 1
+          fi
+
+          upstream_sha="$(cat /tmp/fleet-upstream-sha)"
+          cat > COMMUNITY_PLUS_UPSTREAM.md <<'EOF'
           # Fleet Community Plus upstream base
 
           This repository was bootstrapped from the public `fleetdm/fleet` repository.
 
-          Upstream commit: `$(cat /tmp/fleet-upstream-sha)`
+          UPSTREAM_COMMIT_PLACEHOLDER
 
           The upstream `ee/` directory is intentionally excluded. Fleet's root license
           applies to the imported files according to their paths; documentation and
@@ -60,6 +85,26 @@ jobs:
           Premium-equivalent functionality in this repository must be implemented
           independently and must not copy Fleet's restricted Enterprise Edition backend.
           EOF
+          sed -i "s/UPSTREAM_COMMIT_PLACEHOLDER/Upstream commit: `${upstream_sha}`/" COMMUNITY_PLUS_UPSTREAM.md
+
+      - name: Verify import boundaries
+        shell: bash
+        run: |
+          set -euo pipefail
+
+          test ! -e ee
+          test -f README.md
+          test -f docs/CLEAN_ROOM.md
+          test -f docs/FEATURE_PARITY.md
+          test -f .github/workflows/bootstrap-fleet-community.yml
+          test -f COMMUNITY_PLUS_UPSTREAM.md
+
+          workflow_count="$(find .github/workflows -maxdepth 1 -type f | wc -l)"
+          if [ "$workflow_count" -ne 1 ]; then
+            echo "ERROR: unexpected upstream workflows were imported." >&2
+            find .github/workflows -maxdepth 1 -type f -print >&2
+            exit 1
+          fi
 
       - name: Commit imported Community base
         shell: bash
