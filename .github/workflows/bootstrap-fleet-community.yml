@@ -1,0 +1,76 @@
+name: Bootstrap Fleet Community base
+
+on:
+  push:
+    branches: [main]
+    paths:
+      - '.github/workflows/bootstrap-fleet-community.yml'
+  workflow_dispatch:
+
+permissions:
+  contents: write
+
+concurrency:
+  group: bootstrap-fleet-community
+  cancel-in-progress: false
+
+jobs:
+  import-community-base:
+    if: github.actor != 'github-actions[bot]'
+    runs-on: ubuntu-latest
+    steps:
+      - name: Check out target repository
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - name: Clone Fleet upstream
+        run: |
+          git clone --depth 1 https://github.com/fleetdm/fleet.git /tmp/fleet-upstream
+          git -C /tmp/fleet-upstream rev-parse HEAD > /tmp/fleet-upstream-sha
+
+      - name: Import source-available Community tree only
+        shell: bash
+        run: |
+          set -euo pipefail
+
+          # Keep this bootstrap workflow, but replace the rest of the worktree
+          # with Fleet upstream. Enterprise Edition server code under ee/ is
+          # deliberately excluded because it is not licensed for unlicensed
+          # production use.
+          rsync -a --delete \
+            --exclude='.git/' \
+            --exclude='ee/' \
+            --exclude='.github/workflows/bootstrap-fleet-community.yml' \
+            /tmp/fleet-upstream/ ./
+
+          rm -rf ee
+
+          cat > COMMUNITY_PLUS_UPSTREAM.md <<EOF
+          # Fleet Community Plus upstream base
+
+          This repository was bootstrapped from the public `fleetdm/fleet` repository.
+
+          Upstream commit: `$(cat /tmp/fleet-upstream-sha)`
+
+          The upstream `ee/` directory is intentionally excluded. Fleet's root license
+          applies to the imported files according to their paths; documentation and
+          third-party components retain their respective upstream licenses.
+
+          Premium-equivalent functionality in this repository must be implemented
+          independently and must not copy Fleet's restricted Enterprise Edition backend.
+          EOF
+
+      - name: Commit imported Community base
+        shell: bash
+        run: |
+          set -euo pipefail
+          git config user.name 'github-actions[bot]'
+          git config user.email '41898282+github-actions[bot]@users.noreply.github.com'
+          git add -A
+          if git diff --cached --quiet; then
+            echo 'No changes to commit.'
+            exit 0
+          fi
+          git commit -m 'chore: bootstrap Fleet Community upstream base'
+          git push origin HEAD:main
