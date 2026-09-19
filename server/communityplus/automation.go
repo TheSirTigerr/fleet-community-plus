@@ -68,9 +68,9 @@ func (r AutomationRule) Validate() error {
 
 // AutomationEvent is emitted by a Fleet adapter into the automation engine.
 type AutomationEvent struct {
-	Trigger Trigger            `json:"trigger"`
-	Scope   Scope              `json:"scope"`
-	HostID  uint               `json:"host_id,omitempty"`
+	Trigger Trigger           `json:"trigger"`
+	Scope   Scope             `json:"scope"`
+	HostID  uint              `json:"host_id,omitempty"`
 	Data    map[string]string `json:"data,omitempty"`
 }
 
