@@ -22,6 +22,8 @@ The initial foundation lives in `server/communityplus`:
 - `rbac.go` — global/Fleet scopes, permissions, roles and authorization.
 - `audit.go` — validated audit events plus a pluggable persistence sink.
 - `automation.go` — scoped event/rule engine for remediation and orchestration.
+- `sqlstore.go` — MySQL persistence for audit events and automation rules.
+- `httpapi.go` — authenticated, scope-aware REST API for capabilities, audit and automation management.
 
 This layer intentionally has no dependency on Fleet's datastore or service packages. Integration is
 performed through adapters so Community+ remains testable and upstream Fleet changes remain mergeable.
@@ -82,6 +84,17 @@ but Fleet permissions cannot elevate to global scope. The automation engine appl
 rule before an action can execute.
 
 Persistent adapters and HTTP handlers must keep that invariant rather than trusting user-provided Fleet IDs.
+
+## Upstream build boundary
+
+The initial bootstrap removed upstream's complete `ee/` directory, but the imported Community server still
+contains production imports of packages below that path. As a result, the full Fleet server is not buildable
+until those imports are replaced with independently implemented Community+ adapters. Restricted upstream EE
+implementations must not be copied back to repair the build.
+
+The Community+ package is deliberately isolated and independently testable while this compatibility work is
+completed. An HTTP API being implemented here is not considered integrated until the complete Fleet server
+build succeeds and the handler is mounted behind Fleet authentication.
 
 ## Feature maturity
 

@@ -100,6 +100,41 @@ func TestSQLStoreUpsertsAndListsAutomationRules(t *testing.T) {
 	}
 }
 
+func TestSQLStoreListsFleetAuditEvents(t *testing.T) {
+	db, mock, err := sqlmock.New()
+	if err != nil {
+		t.Fatalf("new sqlmock: %v", err)
+	}
+	defer db.Close()
+	store, err := NewSQLStore(db)
+	if err != nil {
+		t.Fatalf("new SQL store: %v", err)
+	}
+
+	columns := []string{
+		"id", "occurred_at", "actor_id", "action", "resource", "resource_id",
+		"scope_kind", "fleet_id", "metadata",
+	}
+	occurredAt := time.Date(2026, time.September, 19, 20, 0, 0, 0, time.UTC)
+	mock.ExpectQuery("SELECT id, occurred_at, actor_id").
+		WithArgs(uint(7), 25).
+		WillReturnRows(sqlmock.NewRows(columns).AddRow(
+			"audit-7", occurredAt, "user-7", "automation_rule.upsert",
+			ResourceAutomations, "rule-7", ScopeFleet, 7, []byte(`{"source":"api"}`),
+		))
+	fleetID := uint(7)
+	events, err := store.ListAuditEvents(context.Background(), AuditFilter{FleetID: &fleetID, Limit: 25})
+	if err != nil {
+		t.Fatalf("list audit events: %v", err)
+	}
+	if len(events) != 1 || events[0].Scope != FleetScope(7) || events[0].Metadata["source"] != "api" {
+		t.Fatalf("unexpected audit events: %#v", events)
+	}
+	if err := mock.ExpectationsWereMet(); err != nil {
+		t.Fatal(err)
+	}
+}
+
 type staticRuleStore struct {
 	rules []AutomationRule
 	err   error

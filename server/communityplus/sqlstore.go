@@ -19,6 +19,25 @@ type SQLStore struct {
 	db SQLExecutor
 }
 
+// AutomationStore is the persistence contract used by the Community+ API.
+type AutomationStore interface {
+	UpsertAutomationRule(context.Context, AutomationRule) error
+	DeleteAutomationRule(context.Context, string) error
+	ListAutomationRules(context.Context) ([]AutomationRule, error)
+}
+
+// AuditStore is the read/write persistence contract used by the Community+ API.
+type AuditStore interface {
+	AuditSink
+	ListAuditEvents(context.Context, AuditFilter) ([]AuditEvent, error)
+}
+
+// AuditFilter limits audit results. FleetID nil means all scopes.
+type AuditFilter struct {
+	FleetID *uint
+	Limit   int
+}
+
 func NewSQLStore(db SQLExecutor) (*SQLStore, error) {
 	if db == nil {
 		return nil, fmt.Errorf("communityplus: SQL executor is required")
@@ -50,6 +69,70 @@ VALUES (?, ?, ?, ?, ?, NULLIF(?, ''), ?, ?, ?)`,
 		return fmt.Errorf("communityplus: record audit event: %w", err)
 	}
 	return nil
+}
+
+// ListAuditEvents returns newest events first. Limits are bounded to keep the
+// administrative endpoint from accidentally issuing an unbounded query.
+func (s *SQLStore) ListAuditEvents(ctx context.Context, filter AuditFilter) ([]AuditEvent, error) {
+	limit := filter.Limit
+	if limit <= 0 {
+		limit = 100
+	}
+	if limit > 1000 {
+		limit = 1000
+	}
+	query := `
+SELECT id, occurred_at, actor_id, action, resource, COALESCE(resource_id, ''),
+       scope_kind, fleet_id, metadata
+FROM communityplus_audit_events`
+	args := make([]any, 0, 2)
+	if filter.FleetID != nil {
+		if *filter.FleetID == 0 {
+			return nil, fmt.Errorf("communityplus: audit fleet_id must be greater than zero")
+		}
+		query += ` WHERE fleet_id = ?`
+		args = append(args, *filter.FleetID)
+	}
+	query += ` ORDER BY occurred_at DESC, id DESC LIMIT ?`
+	args = append(args, limit)
+
+	rows, err := s.db.QueryContext(ctx, query, args...)
+	if err != nil {
+		return nil, fmt.Errorf("communityplus: list audit events: %w", err)
+	}
+	defer rows.Close()
+
+	events := make([]AuditEvent, 0)
+	for rows.Next() {
+		var event AuditEvent
+		var fleetID sql.NullInt64
+		var metadata []byte
+		if err := rows.Scan(
+			&event.ID, &event.OccurredAt, &event.ActorID, &event.Action, &event.Resource,
+			&event.ResourceID, &event.Scope.Kind, &fleetID, &metadata,
+		); err != nil {
+			return nil, fmt.Errorf("communityplus: scan audit event: %w", err)
+		}
+		if fleetID.Valid {
+			if fleetID.Int64 <= 0 {
+				return nil, fmt.Errorf("communityplus: invalid stored audit fleet_id %d", fleetID.Int64)
+			}
+			event.Scope.FleetID = uint(fleetID.Int64)
+		}
+		if len(metadata) > 0 && string(metadata) != "null" {
+			if err := json.Unmarshal(metadata, &event.Metadata); err != nil {
+				return nil, fmt.Errorf("communityplus: decode audit metadata for %q: %w", event.ID, err)
+			}
+		}
+		if err := event.Validate(); err != nil {
+			return nil, fmt.Errorf("communityplus: validate stored audit event %q: %w", event.ID, err)
+		}
+		events = append(events, event)
+	}
+	if err := rows.Err(); err != nil {
+		return nil, fmt.Errorf("communityplus: iterate audit events: %w", err)
+	}
+	return events, nil
 }
 
 // UpsertAutomationRule creates or replaces a durable automation rule.

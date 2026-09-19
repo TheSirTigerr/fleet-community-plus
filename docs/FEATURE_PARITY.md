@@ -85,4 +85,13 @@ This document tracks independently implemented equivalents for Fleet Premium cap
 6. Add patching, vulnerability enrichment and advanced lifecycle automation.
 7. Add compatibility/integration tests against documented Fleet API behavior where useful.
 
+## Current integration gate
+
+- [x] Community+ capability, RBAC, audit and automation domain foundation
+- [x] MySQL schema and persistence for audit events and automation rules
+- [x] Scope-aware REST handler with API tests
+- [ ] Replace remaining production imports from the removed upstream `ee/` tree
+- [ ] Mount Community+ routes behind Fleet user authentication
+- [ ] Pass a full Fleet server build before advertising any feature as production-ready
+
 A checkbox is only marked complete when the feature is production-usable, has migrations/API coverage, and has automated tests.

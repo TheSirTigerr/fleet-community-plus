@@ -72,6 +72,7 @@ const (
 	ResourceUsers           Resource = "users"
 	ResourceReports         Resource = "reports"
 	ResourceAudit           Resource = "audit"
+	ResourceAutomations     Resource = "automations"
 	ResourceSettings        Resource = "settings"
 )
 
@@ -123,7 +124,7 @@ func GlobalAdminRole() Role {
 	resources := []Resource{
 		ResourceHosts, ResourceFleets, ResourcePolicies, ResourceSoftware,
 		ResourceScripts, ResourceMDM, ResourceVulnerabilities, ResourceUsers,
-		ResourceReports, ResourceAudit, ResourceSettings,
+		ResourceReports, ResourceAudit, ResourceAutomations, ResourceSettings,
 	}
 	permissions := make([]Permission, 0, len(resources))
 	for _, resource := range resources {
@@ -142,7 +143,7 @@ func FleetAdminRole(fleetID uint) (Role, error) {
 	resources := []Resource{
 		ResourceHosts, ResourceFleets, ResourcePolicies, ResourceSoftware,
 		ResourceScripts, ResourceMDM, ResourceVulnerabilities, ResourceReports,
-		ResourceAudit,
+		ResourceAudit, ResourceAutomations,
 	}
 	permissions := make([]Permission, 0, len(resources))
 	for _, resource := range resources {
@@ -160,6 +161,7 @@ func ObserverRole(fleetID uint) (Role, error) {
 	resources := []Resource{
 		ResourceHosts, ResourceFleets, ResourcePolicies, ResourceSoftware,
 		ResourceMDM, ResourceVulnerabilities, ResourceReports, ResourceAudit,
+		ResourceAutomations,
 	}
 	permissions := make([]Permission, 0, len(resources))
 	for _, resource := range resources {
