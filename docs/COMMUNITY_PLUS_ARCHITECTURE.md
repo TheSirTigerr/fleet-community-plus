@@ -25,6 +25,8 @@ The initial foundation lives in `server/communityplus`:
 - `sqlstore.go` — MySQL persistence for audit events and automation rules.
 - `httpapi.go` — authenticated, scope-aware REST API for capabilities, audit and automation management.
 - `hostidentity/` — ECDSA host certificate serialization and HTTP message-signature verification used by agent authentication.
+- `digicert/` — DigiCert ONE profile validation, CSR enrollment and PKCS#12 packaging.
+- `scep/` — NDES/Smallstep challenge retrieval and a host/profile-bound SCEP proxy.
 
 This layer intentionally has no dependency on Fleet's datastore or service packages. Integration is
 performed through adapters so Community+ remains testable and upstream Fleet changes remain mergeable.
