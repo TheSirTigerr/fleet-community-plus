@@ -16,6 +16,11 @@ on:
       - 'ee/maintained-apps/**'
       - 'ee/server/licensing/**'
       - 'ee/fleetctl/**'
+      - 'ee/server/calendar/**'
+      - 'ee/server/googleworkspace/**'
+      - 'ee/server/scim/**'
+      - 'ee/server/service/**'
+      - 'ee/server/webhooks/**'
       - 'server/vulnerabilities/nvd/tools/cvefeed/**'
       - '.github/workflows/community-plus-tests.yml'
   pull_request:
@@ -30,6 +35,11 @@ on:
       - 'ee/maintained-apps/**'
       - 'ee/server/licensing/**'
       - 'ee/fleetctl/**'
+      - 'ee/server/calendar/**'
+      - 'ee/server/googleworkspace/**'
+      - 'ee/server/scim/**'
+      - 'ee/server/service/**'
+      - 'ee/server/webhooks/**'
       - 'server/vulnerabilities/nvd/tools/cvefeed/**'
       - '.github/workflows/community-plus-tests.yml'
   workflow_dispatch:
@@ -76,7 +86,16 @@ jobs:
           ./ee/maintained-apps
           ./ee/server/licensing
           ./ee/fleetctl
+          ./ee/server/calendar
+          ./ee/server/googleworkspace
+          ./ee/server/scim
+          ./ee/server/service
+          ./ee/server/service/est
+          ./ee/server/webhooks
           ./server/vulnerabilities/nvd/tools/cvefeed/...
 
       - name: Build fleetctl
         run: go build ./cmd/fleetctl/fleetctl
+
+      - name: Build Fleet server
+        run: go build ./cmd/fleet

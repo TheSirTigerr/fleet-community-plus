@@ -24,7 +24,7 @@ type Service struct {
 	inner *communityplus.Service
 }
 
-func NewService(opts ...Option) *Service {
+func NewService(opts ...Option) fleet.DigiCertService {
 	configured := &options{}
 	for _, opt := range opts {
 		if opt != nil {
