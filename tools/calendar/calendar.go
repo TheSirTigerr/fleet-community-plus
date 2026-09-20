@@ -8,7 +8,7 @@ import (
 	"os"
 	"time"
 
-	calendartest "github.com/fleetdm/fleet/v4/ee/server/calendar/load_test"
+	calendartest "github.com/fleetdm/fleet/v4/server/communityplus/calendarload"
 	_ "github.com/mattn/go-sqlite3"
 )
 

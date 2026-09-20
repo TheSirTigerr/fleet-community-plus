@@ -14,6 +14,9 @@ on:
       - 'ee/server/service/hostidentity/**'
       - 'ee/server/service/condaccess/**'
       - 'ee/maintained-apps/**'
+      - 'cmd/maintained-apps/**'
+      - 'server/communityplus/calendarload/**'
+      - 'tools/calendar/**'
       - 'ee/server/licensing/**'
       - 'ee/fleetctl/**'
       - 'ee/server/calendar/**'
@@ -33,6 +36,9 @@ on:
       - 'ee/server/service/hostidentity/**'
       - 'ee/server/service/condaccess/**'
       - 'ee/maintained-apps/**'
+      - 'cmd/maintained-apps/**'
+      - 'server/communityplus/calendarload/**'
+      - 'tools/calendar/**'
       - 'ee/server/licensing/**'
       - 'ee/fleetctl/**'
       - 'ee/server/calendar/**'
@@ -99,3 +105,6 @@ jobs:
 
       - name: Build Fleet server
         run: go build ./cmd/fleet
+
+      - name: Build auxiliary tools
+        run: go build ./cmd/maintained-apps ./tools/calendar
