@@ -27,6 +27,7 @@ The initial foundation lives in `server/communityplus`:
 - `hostidentity/` — ECDSA host certificate serialization and HTTP message-signature verification used by agent authentication.
 - `digicert/` — DigiCert ONE profile validation, CSR enrollment and PKCS#12 packaging.
 - `scep/` — NDES/Smallstep challenge retrieval and a host/profile-bound SCEP proxy.
+- `maintainedapps/` — public maintained-app manifest schema and platform validation.
 
 This layer intentionally has no dependency on Fleet's datastore or service packages. Integration is
 performed through adapters so Community+ remains testable and upstream Fleet changes remain mergeable.
