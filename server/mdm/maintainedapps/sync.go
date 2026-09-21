@@ -12,8 +12,8 @@ import (
 	"strings"
 	"time"
 
-	ma "github.com/fleetdm/fleet/v4/ee/maintained-apps"
 	"github.com/fleetdm/fleet/v4/pkg/fleethttp"
+	ma "github.com/fleetdm/fleet/v4/server/communityplus/maintainedapps"
 	"github.com/fleetdm/fleet/v4/server/contexts/ctxerr"
 	"github.com/fleetdm/fleet/v4/server/dev_mode"
 	"github.com/fleetdm/fleet/v4/server/fleet"

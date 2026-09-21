@@ -13,11 +13,11 @@ import (
 	"slices"
 	"strings"
 
-	maintained_apps "github.com/fleetdm/fleet/v4/ee/maintained-apps"
-	"github.com/fleetdm/fleet/v4/ee/maintained-apps/ingesters/homebrew"
-	"github.com/fleetdm/fleet/v4/ee/maintained-apps/ingesters/winget"
-	"github.com/fleetdm/fleet/v4/ee/maintained-apps/sources"
 	"github.com/fleetdm/fleet/v4/pkg/file"
+	maintained_apps "github.com/fleetdm/fleet/v4/server/communityplus/maintainedapps"
+	"github.com/fleetdm/fleet/v4/server/communityplus/maintainedapps/ingesters/homebrew"
+	"github.com/fleetdm/fleet/v4/server/communityplus/maintainedapps/ingesters/winget"
+	"github.com/fleetdm/fleet/v4/server/communityplus/maintainedapps/sources"
 	"github.com/fleetdm/fleet/v4/server/contexts/ctxerr"
 )
 
