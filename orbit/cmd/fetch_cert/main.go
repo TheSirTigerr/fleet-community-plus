@@ -13,8 +13,8 @@ import (
 	"path/filepath"
 	"strings"
 
-	"github.com/fleetdm/fleet/v4/ee/orbit/pkg/scep"
-	"github.com/fleetdm/fleet/v4/ee/orbit/pkg/securehw"
+	"github.com/fleetdm/fleet/v4/orbit/pkg/communityplus/scep"
+	"github.com/fleetdm/fleet/v4/orbit/pkg/communityplus/securehw"
 	"github.com/fleetdm/fleet/v4/orbit/pkg/constant"
 	"github.com/fleetdm/fleet/v4/orbit/pkg/update"
 	"github.com/fleetdm/fleet/v4/pkg/fleethttpsig"
