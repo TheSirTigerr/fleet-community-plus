@@ -14,7 +14,14 @@ import (
 // provider explicit so a deployment cannot accidentally switch sources.
 type CatalogProvider string
 
-const CatalogProviderWinget CatalogProvider = "winget"
+const (
+	CatalogProviderWinget   CatalogProvider = "winget"
+	CatalogProviderHomebrew CatalogProvider = "homebrew"
+)
+
+func supportedCatalogProvider(provider CatalogProvider) bool {
+	return provider == CatalogProviderWinget || provider == CatalogProviderHomebrew
+}
 
 // CatalogEntry is an approved package version. It intentionally stores the
 // immutable installer URL and SHA-256 instead of a "latest" package reference.
@@ -36,11 +43,18 @@ type CatalogEntry struct {
 }
 
 func (e CatalogEntry) Validate() error {
-	if e.ID == "" || e.Provider != CatalogProviderWinget || e.PackageIdentifier == "" || e.Name == "" || e.Version == "" {
-		return fmt.Errorf("communityplus: catalog entry id, provider, package_identifier, name and version are required")
+	if e.ID == "" || !supportedCatalogProvider(e.Provider) || e.PackageIdentifier == "" || e.Name == "" || e.Version == "" {
+		return fmt.Errorf("communityplus: catalog entry id, supported provider, package_identifier, name and version are required")
 	}
-	if e.InstallerType != "msi" && e.InstallerType != "msix" && e.InstallerType != "msixbundle" {
-		return fmt.Errorf("communityplus: installer type %q is not supported for automatic deployment", e.InstallerType)
+	switch e.Provider {
+	case CatalogProviderWinget:
+		if e.InstallerType != "msi" && e.InstallerType != "msix" && e.InstallerType != "msixbundle" {
+			return fmt.Errorf("communityplus: installer type %q is not supported for WinGet automatic deployment", e.InstallerType)
+		}
+	case CatalogProviderHomebrew:
+		if e.InstallerType != "pkg" {
+			return fmt.Errorf("communityplus: installer type %q is not supported for Homebrew automatic deployment", e.InstallerType)
+		}
 	}
 	if !strings.HasPrefix(e.InstallerURL, "https://") || !strings.HasPrefix(e.SourceURL, "https://") {
 		return fmt.Errorf("communityplus: installer_url and source_url must use HTTPS")
@@ -102,7 +116,7 @@ type CatalogStore interface {
 // SearchCatalogEntries sorts entries by name then package id so the UI has a
 // deterministic result order even when its backing store does not specify one.
 func SearchCatalogEntries(ctx context.Context, store CatalogStore, provider CatalogProvider, query string, limit int) ([]CatalogEntry, error) {
-	if store == nil || provider != CatalogProviderWinget {
+	if store == nil || !supportedCatalogProvider(provider) {
 		return nil, fmt.Errorf("communityplus: supported catalog provider is required")
 	}
 	query = strings.TrimSpace(query)
