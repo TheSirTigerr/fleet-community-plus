@@ -16,6 +16,7 @@ import (
 	"github.com/fleetdm/fleet/v4/ee/server/service/hostidentity/httpsig"
 	"github.com/fleetdm/fleet/v4/pkg/str"
 	"github.com/fleetdm/fleet/v4/server"
+	"github.com/fleetdm/fleet/v4/server/communityplus"
 	"github.com/fleetdm/fleet/v4/server/contexts/capabilities"
 	"github.com/fleetdm/fleet/v4/server/contexts/ctxdb"
 	"github.com/fleetdm/fleet/v4/server/contexts/ctxerr"
@@ -797,6 +798,11 @@ func (svc *Service) GetOrbitConfig(ctx context.Context) (fleet.OrbitConfig, erro
 	}
 	if len(pendingInstalls) > 0 {
 		notifs.PendingSoftwareInstallerIDs = pendingInstalls
+	}
+	if pendingDeployments, err := communityplus.PendingOrbitDeployments(ctx, host); err != nil {
+		return fleet.OrbitConfig{}, err
+	} else {
+		notifs.PendingCommunityPlusDeploymentIDs = pendingDeployments
 	}
 
 	// The WebSocket transport directive is server-config driven and applies to
@@ -2080,6 +2086,21 @@ func (svc *Service) OrbitDownloadSoftwareInstaller(ctx context.Context, installe
 	svc.authz.SkipAuthorization(ctx)
 
 	return nil, fleet.ErrMissingLicense
+}
+
+
+func getOrbitCommunityPlusDeploymentEndpoint(ctx context.Context, request interface{}, _ fleet.Service) (fleet.Errorer, error) {
+	host, ok := hostctx.FromContext(ctx)
+	if !ok { return fleet.OrbitGetCommunityPlusDeploymentResponse{Err: fmt.Errorf("missing Orbit host")}, nil }
+	plan, err := communityplus.OrbitWindowsPlan(ctx, host, request.(*fleet.OrbitGetCommunityPlusDeploymentRequest).DeploymentID)
+	return fleet.OrbitGetCommunityPlusDeploymentResponse{Err: err, Plan: plan}, nil
+}
+
+func postOrbitCommunityPlusDeploymentResultEndpoint(ctx context.Context, request interface{}, _ fleet.Service) (fleet.Errorer, error) {
+	host, ok := hostctx.FromContext(ctx)
+	if !ok { return fleet.OrbitPostCommunityPlusDeploymentResultResponse{Err: fmt.Errorf("missing Orbit host")}, nil }
+	err := communityplus.RecordOrbitDeploymentResult(ctx, host, request.(*fleet.OrbitPostCommunityPlusDeploymentResultRequest).CommunityPlusDeploymentResult)
+	return fleet.OrbitPostCommunityPlusDeploymentResultResponse{Err: err}, nil
 }
 
 /////////////////////////////////////////////////////////////////////////////////
