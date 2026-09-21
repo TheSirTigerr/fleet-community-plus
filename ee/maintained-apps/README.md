@@ -25,9 +25,15 @@ The importer accepts a single app object or an object with an `apps` array.
 ```
 
 Run `go run ./cmd/maintained-apps` from the repository root to create the
-files under `outputs/`. Publish that directory over HTTPS and configure Fleet
-with `FLEET_COMMUNITYPLUS_MAINTAINED_APPS_BASE_URL`. An optional second URL can
-be configured with `FLEET_COMMUNITYPLUS_MAINTAINED_APPS_FALLBACK_BASE_URL`.
+files under `outputs/`. Use `--check` in CI or before publishing; it validates
+all entries without creating or changing files. `--input-root`, `--output-dir`
+and `--slug` make the same generator usable from a release pipeline.
+
+Publish the generated directory over HTTPS and configure Fleet with
+`FLEET_COMMUNITYPLUS_MAINTAINED_APPS_BASE_URL`. An optional second URL can be
+configured with `FLEET_COMMUNITYPLUS_MAINTAINED_APPS_FALLBACK_BASE_URL`.
+Without the primary variable Fleet refuses the catalog sync instead of silently
+using a third-party catalog.
 
 The importer rejects non-HTTPS installer URLs, missing SHA-256 hashes, missing
 scripts, and malformed platform slugs. Review catalog changes like code: they

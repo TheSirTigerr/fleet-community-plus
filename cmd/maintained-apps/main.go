@@ -9,6 +9,7 @@ import (
 	"log/slog"
 	"os"
 	"path"
+	"path/filepath"
 	"slices"
 	"strings"
 
@@ -22,6 +23,9 @@ import (
 func main() {
 	slugPtr := flag.String("slug", "", "app slug")
 	debugPtr := flag.Bool("debug", false, "enable debug logging")
+	inputRootPtr := flag.String("input-root", "ee/maintained-apps/inputs", "directory containing homebrew and winget catalog sources")
+	outputDirPtr := flag.String("output-dir", maintained_apps.OutputPath, "directory for generated catalog manifests")
+	checkPtr := flag.Bool("check", false, "validate the catalog without writing output files")
 	flag.Parse()
 	ctx := context.Background()
 	logLevel := slog.LevelInfo
@@ -30,55 +34,84 @@ func main() {
 	}
 	logger := slog.New(slog.NewJSONHandler(os.Stderr, &slog.HandlerOptions{Level: logLevel}))
 
-	logger.InfoContext(ctx, "starting maintained app ingestion")
-
-	ingesters := map[string]maintained_apps.Ingester{
-		"ee/maintained-apps/inputs/homebrew": homebrew.IngestApps,
-		"ee/maintained-apps/inputs/winget":   winget.IngestApps,
-	}
-
-	for inputDir, ingest := range ingesters {
-		apps, err := ingest(ctx, logger, inputDir, *slugPtr)
-		if err != nil {
-			panic(err)
-		}
-
-		for _, app := range apps {
-
-			if app.IsEmpty() {
-				logger.InfoContext(ctx, "skipping manifest update due to empty output", "slug", app.Slug)
-				continue
-			}
-
-			if err := processOutput(ctx, app); err != nil {
-				logger.ErrorContext(ctx, "failed to process maintained app output", "err", err)
-			}
-		}
+	if err := run(ctx, logger, catalogOptions{
+		Slug:      *slugPtr,
+		InputRoot: *inputRootPtr,
+		OutputDir: *outputDirPtr,
+		CheckOnly: *checkPtr,
+	}); err != nil {
+		logger.ErrorContext(ctx, "maintained app ingestion failed", "err", err)
+		os.Exit(1)
 	}
 }
 
-func processOutput(ctx context.Context, app *maintained_apps.FMAManifestApp) error {
-	// validate categories before writing any files
-	if err := validateCategories(ctx, app); err != nil {
-		// Make the validation failure very obvious on stderr.
-		fmt.Fprintf(
-			os.Stderr,
-			"maintained-apps: fatal error processing %s: %v\n",
-			app.Slug,
-			err,
-		)
-		// Wrap so callers still see a proper error.
-		return ctxerr.Wrap(ctx, err, "validating categories")
+type catalogOptions struct {
+	Slug      string
+	InputRoot string
+	OutputDir string
+	CheckOnly bool
+}
+
+type catalogIngester struct {
+	name   string
+	ingest maintained_apps.Ingester
+}
+
+func run(ctx context.Context, logger *slog.Logger, options catalogOptions) error {
+	if options.InputRoot == "" || options.OutputDir == "" {
+		return fmt.Errorf("input-root and output-dir must not be empty")
+	}
+	logger.InfoContext(ctx, "starting Community+ maintained app ingestion", "check_only", options.CheckOnly)
+
+	ingesters := []catalogIngester{
+		{name: "homebrew", ingest: homebrew.IngestApps},
+		{name: "winget", ingest: winget.IngestApps},
+	}
+	var apps []*maintained_apps.FMAManifestApp
+	seen := make(map[string]string)
+	for _, ingester := range ingesters {
+		inputDir := filepath.Join(options.InputRoot, ingester.name)
+		imported, err := ingester.ingest(ctx, logger, inputDir, options.Slug)
+		if err != nil {
+			return fmt.Errorf("ingest %s catalog: %w", ingester.name, err)
+		}
+		for _, app := range imported {
+			if app.IsEmpty() {
+				return fmt.Errorf("%s catalog returned an incomplete app", ingester.name)
+			}
+			if previous, ok := seen[app.Slug]; ok {
+				return fmt.Errorf("duplicate catalog slug %q in %s and %s", app.Slug, previous, ingester.name)
+			}
+			if err := validateCategories(ctx, app); err != nil {
+				return err
+			}
+			seen[app.Slug] = ingester.name
+			apps = append(apps, app)
+		}
 	}
 
-	if err := updateAppsListFile(ctx, app); err != nil {
-		return ctxerr.Wrap(ctx, err, "updating apps list file")
+	if options.CheckOnly {
+		logger.InfoContext(ctx, "Community+ maintained app catalog is valid", "apps", len(apps))
+		return nil
 	}
-	app.UniqueIdentifier = "" // make sure we don't leak unique_identifier into individual app manifests
+	if err := os.MkdirAll(options.OutputDir, 0o755); err != nil {
+		return fmt.Errorf("create catalog output directory: %w", err)
+	}
+	for _, app := range apps {
+		if err := processOutput(ctx, app, options.OutputDir); err != nil {
+			return err
+		}
+	}
+	return ensureAppsList(options.OutputDir)
+}
+
+func processOutput(ctx context.Context, app *maintained_apps.FMAManifestApp, outputDir string) error {
+	appCopy := *app
+	appCopy.UniqueIdentifier = "" // App-list metadata must not leak into individual app manifests.
 
 	outFile := maintained_apps.FMAManifestFile{
-		Versions: []*maintained_apps.FMAManifestApp{app},
-		Refs:     map[string]string{app.UninstallScriptRef: app.UninstallScript, app.InstallScriptRef: app.InstallScript},
+		Versions: []*maintained_apps.FMAManifestApp{&appCopy},
+		Refs:     map[string]string{appCopy.UninstallScriptRef: appCopy.UninstallScript, appCopy.InstallScriptRef: appCopy.InstallScript},
 	}
 
 	var buf bytes.Buffer
@@ -90,12 +123,12 @@ func processOutput(ctx context.Context, app *maintained_apps.FMAManifestApp) err
 	}
 	outBytes := buf.Bytes()
 
-	outDir := path.Join(maintained_apps.OutputPath, app.SlugAppName())
+	outDir := path.Join(outputDir, app.SlugAppName())
 
-	if err := os.MkdirAll(outDir, os.ModePerm); err != nil {
+	if err := os.MkdirAll(outDir, 0o755); err != nil {
 		return ctxerr.Wrap(ctx, err)
 	}
-	outFilePath := path.Join(maintained_apps.OutputPath, fmt.Sprintf("%s.json", app.Slug))
+	outFilePath := path.Join(outputDir, fmt.Sprintf("%s.json", app.Slug))
 	outFileExists, err := file.Exists(outFilePath)
 	if err != nil {
 		return ctxerr.Wrap(ctx, err, "checking if output json file exists")
@@ -104,9 +137,12 @@ func processOutput(ctx context.Context, app *maintained_apps.FMAManifestApp) err
 	// Overwrite the file unless frozen, since right now we're only caring about 1 version (latest). If we
 	// care about previous data, it will be in our Git history.
 	if !app.Frozen || !outFileExists {
-		if err := os.WriteFile(outFilePath, outBytes, 0o644); err != nil {
+		if err := writeFileAtomic(outFilePath, outBytes); err != nil {
 			return ctxerr.Wrap(ctx, err, "writing output json file")
 		}
+	}
+	if err := updateAppsListFile(ctx, app, outputDir); err != nil {
+		return ctxerr.Wrap(ctx, err, "updating apps list file")
 	}
 
 	return nil
@@ -145,16 +181,18 @@ func validateCategories(ctx context.Context, app *maintained_apps.FMAManifestApp
 	return nil
 }
 
-func updateAppsListFile(ctx context.Context, outApp *maintained_apps.FMAManifestApp) error {
-	appListFilePath := path.Join(maintained_apps.OutputPath, "apps.json")
+func updateAppsListFile(ctx context.Context, outApp *maintained_apps.FMAManifestApp, outputDir string) error {
+	appListFilePath := path.Join(outputDir, "apps.json")
 	inputJson, err := os.ReadFile(appListFilePath)
-	if err != nil {
+	if err != nil && !os.IsNotExist(err) {
 		return ctxerr.Wrap(ctx, err, "reading output apps list file")
 	}
 
-	var outputAppsFile maintained_apps.FMAListFile
-	if err := json.Unmarshal(inputJson, &outputAppsFile); err != nil {
-		return ctxerr.Wrap(ctx, err, "unmarshaling output apps list file")
+	outputAppsFile := maintained_apps.FMAListFile{Version: 2}
+	if len(inputJson) > 0 {
+		if err := json.Unmarshal(inputJson, &outputAppsFile); err != nil {
+			return ctxerr.Wrap(ctx, err, "unmarshaling output apps list file")
+		}
 	}
 	if outputAppsFile.Version == 0 {
 		outputAppsFile.Version = 2
@@ -193,10 +231,46 @@ func updateAppsListFile(ctx context.Context, outApp *maintained_apps.FMAManifest
 		}
 		updatedFile := buf.Bytes()
 
-		if err := os.WriteFile(appListFilePath, updatedFile, 0o644); err != nil {
+		if err := writeFileAtomic(appListFilePath, updatedFile); err != nil {
 			return ctxerr.Wrap(ctx, err, "writing updated output apps file")
 		}
 	}
 
 	return nil
+}
+
+func ensureAppsList(outputDir string) error {
+	appListFilePath := path.Join(outputDir, "apps.json")
+	if _, err := os.Stat(appListFilePath); err == nil {
+		return nil
+	} else if !os.IsNotExist(err) {
+		return fmt.Errorf("check output apps list: %w", err)
+	}
+	data, err := json.MarshalIndent(maintained_apps.FMAListFile{Version: 2, Apps: []maintained_apps.FMAListFileApp{}}, "", "  ")
+	if err != nil {
+		return fmt.Errorf("marshal empty output apps list: %w", err)
+	}
+	return writeFileAtomic(appListFilePath, append(data, '\n'))
+}
+
+func writeFileAtomic(path string, data []byte) error {
+	dir := filepath.Dir(path)
+	temporary, err := os.CreateTemp(dir, ".catalog-*.tmp")
+	if err != nil {
+		return err
+	}
+	temporaryPath := temporary.Name()
+	defer os.Remove(temporaryPath)
+	if _, err := temporary.Write(data); err != nil {
+		_ = temporary.Close()
+		return err
+	}
+	if err := temporary.Chmod(0o644); err != nil {
+		_ = temporary.Close()
+		return err
+	}
+	if err := temporary.Close(); err != nil {
+		return err
+	}
+	return os.Rename(temporaryPath, path)
 }

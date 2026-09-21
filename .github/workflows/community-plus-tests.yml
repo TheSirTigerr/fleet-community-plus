@@ -119,5 +119,8 @@ jobs:
       - name: Build auxiliary tools
         run: go build ./cmd/maintained-apps ./tools/calendar
 
+      - name: Validate Community+ maintained app catalog
+        run: go run ./cmd/maintained-apps --check
+
       - name: Build Orbit binaries
         run: go build ./orbit/cmd/fetch_cert ./orbit/cmd/orbit
