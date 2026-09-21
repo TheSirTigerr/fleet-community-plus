@@ -83,11 +83,34 @@ func (a *HTTPAPI) Handler() http.Handler {
 		mux.HandleFunc("DELETE "+base+"/automation-rules/{id}", a.deleteAutomationRule)
 		mux.HandleFunc("GET "+base+"/audit", a.listAuditEvents)
 		mux.HandleFunc("GET "+base+"/catalog/winget", a.searchWingetCatalog)
+		mux.HandleFunc("GET "+base+"/catalog/winget/upstream", a.searchWingetUpstream)
 		mux.HandleFunc("POST "+base+"/catalog/winget/import", a.importWingetCatalogEntry)
 		mux.HandleFunc("POST "+base+"/catalog/deployments", a.createCatalogDeployment)
 		mux.HandleFunc("GET "+base+"/catalog/deployments", a.listCatalogDeployments)
 	}
 	return mux
+}
+
+func (a *HTTPAPI) searchWingetUpstream(w http.ResponseWriter, r *http.Request) {
+	if _, err := a.access.Authorize(r.Context(), Request{Resource: ResourceSoftware, Action: ActionAdmin, Scope: GlobalScope()}); err != nil {
+		writeAPIError(w, err)
+		return
+	}
+	limit := 10
+	if raw := r.URL.Query().Get("limit"); raw != "" {
+		var err error
+		limit, err = strconv.Atoi(raw)
+		if err != nil {
+			writeAPIError(w, fmt.Errorf("communityplus: invalid upstream search limit"))
+			return
+		}
+	}
+	entries, err := SearchWinGetUpstream(r.Context(), r.URL.Query().Get("query"), limit)
+	if err != nil {
+		writeAPIError(w, err)
+		return
+	}
+	writeJSON(w, http.StatusOK, map[string]any{"upstream_entries": entries})
 }
 
 func (a *HTTPAPI) requireCatalogStore() (CatalogStore, error) {
