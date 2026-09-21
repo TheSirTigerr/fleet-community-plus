@@ -7,6 +7,12 @@ import (
 	"github.com/gorilla/mux"
 )
 
+func TestRegisterSCIMLeavesLiveProvisioningUnmounted(t *testing.T) {
+	if err := RegisterSCIM(nil, nil, nil, nil, nil); err != nil {
+		t.Fatalf("register SCIM boundary: %v", err)
+	}
+}
+
 func TestRegisterValidationRoutes(t *testing.T) {
 	r := mux.NewRouter()
 	RegisterValidationRoutes(r, nil)
