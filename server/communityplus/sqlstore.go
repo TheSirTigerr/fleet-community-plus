@@ -5,6 +5,8 @@ import (
 	"database/sql"
 	"encoding/json"
 	"fmt"
+
+	"github.com/fleetdm/fleet/v4/server/fleet"
 )
 
 // SQLExecutor is the subset of database/sql used by SQLStore. Both *sql.DB
@@ -333,4 +335,20 @@ func (s *SQLStore) ListDeployments(ctx context.Context, scope Scope) ([]Deployme
 		return nil, fmt.Errorf("communityplus: iterate catalog deployments: %w", err)
 	}
 	return result, nil
+}
+
+func (s *SQLStore) GetDeployment(ctx context.Context, id string) (Deployment, error) {
+	var d Deployment; var fleetID uint
+	err := s.db.QueryRowContext(ctx, `SELECT id, catalog_entry_id, fleet_id, self_service, automatic_install, patch, created_at, created_by FROM communityplus_catalog_deployments WHERE id = ?`, id).Scan(&d.ID, &d.CatalogEntryID, &fleetID, &d.SelfService, &d.Automatic, &d.Patch, &d.CreatedAt, &d.CreatedBy)
+	if err != nil { return Deployment{}, fmt.Errorf("communityplus: get deployment: %w", err) }
+	d.Scope = Scope{Kind: ScopeFleet, FleetID: fleetID}; return d, nil
+}
+func (s *SQLStore) PendingDeploymentIDs(ctx context.Context, hostID, fleetID uint) ([]string, error) {
+	rows, err := s.db.QueryContext(ctx, `SELECT d.id FROM communityplus_catalog_deployments d LEFT JOIN communityplus_deployment_results r ON r.deployment_id = d.id AND r.host_id = ? AND r.exit_code = 0 WHERE d.fleet_id = ? AND d.automatic_install = 1 AND r.deployment_id IS NULL ORDER BY d.created_at, d.id`, hostID, fleetID)
+	if err != nil { return nil, fmt.Errorf("communityplus: list pending deployments: %w", err) }; defer rows.Close(); var ids []string
+	for rows.Next() { var id string; if err := rows.Scan(&id); err != nil { return nil, err }; ids = append(ids, id) }; return ids, rows.Err()
+}
+func (s *SQLStore) RecordDeploymentResult(ctx context.Context, hostID uint, result fleet.CommunityPlusDeploymentResult) error {
+	if result.DeploymentID == "" { return fmt.Errorf("communityplus: deployment id is required") }
+	_, err := s.db.ExecContext(ctx, `INSERT INTO communityplus_deployment_results (deployment_id, host_id, exit_code, output, updated_at) VALUES (?, ?, ?, ?, NOW(6)) ON DUPLICATE KEY UPDATE exit_code = VALUES(exit_code), output = VALUES(output), updated_at = VALUES(updated_at)`, result.DeploymentID, hostID, result.ExitCode, result.Output); return err
 }
