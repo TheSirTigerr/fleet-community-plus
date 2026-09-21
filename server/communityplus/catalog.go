@@ -93,8 +93,10 @@ type CatalogStore interface {
 	UpsertCatalogEntry(context.Context, CatalogEntry) error
 	SearchCatalogEntries(context.Context, CatalogProvider, string, int) ([]CatalogEntry, error)
 	GetCatalogEntry(context.Context, string) (CatalogEntry, error)
+	GetDeployment(context.Context, string) (Deployment, error)
 	UpsertDeployment(context.Context, Deployment) error
 	ListDeployments(context.Context, Scope) ([]Deployment, error)
+	ListDeploymentResults(context.Context, string) ([]DeploymentResult, error)
 }
 
 // SearchCatalogEntries sorts entries by name then package id so the UI has a
@@ -122,3 +124,6 @@ func SearchCatalogEntries(ctx context.Context, store CatalogStore, provider Cata
 	})
 	return entries, nil
 }
+
+// DeploymentResult is the latest outcome recorded by one host.
+type DeploymentResult struct { DeploymentID string `json:"deployment_id"`; HostID uint `json:"host_id"`; Hostname string `json:"hostname"`; ExitCode int `json:"exit_code"`; Output string `json:"output,omitempty"`; UpdatedAt time.Time `json:"updated_at"` }
