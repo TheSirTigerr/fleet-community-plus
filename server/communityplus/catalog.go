@@ -126,4 +126,12 @@ func SearchCatalogEntries(ctx context.Context, store CatalogStore, provider Cata
 }
 
 // DeploymentResult is the latest outcome recorded by one host.
-type DeploymentResult struct { DeploymentID string `json:"deployment_id"`; HostID uint `json:"host_id"`; Hostname string `json:"hostname"`; ExitCode int `json:"exit_code"`; Output string `json:"output,omitempty"`; UpdatedAt time.Time `json:"updated_at"` }
+type DeploymentResult struct {
+	DeploymentID string    `json:"deployment_id"`
+	HostID       uint      `json:"host_id"`
+	Hostname     string    `json:"hostname"`
+	ExitCode     int       `json:"exit_code"`
+	Output       string    `json:"output,omitempty"`
+	AttemptCount int       `json:"attempt_count"`
+	UpdatedAt    time.Time `json:"updated_at"`
+}
