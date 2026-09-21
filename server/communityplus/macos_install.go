@@ -5,7 +5,7 @@ import "fmt"
 // MacOSInstallPlan is an immutable direct-PKG contract derived from a reviewed
 // Homebrew cask. Community+ never executes Homebrew Ruby or arbitrary scripts.
 type MacOSInstallPlan struct {
-	DeploymentID string
+	DeploymentID  string
 	PackageID     string
 	Version       string
 	InstallerURL  string
@@ -27,11 +27,11 @@ func NewMacOSInstallPlan(deployment Deployment, entry CatalogEntry) (MacOSInstal
 		return MacOSInstallPlan{}, fmt.Errorf("communityplus: unsupported macOS catalog entry")
 	}
 	return MacOSInstallPlan{
-		DeploymentID: deployment.ID,
-		PackageID: entry.PackageIdentifier,
-		Version: entry.Version,
-		InstallerURL: entry.InstallerURL,
-		SHA256: entry.InstallerSHA256,
+		DeploymentID:  deployment.ID,
+		PackageID:     entry.PackageIdentifier,
+		Version:       entry.Version,
+		InstallerURL:  entry.InstallerURL,
+		SHA256:        entry.InstallerSHA256,
 		InstallerType: entry.InstallerType,
 	}, nil
 }

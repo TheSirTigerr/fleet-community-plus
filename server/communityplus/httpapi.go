@@ -486,4 +486,25 @@ func writeJSON(w http.ResponseWriter, status int, value any) {
 	_ = json.NewEncoder(w).Encode(value)
 }
 
-func (a *HTTPAPI) listCatalogDeploymentResults(w http.ResponseWriter, r *http.Request) { store, err := a.requireCatalogStore(); if err != nil { writeAPIError(w, err); return }; deployment, err := store.GetDeployment(r.Context(), r.PathValue("id")); if err != nil { writeAPIError(w, err); return }; if _, err = a.access.Authorize(r.Context(), Request{Resource: ResourceSoftware, Action: ActionRead, Scope: deployment.Scope}); err != nil { writeAPIError(w, err); return }; results, err := store.ListDeploymentResults(r.Context(), deployment.ID); if err != nil { writeAPIError(w, err); return }; writeJSON(w, http.StatusOK, map[string]any{"deployment": deployment, "results": results}) }
+func (a *HTTPAPI) listCatalogDeploymentResults(w http.ResponseWriter, r *http.Request) {
+	store, err := a.requireCatalogStore()
+	if err != nil {
+		writeAPIError(w, err)
+		return
+	}
+	deployment, err := store.GetDeployment(r.Context(), r.PathValue("id"))
+	if err != nil {
+		writeAPIError(w, err)
+		return
+	}
+	if _, err = a.access.Authorize(r.Context(), Request{Resource: ResourceSoftware, Action: ActionRead, Scope: deployment.Scope}); err != nil {
+		writeAPIError(w, err)
+		return
+	}
+	results, err := store.ListDeploymentResults(r.Context(), deployment.ID)
+	if err != nil {
+		writeAPIError(w, err)
+		return
+	}
+	writeJSON(w, http.StatusOK, map[string]any{"deployment": deployment, "results": results})
+}

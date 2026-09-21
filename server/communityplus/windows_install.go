@@ -9,20 +9,28 @@ import (
 // Community+ Windows worker. It contains only reviewed metadata from a
 // catalog entry; no caller-provided script is ever executed.
 type WindowsInstallPlan struct {
-	DeploymentID string `json:"deployment_id"`
-	PackageID    string `json:"package_identifier"`
-	Version      string `json:"version"`
-	InstallerURL string `json:"installer_url"`
-	SHA256       string `json:"sha256"`
+	DeploymentID  string `json:"deployment_id"`
+	PackageID     string `json:"package_identifier"`
+	Version       string `json:"version"`
+	InstallerURL  string `json:"installer_url"`
+	SHA256        string `json:"sha256"`
 	InstallerType string `json:"installer_type"`
-	ProductCode  string `json:"product_code,omitempty"`
+	ProductCode   string `json:"product_code,omitempty"`
 }
 
 func NewWindowsInstallPlan(deployment Deployment, entry CatalogEntry) (WindowsInstallPlan, error) {
-	if err := deployment.Validate(); err != nil { return WindowsInstallPlan{}, err }
-	if err := entry.Validate(); err != nil { return WindowsInstallPlan{}, err }
-	if deployment.CatalogEntryID != entry.ID { return WindowsInstallPlan{}, fmt.Errorf("communityplus: deployment does not reference catalog entry") }
-	if entry.InstallerType != "msi" && entry.InstallerType != "msix" && entry.InstallerType != "msixbundle" { return WindowsInstallPlan{}, fmt.Errorf("communityplus: unsupported Windows installer type %q", entry.InstallerType) }
+	if err := deployment.Validate(); err != nil {
+		return WindowsInstallPlan{}, err
+	}
+	if err := entry.Validate(); err != nil {
+		return WindowsInstallPlan{}, err
+	}
+	if deployment.CatalogEntryID != entry.ID {
+		return WindowsInstallPlan{}, fmt.Errorf("communityplus: deployment does not reference catalog entry")
+	}
+	if entry.InstallerType != "msi" && entry.InstallerType != "msix" && entry.InstallerType != "msixbundle" {
+		return WindowsInstallPlan{}, fmt.Errorf("communityplus: unsupported Windows installer type %q", entry.InstallerType)
+	}
 	return WindowsInstallPlan{DeploymentID: deployment.ID, PackageID: entry.PackageIdentifier, Version: entry.Version, InstallerURL: entry.InstallerURL, SHA256: entry.InstallerSHA256, InstallerType: entry.InstallerType, ProductCode: entry.ProductCode}, nil
 }
 
@@ -31,8 +39,12 @@ func NewWindowsInstallPlan(deployment Deployment, entry CatalogEntry) (WindowsIn
 // invoking Windows Installer or Add-AppxPackage. MSI product-code detection
 // makes repeated runs idempotent at the installed target version.
 func (p WindowsInstallPlan) PowerShell() (string, error) {
-	if p.DeploymentID == "" || p.PackageID == "" || p.Version == "" || !validSHA256(p.SHA256) || !strings.HasPrefix(p.InstallerURL, "https://") { return "", fmt.Errorf("communityplus: invalid Windows install plan") }
-	if p.InstallerType != "msi" && p.InstallerType != "msix" && p.InstallerType != "msixbundle" { return "", fmt.Errorf("communityplus: unsupported Windows installer type") }
+	if p.DeploymentID == "" || p.PackageID == "" || p.Version == "" || !validSHA256(p.SHA256) || !strings.HasPrefix(p.InstallerURL, "https://") {
+		return "", fmt.Errorf("communityplus: invalid Windows install plan")
+	}
+	if p.InstallerType != "msi" && p.InstallerType != "msix" && p.InstallerType != "msixbundle" {
+		return "", fmt.Errorf("communityplus: unsupported Windows installer type")
+	}
 	return fmt.Sprintf(`$ErrorActionPreference = 'Stop'
 $url = '%s'
 $expectedHash = '%s'

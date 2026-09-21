@@ -338,19 +338,42 @@ func (s *SQLStore) ListDeployments(ctx context.Context, scope Scope) ([]Deployme
 }
 
 func (s *SQLStore) GetDeployment(ctx context.Context, id string) (Deployment, error) {
-	var d Deployment; var fleetID uint
+	var d Deployment
+	var fleetID uint
 	err := s.db.QueryRowContext(ctx, `SELECT id, catalog_entry_id, fleet_id, self_service, automatic_install, patch, created_at, created_by FROM communityplus_catalog_deployments WHERE id = ?`, id).Scan(&d.ID, &d.CatalogEntryID, &fleetID, &d.SelfService, &d.Automatic, &d.Patch, &d.CreatedAt, &d.CreatedBy)
-	if err != nil { return Deployment{}, fmt.Errorf("communityplus: get deployment: %w", err) }
-	d.Scope = Scope{Kind: ScopeFleet, FleetID: fleetID}; return d, nil
+	if err != nil {
+		return Deployment{}, fmt.Errorf("communityplus: get deployment: %w", err)
+	}
+	d.Scope = Scope{Kind: ScopeFleet, FleetID: fleetID}
+	return d, nil
 }
 func (s *SQLStore) PendingDeploymentIDs(ctx context.Context, hostID, fleetID uint) ([]string, error) {
 	rows, err := s.db.QueryContext(ctx, `SELECT d.id FROM communityplus_catalog_deployments d LEFT JOIN communityplus_deployment_results r ON r.deployment_id = d.id AND r.host_id = ? WHERE d.fleet_id = ? AND d.automatic_install = 1 AND (r.deployment_id IS NULL OR (r.exit_code <> 0 AND r.attempt_count < 3 AND r.updated_at <= DATE_SUB(NOW(6), INTERVAL 5 MINUTE))) ORDER BY d.created_at, d.id`, hostID, fleetID)
-	if err != nil { return nil, fmt.Errorf("communityplus: list pending deployments: %w", err) }; defer rows.Close(); var ids []string
-	for rows.Next() { var id string; if err := rows.Scan(&id); err != nil { return nil, err }; ids = append(ids, id) }; return ids, rows.Err()
+	if err != nil {
+		return nil, fmt.Errorf("communityplus: list pending deployments: %w", err)
+	}
+	defer rows.Close()
+	var ids []string
+	for rows.Next() {
+		var id string
+		if err := rows.Scan(&id); err != nil {
+			return nil, err
+		}
+		ids = append(ids, id)
+	}
+	return ids, rows.Err()
 }
 func (s *SQLStore) RecordDeploymentResult(ctx context.Context, hostID uint, result fleet.CommunityPlusDeploymentResult) error {
-	if result.DeploymentID == "" { return fmt.Errorf("communityplus: deployment id is required") }
-	_, err := s.db.ExecContext(ctx, `INSERT INTO communityplus_deployment_results (deployment_id, host_id, exit_code, output, attempt_count, updated_at) VALUES (?, ?, ?, ?, ?, NOW(6)) ON DUPLICATE KEY UPDATE exit_code = VALUES(exit_code), output = VALUES(output), attempt_count = IF(VALUES(exit_code) = 0, 0, attempt_count + 1), updated_at = VALUES(updated_at)`, result.DeploymentID, hostID, result.ExitCode, result.Output, func() int { if result.ExitCode != 0 { return 1 }; return 0 }()); return err
+	if result.DeploymentID == "" {
+		return fmt.Errorf("communityplus: deployment id is required")
+	}
+	_, err := s.db.ExecContext(ctx, `INSERT INTO communityplus_deployment_results (deployment_id, host_id, exit_code, output, attempt_count, updated_at) VALUES (?, ?, ?, ?, ?, NOW(6)) ON DUPLICATE KEY UPDATE exit_code = VALUES(exit_code), output = VALUES(output), attempt_count = IF(VALUES(exit_code) = 0, 0, attempt_count + 1), updated_at = VALUES(updated_at)`, result.DeploymentID, hostID, result.ExitCode, result.Output, func() int {
+		if result.ExitCode != 0 {
+			return 1
+		}
+		return 0
+	}())
+	return err
 }
 
 func (s *SQLStore) ListDeploymentResults(ctx context.Context, deploymentID string) ([]DeploymentResult, error) {

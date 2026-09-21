@@ -31,8 +31,17 @@ func (s *memoryCatalogStore) UpsertDeployment(_ context.Context, d Deployment) e
 	s.deployments = append(s.deployments, d)
 	return nil
 }
-func (s *memoryCatalogStore) GetDeployment(_ context.Context, id string) (Deployment, error) { for _, d := range s.deployments { if d.ID == id { return d, nil } }; return Deployment{}, fmt.Errorf("not found") }
-func (s *memoryCatalogStore) ListDeploymentResults(_ context.Context, _ string) ([]DeploymentResult, error) { return nil, nil }
+func (s *memoryCatalogStore) GetDeployment(_ context.Context, id string) (Deployment, error) {
+	for _, d := range s.deployments {
+		if d.ID == id {
+			return d, nil
+		}
+	}
+	return Deployment{}, fmt.Errorf("not found")
+}
+func (s *memoryCatalogStore) ListDeploymentResults(_ context.Context, _ string) ([]DeploymentResult, error) {
+	return nil, nil
+}
 
 func (s *memoryCatalogStore) ListDeployments(_ context.Context, scope Scope) ([]Deployment, error) {
 	var result []Deployment

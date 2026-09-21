@@ -31,22 +31,22 @@ type HomebrewUpstreamEntry struct {
 }
 
 type homebrewCask struct {
-	Token      string                     `json:"token"`
-	Name       []string                   `json:"name"`
-	Desc       string                     `json:"desc"`
-	Homepage   string                     `json:"homepage"`
-	URL        string                     `json:"url"`
-	Version    string                     `json:"version"`
-	SHA256     string                     `json:"sha256"`
-	Deprecated bool                       `json:"deprecated"`
-	Disabled   bool                       `json:"disabled"`
-	Variations map[string]json.RawMessage `json:"variations"`
+	Token      string                       `json:"token"`
+	Name       []string                     `json:"name"`
+	Desc       string                       `json:"desc"`
+	Homepage   string                       `json:"homepage"`
+	URL        string                       `json:"url"`
+	Version    string                       `json:"version"`
+	SHA256     string                       `json:"sha256"`
+	Deprecated bool                         `json:"deprecated"`
+	Disabled   bool                         `json:"disabled"`
+	Variations map[string]json.RawMessage   `json:"variations"`
 	Artifacts  []map[string]json.RawMessage `json:"artifacts"`
 }
 
 func homebrewHTTPClient() *http.Client {
 	return &http.Client{
-		Timeout: 20 * time.Second,
+		Timeout:       20 * time.Second,
 		CheckRedirect: func(*http.Request, []*http.Request) error { return http.ErrUseLastResponse },
 	}
 }

@@ -8,14 +8,14 @@ import (
 // CommunityPlusInstallPlan is the immutable reviewed package contract consumed
 // by Orbit. The old Windows name remains as an alias for source compatibility.
 type CommunityPlusInstallPlan struct {
-	DeploymentID string `json:"deployment_id"`
-	PackageID string `json:"package_identifier"`
-	Version string `json:"version"`
-	InstallerURL string `json:"installer_url"`
-	SHA256 string `json:"sha256"`
+	DeploymentID  string `json:"deployment_id"`
+	PackageID     string `json:"package_identifier"`
+	Version       string `json:"version"`
+	InstallerURL  string `json:"installer_url"`
+	SHA256        string `json:"sha256"`
 	InstallerType string `json:"installer_type"`
-	ProductCode string `json:"product_code,omitempty"`
-	Platform string `json:"platform,omitempty"`
+	ProductCode   string `json:"product_code,omitempty"`
+	Platform      string `json:"platform,omitempty"`
 }
 
 type CommunityPlusWindowsInstallPlan = CommunityPlusInstallPlan
@@ -68,7 +68,7 @@ func (r *OrbitGetCommunityPlusDeploymentRequest) SetOrbitNodeKey(k string) { r.O
 func (r *OrbitGetCommunityPlusDeploymentRequest) OrbitHostNodeKey() string { return r.OrbitNodeKey }
 
 type OrbitGetCommunityPlusDeploymentResponse struct {
-	Err error `json:"error,omitempty"`
+	Err  error                     `json:"error,omitempty"`
 	Plan *CommunityPlusInstallPlan `json:"plan,omitempty"`
 }
 
@@ -76,8 +76,8 @@ func (r OrbitGetCommunityPlusDeploymentResponse) Error() error { return r.Err }
 
 type CommunityPlusDeploymentResult struct {
 	DeploymentID string `json:"deployment_id"`
-	ExitCode int `json:"exit_code"`
-	Output string `json:"output,omitempty"`
+	ExitCode     int    `json:"exit_code"`
+	Output       string `json:"output,omitempty"`
 }
 
 type OrbitPostCommunityPlusDeploymentResultRequest struct {
@@ -86,7 +86,9 @@ type OrbitPostCommunityPlusDeploymentResultRequest struct {
 }
 
 func (r *OrbitPostCommunityPlusDeploymentResultRequest) SetOrbitNodeKey(k string) { r.OrbitNodeKey = k }
-func (r *OrbitPostCommunityPlusDeploymentResultRequest) OrbitHostNodeKey() string { return r.OrbitNodeKey }
+func (r *OrbitPostCommunityPlusDeploymentResultRequest) OrbitHostNodeKey() string {
+	return r.OrbitNodeKey
+}
 
 type OrbitPostCommunityPlusDeploymentResultResponse struct {
 	Err error `json:"error,omitempty"`
