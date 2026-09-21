@@ -20,3 +20,9 @@ func Load(key string) (*fleet.LicenseInfo, error) {
 	}
 	return &fleet.LicenseInfo{Tier: fleet.TierFree}, nil
 }
+
+// LoadLicense preserves Fleet's existing startup call shape while callers are
+// migrated from the historical ee/ package path.
+func LoadLicense(key string) (*fleet.LicenseInfo, error) {
+	return Load(key)
+}
