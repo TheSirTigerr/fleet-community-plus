@@ -1,24 +1,16 @@
-// Package httpsigproxy is the local signed-proxy boundary for Orbit.
+// Package httpsigproxy is a compatibility facade for the Community+ Orbit
+// HTTP-signature proxy boundary.
 package httpsigproxy
 
 import (
-	"errors"
-	"net/url"
-
+	communityhttpsigproxy "github.com/fleetdm/fleet/v4/orbit/pkg/communityplus/httpsigproxy"
 	httpsig "github.com/remitly-oss/httpsig-go"
 )
 
-var ErrUnavailable = errors.New("Community+ Orbit HTTP-signature proxy is unavailable")
+var ErrUnavailable = communityhttpsigproxy.ErrUnavailable
 
-type Proxy struct {
-	ParsedURL       *url.URL
-	CertificatePath string
+type Proxy = communityhttpsigproxy.Proxy
+
+func NewProxy(rootDir, fleetURL, certPath string, insecure bool, signer *httpsig.Signer) (*Proxy, error) {
+	return communityhttpsigproxy.NewProxy(rootDir, fleetURL, certPath, insecure, signer)
 }
-
-func NewProxy(_ string, _ string, _ string, _ bool, _ *httpsig.Signer) (*Proxy, error) {
-	return nil, ErrUnavailable
-}
-
-func (p *Proxy) Serve() error { return ErrUnavailable }
-
-func (p *Proxy) Close() error { return nil }
