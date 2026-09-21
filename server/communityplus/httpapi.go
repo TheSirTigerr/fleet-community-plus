@@ -2,13 +2,19 @@ package communityplus
 
 import (
 	"context"
+	"crypto/sha256"
+	"encoding/hex"
 	"encoding/json"
 	"errors"
 	"fmt"
 	"io"
 	"net/http"
+	"net/url"
 	"strconv"
 	"strings"
+	"time"
+
+	"github.com/fleetdm/fleet/v4/server/communityplus/winget"
 )
 
 var (
@@ -32,6 +38,7 @@ type HTTPAPI struct {
 	auditStore      AuditStore
 	auditRecorder   *AuditRecorder
 	access          AccessController
+	catalogStore    CatalogStore
 }
 
 func NewHTTPAPI(
@@ -40,6 +47,7 @@ func NewHTTPAPI(
 	automationStore AutomationStore,
 	auditStore AuditStore,
 	access AccessController,
+	catalogStores ...CatalogStore,
 ) (*HTTPAPI, error) {
 	if registry == nil || engine == nil || automationStore == nil || auditStore == nil || access == nil {
 		return nil, fmt.Errorf("communityplus: HTTP API dependencies are required")
@@ -48,10 +56,20 @@ func NewHTTPAPI(
 	if err != nil {
 		return nil, err
 	}
-	return &HTTPAPI{
+	api := &HTTPAPI{
 		registry: registry, engine: engine, automationStore: automationStore,
 		auditStore: auditStore, auditRecorder: recorder, access: access,
-	}, nil
+	}
+	if len(catalogStores) > 1 {
+		return nil, fmt.Errorf("communityplus: only one catalog store may be configured")
+	}
+	if len(catalogStores) == 1 {
+		if catalogStores[0] == nil {
+			return nil, fmt.Errorf("communityplus: catalog store must not be nil")
+		}
+		api.catalogStore = catalogStores[0]
+	}
+	return api, nil
 }
 
 // Handler returns routes for Fleet's supported API aliases.
@@ -64,8 +82,198 @@ func (a *HTTPAPI) Handler() http.Handler {
 		mux.HandleFunc("PUT "+base+"/automation-rules/{id}", a.putAutomationRule)
 		mux.HandleFunc("DELETE "+base+"/automation-rules/{id}", a.deleteAutomationRule)
 		mux.HandleFunc("GET "+base+"/audit", a.listAuditEvents)
+		mux.HandleFunc("GET "+base+"/catalog/winget", a.searchWingetCatalog)
+		mux.HandleFunc("POST "+base+"/catalog/winget/import", a.importWingetCatalogEntry)
+		mux.HandleFunc("POST "+base+"/catalog/deployments", a.createCatalogDeployment)
+		mux.HandleFunc("GET "+base+"/catalog/deployments", a.listCatalogDeployments)
 	}
 	return mux
+}
+
+func (a *HTTPAPI) requireCatalogStore() (CatalogStore, error) {
+	if a.catalogStore == nil {
+		return nil, fmt.Errorf("communityplus: server catalog is not configured")
+	}
+	return a.catalogStore, nil
+}
+
+func (a *HTTPAPI) searchWingetCatalog(w http.ResponseWriter, r *http.Request) {
+	store, err := a.requireCatalogStore()
+	if err != nil {
+		writeAPIError(w, err)
+		return
+	}
+	if _, err := a.access.Authorize(r.Context(), Request{Resource: ResourceSoftware, Action: ActionRead, Scope: GlobalScope()}); err != nil {
+		writeAPIError(w, err)
+		return
+	}
+	limit := 25
+	if raw := r.URL.Query().Get("limit"); raw != "" {
+		limit, err = strconv.Atoi(raw)
+		if err != nil {
+			writeAPIError(w, fmt.Errorf("communityplus: invalid search limit"))
+			return
+		}
+	}
+	entries, err := SearchCatalogEntries(r.Context(), store, CatalogProviderWinget, r.URL.Query().Get("query"), limit)
+	if err != nil {
+		writeAPIError(w, err)
+		return
+	}
+	writeJSON(w, http.StatusOK, map[string]any{"catalog_entries": entries})
+}
+
+type importWingetCatalogEntryRequest struct {
+	SourceURL    string `json:"source_url"`
+	SourceSHA256 string `json:"source_sha256"`
+	DisplayName  string `json:"display_name"`
+}
+
+func (a *HTTPAPI) importWingetCatalogEntry(w http.ResponseWriter, r *http.Request) {
+	store, err := a.requireCatalogStore()
+	if err != nil {
+		writeAPIError(w, err)
+		return
+	}
+	var req importWingetCatalogEntryRequest
+	if err := decodeJSONBody(w, r, &req); err != nil {
+		writeAPIError(w, err)
+		return
+	}
+	if strings.TrimSpace(req.DisplayName) == "" || !validSHA256(req.SourceSHA256) {
+		writeAPIError(w, fmt.Errorf("communityplus: display_name and source_sha256 are required"))
+		return
+	}
+	actor, err := a.access.Authorize(r.Context(), Request{Resource: ResourceSoftware, Action: ActionAdmin, Scope: GlobalScope()})
+	if err != nil {
+		writeAPIError(w, err)
+		return
+	}
+	manifest, err := downloadPinnedWingetManifest(r.Context(), req.SourceURL, req.SourceSHA256)
+	if err != nil {
+		writeAPIError(w, err)
+		return
+	}
+	parsed, err := winget.Parse(manifest)
+	if err != nil {
+		writeAPIError(w, err)
+		return
+	}
+	entry := CatalogEntry{ID: catalogEntryID(parsed.PackageIdentifier, parsed.PackageVersion, parsed.InstallerSHA256), Provider: CatalogProviderWinget, PackageIdentifier: parsed.PackageIdentifier, Name: strings.TrimSpace(req.DisplayName), Version: parsed.PackageVersion, InstallerType: parsed.InstallerType, InstallerURL: parsed.InstallerURL, InstallerSHA256: parsed.InstallerSHA256, ProductCode: parsed.ProductCode, SourceURL: req.SourceURL, SourceSHA256: strings.ToLower(req.SourceSHA256), ImportedAt: time.Now().UTC(), ImportedBy: actor}
+	if err := entry.Validate(); err != nil {
+		writeAPIError(w, err)
+		return
+	}
+	if err := store.UpsertCatalogEntry(r.Context(), entry); err != nil {
+		writeAPIError(w, err)
+		return
+	}
+	if err := a.auditRecorder.Record(r.Context(), AuditEvent{ActorID: actor, Action: "catalog_entry.import", Resource: ResourceSoftware, ResourceID: entry.ID, Scope: GlobalScope(), Metadata: map[string]string{"provider": string(entry.Provider), "package_identifier": entry.PackageIdentifier, "version": entry.Version}}); err != nil {
+		writeAPIError(w, err)
+		return
+	}
+	writeJSON(w, http.StatusCreated, map[string]any{"catalog_entry": entry})
+}
+
+func catalogEntryID(packageID, version, installerSHA string) string {
+	sum := sha256.Sum256([]byte(strings.ToLower(packageID) + "\x00" + version + "\x00" + strings.ToLower(installerSHA)))
+	return "winget-" + hex.EncodeToString(sum[:16])
+}
+
+func downloadPinnedWingetManifest(ctx context.Context, rawURL, expectedSHA string) ([]byte, error) {
+	u, err := url.Parse(rawURL)
+	if err != nil || u.Scheme != "https" || !strings.EqualFold(u.Host, "raw.githubusercontent.com") || !strings.HasPrefix(u.Path, "/microsoft/winget-pkgs/") {
+		return nil, fmt.Errorf("communityplus: source_url must be an HTTPS raw.githubusercontent.com/microsoft/winget-pkgs URL")
+	}
+	client := &http.Client{Timeout: 15 * time.Second, CheckRedirect: func(*http.Request, []*http.Request) error { return http.ErrUseLastResponse }}
+	req, err := http.NewRequestWithContext(ctx, http.MethodGet, rawURL, nil)
+	if err != nil {
+		return nil, fmt.Errorf("communityplus: create WinGet manifest request: %w", err)
+	}
+	res, err := client.Do(req)
+	if err != nil {
+		return nil, fmt.Errorf("communityplus: download WinGet manifest: %w", err)
+	}
+	defer res.Body.Close()
+	if res.StatusCode != http.StatusOK {
+		return nil, fmt.Errorf("communityplus: WinGet manifest returned HTTP %d", res.StatusCode)
+	}
+	data, err := io.ReadAll(io.LimitReader(res.Body, (2<<20)+1))
+	if err != nil {
+		return nil, fmt.Errorf("communityplus: read WinGet manifest: %w", err)
+	}
+	if len(data) > 2<<20 {
+		return nil, fmt.Errorf("communityplus: WinGet manifest exceeds 2 MiB")
+	}
+	sum := sha256.Sum256(data)
+	if !strings.EqualFold(hex.EncodeToString(sum[:]), expectedSHA) {
+		return nil, fmt.Errorf("communityplus: WinGet manifest hash mismatch")
+	}
+	return data, nil
+}
+
+func (a *HTTPAPI) createCatalogDeployment(w http.ResponseWriter, r *http.Request) {
+	store, err := a.requireCatalogStore()
+	if err != nil {
+		writeAPIError(w, err)
+		return
+	}
+	var deployment Deployment
+	if err := decodeJSONBody(w, r, &deployment); err != nil {
+		writeAPIError(w, err)
+		return
+	}
+	if deployment.ID == "" {
+		writeAPIError(w, fmt.Errorf("communityplus: deployment id is required"))
+		return
+	}
+	actor, err := a.access.Authorize(r.Context(), Request{Resource: ResourceSoftware, Action: ActionWrite, Scope: deployment.Scope})
+	if err != nil {
+		writeAPIError(w, err)
+		return
+	}
+	if _, err := store.GetCatalogEntry(r.Context(), deployment.CatalogEntryID); err != nil {
+		writeAPIError(w, err)
+		return
+	}
+	deployment.CreatedBy, deployment.CreatedAt = actor, time.Now().UTC()
+	if err := deployment.Validate(); err != nil {
+		writeAPIError(w, err)
+		return
+	}
+	if err := store.UpsertDeployment(r.Context(), deployment); err != nil {
+		writeAPIError(w, err)
+		return
+	}
+	if err := a.auditRecorder.Record(r.Context(), AuditEvent{ActorID: actor, Action: "catalog_deployment.upsert", Resource: ResourceSoftware, ResourceID: deployment.ID, Scope: deployment.Scope, Metadata: map[string]string{"catalog_entry_id": deployment.CatalogEntryID, "automatic": strconv.FormatBool(deployment.Automatic), "patch": strconv.FormatBool(deployment.Patch)}}); err != nil {
+		writeAPIError(w, err)
+		return
+	}
+	writeJSON(w, http.StatusCreated, map[string]any{"deployment": deployment})
+}
+
+func (a *HTTPAPI) listCatalogDeployments(w http.ResponseWriter, r *http.Request) {
+	store, err := a.requireCatalogStore()
+	if err != nil {
+		writeAPIError(w, err)
+		return
+	}
+	fleetID, err := strconv.ParseUint(r.URL.Query().Get("fleet_id"), 10, 0)
+	if err != nil || fleetID == 0 {
+		writeAPIError(w, fmt.Errorf("communityplus: fleet_id is required"))
+		return
+	}
+	scope := FleetScope(uint(fleetID))
+	if _, err := a.access.Authorize(r.Context(), Request{Resource: ResourceSoftware, Action: ActionRead, Scope: scope}); err != nil {
+		writeAPIError(w, err)
+		return
+	}
+	deployments, err := store.ListDeployments(r.Context(), scope)
+	if err != nil {
+		writeAPIError(w, err)
+		return
+	}
+	writeJSON(w, http.StatusOK, map[string]any{"deployments": deployments})
 }
 
 func (a *HTTPAPI) getCapabilities(w http.ResponseWriter, r *http.Request) {

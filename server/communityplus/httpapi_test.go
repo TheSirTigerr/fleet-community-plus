@@ -255,3 +255,39 @@ func TestWriteAPIErrorStatus(t *testing.T) {
 		}
 	}
 }
+
+func TestHTTPAPICatalogSearchAndFleetDeployment(t *testing.T) {
+	admin := GlobalAdminRole()
+	engine, err := NewAutomationEngine(&recordingExecutor{})
+	if err != nil {
+		t.Fatal(err)
+	}
+	foundation := newMemoryFoundationStore()
+	catalog := &memoryCatalogStore{entries: []CatalogEntry{validCatalogEntry()}}
+	api, err := NewHTTPAPI(NewRegistry(), engine, foundation, foundation, roleAccessController{actor: "admin", roles: []Role{admin}}, catalog)
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	req := httptest.NewRequest(http.MethodGet, "/api/latest/fleet/communityplus/catalog/winget?query=power", nil)
+	res := httptest.NewRecorder()
+	api.Handler().ServeHTTP(res, req)
+	if res.Code != http.StatusOK || !bytes.Contains(res.Body.Bytes(), []byte("Microsoft.PowerToys")) {
+		t.Fatalf("catalog search failed: status=%d body=%s", res.Code, res.Body.String())
+	}
+
+	body := []byte(`{"id":"team-seven-powertoys","catalog_entry_id":"entry-1","scope":{"kind":"fleet","fleet_id":7},"automatic":true,"patch":true}`)
+	req = httptest.NewRequest(http.MethodPost, "/api/latest/fleet/communityplus/catalog/deployments", bytes.NewReader(body))
+	res = httptest.NewRecorder()
+	api.Handler().ServeHTTP(res, req)
+	if res.Code != http.StatusCreated || len(catalog.deployments) != 1 || catalog.deployments[0].CreatedBy != "admin" {
+		t.Fatalf("catalog deployment failed: status=%d body=%s deployments=%#v", res.Code, res.Body.String(), catalog.deployments)
+	}
+
+	req = httptest.NewRequest(http.MethodGet, "/api/latest/fleet/communityplus/catalog/deployments?fleet_id=7", nil)
+	res = httptest.NewRecorder()
+	api.Handler().ServeHTTP(res, req)
+	if res.Code != http.StatusOK || !bytes.Contains(res.Body.Bytes(), []byte("team-seven-powertoys")) {
+		t.Fatalf("deployment listing failed: status=%d body=%s", res.Code, res.Body.String())
+	}
+}

@@ -12,6 +12,7 @@ import (
 type SQLExecutor interface {
 	ExecContext(context.Context, string, ...any) (sql.Result, error)
 	QueryContext(context.Context, string, ...any) (*sql.Rows, error)
+	QueryRowContext(context.Context, string, ...any) *sql.Row
 }
 
 // SQLStore persists Community+ foundation data in Fleet's MySQL database.
@@ -242,4 +243,94 @@ func RestoreAutomationRules(ctx context.Context, store interface {
 		}
 	}
 	return nil
+}
+
+// UpsertCatalogEntry persists one reviewed, immutable package version.
+func (s *SQLStore) UpsertCatalogEntry(ctx context.Context, entry CatalogEntry) error {
+	if err := entry.Validate(); err != nil {
+		return err
+	}
+	_, err := s.db.ExecContext(ctx, `
+INSERT INTO communityplus_catalog_entries
+  (id, provider, package_identifier, name, version, installer_type, installer_url, installer_sha256, product_code, source_url, source_sha256, imported_at, imported_by)
+VALUES (?, ?, ?, ?, ?, ?, ?, ?, NULLIF(?, ''), ?, ?, ?, ?)
+ON DUPLICATE KEY UPDATE
+  name = VALUES(name), installer_type = VALUES(installer_type), installer_url = VALUES(installer_url), installer_sha256 = VALUES(installer_sha256), product_code = VALUES(product_code), source_url = VALUES(source_url), source_sha256 = VALUES(source_sha256), imported_at = VALUES(imported_at), imported_by = VALUES(imported_by)`,
+		entry.ID, entry.Provider, entry.PackageIdentifier, entry.Name, entry.Version, entry.InstallerType, entry.InstallerURL, entry.InstallerSHA256, entry.ProductCode, entry.SourceURL, entry.SourceSHA256, entry.ImportedAt, entry.ImportedBy)
+	if err != nil {
+		return fmt.Errorf("communityplus: upsert catalog entry: %w", err)
+	}
+	return nil
+}
+
+func (s *SQLStore) SearchCatalogEntries(ctx context.Context, provider CatalogProvider, query string, limit int) ([]CatalogEntry, error) {
+	needle := "%" + query + "%"
+	rows, err := s.db.QueryContext(ctx, `
+SELECT id, provider, package_identifier, name, version, installer_type, installer_url, installer_sha256, COALESCE(product_code, ''), source_url, source_sha256, imported_at, imported_by
+FROM communityplus_catalog_entries
+WHERE provider = ? AND (name LIKE ? OR package_identifier LIKE ?)
+ORDER BY name, package_identifier LIMIT ?`, provider, needle, needle, limit)
+	if err != nil {
+		return nil, fmt.Errorf("communityplus: search catalog entries: %w", err)
+	}
+	defer rows.Close()
+	entries := []CatalogEntry{}
+	for rows.Next() {
+		var e CatalogEntry
+		if err := rows.Scan(&e.ID, &e.Provider, &e.PackageIdentifier, &e.Name, &e.Version, &e.InstallerType, &e.InstallerURL, &e.InstallerSHA256, &e.ProductCode, &e.SourceURL, &e.SourceSHA256, &e.ImportedAt, &e.ImportedBy); err != nil {
+			return nil, fmt.Errorf("communityplus: scan catalog entry: %w", err)
+		}
+		entries = append(entries, e)
+	}
+	if err := rows.Err(); err != nil {
+		return nil, fmt.Errorf("communityplus: iterate catalog entries: %w", err)
+	}
+	return entries, nil
+}
+
+func (s *SQLStore) GetCatalogEntry(ctx context.Context, id string) (CatalogEntry, error) {
+	var e CatalogEntry
+	err := s.db.QueryRowContext(ctx, `SELECT id, provider, package_identifier, name, version, installer_type, installer_url, installer_sha256, COALESCE(product_code, ''), source_url, source_sha256, imported_at, imported_by FROM communityplus_catalog_entries WHERE id = ?`, id).Scan(&e.ID, &e.Provider, &e.PackageIdentifier, &e.Name, &e.Version, &e.InstallerType, &e.InstallerURL, &e.InstallerSHA256, &e.ProductCode, &e.SourceURL, &e.SourceSHA256, &e.ImportedAt, &e.ImportedBy)
+	if err != nil {
+		return CatalogEntry{}, fmt.Errorf("communityplus: get catalog entry: %w", err)
+	}
+	return e, nil
+}
+
+func (s *SQLStore) UpsertDeployment(ctx context.Context, deployment Deployment) error {
+	if err := deployment.Validate(); err != nil {
+		return err
+	}
+	_, err := s.db.ExecContext(ctx, `
+INSERT INTO communityplus_catalog_deployments (id, catalog_entry_id, fleet_id, self_service, automatic_install, patch, created_at, created_by)
+VALUES (?, ?, ?, ?, ?, ?, ?, ?)
+ON DUPLICATE KEY UPDATE catalog_entry_id = VALUES(catalog_entry_id), fleet_id = VALUES(fleet_id), self_service = VALUES(self_service), automatic_install = VALUES(automatic_install), patch = VALUES(patch), created_at = VALUES(created_at), created_by = VALUES(created_by)`, deployment.ID, deployment.CatalogEntryID, deployment.Scope.FleetID, deployment.SelfService, deployment.Automatic, deployment.Patch, deployment.CreatedAt, deployment.CreatedBy)
+	if err != nil {
+		return fmt.Errorf("communityplus: upsert catalog deployment: %w", err)
+	}
+	return nil
+}
+
+func (s *SQLStore) ListDeployments(ctx context.Context, scope Scope) ([]Deployment, error) {
+	if err := scope.Validate(); err != nil || scope.Kind != ScopeFleet {
+		return nil, fmt.Errorf("communityplus: a Fleet scope is required")
+	}
+	rows, err := s.db.QueryContext(ctx, `SELECT id, catalog_entry_id, self_service, automatic_install, patch, created_at, created_by FROM communityplus_catalog_deployments WHERE fleet_id = ? ORDER BY created_at DESC, id DESC`, scope.FleetID)
+	if err != nil {
+		return nil, fmt.Errorf("communityplus: list catalog deployments: %w", err)
+	}
+	defer rows.Close()
+	result := []Deployment{}
+	for rows.Next() {
+		var d Deployment
+		d.Scope = scope
+		if err := rows.Scan(&d.ID, &d.CatalogEntryID, &d.SelfService, &d.Automatic, &d.Patch, &d.CreatedAt, &d.CreatedBy); err != nil {
+			return nil, fmt.Errorf("communityplus: scan catalog deployment: %w", err)
+		}
+		result = append(result, d)
+	}
+	if err := rows.Err(); err != nil {
+		return nil, fmt.Errorf("communityplus: iterate catalog deployments: %w", err)
+	}
+	return result, nil
 }
