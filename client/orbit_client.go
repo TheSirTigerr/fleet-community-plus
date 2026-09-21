@@ -508,6 +508,17 @@ func (oc *OrbitClient) SaveInstallerResult(payload *fleet.HostSoftwareInstallRes
 	return nil
 }
 
+func (oc *OrbitClient) GetCommunityPlusDeployment(deploymentID string) (*fleet.CommunityPlusWindowsInstallPlan, error) {
+	var resp fleet.OrbitGetCommunityPlusDeploymentResponse
+	if err := oc.authenticatedRequest("POST", "/api/fleet/orbit/communityplus/deployment", &fleet.OrbitGetCommunityPlusDeploymentRequest{DeploymentID: deploymentID}, &resp); err != nil { return nil, err }
+	return resp.Plan, nil
+}
+
+func (oc *OrbitClient) SaveCommunityPlusDeploymentResult(result *fleet.CommunityPlusDeploymentResult) error {
+	var resp fleet.OrbitPostCommunityPlusDeploymentResultResponse
+	return oc.authenticatedRequest("POST", "/api/fleet/orbit/communityplus/deployment/result", &fleet.OrbitPostCommunityPlusDeploymentResultRequest{CommunityPlusDeploymentResult: result}, &resp)
+}
+
 func (oc *OrbitClient) DownloadSoftwareInstaller(installerID uint, downloadDirectory string, progressFunc func(n int)) (string, error) {
 	verb, path := "POST", "/api/fleet/orbit/software_install/package?alt=media"
 	resp := FileResponse{
