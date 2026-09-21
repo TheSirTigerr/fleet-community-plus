@@ -68,7 +68,7 @@ func SearchWinGetUpstream(ctx context.Context, query string, limit int) ([]upstr
 		return nil, fmt.Errorf("communityplus: WinGet source search returned HTTP %d; configure GITHUB_TOKEN on the server when GitHub requires authentication", res.StatusCode)
 	}
 	var search githubCodeSearchResponse
-	if err := json.NewDecoder(http.MaxBytesReader(nil, res.Body, 2<<20)).Decode(&search); err != nil {
+	if err := json.NewDecoder(io.LimitReader(res.Body, 2<<20)).Decode(&search); err != nil {
 		return nil, fmt.Errorf("communityplus: decode WinGet source search: %w", err)
 	}
 	result := make([]upstreamWingetCandidate, 0, limit)
