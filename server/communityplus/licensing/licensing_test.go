@@ -19,3 +19,16 @@ func TestLoad(t *testing.T) {
 		t.Fatalf("expected unsupported external license error, got %v", err)
 	}
 }
+
+func TestLoadLicenseStartupCompatibility(t *testing.T) {
+	license, err := LoadLicense("")
+	if err != nil {
+		t.Fatalf("load startup license: %v", err)
+	}
+	if license == nil || license.Tier != fleet.TierFree {
+		t.Fatalf("expected free tier startup license, got %#v", license)
+	}
+	if _, err := LoadLicense("external-enterprise-token"); !errors.Is(err, ErrExternalLicenseUnsupported) {
+		t.Fatalf("expected unsupported external license error, got %v", err)
+	}
+}
