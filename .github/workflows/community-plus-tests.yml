@@ -19,6 +19,7 @@ on:
       - 'server/communityplus/calendarload/**'
       - 'tools/calendar/**'
       - 'ee/orbit/**'
+      - 'orbit/pkg/communityplus/**'
       - 'orbit/cmd/fetch_cert/**'
       - 'orbit/cmd/orbit/**'
       - 'ee/server/licensing/**'
@@ -45,6 +46,7 @@ on:
       - 'server/communityplus/calendarload/**'
       - 'tools/calendar/**'
       - 'ee/orbit/**'
+      - 'orbit/pkg/communityplus/**'
       - 'orbit/cmd/fetch_cert/**'
       - 'orbit/cmd/orbit/**'
       - 'ee/server/licensing/**'
@@ -78,7 +80,7 @@ jobs:
         shell: bash
         run: |
           set -euo pipefail
-          files="$(find server/communityplus server/mdm/maintainedapps ee/pkg/hostidentity/types ee/server/service/hostidentity/httpsig ee/server/service/digicert ee/server/service/scep ee/maintained-apps ee/server/licensing ee/fleetctl -name '*.go' -type f -print)"
+          files="$(find server/communityplus server/mdm/maintainedapps orbit/pkg/communityplus ee/pkg/hostidentity/types ee/server/service/hostidentity/httpsig ee/server/service/digicert ee/server/service/scep ee/maintained-apps ee/server/licensing ee/fleetctl -name '*.go' -type f -print)"
           test -n "$files"
           unformatted="$(gofmt -l $files)"
           if [ -n "$unformatted" ]; then
@@ -91,6 +93,7 @@ jobs:
         run: >-
           go test -race
           ./server/communityplus/...
+          ./orbit/pkg/communityplus/...
           ./ee/pkg/hostidentity/types
           ./ee/server/service/hostidentity/httpsig
           ./ee/server/service/digicert
