@@ -35,6 +35,10 @@ const addSoftwareSubNav: IAddSoftwareSubNavItem[] = [
     pathname: PATHS.SOFTWARE_ADD_FLEET_MAINTAINED,
   },
   {
+    name: "WinGet catalog",
+    pathname: PATHS.SOFTWARE_ADD_WINGET,
+  },
+  {
     name: "App store",
     pathname: PATHS.SOFTWARE_ADD_APP_STORE,
   },

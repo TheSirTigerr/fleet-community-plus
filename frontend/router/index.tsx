@@ -283,6 +283,9 @@ const LazySoftwareFleetMaintained = lazyPage(
       /* webpackChunkName: "software" */ "pages/SoftwarePage/SoftwareAddPage/SoftwareFleetMaintained"
     )
 );
+const LazySoftwareWingetCatalog = lazyPage(
+  () => import(/* webpackChunkName: "software" */ "pages/SoftwarePage/SoftwareAddPage/SoftwareWingetCatalog")
+);
 const LazySoftwareCustomPackage = lazyPage(
   () =>
     import(
@@ -715,6 +718,7 @@ const routes = (
                   path="fleet-maintained"
                   component={LazySoftwareFleetMaintained}
                 />
+                <Route path="winget" component={LazySoftwareWingetCatalog} />
                 <Route path="app-store" component={LazySoftwareAppStore} />
                 <Route path="package" component={LazySoftwareCustomPackage} />
               </Route>

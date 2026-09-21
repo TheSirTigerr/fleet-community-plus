@@ -103,7 +103,16 @@ func (a *HTTPAPI) searchWingetCatalog(w http.ResponseWriter, r *http.Request) {
 		writeAPIError(w, err)
 		return
 	}
-	if _, err := a.access.Authorize(r.Context(), Request{Resource: ResourceSoftware, Action: ActionRead, Scope: GlobalScope()}); err != nil {
+	scope := GlobalScope()
+	if fleetID := r.URL.Query().Get("fleet_id"); fleetID != "" {
+		id, parseErr := strconv.ParseUint(fleetID, 10, 0)
+		if parseErr != nil || id == 0 {
+			writeAPIError(w, fmt.Errorf("communityplus: invalid fleet_id"))
+			return
+		}
+		scope = FleetScope(uint(id))
+	}
+	if _, err := a.access.Authorize(r.Context(), Request{Resource: ResourceSoftware, Action: ActionRead, Scope: scope}); err != nil {
 		writeAPIError(w, err)
 		return
 	}
