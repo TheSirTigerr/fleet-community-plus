@@ -8,6 +8,8 @@ import (
 	"fmt"
 	"io"
 	"net/http"
+	"os"
+	"strings"
 	"time"
 
 	ma "github.com/fleetdm/fleet/v4/ee/maintained-apps"
@@ -29,42 +31,53 @@ type AppsList struct {
 	Apps    []appListing `json:"apps"`
 }
 
-const fmaOutputsBase = "https://maintained-apps.fleetdm.com/manifests"
-const fmaOutputsFallbackBase = "https://raw.githubusercontent.com/fleetdm/fleet/refs/heads/main/ee/maintained-apps/outputs"
+const (
+	communityPlusCatalogBaseURLEnv         = "FLEET_COMMUNITYPLUS_MAINTAINED_APPS_BASE_URL"
+	communityPlusCatalogFallbackBaseURLEnv = "FLEET_COMMUNITYPLUS_MAINTAINED_APPS_FALLBACK_BASE_URL"
+)
 
-// resolveBaseURLs returns the primary and fallback base URLs for FMA manifests,
-// taking into account any dev-mode env var overrides.
+var ErrCatalogNotConfigured = errors.New("Community+ maintained app catalog is not configured")
+
+// resolveBaseURLs returns the explicitly configured Community+ catalog URLs.
+// Fleet Community+ never falls back to Fleet's hosted Enterprise catalog.
 func resolveBaseURLs() (primary, fallback string) {
-	primary = fmaOutputsBase
+	primary = os.Getenv(communityPlusCatalogBaseURLEnv)
 	if baseFromEnvVar := dev_mode.Env("FLEET_DEV_MAINTAINED_APPS_BASE_URL"); baseFromEnvVar != "" {
 		primary = baseFromEnvVar
 	}
 
-	fallback = fmaOutputsFallbackBase
+	fallback = os.Getenv(communityPlusCatalogFallbackBaseURLEnv)
 	if fallbackFromEnvVar := dev_mode.Env("FLEET_DEV_MAINTAINED_APPS_FALLBACK_BASE_URL"); fallbackFromEnvVar != "" {
 		fallback = fallbackFromEnvVar
 	}
 
-	return primary, fallback
+	return strings.TrimRight(primary, "/"), strings.TrimRight(fallback, "/")
 }
 
 // fetchManifestFile fetches a manifest file from the primary FMA CDN, falling back to the
 // fallback CDN if the primary fails.
 func fetchManifestFile(ctx context.Context, path string) ([]byte, error) {
 	primaryBase, fallbackBase := resolveBaseURLs()
+	if primaryBase == "" {
+		return nil, fmt.Errorf("%w: set %s", ErrCatalogNotConfigured, communityPlusCatalogBaseURLEnv)
+	}
 
 	body, primaryErr := doFetch(ctx, primaryBase, path)
 	if primaryErr == nil {
 		return body, nil
 	}
 
-	// Primary failed; try fallback.
+	if fallbackBase == "" {
+		return nil, ctxerr.Wrapf(ctx, primaryErr, "fetching Community+ app catalog file %q from %s", path, primaryBase)
+	}
+
+	// Primary failed; try the explicitly configured fallback.
 	body, fallbackErr := doFetch(ctx, fallbackBase, path)
 	if fallbackErr == nil {
 		return body, nil
 	}
 
-	return nil, ctxerr.Errorf(ctx, "fetching FMA manifest file %q: primary (%s) failed: %v; fallback (%s) also failed: %v",
+	return nil, ctxerr.Errorf(ctx, "fetching Community+ app catalog file %q: primary (%s) failed: %v; fallback (%s) also failed: %v",
 		path, primaryBase, primaryErr, fallbackBase, fallbackErr)
 }
 

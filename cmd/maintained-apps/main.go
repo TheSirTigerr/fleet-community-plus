@@ -156,6 +156,9 @@ func updateAppsListFile(ctx context.Context, outApp *maintained_apps.FMAManifest
 	if err := json.Unmarshal(inputJson, &outputAppsFile); err != nil {
 		return ctxerr.Wrap(ctx, err, "unmarshaling output apps list file")
 	}
+	if outputAppsFile.Version == 0 {
+		outputAppsFile.Version = 2
+	}
 
 	var found bool
 	for _, a := range outputAppsFile.Apps {

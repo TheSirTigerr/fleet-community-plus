@@ -18,7 +18,8 @@ type Ingester func(context.Context, *slog.Logger, string, string) ([]*FMAManifes
 const OutputPath = "ee/maintained-apps/outputs"
 
 type FMAListFile struct {
-	Apps []FMAListFileApp `json:"apps"`
+	Version uint             `json:"version"`
+	Apps    []FMAListFileApp `json:"apps"`
 }
 
 type FMAListFileApp struct {

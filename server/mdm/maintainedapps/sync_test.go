@@ -293,11 +293,13 @@ func TestFetchManifestDataPrimarySucceedsSkipsFallback(t *testing.T) {
 }
 
 func TestResolveBaseURLsDefaults(t *testing.T) {
+	t.Setenv(communityPlusCatalogBaseURLEnv, "")
+	t.Setenv(communityPlusCatalogFallbackBaseURLEnv, "")
 	dev_mode.SetOverride("FLEET_DEV_MAINTAINED_APPS_BASE_URL", "", t)
 	dev_mode.SetOverride("FLEET_DEV_MAINTAINED_APPS_FALLBACK_BASE_URL", "", t)
 	primary, fallback := resolveBaseURLs()
-	assert.Equal(t, fmaOutputsBase, primary)
-	assert.Equal(t, fmaOutputsFallbackBase, fallback)
+	assert.Empty(t, primary)
+	assert.Empty(t, fallback)
 }
 
 func TestResolveBaseURLsWithOverrides(t *testing.T) {
@@ -307,6 +309,16 @@ func TestResolveBaseURLsWithOverrides(t *testing.T) {
 	primary, fallback := resolveBaseURLs()
 	assert.Equal(t, "http://custom-primary", primary)
 	assert.Equal(t, "http://custom-fallback", fallback)
+}
+
+func TestFetchAppsListRequiresCommunityPlusCatalog(t *testing.T) {
+	t.Setenv(communityPlusCatalogBaseURLEnv, "")
+	t.Setenv(communityPlusCatalogFallbackBaseURLEnv, "")
+	dev_mode.SetOverride("FLEET_DEV_MAINTAINED_APPS_BASE_URL", "", t)
+	dev_mode.SetOverride("FLEET_DEV_MAINTAINED_APPS_FALLBACK_BASE_URL", "", t)
+
+	_, err := FetchAppsList(t.Context())
+	require.ErrorIs(t, err, ErrCatalogNotConfigured)
 }
 
 func TestDoFetchSuccess(t *testing.T) {

@@ -14,6 +14,7 @@ on:
       - 'ee/server/service/hostidentity/**'
       - 'ee/server/service/condaccess/**'
       - 'ee/maintained-apps/**'
+      - 'server/mdm/maintainedapps/**'
       - 'cmd/maintained-apps/**'
       - 'server/communityplus/calendarload/**'
       - 'tools/calendar/**'
@@ -39,6 +40,7 @@ on:
       - 'ee/server/service/hostidentity/**'
       - 'ee/server/service/condaccess/**'
       - 'ee/maintained-apps/**'
+      - 'server/mdm/maintainedapps/**'
       - 'cmd/maintained-apps/**'
       - 'server/communityplus/calendarload/**'
       - 'tools/calendar/**'
@@ -76,7 +78,7 @@ jobs:
         shell: bash
         run: |
           set -euo pipefail
-          files="$(find server/communityplus ee/pkg/hostidentity/types ee/server/service/hostidentity/httpsig ee/server/service/digicert ee/server/service/scep ee/maintained-apps ee/server/licensing ee/fleetctl -name '*.go' -type f -print)"
+          files="$(find server/communityplus server/mdm/maintainedapps ee/pkg/hostidentity/types ee/server/service/hostidentity/httpsig ee/server/service/digicert ee/server/service/scep ee/maintained-apps ee/server/licensing ee/fleetctl -name '*.go' -type f -print)"
           test -n "$files"
           unformatted="$(gofmt -l $files)"
           if [ -n "$unformatted" ]; then
@@ -96,6 +98,8 @@ jobs:
           ./ee/server/service/hostidentity/...
           ./ee/server/service/condaccess/...
           ./ee/maintained-apps
+          ./ee/maintained-apps/ingesters/source
+          ./server/mdm/maintainedapps
           ./ee/server/licensing
           ./ee/fleetctl
           ./ee/server/calendar
