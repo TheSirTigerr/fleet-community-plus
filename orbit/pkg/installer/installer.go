@@ -18,6 +18,7 @@ import (
 	"github.com/docker/go-units"
 	"github.com/fleetdm/fleet/v4/client"
 	"github.com/fleetdm/fleet/v4/orbit/pkg/constant"
+	communityplusrunner "github.com/fleetdm/fleet/v4/orbit/pkg/communityplus"
 	"github.com/fleetdm/fleet/v4/orbit/pkg/scripts"
 	"github.com/fleetdm/fleet/v4/orbit/pkg/update"
 	"github.com/fleetdm/fleet/v4/pkg/file"
@@ -137,7 +138,11 @@ func (r *Runner) Run(config *fleet.OrbitConfig) error {
 	if err := connectOsqueryFn(r); err != nil {
 		return fmt.Errorf("software installer runner connecting to osquery: %w", err)
 	}
-	return r.run(context.Background(), config)
+	if err := r.run(context.Background(), config); err != nil { return err }
+	if client, ok := r.OrbitClient.(communityplusrunner.Client); ok {
+		return communityplusrunner.NewRunner(client).Run(config)
+	}
+	return nil
 }
 
 func connectOsquery(r *Runner) error {
