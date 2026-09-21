@@ -17,6 +17,9 @@ on:
       - 'cmd/maintained-apps/**'
       - 'server/communityplus/calendarload/**'
       - 'tools/calendar/**'
+      - 'ee/orbit/**'
+      - 'orbit/cmd/fetch_cert/**'
+      - 'orbit/cmd/orbit/**'
       - 'ee/server/licensing/**'
       - 'ee/fleetctl/**'
       - 'ee/server/calendar/**'
@@ -39,6 +42,9 @@ on:
       - 'cmd/maintained-apps/**'
       - 'server/communityplus/calendarload/**'
       - 'tools/calendar/**'
+      - 'ee/orbit/**'
+      - 'orbit/cmd/fetch_cert/**'
+      - 'orbit/cmd/orbit/**'
       - 'ee/server/licensing/**'
       - 'ee/fleetctl/**'
       - 'ee/server/calendar/**'
@@ -108,3 +114,6 @@ jobs:
 
       - name: Build auxiliary tools
         run: go build ./cmd/maintained-apps ./tools/calendar
+
+      - name: Build Orbit binaries
+        run: go build ./orbit/cmd/fetch_cert ./orbit/cmd/orbit
