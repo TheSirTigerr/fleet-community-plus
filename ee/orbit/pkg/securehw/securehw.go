@@ -1,49 +1,27 @@
-// Package securehw defines the hardware-key boundary used by Orbit host identity.
+// Package securehw is a compatibility facade for the Community+ Orbit secure
+// hardware boundary.
 package securehw
 
 import (
-	"crypto"
-	"errors"
-
+	communitysecurehw "github.com/fleetdm/fleet/v4/orbit/pkg/communityplus/securehw"
 	"github.com/rs/zerolog"
 )
 
-var ErrUnavailable = errors.New("Community+ secure hardware provider is unavailable")
+var ErrUnavailable = communitysecurehw.ErrUnavailable
 
-type ErrKeyNotFound struct{}
-
-func (*ErrKeyNotFound) Error() string { return "secure hardware key not found" }
-
-type ErrSecureHWUnavailable struct{}
-
-func (*ErrSecureHWUnavailable) Error() string { return ErrUnavailable.Error() }
-
-type ECCAlgorithm string
+type ErrKeyNotFound = communitysecurehw.ErrKeyNotFound
+type ErrSecureHWUnavailable = communitysecurehw.ErrSecureHWUnavailable
+type ECCAlgorithm = communitysecurehw.ECCAlgorithm
 
 const (
-	ECCAlgorithmP256 ECCAlgorithm = "P-256"
-	ECCAlgorithmP384 ECCAlgorithm = "P-384"
+	ECCAlgorithmP256 = communitysecurehw.ECCAlgorithmP256
+	ECCAlgorithmP384 = communitysecurehw.ECCAlgorithmP384
 )
 
-type HTTPSigner interface {
-	crypto.Signer
-	ECCAlgorithm() ECCAlgorithm
+type HTTPSigner = communitysecurehw.HTTPSigner
+type Key = communitysecurehw.Key
+type SecureHW = communitysecurehw.SecureHW
+
+func New(rootDir string, logger zerolog.Logger) (SecureHW, error) {
+	return communitysecurehw.New(rootDir, logger)
 }
-
-type Key interface {
-	Public() (crypto.PublicKey, error)
-	HTTPSigner() (HTTPSigner, error)
-}
-
-type SecureHW interface {
-	LoadKey() (Key, error)
-	Close()
-}
-
-type unavailableSecureHW struct{}
-
-func New(_ string, _ zerolog.Logger) (SecureHW, error) { return nil, &ErrSecureHWUnavailable{} }
-
-func (unavailableSecureHW) LoadKey() (Key, error) { return nil, &ErrKeyNotFound{} }
-
-func (unavailableSecureHW) Close() {}
