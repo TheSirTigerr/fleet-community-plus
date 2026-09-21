@@ -48,6 +48,7 @@ import (
 	"github.com/fleetdm/fleet/v4/server/chart"
 	chart_api "github.com/fleetdm/fleet/v4/server/chart/api"
 	chart_bootstrap "github.com/fleetdm/fleet/v4/server/chart/bootstrap"
+	"github.com/fleetdm/fleet/v4/server/communityplus"
 	configpkg "github.com/fleetdm/fleet/v4/server/config"
 	"github.com/fleetdm/fleet/v4/server/contexts/ctxerr"
 	licensectx "github.com/fleetdm/fleet/v4/server/contexts/license"
@@ -842,8 +843,12 @@ func runServeCmd(cmd *cobra.Command, configManager configpkg.Manager, debug, dev
 			extra = append(extra, service.WithAgentWSHub(agentWSHub))
 		}
 
+		communityStore, err := communityplus.NewSQLStore(dbConns.Primary)
+		if err != nil {
+			initFatal(err, "initializing Community+ catalog store")
+		}
 		apiHandler, err = service.MakeHandler(svc, config, httpLogger, limiterStore, redisPool, carveStore,
-			[]endpointer.HandlerRoutesFunc{android_service.GetRoutes(svc, androidSvc), activityRoutes, acmeRoutes, chartRoutes}, extra...)
+			[]endpointer.HandlerRoutesFunc{android_service.GetRoutes(svc, androidSvc), activityRoutes, acmeRoutes, chartRoutes, communityplus.GetRoutes(svc, communityStore)}, extra...)
 		if err != nil {
 			initFatal(err, "initializing the API handler")
 		}
