@@ -16,6 +16,7 @@ import (
 	maintained_apps "github.com/fleetdm/fleet/v4/ee/maintained-apps"
 	"github.com/fleetdm/fleet/v4/ee/maintained-apps/ingesters/homebrew"
 	"github.com/fleetdm/fleet/v4/ee/maintained-apps/ingesters/winget"
+	"github.com/fleetdm/fleet/v4/ee/maintained-apps/sources"
 	"github.com/fleetdm/fleet/v4/pkg/file"
 	"github.com/fleetdm/fleet/v4/server/contexts/ctxerr"
 )
@@ -26,6 +27,7 @@ func main() {
 	inputRootPtr := flag.String("input-root", "ee/maintained-apps/inputs", "directory containing homebrew and winget catalog sources")
 	outputDirPtr := flag.String("output-dir", maintained_apps.OutputPath, "directory for generated catalog manifests")
 	checkPtr := flag.Bool("check", false, "validate the catalog without writing output files")
+	fetchSourcesPtr := flag.Bool("fetch-sources", false, "download and verify pinned public source files before generating the catalog")
 	flag.Parse()
 	ctx := context.Background()
 	logLevel := slog.LevelInfo
@@ -34,12 +36,23 @@ func main() {
 	}
 	logger := slog.New(slog.NewJSONHandler(os.Stderr, &slog.HandlerOptions{Level: logLevel}))
 
-	if err := run(ctx, logger, catalogOptions{
+	options := catalogOptions{
 		Slug:      *slugPtr,
 		InputRoot: *inputRootPtr,
 		OutputDir: *outputDirPtr,
 		CheckOnly: *checkPtr,
-	}); err != nil {
+	}
+	if *fetchSourcesPtr {
+		if options.CheckOnly {
+			logger.ErrorContext(ctx, "maintained app ingestion failed", "err", "--fetch-sources cannot be combined with --check")
+			os.Exit(1)
+		}
+		if err := sources.Sync(ctx, options.InputRoot); err != nil {
+			logger.ErrorContext(ctx, "maintained app source download failed", "err", err)
+			os.Exit(1)
+		}
+	}
+	if err := run(ctx, logger, options); err != nil {
 		logger.ErrorContext(ctx, "maintained app ingestion failed", "err", err)
 		os.Exit(1)
 	}
