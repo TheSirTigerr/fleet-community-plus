@@ -199,10 +199,11 @@ func loadCredentials(rootDir string, logger zerolog.Logger) (*Credentials, error
 	}
 
 	credentials.SecureHWKey, err = secureHWDevice.LoadKey()
+	var keyNotFound *securehw.ErrKeyNotFound
 	switch {
 	case err == nil:
 		// OK
-	case errors.As(err, &securehw.ErrKeyNotFound{}):
+	case errors.As(err, &keyNotFound):
 		return nil, errors.New("a certificate has not yet been issued to this device, try again later")
 	default:
 		return nil, fmt.Errorf("failed to load secure hardware key: %w", err)

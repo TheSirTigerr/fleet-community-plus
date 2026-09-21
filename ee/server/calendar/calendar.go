@@ -21,7 +21,11 @@ func ClearMockChannels() {}
 
 func SetMockEventsToNow() {}
 
-func ListGoogleMockEvents() []*googlecalendar.Event { return nil }
+// ListGoogleMockEvents preserves the public test-helper shape. The production
+// adapter remains fail-closed, so it never creates entries in this map.
+func ListGoogleMockEvents() map[string]*googlecalendar.Event {
+	return map[string]*googlecalendar.Event{}
+}
 
 func MockChannelsCount() int { return 0 }
 
