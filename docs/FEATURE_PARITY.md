@@ -97,6 +97,6 @@ This document tracks independently implemented equivalents for Fleet Premium cap
 - [x] Community+ edition identity and fleetctl compatibility boundary
 - [ ] Replace remaining production imports from the removed upstream `ee/` tree
 - [x] Mount Community+ routes behind Fleet user authentication
-- [ ] Pass a full Fleet server build before advertising any feature as production-ready
+- [x] Pass a full Fleet server build before advertising any feature as production-ready
 
 A checkbox is only marked complete when the feature is production-usable, has migrations/API coverage, and has automated tests.
