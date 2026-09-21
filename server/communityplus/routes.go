@@ -55,9 +55,10 @@ func GetRoutes(fleetSvc fleet.Service, store *SQLStore) endpointer.HandlerRoutes
 		if err != nil {
 			panic(err)
 		}
+		communityPlusHandler := api.WithHomebrew(api.Handler())
 		handler := auth.AuthenticatedUserMiddleware(fleetSvc, func(w http.ResponseWriter, detail string, status int) {
 			writeJSON(w, status, map[string]string{"error": detail})
-		}, api.Handler())
+		}, communityPlusHandler)
 		r.PathPrefix("/api/").Handler(handler).Methods(http.MethodGet, http.MethodPost, http.MethodPut, http.MethodDelete)
 	}
 }
