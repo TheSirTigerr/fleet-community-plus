@@ -353,4 +353,19 @@ func (s *SQLStore) RecordDeploymentResult(ctx context.Context, hostID uint, resu
 	_, err := s.db.ExecContext(ctx, `INSERT INTO communityplus_deployment_results (deployment_id, host_id, exit_code, output, attempt_count, updated_at) VALUES (?, ?, ?, ?, ?, NOW(6)) ON DUPLICATE KEY UPDATE exit_code = VALUES(exit_code), output = VALUES(output), attempt_count = IF(VALUES(exit_code) = 0, 0, attempt_count + 1), updated_at = VALUES(updated_at)`, result.DeploymentID, hostID, result.ExitCode, result.Output, func() int { if result.ExitCode != 0 { return 1 }; return 0 }()); return err
 }
 
-func (s *SQLStore) ListDeploymentResults(ctx context.Context, deploymentID string) ([]DeploymentResult, error) { rows, err := s.db.QueryContext(ctx, `SELECT r.deployment_id, r.host_id, h.hostname, r.exit_code, r.output, r.updated_at FROM communityplus_deployment_results r JOIN hosts h ON h.id = r.host_id WHERE r.deployment_id = ? ORDER BY r.updated_at DESC, r.host_id`, deploymentID); if err != nil { return nil, fmt.Errorf("communityplus: list deployment results: %w", err) }; defer rows.Close(); var results []DeploymentResult; for rows.Next() { var result DeploymentResult; if err := rows.Scan(&result.DeploymentID, &result.HostID, &result.Hostname, &result.ExitCode, &result.Output, &result.UpdatedAt); err != nil { return nil, fmt.Errorf("communityplus: scan deployment result: %w", err) }; results = append(results, result) }; return results, rows.Err() }
+func (s *SQLStore) ListDeploymentResults(ctx context.Context, deploymentID string) ([]DeploymentResult, error) {
+	rows, err := s.db.QueryContext(ctx, `SELECT r.deployment_id, r.host_id, h.hostname, r.exit_code, r.output, r.attempt_count, r.updated_at FROM communityplus_deployment_results r JOIN hosts h ON h.id = r.host_id WHERE r.deployment_id = ? ORDER BY r.updated_at DESC, r.host_id`, deploymentID)
+	if err != nil {
+		return nil, fmt.Errorf("communityplus: list deployment results: %w", err)
+	}
+	defer rows.Close()
+	var results []DeploymentResult
+	for rows.Next() {
+		var result DeploymentResult
+		if err := rows.Scan(&result.DeploymentID, &result.HostID, &result.Hostname, &result.ExitCode, &result.Output, &result.AttemptCount, &result.UpdatedAt); err != nil {
+			return nil, fmt.Errorf("communityplus: scan deployment result: %w", err)
+		}
+		results = append(results, result)
+	}
+	return results, rows.Err()
+}
