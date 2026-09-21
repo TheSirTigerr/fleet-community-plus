@@ -2,7 +2,11 @@
 // Community maintained-app synchronization code.
 package maintainedapps
 
-import "strings"
+import (
+	"context"
+	"log/slog"
+	"strings"
+)
 
 type ManifestFile struct {
 	Refs     map[string]string `json:"refs"`
@@ -30,6 +34,28 @@ type ManifestApp struct {
 	UpgradeCode        string   `json:"upgrade_code,omitempty"`
 	UniqueIdentifier   string   `json:"unique_identifier,omitempty"`
 	Frozen             bool     `json:"frozen,omitempty"`
+}
+
+// Compatibility names are kept here while upstream Community callers are
+// migrated off the historical ee/ package path.
+type FMAManifestFile = ManifestFile
+type FMAManifestApp = ManifestApp
+type FMAQueries = Queries
+
+type Ingester func(context.Context, *slog.Logger, string, string) ([]*FMAManifestApp, error)
+
+const OutputPath = "ee/maintained-apps/outputs"
+
+type FMAListFile struct {
+	Version uint             `json:"version"`
+	Apps    []FMAListFileApp `json:"apps"`
+}
+
+type FMAListFileApp struct {
+	Name             string `json:"name"`
+	Slug             string `json:"slug"`
+	Platform         string `json:"platform"`
+	UniqueIdentifier string `json:"unique_identifier,omitempty"`
 }
 
 func (app ManifestApp) IsEmpty() bool { return app.Slug == "" || app.Version == "" }
