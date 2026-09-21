@@ -56,7 +56,7 @@ func Ingest(ctx context.Context, logger *slog.Logger, inputDir, slugFilter strin
 
 	var apps []App
 	for _, entry := range entries {
-		if entry.IsDir() || !strings.EqualFold(filepath.Ext(entry.Name()), ".json") {
+		if entry.IsDir() || !strings.EqualFold(filepath.Ext(entry.Name()), ".json") || strings.HasSuffix(entry.Name(), ".winget.json") || strings.HasSuffix(entry.Name(), ".cask.json") {
 			continue
 		}
 		if err := ctx.Err(); err != nil {
@@ -69,6 +69,12 @@ func Ingest(ctx context.Context, logger *slog.Logger, inputDir, slugFilter strin
 		apps = append(apps, fileApps...)
 	}
 
+	return Build(ctx, logger, apps, slugFilter)
+}
+
+// Build validates and converts catalog apps already loaded by an adapter. It
+// lets public-source adapters use the exact same safety checks as plain JSON.
+func Build(ctx context.Context, logger *slog.Logger, apps []App, slugFilter string) ([]*maintainedapps.FMAManifestApp, error) {
 	sort.Slice(apps, func(i, j int) bool { return apps[i].Slug < apps[j].Slug })
 	seen := make(map[string]struct{}, len(apps))
 	output := make([]*maintainedapps.FMAManifestApp, 0, len(apps))

@@ -97,8 +97,7 @@ jobs:
           ./ee/server/service/scep
           ./ee/server/service/hostidentity/...
           ./ee/server/service/condaccess/...
-          ./ee/maintained-apps
-          ./ee/maintained-apps/ingesters/source
+          ./ee/maintained-apps/...
           ./server/mdm/maintainedapps
           ./ee/server/licensing
           ./ee/fleetctl

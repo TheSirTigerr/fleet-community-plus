@@ -24,6 +24,33 @@ The importer accepts a single app object or an object with an `apps` array.
 }
 ```
 
+## Public-source adapters
+
+For WinGet, place a downloaded public installer manifest beside a reviewed
+Community+ sidecar. The names must match:
+
+```
+inputs/winget/example.winget.yaml
+inputs/winget/example.winget.json
+```
+
+The YAML provides `PackageVersion`, `InstallerUrl`, `InstallerSha256`, and
+optionally `ProductCode`. The JSON sidecar contains `slug`, scripts, queries,
+categories, and other local policy choices. Its `version`, `installer_url`,
+and `sha256` fields are ignored and replaced with the values from the YAML.
+
+For Homebrew, use the same approach with a Cask and sidecar:
+
+```
+inputs/homebrew/example.cask.rb
+inputs/homebrew/example.cask.json
+```
+
+Only Casks with literal `name`, `version`, `sha256`, and HTTPS `url` values
+are accepted. `#{version}` in the URL is supported; other Ruby interpolation,
+dynamic URLs, and `sha256 :no_check` are rejected. This prevents a catalog
+update from publishing an installer whose integrity cannot be verified.
+
 Run `go run ./cmd/maintained-apps` from the repository root to create the
 files under `outputs/`. Use `--check` in CI or before publishing; it validates
 all entries without creating or changing files. `--input-root`, `--output-dir`
