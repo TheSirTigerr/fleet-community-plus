@@ -1,0 +1,51 @@
+name: Community+ migrate Orbit imports
+
+on:
+  push:
+    branches:
+      - community-plus/foundation
+    paths:
+      - '.github/workflows/community-plus-migrate-orbit-imports.yml'
+
+permissions:
+  contents: write
+
+jobs:
+  migrate:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Check out repository
+        uses: actions/checkout@v4
+
+      - name: Replace legacy EE Orbit imports
+        shell: bash
+        run: |
+          set -euo pipefail
+          python3 - <<'PY'
+          from pathlib import Path
+
+          path = Path('orbit/cmd/orbit/orbit.go')
+          text = path.read_text()
+          replacements = {
+              '"github.com/fleetdm/fleet/v4/ee/orbit/pkg/hostidentity"': '"github.com/fleetdm/fleet/v4/orbit/pkg/communityplus/hostidentity"',
+              'httpsigproxy "github.com/fleetdm/fleet/v4/ee/orbit/pkg/httpsigproxy"': 'httpsigproxy "github.com/fleetdm/fleet/v4/orbit/pkg/communityplus/httpsigproxy"',
+              '"github.com/fleetdm/fleet/v4/ee/orbit/pkg/securehw"': '"github.com/fleetdm/fleet/v4/orbit/pkg/communityplus/securehw"',
+          }
+          for old, new in replacements.items():
+              if old not in text:
+                  raise SystemExit(f'missing expected import: {old}')
+              text = text.replace(old, new, 1)
+          path.write_text(text)
+          PY
+          gofmt -w orbit/cmd/orbit/orbit.go
+
+      - name: Commit migration
+        shell: bash
+        run: |
+          set -euo pipefail
+          git config user.name 'github-actions[bot]'
+          git config user.email '41898282+github-actions[bot]@users.noreply.github.com'
+          git add orbit/cmd/orbit/orbit.go
+          git diff --cached --check
+          git commit -m 'refactor: move Orbit entrypoint off ee imports'
+          git push origin HEAD:community-plus/foundation
