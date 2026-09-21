@@ -1,32 +1,18 @@
-// Package hostidentity is the Community+ Orbit enrollment boundary.
+// Package hostidentity is a compatibility facade for the Community+ Orbit host
+// identity boundary.
 package hostidentity
 
 import (
 	"context"
-	"crypto/x509"
-	"errors"
 
-	"github.com/fleetdm/fleet/v4/ee/orbit/pkg/securehw"
+	communityhostidentity "github.com/fleetdm/fleet/v4/orbit/pkg/communityplus/hostidentity"
 	"github.com/rs/zerolog"
 )
 
-var ErrUnavailable = errors.New("Community+ Orbit host identity enrollment is unavailable")
+var ErrUnavailable = communityhostidentity.ErrUnavailable
 
-type Credentials struct {
-	Certificate     *x509.Certificate
-	CertificatePath string
-	SecureHWKey     securehw.Key
-	SecureHW        securehw.SecureHW
-}
+type Credentials = communityhostidentity.Credentials
 
-func (c *Credentials) Close() {
-	if c != nil && c.SecureHW != nil {
-		c.SecureHW.Close()
-	}
-}
-
-// Setup intentionally fails until a TPM-backed enrollment implementation is
-// available. It never falls back to a filesystem private key.
-func Setup(_ context.Context, _ string, _ string, _ string, _ string, _ string, _ bool, _ zerolog.Logger, _ func(string)) (*Credentials, error) {
-	return nil, ErrUnavailable
+func Setup(ctx context.Context, rootDir, fleetURL, enrollSecret, certPath, keyPath string, insecure bool, logger zerolog.Logger, status func(string)) (*Credentials, error) {
+	return communityhostidentity.Setup(ctx, rootDir, fleetURL, enrollSecret, certPath, keyPath, insecure, logger, status)
 }
