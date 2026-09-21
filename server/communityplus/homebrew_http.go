@@ -1,13 +1,26 @@
 package communityplus
 
 import (
-	"encoding/json"
 	"fmt"
 	"net/http"
 	"strconv"
 	"strings"
 	"time"
 )
+
+// WithHomebrew mounts Homebrew catalog routes in front of the existing
+// Community+ handler without changing the stable WinGet API implementation.
+func (a *HTTPAPI) WithHomebrew(next http.Handler) http.Handler {
+	mux := http.NewServeMux()
+	for _, version := range []string{"v1", "2022-04", "latest"} {
+		base := "/api/" + version + "/fleet/communityplus/catalog/homebrew"
+		mux.HandleFunc("GET "+base, a.searchHomebrewCatalog)
+		mux.HandleFunc("GET "+base+"/upstream", a.searchHomebrewUpstream)
+		mux.HandleFunc("POST "+base+"/import", a.importHomebrewCatalogEntry)
+	}
+	mux.Handle("/", next)
+	return mux
+}
 
 func (a *HTTPAPI) searchHomebrewUpstream(w http.ResponseWriter, r *http.Request) {
 	if _, err := a.access.Authorize(r.Context(), Request{Resource: ResourceSoftware, Action: ActionAdmin, Scope: GlobalScope()}); err != nil {
@@ -112,7 +125,3 @@ func (a *HTTPAPI) importHomebrewCatalogEntry(w http.ResponseWriter, r *http.Requ
 	}
 	writeJSON(w, http.StatusCreated, map[string]any{"catalog_entry": entry})
 }
-
-// Keep encoding/json referenced here so this file remains compatible with the
-// stricter static import checks used in Fleet builds that gate JSON handlers.
-var _ = json.Valid
