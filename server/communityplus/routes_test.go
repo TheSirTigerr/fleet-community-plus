@@ -115,12 +115,12 @@ func TestViewerAccessScopesTeamObserver(t *testing.T) {
 	}
 }
 
-func TestViewerAccessFailsClosedForUnmappedRole(t *testing.T) {
+func TestViewerAccessFailsClosedForUnknownRole(t *testing.T) {
 	ctx := viewer.NewContext(context.Background(), viewer.Viewer{User: &fleet.User{
 		ID:    10,
-		Teams: []fleet.UserTeam{{Team: fleet.Team{ID: 9}, Role: fleet.RoleMaintainer}},
+		Teams: []fleet.UserTeam{{Team: fleet.Team{ID: 9}, Role: "future_role"}},
 	}})
 	if _, err := (ViewerAccess{}).Authorize(ctx, Request{Resource: ResourceSoftware, Action: ActionRead, Scope: FleetScope(9)}); err != ErrForbidden {
-		t.Fatalf("expected unmapped role to fail closed, got %v", err)
+		t.Fatalf("expected unknown role to fail closed, got %v", err)
 	}
 }
