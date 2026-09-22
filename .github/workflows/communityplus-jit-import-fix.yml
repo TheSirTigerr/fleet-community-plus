@@ -1,5 +1,6 @@
 name: Community+ JIT import cleanup
 
+# One-shot cleanup workflow; removed after the guarded patch succeeds.
 on:
   push:
     branches:
