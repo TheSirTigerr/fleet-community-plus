@@ -8,6 +8,7 @@ func TestRuntimeRegistryPublishesOnlyWiredCapabilities(t *testing.T) {
 		FeatureFleets:             StatusAvailable,
 		FeatureRBAC:               StatusAvailable,
 		FeatureAuditLog:           StatusAvailable,
+		FeatureFleetPoliciesQueries: StatusAvailable,
 		FeatureSoftwareAutomation: StatusExperimental,
 		FeaturePatchPolicies:      StatusExperimental,
 		FeatureSCIM:               StatusPlanned,
