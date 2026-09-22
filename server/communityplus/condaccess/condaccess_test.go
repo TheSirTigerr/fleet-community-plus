@@ -10,3 +10,13 @@ func TestLegacyConditionalAccessRoutesStayUnmounted(t *testing.T) {
 		t.Fatalf("register IdP boundary: %v", err)
 	}
 }
+
+func TestConditionalAccessCompatibilityCallShape(t *testing.T) {
+	placeholder := struct{}{}
+	if err := RegisterSCEP(placeholder, placeholder, placeholder, placeholder, placeholder, placeholder); err != nil {
+		t.Fatalf("register SCEP compatibility boundary: %v", err)
+	}
+	if err := RegisterIdP(placeholder, placeholder, placeholder, placeholder, placeholder); err != nil {
+		t.Fatalf("register IdP compatibility boundary: %v", err)
+	}
+}
