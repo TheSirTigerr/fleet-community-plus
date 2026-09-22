@@ -59,11 +59,11 @@ func (p *fakeOIDCProtocol) Complete(_ context.Context, _ OIDCSettings, _ string,
 }
 
 type fakeOIDCFleetService struct {
-	serverURL      string
-	user           *fleet.User
-	session        *fleet.SSOSession
+	serverURL       string
+	user            *fleet.User
+	session         *fleet.SSOSession
 	sessionDuration time.Duration
-	userID         string
+	userID          string
 }
 
 func (s *fakeOIDCFleetService) AppConfigUrls(context.Context) (*fleet.AppConfigUrls, error) {
