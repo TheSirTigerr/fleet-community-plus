@@ -31,11 +31,11 @@ const (
 var keyContextDomain = []byte("fleet-community-plus/apple-psso/key-context/v1")
 
 type sealedKeyContext struct {
-	Version      int    `json:"version"`
-	HostUUID     string `json:"host_uuid"`
-	Username     string `json:"username"`
-	PrivateKey   string `json:"private_key"`
-	ExpiresAt    int64  `json:"expires_at"`
+	Version    int    `json:"version"`
+	HostUUID   string `json:"host_uuid"`
+	Username   string `json:"username"`
+	PrivateKey string `json:"private_key"`
+	ExpiresAt  int64  `json:"expires_at"`
 }
 
 // Handle is the complete Community+ PSSO token entry point. Login requests use

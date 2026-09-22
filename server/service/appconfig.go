@@ -882,10 +882,6 @@ func (svc *Service) ModifyAppConfig(ctx context.Context, p []byte, applyOpts fle
 	clientIDSet := mergedAAP.OAuthIdPClientID.Value != ""
 	switch {
 	case mergedAAP.Configured(): // both public fields set
-		aapProvided := incomingAAP.OAuthIdPTokenURL.Set || incomingAAP.OAuthIdPClientID.Set || incomingAAP.OAuthIdPClientSecret.Set
-		if aapProvided && !lic.IsPremium() {
-			invalid.Append("mdm.apple_account_provisioning", ErrMissingLicense.Error())
-		}
 		if newAAPSecretProvided && svc.config.Server.PrivateKey == "" {
 			invalid.Append("mdm.apple_account_provisioning",
 				"Missing required private key. Learn how to configure the private key here: https://fleetdm.com/learn-more-about/fleet-server-private-key")
