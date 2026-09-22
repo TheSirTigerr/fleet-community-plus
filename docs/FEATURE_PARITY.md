@@ -16,7 +16,7 @@ This document tracks independently implemented equivalents for Fleet Premium cap
 - [x] SAML/OIDC SSO enhancements
 - [x] Just-in-time user provisioning
 - [x] SCIM provisioning
-- [ ] IdP group mapping
+- [x] IdP group mapping
 - [ ] Conditional access integrations
 - [ ] Account/password synchronization where supported by platform APIs
 
