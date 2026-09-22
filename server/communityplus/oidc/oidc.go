@@ -55,8 +55,9 @@ type FlowState struct {
 
 // Identity contains the verified identity claims used by Fleet login.
 type Identity struct {
-	Subject string
-	Email   string
+	Subject    string
+	Email      string
+	Attributes []Attribute
 }
 
 // ValidateSettings validates the static OIDC client configuration.
@@ -295,7 +296,15 @@ func verifyIDToken(ctx context.Context, client *http.Client, settings Settings, 
 	if strings.TrimSpace(claims.Subject) == "" || strings.TrimSpace(claims.Email) == "" {
 		return nil, errors.New("OIDC ID token is missing subject or email")
 	}
-	return &Identity{Subject: claims.Subject, Email: strings.ToLower(strings.TrimSpace(claims.Email))}, nil
+	attributes, err := roleAttributesFromJWTPart(parts[1])
+	if err != nil {
+		return nil, err
+	}
+	return &Identity{
+		Subject:    claims.Subject,
+		Email:      strings.ToLower(strings.TrimSpace(claims.Email)),
+		Attributes: attributes,
+	}, nil
 }
 
 func rsaKey(keys jwks, keyID string) (*rsa.PublicKey, error) {

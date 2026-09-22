@@ -282,4 +282,17 @@ func (a oidcFleetAuth) UserDisplayName() string {
 	return a.identity.Email
 }
 
-func (a oidcFleetAuth) AssertionAttributes() []fleet.SAMLAttribute { return nil }
+func (a oidcFleetAuth) AssertionAttributes() []fleet.SAMLAttribute {
+	if a.identity == nil || len(a.identity.Attributes) == 0 {
+		return nil
+	}
+	result := make([]fleet.SAMLAttribute, 0, len(a.identity.Attributes))
+	for _, attribute := range a.identity.Attributes {
+		values := make([]fleet.SAMLAttributeValue, 0, len(attribute.Values))
+		for _, value := range attribute.Values {
+			values = append(values, fleet.SAMLAttributeValue{Value: value})
+		}
+		result = append(result, fleet.SAMLAttribute{Name: attribute.Name, Values: values})
+	}
+	return result
+}
