@@ -5,6 +5,7 @@ import (
 	"database/sql"
 	"encoding/json"
 	"fmt"
+	"strings"
 
 	"github.com/fleetdm/fleet/v4/server/fleet"
 )
@@ -33,12 +34,6 @@ type AutomationStore interface {
 type AuditStore interface {
 	AuditSink
 	ListAuditEvents(context.Context, AuditFilter) ([]AuditEvent, error)
-}
-
-// AuditFilter limits audit results. FleetID nil means all scopes.
-type AuditFilter struct {
-	FleetID *uint
-	Limit   int
 }
 
 func NewSQLStore(db SQLExecutor) (*SQLStore, error) {
@@ -77,24 +72,50 @@ VALUES (?, ?, ?, ?, ?, NULLIF(?, ''), ?, ?, ?)`,
 // ListAuditEvents returns newest events first. Limits are bounded to keep the
 // administrative endpoint from accidentally issuing an unbounded query.
 func (s *SQLStore) ListAuditEvents(ctx context.Context, filter AuditFilter) ([]AuditEvent, error) {
-	limit := filter.Limit
-	if limit <= 0 {
-		limit = 100
+	if err := filter.Validate(); err != nil {
+		return nil, err
 	}
-	if limit > 1000 {
-		limit = 1000
-	}
+	limit := filter.normalizedLimit()
 	query := `
 SELECT id, occurred_at, actor_id, action, resource, COALESCE(resource_id, ''),
        scope_kind, fleet_id, metadata
 FROM communityplus_audit_events`
-	args := make([]any, 0, 2)
+	conditions := make([]string, 0, 8)
+	args := make([]any, 0, 12)
 	if filter.FleetID != nil {
-		if *filter.FleetID == 0 {
-			return nil, fmt.Errorf("communityplus: audit fleet_id must be greater than zero")
-		}
-		query += ` WHERE fleet_id = ?`
+		conditions = append(conditions, "fleet_id = ?")
 		args = append(args, *filter.FleetID)
+	}
+	if filter.ActorID != "" {
+		conditions = append(conditions, "actor_id = ?")
+		args = append(args, filter.ActorID)
+	}
+	if filter.Action != "" {
+		conditions = append(conditions, "action = ?")
+		args = append(args, filter.Action)
+	}
+	if filter.Resource != "" {
+		conditions = append(conditions, "resource = ?")
+		args = append(args, filter.Resource)
+	}
+	if filter.ResourceID != "" {
+		conditions = append(conditions, "resource_id = ?")
+		args = append(args, filter.ResourceID)
+	}
+	if filter.From != nil {
+		conditions = append(conditions, "occurred_at >= ?")
+		args = append(args, *filter.From)
+	}
+	if filter.Until != nil {
+		conditions = append(conditions, "occurred_at <= ?")
+		args = append(args, *filter.Until)
+	}
+	if filter.Before != nil {
+		conditions = append(conditions, "(occurred_at < ? OR (occurred_at = ? AND id < ?))")
+		args = append(args, filter.Before.Before, filter.Before.Before, filter.Before.BeforeID)
+	}
+	if len(conditions) > 0 {
+		query += " WHERE " + strings.Join(conditions, " AND ")
 	}
 	query += ` ORDER BY occurred_at DESC, id DESC LIMIT ?`
 	args = append(args, limit)

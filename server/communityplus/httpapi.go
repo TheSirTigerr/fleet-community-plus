@@ -420,25 +420,10 @@ func (a *HTTPAPI) deleteAutomationRule(w http.ResponseWriter, r *http.Request) {
 }
 
 func (a *HTTPAPI) listAuditEvents(w http.ResponseWriter, r *http.Request) {
-	filter := AuditFilter{Limit: 100}
-	scope := GlobalScope()
-	if value := r.URL.Query().Get("fleet_id"); value != "" {
-		fleetID, err := strconv.ParseUint(value, 10, 64)
-		if err != nil || fleetID == 0 || uint64(uint(fleetID)) != fleetID {
-			writeAPIError(w, fmt.Errorf("communityplus: invalid fleet_id"))
-			return
-		}
-		id := uint(fleetID)
-		filter.FleetID = &id
-		scope = FleetScope(id)
-	}
-	if value := r.URL.Query().Get("limit"); value != "" {
-		limit, err := strconv.Atoi(value)
-		if err != nil || limit <= 0 || limit > 1000 {
-			writeAPIError(w, fmt.Errorf("communityplus: limit must be between 1 and 1000"))
-			return
-		}
-		filter.Limit = limit
+	filter, scope, err := ParseAuditFilter(r.URL.Query())
+	if err != nil {
+		writeAPIError(w, err)
+		return
 	}
 	if _, err := a.access.Authorize(r.Context(), Request{
 		Resource: ResourceAudit, Action: ActionRead, Scope: scope,
@@ -451,7 +436,11 @@ func (a *HTTPAPI) listAuditEvents(w http.ResponseWriter, r *http.Request) {
 		writeAPIError(w, err)
 		return
 	}
-	writeJSON(w, http.StatusOK, map[string]any{"audit_events": events})
+	response := map[string]any{"audit_events": events}
+	if cursor := NextAuditCursor(events, filter.Limit); cursor != nil {
+		response["next_cursor"] = cursor
+	}
+	writeJSON(w, http.StatusOK, response)
 }
 
 func decodeJSONBody(w http.ResponseWriter, r *http.Request, target any) error {
