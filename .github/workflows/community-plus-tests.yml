@@ -7,6 +7,8 @@ on:
       - 'community-plus/**'
     paths:
       - 'server/communityplus/**'
+      - 'cmd/fleetctl/fleetctl/communityplus_*.go'
+      - 'cmd/fleetctl/fleetctl/fleetctl.go'
       - 'ee/pkg/hostidentity/types/**'
       - 'ee/server/service/hostidentity/httpsig/**'
       - 'ee/server/service/digicert/**'
@@ -34,6 +36,8 @@ on:
   pull_request:
     paths:
       - 'server/communityplus/**'
+      - 'cmd/fleetctl/fleetctl/communityplus_*.go'
+      - 'cmd/fleetctl/fleetctl/fleetctl.go'
       - 'ee/pkg/hostidentity/types/**'
       - 'ee/server/service/hostidentity/httpsig/**'
       - 'ee/server/service/digicert/**'
@@ -80,7 +84,7 @@ jobs:
         shell: bash
         run: |
           set -euo pipefail
-          files="$(find server/communityplus server/mdm/maintainedapps orbit/pkg/communityplus ee/pkg/hostidentity/types ee/server/service/hostidentity/httpsig ee/server/service/digicert ee/server/service/scep ee/maintained-apps ee/server/licensing ee/fleetctl -name '*.go' -type f -print)"
+          files="$(find server/communityplus server/mdm/maintainedapps orbit/pkg/communityplus ee/pkg/hostidentity/types ee/server/service/hostidentity/httpsig ee/server/service/digicert ee/server/service/scep ee/maintained-apps ee/server/licensing ee/fleetctl -name '*.go' -type f -print; find cmd/fleetctl/fleetctl -maxdepth 1 -name 'communityplus_*.go' -type f -print; printf '%s\n' cmd/fleetctl/fleetctl/fleetctl.go)"
           test -n "$files"
           unformatted="$(gofmt -l $files)"
           if [ -n "$unformatted" ]; then
@@ -111,6 +115,9 @@ jobs:
           ./ee/server/service/est
           ./ee/server/webhooks
           ./server/vulnerabilities/nvd/tools/cvefeed/...
+
+      - name: Test Community+ fleetctl
+        run: go test ./cmd/fleetctl/fleetctl -run 'TestCommunityPlus|TestFleetGitOps'
 
       - name: Build fleetctl
         run: go build ./cmd/fleetctl/fleetctl
