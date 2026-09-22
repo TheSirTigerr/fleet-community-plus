@@ -66,7 +66,10 @@ jobs:
           PY
           gofmt -w server/service/conditional_access_microsoft.go server/service/osquery.go server/service/appconfig.go
           git diff --check
-          git diff --exit-code --quiet && { echo 'No patch produced'; exit 1; }
+          if git diff --quiet; then
+            echo 'No patch produced'
+            exit 1
+          fi
       - name: Commit guarded patch
         shell: bash
         run: |
