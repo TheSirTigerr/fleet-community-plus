@@ -52,16 +52,25 @@ func GetRoutes(fleetSvc fleet.Service, store *SQLStore) endpointer.HandlerRoutes
 		if err != nil {
 			panic(err)
 		}
+		oidcSessionSettingsAPI, err := NewOIDCSessionSettingsAPI(store)
+		if err != nil {
+			panic(err)
+		}
 		oidcLoginAPI, err := NewOIDCLoginAPI(store, store, fleetSvc, nil)
 		if err != nil {
 			panic(err)
 		}
 
-		// OIDC authorize/callback are intentionally public: there is no Fleet
-		// session until the callback has been verified and converted to one.
+		// OIDC authorize/callback and the minimal login-page settings endpoint are
+		// intentionally public: there is no Fleet session until the callback has
+		// been verified and converted to one.
 		oidcLoginHandler := oidcLoginAPI.Handler()
 		r.Handle(oidcAuthorizePath, oidcLoginHandler).Methods(http.MethodGet)
 		r.Handle(oidcCallbackPath, oidcLoginHandler).Methods(http.MethodGet)
+		oidcSessionSettingsHandler := oidcSessionSettingsAPI.Handler()
+		for _, version := range []string{"v1", "2022-04", "latest"} {
+			r.Handle("/api/"+version+oidcSessionSettingsSuffix, oidcSessionSettingsHandler).Methods(http.MethodGet)
+		}
 
 		authError := func(w http.ResponseWriter, detail string, status int) {
 			writeJSON(w, status, map[string]string{"error": detail})
