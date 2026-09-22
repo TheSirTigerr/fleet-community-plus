@@ -5,11 +5,11 @@ import "testing"
 func TestRuntimeRegistryPublishesOnlyWiredCapabilities(t *testing.T) {
 	registry := newRuntimeRegistry()
 	checks := map[Feature]FeatureStatus{
+		FeatureFleets:             StatusAvailable,
 		FeatureRBAC:               StatusAvailable,
 		FeatureAuditLog:           StatusAvailable,
 		FeatureSoftwareAutomation: StatusExperimental,
 		FeaturePatchPolicies:      StatusExperimental,
-		FeatureFleets:             StatusPlanned,
 		FeatureSCIM:               StatusPlanned,
 	}
 	for feature, want := range checks {
