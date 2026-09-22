@@ -26,7 +26,6 @@ import (
 	"github.com/e-dard/netbug"
 	"github.com/fleetdm/fleet/v4/cmd/fleetctl/fleetctl"
 	eeservice "github.com/fleetdm/fleet/v4/ee/server/service"
-	"github.com/fleetdm/fleet/v4/ee/server/service/digicert"
 	"github.com/fleetdm/fleet/v4/ee/server/service/hostidentity"
 	"github.com/fleetdm/fleet/v4/ee/server/service/hostidentity/httpsig"
 	"github.com/fleetdm/fleet/v4/ee/server/service/scep"
@@ -46,6 +45,7 @@ import (
 	chart_bootstrap "github.com/fleetdm/fleet/v4/server/chart/bootstrap"
 	"github.com/fleetdm/fleet/v4/server/communityplus"
 	"github.com/fleetdm/fleet/v4/server/communityplus/condaccess"
+	"github.com/fleetdm/fleet/v4/server/communityplus/digicert"
 	"github.com/fleetdm/fleet/v4/server/communityplus/est"
 	"github.com/fleetdm/fleet/v4/server/communityplus/licensing"
 	"github.com/fleetdm/fleet/v4/server/communityplus/scim"
@@ -475,7 +475,7 @@ func runServeCmd(cmd *cobra.Command, configManager configpkg.Manager, debug, dev
 
 	eh := errorstore.NewHandler(ctx, redisPool, logger, config.Logging.ErrorRetentionPeriod)
 	scepConfigMgr := scep.NewSCEPConfigService(logger, nil)
-	digiCertService := digicert.NewService(digicert.WithLogger(logger))
+	digiCertService := digicert.NewFleetService(logger)
 	ctx = ctxerr.NewContext(ctx, eh)
 
 	// Declare svc early so the closure below can capture it.
