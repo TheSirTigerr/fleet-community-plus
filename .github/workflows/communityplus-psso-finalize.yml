@@ -29,13 +29,15 @@ jobs:
           from pathlib import Path
           p = Path('server/service/appconfig.go')
           text = p.read_text()
-          old = '''\t\taapProvided := incomingAAP.OAuthIdPTokenURL.Set || incomingAAP.OAuthIdPClientID.Set || incomingAAP.OAuthIdPClientSecret.Set
-\t\tif aapProvided && !lic.IsPremium() {
-\t\t\tinvalid.Append("mdm.apple_account_provisioning", ErrMissingLicense.Error())
-\t\t}
-'''
-          if text.count(old) != 1:
-              raise SystemExit(f'expected exactly one Apple account provisioning Premium gate, got {text.count(old)}')
+          old = (
+              '\t\taapProvided := incomingAAP.OAuthIdPTokenURL.Set || incomingAAP.OAuthIdPClientID.Set || incomingAAP.OAuthIdPClientSecret.Set\n'
+              '\t\tif aapProvided && !lic.IsPremium() {\n'
+              '\t\t\tinvalid.Append("mdm.apple_account_provisioning", ErrMissingLicense.Error())\n'
+              '\t\t}\n'
+          )
+          actual = text.count(old)
+          if actual != 1:
+              raise SystemExit(f'expected exactly one Apple account provisioning Premium gate, got {actual}')
           p.write_text(text.replace(old, ''))
           PY
           gofmt -w server/service/appconfig.go server/communityplus/applepsso/*.go server/communityplus/servicecompat/apple_psso.go
