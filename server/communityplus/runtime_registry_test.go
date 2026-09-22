@@ -14,7 +14,7 @@ func TestRuntimeRegistryPublishesOnlyWiredCapabilities(t *testing.T) {
 		FeatureGitOps:               StatusAvailable,
 		FeatureSSO:                  StatusAvailable,
 		FeatureSCIM:                 StatusAvailable,
-		FeatureConditionalAccess:    StatusExperimental,
+		FeatureConditionalAccess:    StatusAvailable,
 		FeatureSoftwareAutomation:   StatusExperimental,
 		FeaturePatchPolicies:        StatusExperimental,
 	}
