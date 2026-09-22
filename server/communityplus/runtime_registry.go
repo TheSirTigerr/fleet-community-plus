@@ -5,6 +5,7 @@ package communityplus
 // callers that want an empty capability set.
 func newRuntimeRegistry() *Registry {
 	registry := NewRegistry()
+	mustSetRuntimeStatus(registry, FeatureFleets, StatusAvailable)
 	mustSetRuntimeStatus(registry, FeatureRBAC, StatusAvailable)
 	mustSetRuntimeStatus(registry, FeatureAuditLog, StatusAvailable)
 	mustSetRuntimeStatus(registry, FeatureSoftwareAutomation, StatusExperimental)
