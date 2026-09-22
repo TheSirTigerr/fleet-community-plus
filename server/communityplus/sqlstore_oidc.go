@@ -13,10 +13,11 @@ func (s *SQLStore) GetOIDCSettings(ctx context.Context) (OIDCSettings, error) {
 	settings := DefaultOIDCSettings()
 	var scopes []byte
 	err := s.db.QueryRowContext(ctx, `
-SELECT enabled, issuer_url, client_id, client_secret, scopes, idp_name
+SELECT enabled, enable_jit_provisioning, issuer_url, client_id, client_secret, scopes, idp_name
 FROM communityplus_oidc_settings
 WHERE id = 1`).Scan(
 		&settings.Enabled,
+		&settings.EnableJITProvisioning,
 		&settings.IssuerURL,
 		&settings.ClientID,
 		&settings.ClientSecret,
@@ -51,16 +52,18 @@ func (s *SQLStore) UpsertOIDCSettings(ctx context.Context, settings OIDCSettings
 	}
 	_, err = s.db.ExecContext(ctx, `
 INSERT INTO communityplus_oidc_settings
-    (id, enabled, issuer_url, client_id, client_secret, scopes, idp_name)
-VALUES (1, ?, ?, ?, ?, ?, ?)
+    (id, enabled, enable_jit_provisioning, issuer_url, client_id, client_secret, scopes, idp_name)
+VALUES (1, ?, ?, ?, ?, ?, ?, ?)
 ON DUPLICATE KEY UPDATE
     enabled = VALUES(enabled),
+    enable_jit_provisioning = VALUES(enable_jit_provisioning),
     issuer_url = VALUES(issuer_url),
     client_id = VALUES(client_id),
     client_secret = VALUES(client_secret),
     scopes = VALUES(scopes),
     idp_name = VALUES(idp_name)`,
 		settings.Enabled,
+		settings.EnableJITProvisioning,
 		settings.IssuerURL,
 		settings.ClientID,
 		settings.ClientSecret,
