@@ -88,7 +88,7 @@ func TestViewerAccessScopesTeamObserver(t *testing.T) {
 	for _, fleetRole := range []string{fleet.RoleObserver, fleet.RoleObserverPlus} {
 		t.Run(fleetRole, func(t *testing.T) {
 			ctx := viewer.NewContext(context.Background(), viewer.Viewer{User: &fleet.User{
-				ID: 9,
+				ID:    9,
 				Teams: []fleet.UserTeam{{Team: fleet.Team{ID: 12}, Role: fleetRole}},
 			}})
 
@@ -117,7 +117,7 @@ func TestViewerAccessScopesTeamObserver(t *testing.T) {
 
 func TestViewerAccessFailsClosedForUnmappedRole(t *testing.T) {
 	ctx := viewer.NewContext(context.Background(), viewer.Viewer{User: &fleet.User{
-		ID: 10,
+		ID:    10,
 		Teams: []fleet.UserTeam{{Team: fleet.Team{ID: 9}, Role: fleet.RoleMaintainer}},
 	}})
 	if _, err := (ViewerAccess{}).Authorize(ctx, Request{Resource: ResourceSoftware, Action: ActionRead, Scope: FleetScope(9)}); err != ErrForbidden {
