@@ -5,6 +5,8 @@ import (
 	"fmt"
 	"io"
 	"net/http"
+
+	"github.com/fleetdm/fleet/v4/server/fleet"
 )
 
 type communityPlusCapabilityDoer interface {
@@ -48,4 +50,15 @@ func communityPlusFeatureEnabled(client communityPlusCapabilityDoer, feature str
 		}
 	}
 	return false, nil
+}
+
+// fleetGitOpsSupported preserves Fleet Premium behavior while allowing a
+// Community+ server that independently implements fleets to accept fleet-scoped
+// GitOps files. It does not turn the Fleet license into Premium, so unrelated
+// Premium-only GitOps keys keep their existing validation and gating.
+func fleetGitOpsSupported(license *fleet.LicenseInfo, client communityPlusCapabilityDoer) (bool, error) {
+	if license != nil && license.IsPremium() {
+		return true, nil
+	}
+	return communityPlusFeatureEnabled(client, "fleets")
 }
