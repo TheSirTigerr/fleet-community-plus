@@ -64,6 +64,7 @@ type fakeOIDCFleetService struct {
 	session         *fleet.SSOSession
 	sessionDuration time.Duration
 	userID          string
+	jitEnabled      bool
 }
 
 func (s *fakeOIDCFleetService) AppConfigUrls(context.Context) (*fleet.AppConfigUrls, error) {
@@ -78,6 +79,11 @@ func (s *fakeOIDCFleetService) GetSSOUser(_ context.Context, auth fleet.Auth) (*
 		return nil, errors.New("user not found")
 	}
 	return s.user, nil
+}
+
+func (s *fakeOIDCFleetService) CommunityPlusGetSSOUser(ctx context.Context, auth fleet.Auth, enableJIT bool) (*fleet.User, error) {
+	s.jitEnabled = enableJIT
+	return s.GetSSOUser(ctx, auth)
 }
 
 func (s *fakeOIDCFleetService) LoginSSOUser(_ context.Context, _ *fleet.User, redirectURL string) (*fleet.SSOSession, error) {
@@ -96,11 +102,12 @@ func (s *fakeOIDCFleetService) GetSessionDuration(context.Context) time.Duration
 func TestOIDCLoginAPIAuthorizeAndCallback(t *testing.T) {
 	settingsStore := newMemoryOIDCSettingsStore()
 	settingsStore.settings = OIDCSettings{
-		Enabled:   true,
-		IssuerURL: "https://idp.example",
-		ClientID:  "fleet-client",
-		Scopes:    []string{"openid", "email"},
-		IDPName:   "Example IdP",
+		Enabled:               true,
+		EnableJITProvisioning: true,
+		IssuerURL:             "https://idp.example",
+		ClientID:              "fleet-client",
+		Scopes:                []string{"openid", "email"},
+		IDPName:               "Example IdP",
 	}
 	flowStore := &memoryOIDCFlowStore{}
 	protocol := &fakeOIDCProtocol{
@@ -140,8 +147,8 @@ func TestOIDCLoginAPIAuthorizeAndCallback(t *testing.T) {
 	if recorder.Code != http.StatusFound || recorder.Header().Get("Location") != "/hosts?fleet_id=7" {
 		t.Fatalf("callback status=%d location=%q body=%s", recorder.Code, recorder.Header().Get("Location"), recorder.Body.String())
 	}
-	if fleetSvc.userID != "user@example.com" || protocol.completeCode != "code-1" || protocol.completeFlow.Nonce != "nonce-1" || protocol.completeFlow.CodeVerifier != "verifier-1" {
-		t.Fatalf("callback did not use verified flow: user=%q code=%q flow=%#v", fleetSvc.userID, protocol.completeCode, protocol.completeFlow)
+	if fleetSvc.userID != "user@example.com" || !fleetSvc.jitEnabled || protocol.completeCode != "code-1" || protocol.completeFlow.Nonce != "nonce-1" || protocol.completeFlow.CodeVerifier != "verifier-1" {
+		t.Fatalf("callback did not use verified JIT flow: user=%q jit=%v code=%q flow=%#v", fleetSvc.userID, fleetSvc.jitEnabled, protocol.completeCode, protocol.completeFlow)
 	}
 	if cookie := recorder.Header().Get("Set-Cookie"); !strings.Contains(cookie, "__Host-token=session-token") || !strings.Contains(cookie, "Secure") {
 		t.Fatalf("missing secure Fleet session cookie: %q", cookie)
