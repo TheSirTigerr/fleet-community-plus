@@ -8,7 +8,7 @@ This document tracks independently implemented equivalents for Fleet Premium cap
 - [x] Advanced RBAC and role scoping
 - [x] Audit logging
 - [x] Fleet-level policies and queries
-- [ ] Custom reporting / tables
+- [x] Custom reporting / tables
 - [ ] GitOps-managed configuration
 
 ## Identity and access
