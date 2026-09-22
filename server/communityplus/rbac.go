@@ -152,20 +152,61 @@ func FleetAdminRole(fleetID uint) (Role, error) {
 	return Role{Name: "fleet_admin", Permissions: permissions}, nil
 }
 
-// ObserverRole creates a read-only role for one Fleet.
+var observerFleetResources = []Resource{
+	ResourceHosts, ResourceFleets, ResourcePolicies, ResourceSoftware,
+	ResourceScripts, ResourceMDM, ResourceVulnerabilities, ResourceReports,
+	ResourceAudit, ResourceAutomations,
+}
+
+var globalObserverResources = []Resource{
+	ResourceHosts, ResourceFleets, ResourcePolicies, ResourceSoftware,
+	ResourceScripts, ResourceMDM, ResourceVulnerabilities, ResourceUsers,
+	ResourceReports, ResourceAudit, ResourceAutomations, ResourceSettings,
+}
+
+// GlobalObserverRole mirrors Fleet's global observer read boundary for the
+// Community+ resource families. It never grants write, execute, or admin.
+func GlobalObserverRole() Role {
+	return globalReadOnlyRole("global_observer")
+}
+
+// GlobalObserverPlusRole currently has the same Community+ resource-family
+// permissions as observer. Fleet's observer_plus differences concern more
+// granular data surfaces that Community+ does not expose yet.
+func GlobalObserverPlusRole() Role {
+	return globalReadOnlyRole("global_observer_plus")
+}
+
+func globalReadOnlyRole(name string) Role {
+	permissions := make([]Permission, 0, len(globalObserverResources))
+	for _, resource := range globalObserverResources {
+		permissions = append(permissions, Permission{Resource: resource, Action: ActionRead, Scope: GlobalScope()})
+	}
+	return Role{Name: name, Permissions: permissions}
+}
+
+// ObserverRole creates a read-only role for one Fleet. Fleet team roles are
+// also allowed to read global app configuration, represented here by the
+// Community+ settings capability surface.
 func ObserverRole(fleetID uint) (Role, error) {
+	return fleetObserverRole("observer", fleetID)
+}
+
+// ObserverPlusRole is scoped identically until Community+ exposes a resource
+// that corresponds to Fleet's observer_plus-only data surfaces.
+func ObserverPlusRole(fleetID uint) (Role, error) {
+	return fleetObserverRole("observer_plus", fleetID)
+}
+
+func fleetObserverRole(name string, fleetID uint) (Role, error) {
 	scope := FleetScope(fleetID)
 	if err := scope.Validate(); err != nil {
 		return Role{}, err
 	}
-	resources := []Resource{
-		ResourceHosts, ResourceFleets, ResourcePolicies, ResourceSoftware,
-		ResourceMDM, ResourceVulnerabilities, ResourceReports, ResourceAudit,
-		ResourceAutomations,
-	}
-	permissions := make([]Permission, 0, len(resources))
-	for _, resource := range resources {
+	permissions := make([]Permission, 0, len(observerFleetResources)+1)
+	for _, resource := range observerFleetResources {
 		permissions = append(permissions, Permission{Resource: resource, Action: ActionRead, Scope: scope})
 	}
-	return Role{Name: "observer", Permissions: permissions}, nil
+	permissions = append(permissions, Permission{Resource: ResourceSettings, Action: ActionRead, Scope: GlobalScope()})
+	return Role{Name: name, Permissions: permissions}, nil
 }
