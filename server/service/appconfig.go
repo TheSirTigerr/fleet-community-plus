@@ -385,7 +385,6 @@ func applyAndValidateConditionalAccessOktaFields(
 	appConfig *fleet.AppConfig,
 	newAppConfig *fleet.AppConfig,
 	invalid *fleet.InvalidArgumentError,
-	lic *fleet.LicenseInfo,
 ) error {
 	if appConfig.ConditionalAccess == nil {
 		appConfig.ConditionalAccess = &fleet.ConditionalAccessSettings{}
@@ -394,8 +393,7 @@ func applyAndValidateConditionalAccessOktaFields(
 		newAppConfig.ConditionalAccess = &fleet.ConditionalAccessSettings{}
 	}
 
-	// Normalize incoming Okta fields (trim whitespace) BEFORE the premium-license gate so a
-	// whitespace-only input that would persist as empty does not trip the license check.
+	// Normalize incoming Okta fields so whitespace-only values persist as empty.
 	normalizeOptString := func(src optjson.String) optjson.String {
 		if src.Set && src.Valid {
 			src.Value = strings.TrimSpace(src.Value)
@@ -415,14 +413,6 @@ func applyAndValidateConditionalAccessOktaFields(
 	applyOptString(&appConfig.ConditionalAccess.OktaAssertionConsumerServiceURL, oktaACSURL)
 	applyOptString(&appConfig.ConditionalAccess.OktaAudienceURI, oktaAudienceURI)
 	applyOptString(&appConfig.ConditionalAccess.OktaCertificate, oktaCert)
-
-	isNonEmpty := func(s optjson.String) bool {
-		return s.Set && s.Valid && s.Value != ""
-	}
-	oktaFieldsBeingSet := isNonEmpty(oktaIDPID) ||
-		isNonEmpty(oktaACSURL) ||
-		isNonEmpty(oktaAudienceURI) ||
-		isNonEmpty(oktaCert)
 
 	oktaFieldsSet := 0
 	if appConfig.ConditionalAccess.OktaIDPID.Valid && appConfig.ConditionalAccess.OktaIDPID.Value != "" {
@@ -1085,7 +1075,7 @@ func (svc *Service) ModifyAppConfig(ctx context.Context, p []byte, applyOpts fle
 	fleet.ValidateEnabledHostStatusIntegrations(appConfig.WebhookSettings.HostStatusWebhook, invalid)
 	fleet.ValidateEnabledActivitiesWebhook(appConfig.WebhookSettings.ActivitiesWebhook, invalid)
 
-	if err := applyAndValidateConditionalAccessOktaFields(ctx, appConfig, &newAppConfig, invalid, lic); err != nil {
+	if err := applyAndValidateConditionalAccessOktaFields(ctx, appConfig, &newAppConfig, invalid); err != nil {
 		return nil, err
 	}
 
