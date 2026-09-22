@@ -74,6 +74,27 @@ const LoginPage = ({ router, location }: ILoginPageProps) => {
     select: (data) => data.settings,
   });
 
+  const {
+    data: communityPlusOIDCSettings,
+    isLoading: isLoadingCommunityPlusOIDCSettings,
+  } = useQuery<ISSOSettingsResponse, Error, ISSOSettings>(
+    ["communityPlusOIDCSettings"],
+    () => sessionsAPI.communityPlusOIDCSettings(),
+    {
+      enabled: !currentUser,
+      onError: (err) => {
+        console.error(err);
+      },
+      select: (data) => data.settings,
+    }
+  );
+
+  const communityPlusOIDCEnabled =
+    communityPlusOIDCSettings?.sso_enabled === true;
+  const effectiveSSOSettings = communityPlusOIDCEnabled
+    ? communityPlusOIDCSettings
+    : ssoSettings;
+
   useEffect(() => {
     // this only needs to run once so we can wrap it in useEffect to avoid unneccesary third-party
     // API calls
@@ -179,6 +200,11 @@ const LoginPage = ({ router, location }: ILoginPageProps) => {
       returnToAfterAuth = redirectLocation;
     }
 
+    if (communityPlusOIDCEnabled) {
+      sessionsAPI.initializeCommunityPlusOIDC(returnToAfterAuth);
+      return;
+    }
+
     try {
       const { url } = await sessionsAPI.initializeSSO(returnToAfterAuth);
       window.location.href = url;
@@ -192,9 +218,9 @@ const LoginPage = ({ router, location }: ILoginPageProps) => {
       const errorObject = formatErrorResponse(ssoError);
       setErrors(errorObject);
     }
-  }, [redirectLocation]);
+  }, [communityPlusOIDCEnabled, redirectLocation]);
 
-  if (isLoadingSSOSettings) {
+  if (isLoadingSSOSettings || isLoadingCommunityPlusOIDCSettings) {
     return <Spinner className={`${baseClass}__loading-spinner`} />;
   }
 
@@ -203,7 +229,7 @@ const LoginPage = ({ router, location }: ILoginPageProps) => {
       <LoginForm
         handleSubmit={onSubmit}
         baseError={errors.base}
-        ssoSettings={ssoSettings}
+        ssoSettings={effectiveSSOSettings}
         handleSSOSignOn={ssoSignOn}
         isSubmitting={isSubmitting}
         pendingEmail={pendingEmail}
