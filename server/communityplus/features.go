@@ -19,6 +19,7 @@ const (
 	FeatureRBAC                    Feature = "rbac"
 	FeatureAuditLog                Feature = "audit_log"
 	FeaturePolicyAutomation        Feature = "policy_automation"
+	FeatureFleetPoliciesQueries   Feature = "fleet_policies_queries"
 	FeatureSoftwareAutomation      Feature = "software_automation"
 	FeaturePatchPolicies           Feature = "patch_policies"
 	FeatureAdvancedMDM             Feature = "advanced_mdm"
@@ -51,6 +52,7 @@ var knownFeatures = []Feature{
 	FeatureRBAC,
 	FeatureAuditLog,
 	FeaturePolicyAutomation,
+	FeatureFleetPoliciesQueries,
 	FeatureSoftwareAutomation,
 	FeaturePatchPolicies,
 	FeatureAdvancedMDM,
