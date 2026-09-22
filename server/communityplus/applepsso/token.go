@@ -20,11 +20,11 @@ import (
 const defaultIdPTokenLifetime = time.Hour
 
 type tokenSettings struct {
-	issuerURL    string
-	idpTokenURL  string
-	idpClientID  string
-	idpSecret    string
-	idpScopes    string
+	issuerURL   string
+	idpTokenURL string
+	idpClientID string
+	idpSecret   string
+	idpScopes   string
 }
 
 type upstreamTokenResponse struct {
