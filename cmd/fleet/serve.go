@@ -1016,13 +1016,15 @@ func runServeCmd(cmd *cobra.Command, configManager configpkg.Manager, debug, dev
 		}
 	}
 
+	// Community+ SCIM provisioning is available independently of the premium license.
+	if err = scim.RegisterSCIM(rootMux, ds, svc, logger, &config); err != nil {
+		initFatal(err, "setup SCIM")
+	}
+
 	if license.IsPremium() {
 		// SCEP proxy (for NDES, etc.)
 		if err = service.RegisterSCEPProxy(rootMux, ds, logger, nil, &config); err != nil {
 			initFatal(err, "setup SCEP proxy")
-		}
-		if err = scim.RegisterSCIM(rootMux, ds, svc, logger, &config); err != nil {
-			initFatal(err, "setup SCIM")
 		}
 		// Host identify and conditional access SCEP feature only works if a private key has been set up
 		if len(config.Server.PrivateKey) > 0 {
