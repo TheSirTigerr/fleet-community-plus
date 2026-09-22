@@ -26,6 +26,10 @@ type oidcFleetService interface {
 	GetSessionDuration(context.Context) time.Duration
 }
 
+type oidcJITFleetService interface {
+	CommunityPlusGetSSOUser(context.Context, fleet.Auth, bool) (*fleet.User, error)
+}
+
 type oidcProtocol interface {
 	Begin(context.Context, OIDCSettings, string) (oidc.FlowState, string, error)
 	Complete(context.Context, OIDCSettings, string, string, oidc.FlowState) (*oidc.Identity, error)
@@ -187,7 +191,13 @@ func (a *OIDCLoginAPI) callback(w http.ResponseWriter, r *http.Request) {
 		writePublicOIDCError(w, http.StatusUnauthorized)
 		return
 	}
-	user, err := a.fleetSvc.GetSSOUser(r.Context(), oidcFleetAuth{identity: identity})
+	auth := oidcFleetAuth{identity: identity}
+	var user *fleet.User
+	if jitSvc, ok := a.fleetSvc.(oidcJITFleetService); ok {
+		user, err = jitSvc.CommunityPlusGetSSOUser(r.Context(), auth, settings.EnableJITProvisioning)
+	} else {
+		user, err = a.fleetSvc.GetSSOUser(r.Context(), auth)
+	}
 	if err != nil {
 		writePublicOIDCError(w, http.StatusUnauthorized)
 		return
