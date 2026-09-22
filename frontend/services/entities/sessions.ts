@@ -1,6 +1,7 @@
 import { ISSOSettings } from "interfaces/ssoSettings";
 import { ITeamSummary } from "interfaces/team";
 import { IUser } from "interfaces/user";
+import URL_PREFIX from "router/url_prefix";
 import sendRequest from "services";
 import endpoints from "utilities/endpoints";
 import helpers from "utilities/helpers";
@@ -25,6 +26,11 @@ export interface ILoginResponse {
   token: string;
   token_expires_at?: string;
 }
+
+const COMMUNITY_PLUS_OIDC_SETTINGS =
+  "/latest/fleet/communityplus/sso/oidc/session";
+const COMMUNITY_PLUS_OIDC_AUTHORIZE =
+  "/api/v1/fleet/communityplus/sso/oidc/authorize";
 
 export default {
   login: ({ email, password }: ILoginProps): Promise<ILoginResponse> => {
@@ -84,5 +90,13 @@ export default {
   ssoSettings: (): Promise<ISSOSettingsResponse> => {
     const { SSO } = endpoints;
     return sendRequest("GET", SSO);
+  },
+  communityPlusOIDCSettings: (): Promise<ISSOSettingsResponse> => {
+    return sendRequest("GET", COMMUNITY_PLUS_OIDC_SETTINGS);
+  },
+  initializeCommunityPlusOIDC: (redirectUrl: string) => {
+    const { origin } = global.window.location;
+    const query = new URLSearchParams({ redirect_url: redirectUrl });
+    global.window.location.href = `${origin}${URL_PREFIX}${COMMUNITY_PLUS_OIDC_AUTHORIZE}?${query.toString()}`;
   },
 };
