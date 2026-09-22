@@ -463,6 +463,8 @@ func writeAPIError(w http.ResponseWriter, err error) {
 		status = http.StatusUnauthorized
 	case errors.Is(err, ErrForbidden):
 		status = http.StatusForbidden
+	case errors.Is(err, ErrScopeConflict):
+		status = http.StatusConflict
 	case strings.Contains(err.Error(), "invalid"), strings.Contains(err.Error(), "required"), strings.Contains(err.Error(), "must"):
 		status = http.StatusBadRequest
 	}

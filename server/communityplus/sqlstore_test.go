@@ -2,6 +2,7 @@ package communityplus
 
 import (
 	"context"
+	"errors"
 	"testing"
 	"time"
 
@@ -72,6 +73,9 @@ func TestSQLStoreUpsertsAndListsAutomationRules(t *testing.T) {
 			true, sqlmock.AnyArg(), sqlmock.AnyArg(),
 		).
 		WillReturnResult(sqlmock.NewResult(1, 1))
+	mock.ExpectQuery("SELECT scope_kind, fleet_id FROM communityplus_automation_rules").
+		WithArgs(rule.ID).
+		WillReturnRows(sqlmock.NewRows([]string{"scope_kind", "fleet_id"}).AddRow(ScopeFleet, 12))
 	if err := store.UpsertAutomationRule(context.Background(), rule); err != nil {
 		t.Fatalf("upsert automation rule: %v", err)
 	}
@@ -166,5 +170,63 @@ func TestRestoreAutomationRules(t *testing.T) {
 	}
 	if len(executed) != 1 || executed[0] != rule.ID {
 		t.Fatalf("unexpected executed rules: %#v", executed)
+	}
+}
+
+func TestSQLStoreRejectsAutomationRuleScopeChange(t *testing.T) {
+	db, mock, err := sqlmock.New()
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer db.Close()
+	store, err := NewSQLStore(db)
+	if err != nil {
+		t.Fatal(err)
+	}
+	rule := AutomationRule{
+		ID: "shared-id", Name: "Fleet 12 rule", Scope: FleetScope(12),
+		Trigger: TriggerPolicyFailed, Action: AutomationNotify, Enabled: true,
+	}
+	mock.ExpectExec("name = IF\\(scope_kind = VALUES\\(scope_kind\\) AND fleet_id <=> VALUES\\(fleet_id\\)").
+		WithArgs(rule.ID, rule.Name, ScopeFleet, uint(12), rule.Trigger, rule.Action, true, sqlmock.AnyArg(), sqlmock.AnyArg()).
+		WillReturnResult(sqlmock.NewResult(0, 0))
+	mock.ExpectQuery("SELECT scope_kind, fleet_id FROM communityplus_automation_rules").
+		WithArgs(rule.ID).
+		WillReturnRows(sqlmock.NewRows([]string{"scope_kind", "fleet_id"}).AddRow(ScopeFleet, 13))
+	err = store.UpsertAutomationRule(context.Background(), rule)
+	if !errors.Is(err, ErrScopeConflict) {
+		t.Fatalf("expected ErrScopeConflict, got %v", err)
+	}
+	if err := mock.ExpectationsWereMet(); err != nil {
+		t.Fatal(err)
+	}
+}
+
+func TestSQLStoreRejectsDeploymentScopeChange(t *testing.T) {
+	db, mock, err := sqlmock.New()
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer db.Close()
+	store, err := NewSQLStore(db)
+	if err != nil {
+		t.Fatal(err)
+	}
+	deployment := Deployment{
+		ID: "shared-deployment", CatalogEntryID: "entry-1", Scope: FleetScope(7),
+		Automatic: true, CreatedAt: time.Now().UTC(), CreatedBy: "user-7",
+	}
+	mock.ExpectExec("catalog_entry_id = IF\\(fleet_id = VALUES\\(fleet_id\\)").
+		WithArgs(deployment.ID, deployment.CatalogEntryID, uint(7), false, true, false, deployment.CreatedAt, deployment.CreatedBy).
+		WillReturnResult(sqlmock.NewResult(0, 0))
+	mock.ExpectQuery("SELECT fleet_id FROM communityplus_catalog_deployments").
+		WithArgs(deployment.ID).
+		WillReturnRows(sqlmock.NewRows([]string{"fleet_id"}).AddRow(8))
+	err = store.UpsertDeployment(context.Background(), deployment)
+	if !errors.Is(err, ErrScopeConflict) {
+		t.Fatalf("expected ErrScopeConflict, got %v", err)
+	}
+	if err := mock.ExpectationsWereMet(); err != nil {
+		t.Fatal(err)
 	}
 }

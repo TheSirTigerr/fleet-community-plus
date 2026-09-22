@@ -181,14 +181,36 @@ INSERT INTO communityplus_automation_rules
     (id, name, scope_kind, fleet_id, trigger_name, action_name, enabled, conditions, config)
 VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
 ON DUPLICATE KEY UPDATE
-    name = VALUES(name), scope_kind = VALUES(scope_kind), fleet_id = VALUES(fleet_id),
-    trigger_name = VALUES(trigger_name), action_name = VALUES(action_name),
-    enabled = VALUES(enabled), conditions = VALUES(conditions), config = VALUES(config)`,
+    name = IF(scope_kind = VALUES(scope_kind) AND fleet_id <=> VALUES(fleet_id), VALUES(name), name),
+    trigger_name = IF(scope_kind = VALUES(scope_kind) AND fleet_id <=> VALUES(fleet_id), VALUES(trigger_name), trigger_name),
+    action_name = IF(scope_kind = VALUES(scope_kind) AND fleet_id <=> VALUES(fleet_id), VALUES(action_name), action_name),
+    enabled = IF(scope_kind = VALUES(scope_kind) AND fleet_id <=> VALUES(fleet_id), VALUES(enabled), enabled),
+    conditions = IF(scope_kind = VALUES(scope_kind) AND fleet_id <=> VALUES(fleet_id), VALUES(conditions), conditions),
+    config = IF(scope_kind = VALUES(scope_kind) AND fleet_id <=> VALUES(fleet_id), VALUES(config), config)`,
 		rule.ID, rule.Name, rule.Scope.Kind, fleetID, rule.Trigger, rule.Action,
 		rule.Enabled, conditions, config,
 	)
 	if err != nil {
 		return fmt.Errorf("communityplus: upsert automation rule: %w", err)
+	}
+
+	var storedKind ScopeKind
+	var storedFleetID sql.NullInt64
+	if err := s.db.QueryRowContext(ctx, `SELECT scope_kind, fleet_id FROM communityplus_automation_rules WHERE id = ?`, rule.ID).Scan(&storedKind, &storedFleetID); err != nil {
+		return fmt.Errorf("communityplus: verify automation rule scope: %w", err)
+	}
+	storedScope := Scope{Kind: storedKind}
+	if storedFleetID.Valid {
+		if storedFleetID.Int64 <= 0 {
+			return fmt.Errorf("communityplus: invalid stored automation fleet_id %d", storedFleetID.Int64)
+		}
+		storedScope.FleetID = uint(storedFleetID.Int64)
+	}
+	if err := storedScope.Validate(); err != nil {
+		return fmt.Errorf("communityplus: validate stored automation scope: %w", err)
+	}
+	if storedScope != rule.Scope {
+		return fmt.Errorf("%w: automation rule %q", ErrScopeConflict, rule.ID)
 	}
 	return nil
 }
@@ -327,9 +349,23 @@ func (s *SQLStore) UpsertDeployment(ctx context.Context, deployment Deployment) 
 	_, err := s.db.ExecContext(ctx, `
 INSERT INTO communityplus_catalog_deployments (id, catalog_entry_id, fleet_id, self_service, automatic_install, patch, created_at, created_by)
 VALUES (?, ?, ?, ?, ?, ?, ?, ?)
-ON DUPLICATE KEY UPDATE catalog_entry_id = VALUES(catalog_entry_id), fleet_id = VALUES(fleet_id), self_service = VALUES(self_service), automatic_install = VALUES(automatic_install), patch = VALUES(patch), created_at = VALUES(created_at), created_by = VALUES(created_by)`, deployment.ID, deployment.CatalogEntryID, deployment.Scope.FleetID, deployment.SelfService, deployment.Automatic, deployment.Patch, deployment.CreatedAt, deployment.CreatedBy)
+ON DUPLICATE KEY UPDATE
+    catalog_entry_id = IF(fleet_id = VALUES(fleet_id), VALUES(catalog_entry_id), catalog_entry_id),
+    self_service = IF(fleet_id = VALUES(fleet_id), VALUES(self_service), self_service),
+    automatic_install = IF(fleet_id = VALUES(fleet_id), VALUES(automatic_install), automatic_install),
+    patch = IF(fleet_id = VALUES(fleet_id), VALUES(patch), patch),
+    created_at = IF(fleet_id = VALUES(fleet_id), VALUES(created_at), created_at),
+    created_by = IF(fleet_id = VALUES(fleet_id), VALUES(created_by), created_by)`, deployment.ID, deployment.CatalogEntryID, deployment.Scope.FleetID, deployment.SelfService, deployment.Automatic, deployment.Patch, deployment.CreatedAt, deployment.CreatedBy)
 	if err != nil {
 		return fmt.Errorf("communityplus: upsert catalog deployment: %w", err)
+	}
+
+	var storedFleetID uint
+	if err := s.db.QueryRowContext(ctx, `SELECT fleet_id FROM communityplus_catalog_deployments WHERE id = ?`, deployment.ID).Scan(&storedFleetID); err != nil {
+		return fmt.Errorf("communityplus: verify catalog deployment scope: %w", err)
+	}
+	if storedFleetID != deployment.Scope.FleetID {
+		return fmt.Errorf("%w: catalog deployment %q", ErrScopeConflict, deployment.ID)
 	}
 	return nil
 }

@@ -240,6 +240,7 @@ func TestWriteAPIErrorStatus(t *testing.T) {
 	}{
 		{ErrUnauthenticated, http.StatusUnauthorized},
 		{ErrForbidden, http.StatusForbidden},
+		{ErrScopeConflict, http.StatusConflict},
 		{errors.New("invalid value"), http.StatusBadRequest},
 		{errors.New("database unavailable"), http.StatusInternalServerError},
 	}
