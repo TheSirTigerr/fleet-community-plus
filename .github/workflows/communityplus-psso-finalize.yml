@@ -12,6 +12,7 @@ permissions:
 
 jobs:
   finalize:
+    # This guarded workflow is temporary and removed after a successful patch.
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
