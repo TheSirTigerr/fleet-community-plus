@@ -99,11 +99,11 @@ func (a *OIDCSettingsAPI) put(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	if err := a.audit.Record(r.Context(), AuditEvent{
-		ActorID: actorID,
-		Action: "oidc_settings.update",
-		Resource: ResourceSettings,
+		ActorID:    actorID,
+		Action:     "oidc_settings.update",
+		Resource:   ResourceSettings,
 		ResourceID: "oidc",
-		Scope: GlobalScope(),
+		Scope:      GlobalScope(),
 		Metadata: map[string]string{
 			"enabled": strconv.FormatBool(settings.Enabled),
 			"issuer":  settings.IssuerURL,
