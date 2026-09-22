@@ -18,8 +18,8 @@ func newHealthProvider(ds fleet.Datastore) *deviceHealthSessionProvider {
 }
 
 func setHealthHostMocks(ds *fleetmock.Store, protected []uint, policies []*fleet.HostPolicy) {
-	ds.HostLiteFunc = func(context.Context, uint) (*fleet.HostLite, error) {
-		return &fleet.HostLite{ID: 42, Platform: "darwin"}, nil
+	ds.HostLiteFunc = func(context.Context, uint) (*fleet.Host, error) {
+		return &fleet.Host{ID: 42, Platform: "darwin"}, nil
 	}
 	ds.GetPoliciesForConditionalAccessFunc = func(context.Context, uint, string) ([]uint, error) {
 		return protected, nil
