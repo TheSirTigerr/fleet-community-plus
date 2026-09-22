@@ -13,6 +13,12 @@ func rolesForFleetUser(user *fleet.User) []Role {
 		switch *user.GlobalRole {
 		case fleet.RoleAdmin:
 			roles = append(roles, GlobalAdminRole())
+		case fleet.RoleMaintainer:
+			roles = append(roles, GlobalMaintainerRole())
+		case fleet.RoleTechnician:
+			roles = append(roles, GlobalTechnicianRole())
+		case fleet.RoleGitOps:
+			roles = append(roles, GlobalGitOpsRole())
 		case fleet.RoleObserver:
 			roles = append(roles, GlobalObserverRole())
 		case fleet.RoleObserverPlus:
@@ -27,6 +33,12 @@ func rolesForFleetUser(user *fleet.User) []Role {
 		switch team.Role {
 		case fleet.RoleAdmin:
 			role, err = FleetAdminRole(team.ID)
+		case fleet.RoleMaintainer:
+			role, err = MaintainerRole(team.ID)
+		case fleet.RoleTechnician:
+			role, err = TechnicianRole(team.ID)
+		case fleet.RoleGitOps:
+			role, err = GitOpsRole(team.ID)
 		case fleet.RoleObserver:
 			role, err = ObserverRole(team.ID)
 		case fleet.RoleObserverPlus:
