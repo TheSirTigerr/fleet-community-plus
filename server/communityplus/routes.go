@@ -30,9 +30,9 @@ func (ViewerAccess) Authorize(ctx context.Context, request Request) (string, err
 	return "", ErrForbidden
 }
 
-// GetRoutes exposes Community+ catalog APIs through Fleet's normal user
-// authentication middleware. The implementation is deliberately separate
-// from Fleet's premium service methods and has no license dependency.
+// GetRoutes exposes Community+ APIs through Fleet's normal user authentication
+// middleware. The implementation is deliberately separate from Fleet's premium
+// service methods and has no license dependency.
 func GetRoutes(fleetSvc fleet.Service, store *SQLStore) endpointer.HandlerRoutesFunc {
 	return func(r *mux.Router, _ []kithttp.ServerOption) {
 		engine, err := NewAutomationEngine(&noopAutomationExecutor{})
@@ -48,10 +48,22 @@ func GetRoutes(fleetSvc fleet.Service, store *SQLStore) endpointer.HandlerRoutes
 		if err != nil {
 			panic(err)
 		}
-		communityPlusHandler := api.WithHomebrew(api.Handler())
-		handler := auth.AuthenticatedUserMiddleware(fleetSvc, func(w http.ResponseWriter, detail string, status int) {
+		oidcSettingsAPI, err := NewOIDCSettingsAPI(store, ViewerAccess{}, store)
+		if err != nil {
+			panic(err)
+		}
+
+		authError := func(w http.ResponseWriter, detail string, status int) {
 			writeJSON(w, status, map[string]string{"error": detail})
-		}, communityPlusHandler)
+		}
+		oidcSettingsHandler := auth.AuthenticatedUserMiddleware(fleetSvc, authError, oidcSettingsAPI.Handler())
+		for _, version := range []string{"v1", "2022-04", "latest"} {
+			r.Handle("/api/"+version+"/fleet/communityplus/sso/oidc", oidcSettingsHandler).
+				Methods(http.MethodGet, http.MethodPut)
+		}
+
+		communityPlusHandler := api.WithHomebrew(api.Handler())
+		handler := auth.AuthenticatedUserMiddleware(fleetSvc, authError, communityPlusHandler)
 		r.PathPrefix("/api/").Handler(handler).Methods(http.MethodGet, http.MethodPost, http.MethodPut, http.MethodDelete)
 	}
 }
