@@ -1,5 +1,6 @@
 name: Community+ SCIM mount
 
+# One-shot guarded integration patch; removed after the mount succeeds.
 on:
   push:
     branches:
