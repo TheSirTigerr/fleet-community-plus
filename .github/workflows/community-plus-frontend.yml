@@ -1,0 +1,52 @@
+name: Community+ frontend checks
+
+on:
+  push:
+    branches:
+      - main
+      - 'community-plus/**'
+    paths:
+      - 'frontend/pages/LoginPage/LoginPage.tsx'
+      - 'frontend/services/entities/sessions.ts'
+      - '.github/workflows/community-plus-frontend.yml'
+  pull_request:
+    paths:
+      - 'frontend/pages/LoginPage/LoginPage.tsx'
+      - 'frontend/services/entities/sessions.ts'
+      - '.github/workflows/community-plus-frontend.yml'
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  frontend:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Check out repository
+        uses: actions/checkout@v4
+
+      - name: Set up Node
+        uses: actions/setup-node@v4
+        with:
+          node-version: '24.10.0'
+
+      - name: Enable Yarn
+        run: |
+          corepack enable
+          corepack prepare yarn@1.22.22 --activate
+
+      - name: Install frontend dependencies
+        run: yarn install --frozen-lockfile --ignore-scripts
+
+      - name: Check Community+ frontend formatting
+        run: >-
+          yarn prettier --check
+          frontend/pages/LoginPage/LoginPage.tsx
+          frontend/services/entities/sessions.ts
+
+      - name: Lint Community+ frontend integration
+        run: >-
+          yarn eslint
+          frontend/pages/LoginPage/LoginPage.tsx
+          frontend/services/entities/sessions.ts
