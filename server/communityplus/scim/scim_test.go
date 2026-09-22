@@ -62,9 +62,14 @@ func TestListUsersSupportsEntraFilter(t *testing.T) {
 func TestPatchUserActive(t *testing.T) {
 	ds := new(fleet_mock.Store)
 	active := true
+	fleetUserID := uint(99)
 	ds.ScimUserByIDFunc = func(_ context.Context, id uint) (*fleet.ScimUser, error) {
 		require.Equal(t, uint(7), id)
-		return &fleet.ScimUser{ID: 7, UserName: "user@example.com", Active: &active}, nil
+		return &fleet.ScimUser{ID: 7, UserName: "user@example.com", Active: &active, FleetUserID: &fleetUserID}, nil
+	}
+	ds.UserByIDFunc = func(_ context.Context, id uint) (*fleet.User, error) {
+		require.Equal(t, fleetUserID, id)
+		return &fleet.User{ID: id, Email: "user@example.com", SSOEnabled: false}, nil
 	}
 	var replaced *fleet.ScimUser
 	ds.ReplaceScimUserFunc = func(_ context.Context, user *fleet.ScimUser) ([]fleet.ActivityTypeResentCertificate, error) {
@@ -81,4 +86,5 @@ func TestPatchUserActive(t *testing.T) {
 	require.NotNil(t, replaced)
 	require.NotNil(t, replaced.Active)
 	require.False(t, *replaced.Active)
+	require.False(t, ds.DeleteUserFuncInvoked)
 }
