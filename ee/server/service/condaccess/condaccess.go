@@ -1,8 +1,12 @@
-// Package condaccess is a compatibility boundary for the Community+ build.
+// Package condaccess is a compatibility facade for Community+ conditional access.
 package condaccess
 
-// RegisterSCEP intentionally registers no legacy premium routes.
-func RegisterSCEP(_ any, _ any, _ any, _ any, _ any, _ any) error { return nil }
+import communitycondaccess "github.com/fleetdm/fleet/v4/server/communityplus/condaccess"
 
-// RegisterIdP intentionally registers no legacy premium routes.
-func RegisterIdP(_ any, _ any, _ any, _ any, _ any) error { return nil }
+func RegisterSCEP(a, b, c, d, e, f any) error {
+	return communitycondaccess.RegisterSCEP(a, b, c, d, e, f)
+}
+
+func RegisterIdP(a, b, c, d, e any) error {
+	return communitycondaccess.RegisterIdP(a, b, c, d, e)
+}
