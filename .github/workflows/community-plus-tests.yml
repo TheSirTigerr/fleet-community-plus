@@ -7,7 +7,7 @@ on:
       - 'community-plus/**'
     paths:
       - 'server/communityplus/**'
-      - 'server/service/communityplus_jit.go'
+      - 'server/service/communityplus_jit*.go'
       - 'server/service/sessions.go'
       - 'server/service/appconfig.go'
       - 'cmd/fleetctl/fleetctl/communityplus_*.go'
@@ -39,7 +39,7 @@ on:
   pull_request:
     paths:
       - 'server/communityplus/**'
-      - 'server/service/communityplus_jit.go'
+      - 'server/service/communityplus_jit*.go'
       - 'server/service/sessions.go'
       - 'server/service/appconfig.go'
       - 'cmd/fleetctl/fleetctl/communityplus_*.go'
@@ -90,7 +90,7 @@ jobs:
         shell: bash
         run: |
           set -euo pipefail
-          files="$(find server/communityplus server/mdm/maintainedapps orbit/pkg/communityplus ee/pkg/hostidentity/types ee/server/service/hostidentity/httpsig ee/server/service/digicert ee/server/service/scep ee/maintained-apps ee/server/licensing ee/fleetctl -name '*.go' -type f -print; find cmd/fleetctl/fleetctl -maxdepth 1 -name 'communityplus_*.go' -type f -print; printf '%s\n' cmd/fleetctl/fleetctl/fleetctl.go server/service/communityplus_jit.go server/service/sessions.go server/service/appconfig.go)"
+          files="$(find server/communityplus server/mdm/maintainedapps orbit/pkg/communityplus ee/pkg/hostidentity/types ee/server/service/hostidentity/httpsig ee/server/service/digicert ee/server/service/scep ee/maintained-apps ee/server/licensing ee/fleetctl -name '*.go' -type f -print; find server/service -maxdepth 1 -name 'communityplus_jit*.go' -type f -print; find cmd/fleetctl/fleetctl -maxdepth 1 -name 'communityplus_*.go' -type f -print; printf '%s\n' cmd/fleetctl/fleetctl/fleetctl.go server/service/sessions.go server/service/appconfig.go)"
           test -n "$files"
           unformatted="$(gofmt -l $files)"
           if [ -n "$unformatted" ]; then
@@ -121,6 +121,9 @@ jobs:
           ./ee/server/service/est
           ./ee/server/webhooks
           ./server/vulnerabilities/nvd/tools/cvefeed/...
+
+      - name: Test Community+ JIT service
+        run: go test ./server/service -run '^TestCommunityPlusGetSSOUser'
 
       - name: Test Community+ fleetctl
         run: go test ./cmd/fleetctl/fleetctl -run 'TestCommunityPlus|TestFleetGitOps'
