@@ -1,0 +1,172 @@
+name: Community+ migrate audit query
+
+on:
+  push:
+    branches:
+      - community-plus/foundation
+    paths:
+      - '.github/workflows/community-plus-migrate-audit-query.yml'
+
+permissions:
+  contents: write
+
+jobs:
+  migrate:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          ref: community-plus/foundation
+      - name: Wire audit filtering and cursor pagination
+        shell: python
+        run: |
+          from pathlib import Path
+
+          sql = Path('server/communityplus/sqlstore.go')
+          text = sql.read_text()
+          old_filter = '''// AuditFilter limits audit results. FleetID nil means all scopes.
+          type AuditFilter struct {
+          \tFleetID *uint
+          \tLimit   int
+          }
+
+          '''
+          if old_filter not in text:
+              raise SystemExit('old AuditFilter block not found')
+          text = text.replace(old_filter, '', 1)
+          if '"strings"' not in text:
+              text = text.replace('"fmt"\n', '"fmt"\n\t"strings"\n', 1)
+          start = text.index('func (s *SQLStore) ListAuditEvents')
+          end = text.index('// UpsertAutomationRule', start)
+          new_list = r'''func (s *SQLStore) ListAuditEvents(ctx context.Context, filter AuditFilter) ([]AuditEvent, error) {
+          	if err := filter.Validate(); err != nil {
+          		return nil, err
+          	}
+          	limit := filter.normalizedLimit()
+          	query := `
+          SELECT id, occurred_at, actor_id, action, resource, COALESCE(resource_id, ''),
+                 scope_kind, fleet_id, metadata
+          FROM communityplus_audit_events`
+          	conditions := make([]string, 0, 8)
+          	args := make([]any, 0, 12)
+          	if filter.FleetID != nil {
+          		conditions = append(conditions, "fleet_id = ?")
+          		args = append(args, *filter.FleetID)
+          	}
+          	if filter.ActorID != "" {
+          		conditions = append(conditions, "actor_id = ?")
+          		args = append(args, filter.ActorID)
+          	}
+          	if filter.Action != "" {
+          		conditions = append(conditions, "action = ?")
+          		args = append(args, filter.Action)
+          	}
+          	if filter.Resource != "" {
+          		conditions = append(conditions, "resource = ?")
+          		args = append(args, filter.Resource)
+          	}
+          	if filter.ResourceID != "" {
+          		conditions = append(conditions, "resource_id = ?")
+          		args = append(args, filter.ResourceID)
+          	}
+          	if filter.From != nil {
+          		conditions = append(conditions, "occurred_at >= ?")
+          		args = append(args, *filter.From)
+          	}
+          	if filter.Until != nil {
+          		conditions = append(conditions, "occurred_at <= ?")
+          		args = append(args, *filter.Until)
+          	}
+          	if filter.Before != nil {
+          		conditions = append(conditions, "(occurred_at < ? OR (occurred_at = ? AND id < ?))")
+          		args = append(args, filter.Before.Before, filter.Before.Before, filter.Before.BeforeID)
+          	}
+          	if len(conditions) > 0 {
+          		query += " WHERE " + strings.Join(conditions, " AND ")
+          	}
+          	query += ` ORDER BY occurred_at DESC, id DESC LIMIT ?`
+          	args = append(args, limit)
+
+          	rows, err := s.db.QueryContext(ctx, query, args...)
+          	if err != nil {
+          		return nil, fmt.Errorf("communityplus: list audit events: %w", err)
+          	}
+          	defer rows.Close()
+
+          	events := make([]AuditEvent, 0)
+          	for rows.Next() {
+          		var event AuditEvent
+          		var fleetID sql.NullInt64
+          		var metadata []byte
+          		if err := rows.Scan(
+          			&event.ID, &event.OccurredAt, &event.ActorID, &event.Action, &event.Resource,
+          			&event.ResourceID, &event.Scope.Kind, &fleetID, &metadata,
+          		); err != nil {
+          			return nil, fmt.Errorf("communityplus: scan audit event: %w", err)
+          		}
+          		if fleetID.Valid {
+          			if fleetID.Int64 <= 0 {
+          				return nil, fmt.Errorf("communityplus: invalid stored audit fleet_id %d", fleetID.Int64)
+          			}
+          			event.Scope.FleetID = uint(fleetID.Int64)
+          		}
+          		if len(metadata) > 0 && string(metadata) != "null" {
+          			if err := json.Unmarshal(metadata, &event.Metadata); err != nil {
+          				return nil, fmt.Errorf("communityplus: decode audit metadata for %q: %w", event.ID, err)
+          			}
+          		}
+          		if err := event.Validate(); err != nil {
+          			return nil, fmt.Errorf("communityplus: validate stored audit event %q: %w", event.ID, err)
+          		}
+          		events = append(events, event)
+          	}
+          	if err := rows.Err(); err != nil {
+          		return nil, fmt.Errorf("communityplus: iterate audit events: %w", err)
+          	}
+          	return events, nil
+          }
+
+          '''
+          text = text[:start] + new_list + text[end:]
+          sql.write_text(text)
+
+          http = Path('server/communityplus/httpapi.go')
+          text = http.read_text()
+          start = text.index('func (a *HTTPAPI) listAuditEvents')
+          end = text.index('func decodeJSONBody', start)
+          new_handler = r'''func (a *HTTPAPI) listAuditEvents(w http.ResponseWriter, r *http.Request) {
+          	filter, scope, err := ParseAuditFilter(r.URL.Query())
+          	if err != nil {
+          		writeAPIError(w, err)
+          		return
+          	}
+          	if _, err := a.access.Authorize(r.Context(), Request{
+          		Resource: ResourceAudit, Action: ActionRead, Scope: scope,
+          	}); err != nil {
+          		writeAPIError(w, err)
+          		return
+          	}
+          	events, err := a.auditStore.ListAuditEvents(r.Context(), filter)
+          	if err != nil {
+          		writeAPIError(w, err)
+          		return
+          	}
+          	response := map[string]any{"audit_events": events}
+          	if cursor := NextAuditCursor(events, filter.Limit); cursor != nil {
+          		response["next_cursor"] = cursor
+          	}
+          	writeJSON(w, http.StatusOK, response)
+          }
+
+          '''
+          text = text[:start] + new_handler + text[end:]
+          http.write_text(text)
+      - name: Format files
+        run: gofmt -w server/communityplus/sqlstore.go server/communityplus/httpapi.go
+      - name: Commit migration
+        run: |
+          git config user.name github-actions[bot]
+          git config user.email 41898282+github-actions[bot]@users.noreply.github.com
+          git add server/communityplus/sqlstore.go server/communityplus/httpapi.go
+          git diff --cached --quiet || git commit -m 'feat: wire audit filtering and pagination'
+          git push origin HEAD:community-plus/foundation
