@@ -1,6 +1,8 @@
-// Package hostidentity is a compatibility boundary for the Community+ build.
+// Package hostidentity is a compatibility facade for Community+ host identity.
 package hostidentity
 
-// RegisterSCEP intentionally registers no routes. Community+ exposes host
-// identity through its own capability gate; the legacy premium gate is closed.
-func RegisterSCEP(_ any, _ any, _ any, _ any, _ any) error { return nil }
+import communityhostidentity "github.com/fleetdm/fleet/v4/server/communityplus/hostidentity"
+
+func RegisterSCEP(a, b, c, d, e any) error {
+	return communityhostidentity.RegisterSCEP(a, b, c, d, e)
+}
