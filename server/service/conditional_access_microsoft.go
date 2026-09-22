@@ -6,7 +6,6 @@ import (
 
 	"github.com/fleetdm/fleet/v4/server/authz"
 	"github.com/fleetdm/fleet/v4/server/contexts/ctxerr"
-	"github.com/fleetdm/fleet/v4/server/contexts/license"
 	"github.com/fleetdm/fleet/v4/server/fleet"
 )
 
@@ -39,10 +38,6 @@ func (svc *Service) ConditionalAccessMicrosoftCreateIntegration(ctx context.Cont
 	// 0. Check user is authorized to create an integration.
 	if err := svc.authz.Authorize(ctx, &fleet.ConditionalAccessMicrosoftIntegration{}, fleet.ActionWrite); err != nil {
 		return "", ctxerr.Wrap(ctx, err, "failed to authorize")
-	}
-
-	if lic, _ := license.FromContext(ctx); lic == nil || !lic.IsPremium() {
-		return "", fleet.ErrMissingLicense
 	}
 
 	// Load current integration, if any.
@@ -117,10 +112,6 @@ func (svc *Service) ConditionalAccessMicrosoftConfirm(ctx context.Context) (conf
 		return false, "", ctxerr.Wrap(ctx, err, "failed to authorize")
 	}
 
-	if lic, _ := license.FromContext(ctx); lic == nil || !lic.IsPremium() {
-		return false, "", fleet.ErrMissingLicense
-	}
-
 	// Load current integration.
 	integration, err := svc.ds.ConditionalAccessMicrosoftGet(ctx)
 	if err != nil {
@@ -183,10 +174,6 @@ func (svc *Service) ConditionalAccessMicrosoftDelete(ctx context.Context) error 
 		return ctxerr.Wrap(ctx, err, "failed to authorize")
 	}
 
-	if lic, _ := license.FromContext(ctx); lic == nil || !lic.IsPremium() {
-		return fleet.ErrMissingLicense
-	}
-
 	// Load current integration.
 	integration, err := svc.ds.ConditionalAccessMicrosoftGet(ctx)
 	if err != nil {
@@ -230,10 +217,6 @@ func (svc *Service) ConditionalAccessMicrosoftGet(ctx context.Context) (*fleet.C
 	// Check user is authorized to read app config (which is where expose integration information)
 	if err := svc.authz.Authorize(ctx, &fleet.AppConfig{}, fleet.ActionRead); err != nil {
 		return nil, ctxerr.Wrap(ctx, err, "failed to authorize")
-	}
-
-	if lic, _ := license.FromContext(ctx); lic == nil || !lic.IsPremium() {
-		return nil, nil
 	}
 
 	// Load current integration.

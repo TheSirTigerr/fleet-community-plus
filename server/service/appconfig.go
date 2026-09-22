@@ -424,11 +424,6 @@ func applyAndValidateConditionalAccessOktaFields(
 		isNonEmpty(oktaAudienceURI) ||
 		isNonEmpty(oktaCert)
 
-	if oktaFieldsBeingSet && !lic.IsPremium() {
-		invalid.Append("conditional_access", ErrMissingLicense.Error())
-		return ctxerr.Wrap(ctx, invalid)
-	}
-
 	oktaFieldsSet := 0
 	if appConfig.ConditionalAccess.OktaIDPID.Valid && appConfig.ConditionalAccess.OktaIDPID.Value != "" {
 		oktaFieldsSet++
