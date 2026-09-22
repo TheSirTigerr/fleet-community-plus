@@ -9,7 +9,7 @@ This document tracks independently implemented equivalents for Fleet Premium cap
 - [x] Audit logging
 - [x] Fleet-level policies and queries
 - [x] Custom reporting / tables
-- [ ] GitOps-managed configuration
+- [x] GitOps-managed configuration
 
 ## Identity and access
 
