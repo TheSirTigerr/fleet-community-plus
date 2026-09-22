@@ -14,8 +14,8 @@ import (
 )
 
 // ViewerAccess adapts Fleet's authenticated user context to the independent
-// Community+ permission model. A global Fleet admin administers the catalog;
-// a team admin can read and deploy packages only for that team.
+// Community+ permission model. Fleet role assignments are translated into
+// Community+ scoped roles and evaluated by the same Authorizer used elsewhere.
 type ViewerAccess struct{}
 
 func (ViewerAccess) Authorize(ctx context.Context, request Request) (string, error) {
@@ -24,16 +24,8 @@ func (ViewerAccess) Authorize(ctx context.Context, request Request) (string, err
 		return "", ErrUnauthenticated
 	}
 	actor := strconv.FormatUint(uint64(v.User.ID), 10)
-	if v.User.GlobalRole != nil && *v.User.GlobalRole == fleet.RoleAdmin {
+	if fleetUserAllowed(v.User, request) {
 		return actor, nil
-	}
-	if request.Scope.Kind != ScopeFleet {
-		return "", ErrForbidden
-	}
-	for _, team := range v.User.Teams {
-		if team.ID == request.Scope.FleetID && team.IsAdmin() {
-			return actor, nil
-		}
 	}
 	return "", ErrForbidden
 }
