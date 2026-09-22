@@ -16,6 +16,7 @@ func TestCustomTablesUseCommunityAgentOptions(t *testing.T) {
 					"query": "SELECT key, value FROM inventory",
 					"path": "/var/lib/example/inventory.db",
 					"columns": ["key", "value"]
+				}
 			}
 		},
 		"command_line_flags": {
