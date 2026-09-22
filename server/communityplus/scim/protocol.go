@@ -41,7 +41,6 @@ func writeSCIMError(w http.ResponseWriter, status int, detail, scimType string) 
 func decodeJSON(w http.ResponseWriter, r *http.Request, dst any) error {
 	r.Body = http.MaxBytesReader(w, r.Body, maxRequestBody)
 	dec := json.NewDecoder(r.Body)
-	dec.DisallowUnknownFields()
 	if err := dec.Decode(dst); err != nil {
 		return fmt.Errorf("invalid SCIM JSON: %w", err)
 	}
@@ -149,7 +148,7 @@ func resourceTypesResponse() map[string]any {
 				"endpoint": "/Users",
 				"schema":   userSchemaURN,
 				"schemaExtensions": []map[string]any{{
-					"schema": enterpriseSchemaURN,
+					"schema":   enterpriseSchemaURN,
 					"required": false,
 				}},
 			},
