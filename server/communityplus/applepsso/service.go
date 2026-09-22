@@ -259,6 +259,8 @@ func (s *Service) privateKeyAsset(ctx context.Context, name fleet.MDMAssetName) 
 
 type discoveryNotFoundError struct{ cause error }
 
-func (e discoveryNotFoundError) Error() string    { return "Apple Platform SSO discovery is not configured" }
+func (e discoveryNotFoundError) Error() string {
+	return "Apple Platform SSO discovery is not configured"
+}
 func (e discoveryNotFoundError) Unwrap() error    { return e.cause }
 func (e discoveryNotFoundError) IsNotFound() bool { return true }
