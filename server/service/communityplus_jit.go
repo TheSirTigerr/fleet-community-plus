@@ -47,7 +47,7 @@ func (svc *Service) CommunityPlusGetSSOUser(ctx context.Context, auth fleet.Auth
 	// been verified. JIT provisioning is authorized by that verified identity and
 	// the explicit server-side JIT setting rather than an existing Fleet viewer.
 	svc.authz.SkipAuthorization(ctx)
-	user, createErr := svc.NewUser(ctx, fleet.UserPayload{
+	user, err = svc.NewUser(ctx, fleet.UserPayload{
 		Name:                     &displayName,
 		Email:                    &email,
 		SSOEnabled:               &ssoEnabled,
@@ -55,17 +55,14 @@ func (svc *Service) CommunityPlusGetSSOUser(ctx context.Context, auth fleet.Auth
 		AdminForcedPasswordReset: &adminForcedPasswordReset,
 		JITProvisioned:           true,
 	})
-	if createErr == nil {
-		return user, nil
+	if err != nil {
+		// Do not turn an arbitrary provisioning failure into success by re-reading
+		// the user. NewUser also records creation/role activities, so a post-insert
+		// activity failure must remain visible to the caller rather than being
+		// mistaken for a harmless concurrent insert.
+		return nil, ctxerr.Wrap(ctx, err, "JIT provision Community+ SSO user")
 	}
-
-	// A second callback for the same new identity can race the unique-email
-	// insert. If another request won, use the user it created; otherwise preserve
-	// the original creation error.
-	if existing, lookupErr := svc.ds.UserByEmail(ctx, email); lookupErr == nil {
-		return existing, nil
-	}
-	return nil, ctxerr.Wrap(ctx, createErr, "JIT provision Community+ SSO user")
+	return user, nil
 }
 
 // CommunityPlusGetSSOUser forwards the Community+ extension through Fleet's
