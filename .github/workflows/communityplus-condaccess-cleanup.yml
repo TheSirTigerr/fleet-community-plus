@@ -1,0 +1,73 @@
+name: Community+ conditional access cleanup
+
+on:
+  push:
+    branches:
+      - community-plus/foundation
+    paths:
+      - '.github/workflows/communityplus-condaccess-cleanup.yml'
+
+permissions:
+  contents: write
+
+jobs:
+  patch:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          ref: community-plus/foundation
+          fetch-depth: 0
+      - name: Remove dead Okta license-gate leftovers
+        shell: bash
+        run: |
+          set -euo pipefail
+          python3 - <<'PY'
+          from pathlib import Path
+          p = Path('server/service/appconfig.go')
+          text = p.read_text()
+
+          replacements = [
+              (
+                  '\tinvalid *fleet.InvalidArgumentError,\n\tlic *fleet.LicenseInfo,\n) error {',
+                  '\tinvalid *fleet.InvalidArgumentError,\n) error {',
+                  1,
+              ),
+              (
+                  '\t// Normalize incoming Okta fields (trim whitespace) BEFORE the premium-license gate so a\n\t// whitespace-only input that would persist as empty does not trip the license check.\n',
+                  '\t// Normalize incoming Okta fields so whitespace-only values persist as empty.\n',
+                  1,
+              ),
+              (
+                  '\n\tisNonEmpty := func(s optjson.String) bool {\n\t\treturn s.Set && s.Valid && s.Value != ""\n\t}\n\toktaFieldsBeingSet := isNonEmpty(oktaIDPID) ||\n\t\tisNonEmpty(oktaACSURL) ||\n\t\tisNonEmpty(oktaAudienceURI) ||\n\t\tisNonEmpty(oktaCert)\n',
+                  '',
+                  1,
+              ),
+              (
+                  'applyAndValidateConditionalAccessOktaFields(ctx, appConfig, &newAppConfig, invalid, lic)',
+                  'applyAndValidateConditionalAccessOktaFields(ctx, appConfig, &newAppConfig, invalid)',
+                  1,
+              ),
+          ]
+          for old, new, expected in replacements:
+              actual = text.count(old)
+              if actual != expected:
+                  raise SystemExit(f'expected {expected} matches, got {actual}: {old[:80]!r}')
+              text = text.replace(old, new)
+          p.write_text(text)
+          PY
+          gofmt -w server/service/appconfig.go
+          git diff --check
+          if git diff --quiet; then
+            echo 'No patch produced'
+            exit 1
+          fi
+      - name: Commit cleanup
+        shell: bash
+        run: |
+          set -euo pipefail
+          git config user.name 'github-actions[bot]'
+          git config user.email '41898282+github-actions[bot]@users.noreply.github.com'
+          git add server/service/appconfig.go
+          git commit -m 'fix: remove dead conditional access license gate state'
+          git push origin HEAD:community-plus/foundation
