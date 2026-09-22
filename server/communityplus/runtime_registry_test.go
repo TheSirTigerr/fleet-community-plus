@@ -13,9 +13,9 @@ func TestRuntimeRegistryPublishesOnlyWiredCapabilities(t *testing.T) {
 		FeatureCustomTables:         StatusAvailable,
 		FeatureGitOps:               StatusAvailable,
 		FeatureSSO:                  StatusAvailable,
+		FeatureSCIM:                 StatusExperimental,
 		FeatureSoftwareAutomation:   StatusExperimental,
 		FeaturePatchPolicies:        StatusExperimental,
-		FeatureSCIM:                 StatusPlanned,
 	}
 	for feature, want := range checks {
 		got, ok := registry.Status(feature)
