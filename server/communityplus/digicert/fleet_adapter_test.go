@@ -34,4 +34,7 @@ func TestNewFleetService(t *testing.T) {
 	if service := NewFleetService(slog.Default()); service == nil {
 		t.Fatal("expected DigiCert Fleet service")
 	}
+	if service := NewFleetService(nil); service == nil {
+		t.Fatal("expected DigiCert Fleet service with nil logger")
+	}
 }
