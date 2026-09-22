@@ -40,6 +40,7 @@ func TestOIDCSettingsAPIAdminLifecycle(t *testing.T) {
 
 	body := []byte(`{
 		"enabled":true,
+		"enable_jit_provisioning":true,
 		"issuer_url":"https://idp.example/",
 		"client_id":"fleet-community-plus",
 		"client_secret":"super-secret",
@@ -58,13 +59,16 @@ func TestOIDCSettingsAPIAdminLifecycle(t *testing.T) {
 	if !bytes.Contains(recorder.Body.Bytes(), []byte(`"client_secret_configured":true`)) {
 		t.Fatalf("secret configured marker missing: %s", recorder.Body.String())
 	}
-	if store.settings.ClientSecret != "super-secret" || store.settings.IssuerURL != "https://idp.example" {
+	if !bytes.Contains(recorder.Body.Bytes(), []byte(`"enable_jit_provisioning":true`)) {
+		t.Fatalf("JIT setting missing from response: %s", recorder.Body.String())
+	}
+	if store.settings.ClientSecret != "super-secret" || store.settings.IssuerURL != "https://idp.example" || !store.settings.EnableJITProvisioning {
 		t.Fatalf("unexpected stored settings: %#v", store.settings)
 	}
 	if got := store.settings.Scopes; len(got) != 3 || got[0] != "openid" || got[1] != "email" || got[2] != "profile" {
 		t.Fatalf("unexpected normalized scopes: %#v", got)
 	}
-	if events := sink.Events(); len(events) != 1 || events[0].Action != "oidc_settings.update" || events[0].ActorID != "admin-1" {
+	if events := sink.Events(); len(events) != 1 || events[0].Action != "oidc_settings.update" || events[0].ActorID != "admin-1" || events[0].Metadata["enable_jit_provisioning"] != "true" {
 		t.Fatalf("unexpected audit events: %#v", events)
 	}
 
@@ -72,6 +76,7 @@ func TestOIDCSettingsAPIAdminLifecycle(t *testing.T) {
 	// clearing a write-only value returned by no GET endpoint.
 	body = []byte(`{
 		"enabled":true,
+		"enable_jit_provisioning":true,
 		"issuer_url":"https://idp.example",
 		"client_id":"fleet-community-plus",
 		"scopes":["profile"],
@@ -80,8 +85,8 @@ func TestOIDCSettingsAPIAdminLifecycle(t *testing.T) {
 	req = httptest.NewRequest(http.MethodPut, "/api/latest/fleet/communityplus/sso/oidc", bytes.NewReader(body))
 	recorder = httptest.NewRecorder()
 	api.Handler().ServeHTTP(recorder, req)
-	if recorder.Code != http.StatusOK || store.settings.ClientSecret != "super-secret" {
-		t.Fatalf("secret was not preserved: status=%d settings=%#v", recorder.Code, store.settings)
+	if recorder.Code != http.StatusOK || store.settings.ClientSecret != "super-secret" || !store.settings.EnableJITProvisioning {
+		t.Fatalf("secret/JIT setting was not preserved: status=%d settings=%#v", recorder.Code, store.settings)
 	}
 
 	req = httptest.NewRequest(http.MethodGet, "/api/2022-04/fleet/communityplus/sso/oidc", nil)
