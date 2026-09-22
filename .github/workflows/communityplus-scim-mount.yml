@@ -1,0 +1,40 @@
+name: Community+ SCIM mount
+
+on:
+  push:
+    branches:
+      - community-plus/foundation
+    paths:
+      - .github/workflows/communityplus-scim-mount.yml
+
+permissions:
+  contents: write
+
+jobs:
+  patch:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          ref: community-plus/foundation
+          fetch-depth: 0
+      - name: Mount SCIM outside premium gate
+        shell: bash
+        run: |
+          python3 - <<'PY'
+          from pathlib import Path
+          path = Path("cmd/fleet/serve.go")
+          text = path.read_text()
+          old = '''\tif license.IsPremium() {\n\t\t// SCEP proxy (for NDES, etc.)\n\t\tif err = service.RegisterSCEPProxy(rootMux, ds, logger, nil, &config); err != nil {\n\t\t\tinitFatal(err, "setup SCEP proxy")\n\t\t}\n\t\tif err = scim.RegisterSCIM(rootMux, ds, svc, logger, &config); err != nil {\n\t\t\tinitFatal(err, "setup SCIM")\n\t\t}\n\t\t// Host identify and conditional access SCEP feature only works if a private key has been set up\n'''
+          new = '''\t// Community+ SCIM provisioning is available independently of the premium license.\n\tif err = scim.RegisterSCIM(rootMux, ds, svc, logger, &config); err != nil {\n\t\tinitFatal(err, "setup SCIM")\n\t}\n\n\tif license.IsPremium() {\n\t\t// SCEP proxy (for NDES, etc.)\n\t\tif err = service.RegisterSCEPProxy(rootMux, ds, logger, nil, &config); err != nil {\n\t\t\tinitFatal(err, "setup SCEP proxy")\n\t\t}\n\t\t// Host identify and conditional access SCEP feature only works if a private key has been set up\n'''
+          if text.count(old) != 1:
+              raise SystemExit(f"expected exactly one SCIM premium-gate block, found {text.count(old)}")
+          path.write_text(text.replace(old, new, 1))
+          PY
+          gofmt -w cmd/fleet/serve.go
+          git diff --check
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          git add cmd/fleet/serve.go
+          git commit -m "feat: mount Community+ SCIM without premium license"
+          git push origin HEAD:community-plus/foundation
