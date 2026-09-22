@@ -85,6 +85,21 @@ func TestCommunityPlusGetSSOUserJITDisabled(t *testing.T) {
 	require.False(t, ds.NewUserFuncInvoked)
 }
 
+func TestCommunityPlusGetSSOUserJITRejectsInvalidEmail(t *testing.T) {
+	ds := new(fleet_mock.Store)
+	svc := newCommunityPlusJITTestService(t, ds)
+	ctx := license.NewContext(context.Background(), &fleet.LicenseInfo{Tier: fleet.TierFree})
+
+	ds.UserByEmailFunc = func(context.Context, string) (*fleet.User, error) {
+		return nil, communityPlusNotFoundError{}
+	}
+
+	user, err := svc.CommunityPlusGetSSOUser(ctx, communityPlusTestAuth{email: "not-an-email"}, true)
+	require.Error(t, err)
+	require.Nil(t, user)
+	require.False(t, ds.NewUserFuncInvoked)
+}
+
 func TestCommunityPlusGetSSOUserKeepsExistingUser(t *testing.T) {
 	ds := new(fleet_mock.Store)
 	svc := newCommunityPlusJITTestService(t, ds)
