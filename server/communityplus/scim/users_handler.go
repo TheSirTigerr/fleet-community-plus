@@ -89,13 +89,41 @@ func (p *provider) createUser(w http.ResponseWriter, r *http.Request) {
 		writeSCIMError(w, http.StatusBadRequest, "userName is required", "invalidValue")
 		return
 	}
-	id, err := p.ds.CreateScimUser(r.Context(), user)
-	if err != nil {
-		p.writeStoreError(w, r, err)
+
+	// A deactivated SCIM identity may be re-provisioned by an IdP with POST.
+	// Reactivate the existing record instead of manufacturing a duplicate ID.
+	existing, lookupErr := p.ds.ScimUserByUserName(r.Context(), user.UserName)
+	switch {
+	case lookupErr == nil:
+		if existing.Active == nil || *existing.Active || user.Active == nil || !*user.Active {
+			writeSCIMError(w, http.StatusConflict, "SCIM user already exists", "uniqueness")
+			return
+		}
+		if err := p.linkMatchingFleetUser(r.Context(), existing); err != nil {
+			p.logger.ErrorContext(r.Context(), "Community+ SCIM: link Fleet user during reactivation", "err", err)
+		}
+		user.ID = existing.ID
+		user.FleetUserID = existing.FleetUserID
+		if _, err := p.ds.ReplaceScimUser(r.Context(), user); err != nil {
+			p.writeStoreError(w, r, err)
+			return
+		}
+	case !fleet.IsNotFound(lookupErr):
+		p.writeStoreError(w, r, lookupErr)
 		return
+	default:
+		id, err := p.ds.CreateScimUser(r.Context(), user)
+		if err != nil {
+			p.writeStoreError(w, r, err)
+			return
+		}
+		user.ID = id
+		if err := p.linkMatchingFleetUser(r.Context(), user); err != nil {
+			p.logger.ErrorContext(r.Context(), "Community+ SCIM: link Fleet user on create", "err", err)
+		}
 	}
-	user.ID = id
-	if stored, getErr := p.ds.ScimUserByID(r.Context(), id); getErr == nil {
+
+	if stored, getErr := p.ds.ScimUserByID(r.Context(), user.ID); getErr == nil {
 		user = stored
 	}
 	resource := userResource(user, apiVersionFromRequest(r))
@@ -127,10 +155,26 @@ func (p *provider) replaceUser(w http.ResponseWriter, r *http.Request, id uint) 
 		writeSCIMError(w, http.StatusBadRequest, "userName is required", "invalidValue")
 		return
 	}
+
+	existing, err := p.ds.ScimUserByID(r.Context(), id)
+	if err != nil {
+		p.writeStoreError(w, r, err)
+		return
+	}
+	previousActive := existing.Active
+	if err := p.linkMatchingFleetUser(r.Context(), existing); err != nil {
+		p.logger.ErrorContext(r.Context(), "Community+ SCIM: link Fleet user before replace", "err", err)
+	}
 	user.ID = id
+	user.FleetUserID = existing.FleetUserID
 	if _, err := p.ds.ReplaceScimUser(r.Context(), user); err != nil {
 		p.writeStoreError(w, r, err)
 		return
+	}
+	if wasDeactivated(previousActive, user.Active) {
+		if err := p.deprovisionMatchingFleetUser(r.Context(), existing); err != nil {
+			p.logger.ErrorContext(r.Context(), "Community+ SCIM: deprovision Fleet user after replace", "err", err)
+		}
 	}
 	stored, err := p.ds.ScimUserByID(r.Context(), id)
 	if err != nil {
@@ -146,6 +190,16 @@ func (p *provider) patchUser(w http.ResponseWriter, r *http.Request, id uint) {
 		p.writeStoreError(w, r, err)
 		return
 	}
+	prePatch := cloneScimUser(user)
+	previousActive := prePatch.Active
+	if err := p.linkMatchingFleetUser(r.Context(), prePatch); err != nil {
+		p.logger.ErrorContext(r.Context(), "Community+ SCIM: link Fleet user before patch", "err", err)
+	}
+	if user.FleetUserID == nil && prePatch.FleetUserID != nil {
+		id := *prePatch.FleetUserID
+		user.FleetUserID = &id
+	}
+
 	var patch patchRequest
 	if err := decodeJSON(w, r, &patch); err != nil {
 		writeSCIMError(w, http.StatusBadRequest, err.Error(), "invalidSyntax")
@@ -169,6 +223,11 @@ func (p *provider) patchUser(w http.ResponseWriter, r *http.Request, id uint) {
 		p.writeStoreError(w, r, err)
 		return
 	}
+	if wasDeactivated(previousActive, user.Active) {
+		if err := p.deprovisionMatchingFleetUser(r.Context(), prePatch); err != nil {
+			p.logger.ErrorContext(r.Context(), "Community+ SCIM: deprovision Fleet user after patch", "err", err)
+		}
+	}
 	stored, err := p.ds.ScimUserByID(r.Context(), id)
 	if err != nil {
 		p.writeStoreError(w, r, err)
@@ -178,6 +237,16 @@ func (p *provider) patchUser(w http.ResponseWriter, r *http.Request, id uint) {
 }
 
 func (p *provider) deleteUser(w http.ResponseWriter, r *http.Request, id uint) {
+	user, err := p.ds.ScimUserByID(r.Context(), id)
+	if err != nil {
+		p.writeStoreError(w, r, err)
+		return
+	}
+	if err := p.deprovisionMatchingFleetUser(r.Context(), user); err != nil {
+		// SCIM deletion remains authoritative even when the linked Fleet account
+		// cannot be removed (for example because it is the last global admin).
+		p.logger.ErrorContext(r.Context(), "Community+ SCIM: deprovision Fleet user on delete", "err", err)
+	}
 	if _, err := p.ds.DeleteScimUser(r.Context(), id); err != nil {
 		p.writeStoreError(w, r, err)
 		return
