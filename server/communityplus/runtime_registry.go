@@ -11,6 +11,7 @@ func newRuntimeRegistry() *Registry {
 	mustSetRuntimeStatus(registry, FeatureFleetPoliciesQueries, StatusAvailable)
 	mustSetRuntimeStatus(registry, FeatureReports, StatusAvailable)
 	mustSetRuntimeStatus(registry, FeatureCustomTables, StatusAvailable)
+	mustSetRuntimeStatus(registry, FeatureGitOps, StatusAvailable)
 	mustSetRuntimeStatus(registry, FeatureSoftwareAutomation, StatusExperimental)
 	mustSetRuntimeStatus(registry, FeaturePatchPolicies, StatusExperimental)
 	return registry
