@@ -792,15 +792,12 @@ func (svc *Service) InitSSOCallback(
 }
 
 func (svc *Service) GetSSOUser(ctx context.Context, auth fleet.Auth) (*fleet.User, error) {
-	user, err := svc.ds.UserByEmail(ctx, auth.UserID())
+	appConfig, err := svc.ds.AppConfig(ctx)
 	if err != nil {
-		var nfe endpointer.NotFoundErrorInterface
-		if errors.As(err, &nfe) {
-			return nil, ctxerr.Wrap(ctx, newSSOError(err, ssoAccountInvalid))
-		}
-		return nil, ctxerr.Wrap(ctx, err, "find user in sso callback")
+		return nil, ctxerr.Wrap(ctx, err, "get config for Community+ sso user")
 	}
-	return user, nil
+	enableJIT := appConfig.SSOSettings != nil && appConfig.SSOSettings.EnableJITProvisioning
+	return svc.CommunityPlusGetSSOUser(ctx, auth, enableJIT)
 }
 
 func (svc *Service) LoginSSOUser(ctx context.Context, user *fleet.User, redirectURL string) (*fleet.SSOSession, error) {
