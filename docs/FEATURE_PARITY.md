@@ -4,7 +4,7 @@ This document tracks independently implemented equivalents for Fleet Premium cap
 
 ## Core platform
 
-- [ ] Fleets / multi-tenancy
+- [x] Fleets / multi-tenancy
 - [x] Advanced RBAC and role scoping
 - [x] Audit logging
 - [ ] Fleet-level policies and queries
