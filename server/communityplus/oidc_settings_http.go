@@ -36,12 +36,13 @@ func (a *OIDCSettingsAPI) Handler() http.Handler {
 }
 
 type oidcSettingsUpdateRequest struct {
-	Enabled      bool     `json:"enabled"`
-	IssuerURL    string   `json:"issuer_url"`
-	ClientID     string   `json:"client_id"`
-	ClientSecret *string  `json:"client_secret,omitempty"`
-	Scopes       []string `json:"scopes"`
-	IDPName      string   `json:"idp_name"`
+	Enabled               bool     `json:"enabled"`
+	EnableJITProvisioning bool     `json:"enable_jit_provisioning"`
+	IssuerURL             string   `json:"issuer_url"`
+	ClientID              string   `json:"client_id"`
+	ClientSecret          *string  `json:"client_secret,omitempty"`
+	Scopes                []string `json:"scopes"`
+	IDPName               string   `json:"idp_name"`
 }
 
 func (a *OIDCSettingsAPI) get(w http.ResponseWriter, r *http.Request) {
@@ -79,12 +80,13 @@ func (a *OIDCSettingsAPI) put(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	settings := OIDCSettings{
-		Enabled:      req.Enabled,
-		IssuerURL:    req.IssuerURL,
-		ClientID:     req.ClientID,
-		ClientSecret: current.ClientSecret,
-		Scopes:       req.Scopes,
-		IDPName:      req.IDPName,
+		Enabled:               req.Enabled,
+		EnableJITProvisioning: req.EnableJITProvisioning,
+		IssuerURL:             req.IssuerURL,
+		ClientID:              req.ClientID,
+		ClientSecret:          current.ClientSecret,
+		Scopes:                req.Scopes,
+		IDPName:               req.IDPName,
 	}
 	if req.ClientSecret != nil {
 		settings.ClientSecret = *req.ClientSecret
@@ -105,8 +107,9 @@ func (a *OIDCSettingsAPI) put(w http.ResponseWriter, r *http.Request) {
 		ResourceID: "oidc",
 		Scope:      GlobalScope(),
 		Metadata: map[string]string{
-			"enabled": strconv.FormatBool(settings.Enabled),
-			"issuer":  settings.IssuerURL,
+			"enabled":                 strconv.FormatBool(settings.Enabled),
+			"enable_jit_provisioning": strconv.FormatBool(settings.EnableJITProvisioning),
+			"issuer":                  settings.IssuerURL,
 		},
 	}); err != nil {
 		writeAPIError(w, err)
