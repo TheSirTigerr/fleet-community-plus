@@ -26,7 +26,8 @@ func TestCommunityPlusFeatureEnabled(t *testing.T) {
 		status: http.StatusOK,
 		body: `{"capabilities":[
 			{"feature":"fleets","status":"available"},
-			{"feature":"gitops","status":"planned"},
+			{"feature":"gitops","status":"available"},
+			{"feature":"scim","status":"planned"},
 			{"feature":"software_automation","status":"experimental"}
 		]}`,
 	}
@@ -36,8 +37,12 @@ func TestCommunityPlusFeatureEnabled(t *testing.T) {
 		t.Fatalf("fleets enabled=%v err=%v", enabled, err)
 	}
 	enabled, err = communityPlusFeatureEnabled(client, "gitops")
+	if err != nil || !enabled {
+		t.Fatalf("gitops enabled=%v err=%v", enabled, err)
+	}
+	enabled, err = communityPlusFeatureEnabled(client, "scim")
 	if err != nil || enabled {
-		t.Fatalf("planned gitops enabled=%v err=%v", enabled, err)
+		t.Fatalf("planned scim enabled=%v err=%v", enabled, err)
 	}
 	enabled, err = communityPlusFeatureEnabled(client, "software_automation")
 	if err != nil || !enabled {
@@ -46,7 +51,7 @@ func TestCommunityPlusFeatureEnabled(t *testing.T) {
 }
 
 func TestCommunityPlusFeatureEnabledTreatsMissingEndpointAsUnsupported(t *testing.T) {
-	enabled, err := communityPlusFeatureEnabled(fakeCommunityPlusCapabilityClient{status: http.StatusNotFound}, "fleets")
+	enabled, err := communityPlusFeatureEnabled(fakeCommunityPlusCapabilityClient{status: http.StatusNotFound}, "gitops")
 	if err != nil || enabled {
 		t.Fatalf("enabled=%v err=%v", enabled, err)
 	}
@@ -55,11 +60,20 @@ func TestCommunityPlusFeatureEnabledTreatsMissingEndpointAsUnsupported(t *testin
 func TestFleetGitOpsSupported(t *testing.T) {
 	communityPlus := fakeCommunityPlusCapabilityClient{
 		status: http.StatusOK,
-		body:   `{"capabilities":[{"feature":"fleets","status":"available"}]}`,
+		body:   `{"capabilities":[{"feature":"gitops","status":"available"}]}`,
 	}
 	enabled, err := fleetGitOpsSupported(&fleet.LicenseInfo{Tier: fleet.TierFree}, communityPlus)
 	if err != nil || !enabled {
 		t.Fatalf("Community+ fleet GitOps enabled=%v err=%v", enabled, err)
+	}
+
+	fleetsOnly := fakeCommunityPlusCapabilityClient{
+		status: http.StatusOK,
+		body:   `{"capabilities":[{"feature":"fleets","status":"available"}]}`,
+	}
+	enabled, err = fleetGitOpsSupported(&fleet.LicenseInfo{Tier: fleet.TierFree}, fleetsOnly)
+	if err != nil || enabled {
+		t.Fatalf("fleets-only Community+ GitOps enabled=%v err=%v", enabled, err)
 	}
 
 	missing := fakeCommunityPlusCapabilityClient{status: http.StatusNotFound}
