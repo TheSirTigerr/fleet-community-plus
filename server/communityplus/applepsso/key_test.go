@@ -69,7 +69,7 @@ func installTestCAAssets(t *testing.T, env *tokenTestEnv) *x509.Certificate {
 	return cert
 }
 
-func (e *tokenTestEnv) keyAssertion(t *testing.T, requestType, requestNonce, keyContext, otherPublicKey string) string {
+func (e *tokenTestEnv) keyAssertion(t *testing.T, requestType pssocrypto.RequestType, requestNonce, keyContext, otherPublicKey string) string {
 	t.Helper()
 	sessionNonce := "unlock-session-nonce"
 	apv, err := pssocrypto.BuildAPV(&e.deviceEncryption.PublicKey, []byte(sessionNonce))
