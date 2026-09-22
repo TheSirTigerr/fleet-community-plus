@@ -58,7 +58,7 @@ func (s *applePSSOWrapper) PSSORegisterDevice(ctx context.Context, req fleet.PSS
 }
 
 func (s *applePSSOWrapper) PSSOToken(ctx context.Context, assertion []byte) ([]byte, error) {
-	return s.psso.Token(ctx, assertion)
+	return s.psso.Handle(ctx, assertion)
 }
 
 func (s *applePSSOWrapper) PSSOJWKS(ctx context.Context) ([]byte, error) {
