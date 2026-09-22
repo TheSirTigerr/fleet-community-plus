@@ -67,3 +67,17 @@ func (svc *Service) CommunityPlusGetSSOUser(ctx context.Context, auth fleet.Auth
 	}
 	return nil, ctxerr.Wrap(ctx, createErr, "JIT provision Community+ SSO user")
 }
+
+// CommunityPlusGetSSOUser forwards the Community+ extension through Fleet's
+// validation middleware. The middleware embeds fleet.Service, whose interface
+// does not expose Community+ extension methods, so an explicit forwarder is
+// required for callers such as the OIDC login router to reach the core service.
+func (mw validationMiddleware) CommunityPlusGetSSOUser(ctx context.Context, auth fleet.Auth, enableJIT bool) (*fleet.User, error) {
+	resolver, ok := mw.Service.(interface {
+		CommunityPlusGetSSOUser(context.Context, fleet.Auth, bool) (*fleet.User, error)
+	})
+	if !ok {
+		return nil, errors.New("communityplus: JIT SSO resolver is unavailable")
+	}
+	return resolver.CommunityPlusGetSSOUser(ctx, auth, enableJIT)
+}
