@@ -17,13 +17,13 @@ type communityPlusTestAuth struct {
 	name  string
 }
 
-func (a communityPlusTestAuth) UserID() string { return a.email }
-func (a communityPlusTestAuth) UserDisplayName() string { return a.name }
+func (a communityPlusTestAuth) UserID() string                             { return a.email }
+func (a communityPlusTestAuth) UserDisplayName() string                    { return a.name }
 func (a communityPlusTestAuth) AssertionAttributes() []fleet.SAMLAttribute { return nil }
 
 type communityPlusNotFoundError struct{}
 
-func (communityPlusNotFoundError) Error() string     { return "not found" }
+func (communityPlusNotFoundError) Error() string    { return "not found" }
 func (communityPlusNotFoundError) IsNotFound() bool { return true }
 
 func newCommunityPlusJITTestService(t *testing.T, ds *fleet_mock.Store) *Service {
