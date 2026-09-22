@@ -74,7 +74,7 @@ func CreateApp(
 		mdmCommand(),
 		upgradePacksCommand(),
 		runScriptCommand(),
-		gitopsCommand(),
+		communityPlusAwareGitOpsCommand(),
 		generateGitopsCommand(),
 		newCommand(),
 	}
