@@ -1,0 +1,55 @@
+name: Community+ OIDC role claims
+
+on:
+  push:
+    branches:
+      - community-plus/foundation
+    paths:
+      - .github/workflows/communityplus-oidc-role-claims.yml
+
+permissions:
+  contents: write
+
+jobs:
+  patch:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          ref: community-plus/foundation
+          fetch-depth: 0
+      - name: Wire verified OIDC role claims
+        shell: bash
+        run: |
+          python3 - <<'PY'
+          from pathlib import Path
+
+          oidc = Path("server/communityplus/oidc/oidc.go")
+          text = oidc.read_text()
+          old_identity = '''type Identity struct {\n\tSubject string\n\tEmail   string\n}\n'''
+          new_identity = '''type Identity struct {\n\tSubject    string\n\tEmail      string\n\tAttributes []Attribute\n}\n'''
+          if text.count(old_identity) != 1:
+              raise SystemExit(f"expected one OIDC Identity block, found {text.count(old_identity)}")
+          text = text.replace(old_identity, new_identity, 1)
+
+          old_return = '''\treturn &Identity{Subject: claims.Subject, Email: strings.ToLower(strings.TrimSpace(claims.Email))}, nil\n'''
+          new_return = '''\tattributes, err := roleAttributesFromJWTPart(parts[1])\n\tif err != nil {\n\t\treturn nil, err\n\t}\n\treturn &Identity{\n\t\tSubject:    claims.Subject,\n\t\tEmail:      strings.ToLower(strings.TrimSpace(claims.Email)),\n\t\tAttributes: attributes,\n\t}, nil\n'''
+          if text.count(old_return) != 1:
+              raise SystemExit(f"expected one OIDC identity return, found {text.count(old_return)}")
+          oidc.write_text(text.replace(old_return, new_return, 1))
+
+          login = Path("server/communityplus/oidc_login.go")
+          text = login.read_text()
+          old_adapter = '''func (a oidcFleetAuth) AssertionAttributes() []fleet.SAMLAttribute { return nil }\n'''
+          new_adapter = '''func (a oidcFleetAuth) AssertionAttributes() []fleet.SAMLAttribute {\n\tif a.identity == nil || len(a.identity.Attributes) == 0 {\n\t\treturn nil\n\t}\n\tresult := make([]fleet.SAMLAttribute, 0, len(a.identity.Attributes))\n\tfor _, attribute := range a.identity.Attributes {\n\t\tvalues := make([]fleet.SAMLAttributeValue, 0, len(attribute.Values))\n\t\tfor _, value := range attribute.Values {\n\t\t\tvalues = append(values, fleet.SAMLAttributeValue{Value: value})\n\t\t}\n\t\tresult = append(result, fleet.SAMLAttribute{Name: attribute.Name, Values: values})\n\t}\n\treturn result\n}\n'''
+          if text.count(old_adapter) != 1:
+              raise SystemExit(f"expected one OIDC auth adapter, found {text.count(old_adapter)}")
+          login.write_text(text.replace(old_adapter, new_adapter, 1))
+          PY
+          gofmt -w server/communityplus/oidc/oidc.go server/communityplus/oidc_login.go
+          git diff --check
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          git add server/communityplus/oidc/oidc.go server/communityplus/oidc_login.go
+          git commit -m "feat: propagate verified OIDC role claims"
+          git push origin HEAD:community-plus/foundation
