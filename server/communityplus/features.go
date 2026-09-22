@@ -24,6 +24,7 @@ const (
 	FeaturePatchPolicies           Feature = "patch_policies"
 	FeatureAdvancedMDM             Feature = "advanced_mdm"
 	FeatureZeroTouch               Feature = "zero_touch"
+	FeatureSSO                     Feature = "sso"
 	FeatureSCIM                    Feature = "scim"
 	FeatureConditionalAccess       Feature = "conditional_access"
 	FeatureVulnerabilityEnrichment Feature = "vulnerability_enrichment"
@@ -57,6 +58,7 @@ var knownFeatures = []Feature{
 	FeaturePatchPolicies,
 	FeatureAdvancedMDM,
 	FeatureZeroTouch,
+	FeatureSSO,
 	FeatureSCIM,
 	FeatureConditionalAccess,
 	FeatureVulnerabilityEnrichment,
