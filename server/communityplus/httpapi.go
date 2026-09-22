@@ -93,7 +93,7 @@ func (a *HTTPAPI) Handler() http.Handler {
 }
 
 func (a *HTTPAPI) searchWingetUpstream(w http.ResponseWriter, r *http.Request) {
-	if _, err := a.access.Authorize(r.Context(), Request{Resource: ResourceSoftware, Action: ActionAdmin, Scope: GlobalScope()}); err != nil {
+	if _, err := a.access.Authorize(r.Context(), Request{Resource: ResourceSoftware, Action: ActionWrite, Scope: GlobalScope()}); err != nil {
 		writeAPIError(w, err)
 		return
 	}
@@ -177,7 +177,7 @@ func (a *HTTPAPI) importWingetCatalogEntry(w http.ResponseWriter, r *http.Reques
 		writeAPIError(w, fmt.Errorf("communityplus: display_name and source_sha256 are required"))
 		return
 	}
-	actor, err := a.access.Authorize(r.Context(), Request{Resource: ResourceSoftware, Action: ActionAdmin, Scope: GlobalScope()})
+	actor, err := a.access.Authorize(r.Context(), Request{Resource: ResourceSoftware, Action: ActionWrite, Scope: GlobalScope()})
 	if err != nil {
 		writeAPIError(w, err)
 		return
@@ -260,7 +260,7 @@ func (a *HTTPAPI) createCatalogDeployment(w http.ResponseWriter, r *http.Request
 		writeAPIError(w, fmt.Errorf("communityplus: deployment id is required"))
 		return
 	}
-	actor, err := a.access.Authorize(r.Context(), Request{Resource: ResourceSoftware, Action: ActionWrite, Scope: deployment.Scope})
+	actor, err := a.access.Authorize(r.Context(), Request{Resource: ResourceSoftware, Action: ActionExecute, Scope: deployment.Scope})
 	if err != nil {
 		writeAPIError(w, err)
 		return

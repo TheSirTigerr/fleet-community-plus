@@ -205,7 +205,7 @@ func TestHTTPAPIAuditScopeAndValidation(t *testing.T) {
 	}
 }
 
-func TestHTTPAPICapabilitiesRequireGlobalAccess(t *testing.T) {
+func TestHTTPAPICapabilitiesAllowTeamObserverRead(t *testing.T) {
 	role, err := ObserverRole(3)
 	if err != nil {
 		t.Fatal(err)
@@ -214,8 +214,8 @@ func TestHTTPAPICapabilitiesRequireGlobalAccess(t *testing.T) {
 	req := httptest.NewRequest(http.MethodGet, "/api/v1/fleet/communityplus/capabilities", nil)
 	recorder := httptest.NewRecorder()
 	api.Handler().ServeHTTP(recorder, req)
-	if recorder.Code != http.StatusForbidden {
-		t.Fatalf("expected forbidden, status=%d body=%s", recorder.Code, recorder.Body.String())
+	if recorder.Code != http.StatusOK {
+		t.Fatalf("expected observer to read capabilities, status=%d body=%s", recorder.Code, recorder.Body.String())
 	}
 }
 
