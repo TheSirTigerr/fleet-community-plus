@@ -7,8 +7,8 @@ import (
 	"testing"
 
 	"github.com/fleetdm/fleet/v4/server/fleet"
-	fleetmock "github.com/fleetdm/fleet/v4/server/mock"
 	scepserver "github.com/fleetdm/fleet/v4/server/mdm/scep/server"
+	fleetmock "github.com/fleetdm/fleet/v4/server/mock"
 	"github.com/smallstep/scep"
 	"github.com/stretchr/testify/require"
 )
