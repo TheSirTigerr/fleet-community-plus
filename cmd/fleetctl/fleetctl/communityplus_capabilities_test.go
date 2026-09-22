@@ -5,6 +5,8 @@ import (
 	"net/http"
 	"strings"
 	"testing"
+
+	"github.com/fleetdm/fleet/v4/server/fleet"
 )
 
 type fakeCommunityPlusCapabilityClient struct {
@@ -47,5 +49,27 @@ func TestCommunityPlusFeatureEnabledTreatsMissingEndpointAsUnsupported(t *testin
 	enabled, err := communityPlusFeatureEnabled(fakeCommunityPlusCapabilityClient{status: http.StatusNotFound}, "fleets")
 	if err != nil || enabled {
 		t.Fatalf("enabled=%v err=%v", enabled, err)
+	}
+}
+
+func TestFleetGitOpsSupported(t *testing.T) {
+	communityPlus := fakeCommunityPlusCapabilityClient{
+		status: http.StatusOK,
+		body:   `{"capabilities":[{"feature":"fleets","status":"available"}]}`,
+	}
+	enabled, err := fleetGitOpsSupported(&fleet.LicenseInfo{Tier: fleet.TierFree}, communityPlus)
+	if err != nil || !enabled {
+		t.Fatalf("Community+ fleet GitOps enabled=%v err=%v", enabled, err)
+	}
+
+	missing := fakeCommunityPlusCapabilityClient{status: http.StatusNotFound}
+	enabled, err = fleetGitOpsSupported(&fleet.LicenseInfo{Tier: fleet.TierFree}, missing)
+	if err != nil || enabled {
+		t.Fatalf("regular free Fleet GitOps enabled=%v err=%v", enabled, err)
+	}
+
+	enabled, err = fleetGitOpsSupported(&fleet.LicenseInfo{Tier: fleet.TierPremium}, fakeCommunityPlusCapabilityClient{status: http.StatusInternalServerError})
+	if err != nil || !enabled {
+		t.Fatalf("Premium Fleet GitOps enabled=%v err=%v", enabled, err)
 	}
 }
