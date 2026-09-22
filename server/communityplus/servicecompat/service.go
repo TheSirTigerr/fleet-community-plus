@@ -10,9 +10,12 @@ import (
 	"github.com/fleetdm/fleet/v4/server/fleet"
 )
 
-// NewService preserves the base Community service. Community+ capabilities are
-// composed through their own services rather than an Enterprise wrapper.
-func NewService(base fleet.Service, _ ...any) (fleet.Service, error) { return base, nil }
+// NewService preserves the base Community service and layers independently
+// implemented Community+ capabilities on top when their dependencies are
+// available.
+func NewService(base fleet.Service, options ...any) (fleet.Service, error) {
+	return wrapApplePSSO(base, options)
+}
 
 func UninstallSoftwareMigration(context.Context, fleet.Datastore, fleet.SoftwareInstallerStore, *slog.Logger) error {
 	return nil
