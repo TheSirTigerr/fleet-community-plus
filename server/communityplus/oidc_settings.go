@@ -21,12 +21,13 @@ const (
 // ClientSecret is intentionally omitted from JSON responses and is only
 // accepted through the write-only update field exposed by the settings API.
 type OIDCSettings struct {
-	Enabled      bool     `json:"enabled"`
-	IssuerURL    string   `json:"issuer_url"`
-	ClientID     string   `json:"client_id"`
-	ClientSecret string   `json:"-"`
-	Scopes       []string `json:"scopes"`
-	IDPName      string   `json:"idp_name"`
+	Enabled               bool     `json:"enabled"`
+	EnableJITProvisioning bool     `json:"enable_jit_provisioning"`
+	IssuerURL             string   `json:"issuer_url"`
+	ClientID              string   `json:"client_id"`
+	ClientSecret          string   `json:"-"`
+	Scopes                []string `json:"scopes"`
+	IDPName               string   `json:"idp_name"`
 }
 
 func DefaultOIDCSettings() OIDCSettings {
@@ -103,6 +104,7 @@ func (s OIDCSettings) Validate() error {
 // OIDCSettingsView is safe to expose over authenticated administrative APIs.
 type OIDCSettingsView struct {
 	Enabled                bool     `json:"enabled"`
+	EnableJITProvisioning  bool     `json:"enable_jit_provisioning"`
 	IssuerURL              string   `json:"issuer_url"`
 	ClientID               string   `json:"client_id"`
 	ClientSecretConfigured bool     `json:"client_secret_configured"`
@@ -113,6 +115,7 @@ type OIDCSettingsView struct {
 func (s OIDCSettings) View() OIDCSettingsView {
 	return OIDCSettingsView{
 		Enabled:                s.Enabled,
+		EnableJITProvisioning:  s.EnableJITProvisioning,
 		IssuerURL:              s.IssuerURL,
 		ClientID:               s.ClientID,
 		ClientSecretConfigured: s.ClientSecret != "",
