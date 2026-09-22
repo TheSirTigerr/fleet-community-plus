@@ -1,18 +1,15 @@
-// Package est provides the optional EST service construction boundary.
+// Package est is a compatibility facade for the Community+ EST boundary.
 package est
 
-import "log/slog"
+import (
+	"log/slog"
 
-type Service struct{}
+	communityest "github.com/fleetdm/fleet/v4/server/communityplus/est"
+)
 
-type Option func(*Service)
+type Service = communityest.Service
+type Option = communityest.Option
 
-func WithLogger(_ *slog.Logger) Option { return func(*Service) {} }
+func WithLogger(logger *slog.Logger) Option { return communityest.WithLogger(logger) }
 
-func NewService(opts ...Option) *Service {
-	svc := &Service{}
-	for _, opt := range opts {
-		opt(svc)
-	}
-	return svc
-}
+func NewService(opts ...Option) *Service { return communityest.NewService(opts...) }
