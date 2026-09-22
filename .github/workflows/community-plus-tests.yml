@@ -7,6 +7,9 @@ on:
       - 'community-plus/**'
     paths:
       - 'server/communityplus/**'
+      - 'server/service/communityplus_jit.go'
+      - 'server/service/sessions.go'
+      - 'server/service/appconfig.go'
       - 'cmd/fleetctl/fleetctl/communityplus_*.go'
       - 'cmd/fleetctl/fleetctl/fleetctl.go'
       - 'ee/pkg/hostidentity/types/**'
@@ -36,6 +39,9 @@ on:
   pull_request:
     paths:
       - 'server/communityplus/**'
+      - 'server/service/communityplus_jit.go'
+      - 'server/service/sessions.go'
+      - 'server/service/appconfig.go'
       - 'cmd/fleetctl/fleetctl/communityplus_*.go'
       - 'cmd/fleetctl/fleetctl/fleetctl.go'
       - 'ee/pkg/hostidentity/types/**'
@@ -84,7 +90,7 @@ jobs:
         shell: bash
         run: |
           set -euo pipefail
-          files="$(find server/communityplus server/mdm/maintainedapps orbit/pkg/communityplus ee/pkg/hostidentity/types ee/server/service/hostidentity/httpsig ee/server/service/digicert ee/server/service/scep ee/maintained-apps ee/server/licensing ee/fleetctl -name '*.go' -type f -print; find cmd/fleetctl/fleetctl -maxdepth 1 -name 'communityplus_*.go' -type f -print; printf '%s\n' cmd/fleetctl/fleetctl/fleetctl.go)"
+          files="$(find server/communityplus server/mdm/maintainedapps orbit/pkg/communityplus ee/pkg/hostidentity/types ee/server/service/hostidentity/httpsig ee/server/service/digicert ee/server/service/scep ee/maintained-apps ee/server/licensing ee/fleetctl -name '*.go' -type f -print; find cmd/fleetctl/fleetctl -maxdepth 1 -name 'communityplus_*.go' -type f -print; printf '%s\n' cmd/fleetctl/fleetctl/fleetctl.go server/service/communityplus_jit.go server/service/sessions.go server/service/appconfig.go)"
           test -n "$files"
           unformatted="$(gofmt -l $files)"
           if [ -n "$unformatted" ]; then
