@@ -1,10 +1,7 @@
-// Package condaccess provides Community+'s conditional-access registration boundary.
+// Package condaccess implements Community+ conditional-access integrations.
 package condaccess
 
-// RegisterSCEP intentionally leaves legacy premium conditional-access SCEP
-// routes unmounted until the Community+ implementation is complete.
-func RegisterSCEP(_ any, _ any, _ any, _ any, _ any, _ any) error { return nil }
-
-// RegisterIdP intentionally leaves legacy premium IdP routes unmounted until
-// the Community+ implementation is complete.
+// RegisterIdP remains the compatibility boundary for the Okta SAML IdP while
+// the Community+ implementation is being wired. Unlike the SCEP path, it does
+// not mount routes yet.
 func RegisterIdP(_ any, _ any, _ any, _ any, _ any) error { return nil }
