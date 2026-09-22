@@ -1,10 +1,12 @@
 package condaccess
 
-import "testing"
+import (
+	"testing"
 
-func TestConditionalAccessIdPCompatibilityBoundary(t *testing.T) {
-	placeholder := struct{}{}
-	if err := RegisterIdP(placeholder, placeholder, placeholder, placeholder, placeholder); err != nil {
-		t.Fatalf("register IdP compatibility boundary: %v", err)
-	}
+	"github.com/stretchr/testify/require"
+)
+
+func TestConditionalAccessIdPRejectsMissingDependencies(t *testing.T) {
+	err := RegisterIdP(nil, nil, nil, nil, nil)
+	require.Error(t, err)
 }
