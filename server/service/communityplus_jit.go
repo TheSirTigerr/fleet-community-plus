@@ -11,17 +11,33 @@ import (
 )
 
 // CommunityPlusGetSSOUser resolves an SSO identity to a Fleet user and, when
-// explicitly enabled, provisions a missing user on first successful IdP login.
-// Newly provisioned users receive the least-privileged built-in global role;
-// role/group mapping is intentionally handled by a separate integration layer.
+// JIT is enabled, applies Fleet's documented FLEET_JIT_USER_ROLE_* attributes
+// on every login. Missing users are provisioned with mapped roles when present
+// and otherwise receive the least-privileged built-in global observer role.
 func (svc *Service) CommunityPlusGetSSOUser(ctx context.Context, auth fleet.Auth, enableJIT bool) (*fleet.User, error) {
 	email := strings.ToLower(strings.TrimSpace(auth.UserID()))
 	if email == "" {
 		return nil, ctxerr.Wrap(ctx, newSSOError(errors.New("SSO identity did not contain an email address"), ssoAccountInvalid))
 	}
+	if err := fleet.ValidateEmail(email); err != nil {
+		return nil, ctxerr.Wrap(ctx, newSSOError(err, ssoAccountInvalid))
+	}
 
 	user, err := svc.ds.UserByEmail(ctx, email)
 	if err == nil {
+		if !enableJIT {
+			return user, nil
+		}
+		globalRole, fleetRoles, mapped, roleErr := svc.communityPlusSSORoles(ctx, auth.AssertionAttributes())
+		if roleErr != nil {
+			return nil, ctxerr.Wrap(ctx, newSSOError(roleErr, ssoAccountInvalid))
+		}
+		if !mapped {
+			return user, nil
+		}
+		if err := svc.communityPlusSyncSSORoles(ctx, user, globalRole, fleetRoles); err != nil {
+			return nil, ctxerr.Wrap(ctx, newSSOError(err, ssoAccountInvalid))
+		}
 		return user, nil
 	}
 	var notFound endpointer.NotFoundErrorInterface
@@ -31,35 +47,44 @@ func (svc *Service) CommunityPlusGetSSOUser(ctx context.Context, auth fleet.Auth
 	if !enableJIT {
 		return nil, ctxerr.Wrap(ctx, newSSOError(err, ssoAccountInvalid))
 	}
-	if err := fleet.ValidateEmail(email); err != nil {
-		return nil, ctxerr.Wrap(ctx, newSSOError(err, ssoAccountInvalid))
+
+	globalRole, fleetRoles, mapped, roleErr := svc.communityPlusSSORoles(ctx, auth.AssertionAttributes())
+	if roleErr != nil {
+		return nil, ctxerr.Wrap(ctx, newSSOError(roleErr, ssoAccountInvalid))
+	}
+	if !mapped {
+		defaultRole := fleet.RoleObserver
+		globalRole = &defaultRole
 	}
 
 	displayName := strings.TrimSpace(auth.UserDisplayName())
 	if displayName == "" {
 		displayName = email
 	}
-	globalRole := fleet.RoleObserver
 	ssoEnabled := true
 	adminForcedPasswordReset := false
-
-	// This endpoint is intentionally unauthenticated until the IdP assertion has
-	// been verified. JIT provisioning is authorized by that verified identity and
-	// the explicit server-side JIT setting rather than an existing Fleet viewer.
-	svc.authz.SkipAuthorization(ctx)
-	user, err = svc.NewUser(ctx, fleet.UserPayload{
+	payload := fleet.UserPayload{
 		Name:                     &displayName,
 		Email:                    &email,
 		SSOEnabled:               &ssoEnabled,
-		GlobalRole:               &globalRole,
+		GlobalRole:               globalRole,
 		AdminForcedPasswordReset: &adminForcedPasswordReset,
 		JITProvisioned:           true,
-	})
+	}
+	if mapped {
+		payload.Teams = &fleetRoles
+	}
+
+	// This callback is intentionally unauthenticated until the IdP assertion has
+	// been verified. Provisioning is authorized by that verified identity and the
+	// explicit server-side JIT setting rather than an existing Fleet viewer.
+	svc.authz.SkipAuthorization(ctx)
+	if mapped {
+		user, err = svc.communityPlusCreateMappedJITUser(ctx, payload)
+	} else {
+		user, err = svc.NewUser(ctx, payload)
+	}
 	if err != nil {
-		// Do not turn an arbitrary provisioning failure into success by re-reading
-		// the user. NewUser also records creation/role activities, so a post-insert
-		// activity failure must remain visible to the caller rather than being
-		// mistaken for a harmless concurrent insert.
 		return nil, ctxerr.Wrap(ctx, err, "JIT provision Community+ SSO user")
 	}
 	return user, nil
