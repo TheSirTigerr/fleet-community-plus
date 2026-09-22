@@ -1,0 +1,46 @@
+name: Community+ migrate host identity imports
+
+on:
+  push:
+    branches:
+      - community-plus/foundation
+    paths:
+      - '.github/workflows/community-plus-migrate-hostidentity-imports.yml'
+
+permissions:
+  contents: write
+
+jobs:
+  migrate:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: Replace host identity EE imports
+        shell: bash
+        run: |
+          set -euo pipefail
+          python3 - <<'PY'
+          from pathlib import Path
+          path = Path('cmd/fleet/serve.go')
+          text = path.read_text()
+          replacements = {
+              '"github.com/fleetdm/fleet/v4/ee/server/service/hostidentity"': '"github.com/fleetdm/fleet/v4/server/communityplus/hostidentity"',
+              '"github.com/fleetdm/fleet/v4/ee/server/service/hostidentity/httpsig"': '"github.com/fleetdm/fleet/v4/server/communityplus/hostidentity/httpsig"',
+          }
+          for old, new in replacements.items():
+              if old not in text:
+                  raise SystemExit(f'missing expected import: {old}')
+              text = text.replace(old, new, 1)
+          path.write_text(text)
+          PY
+          gofmt -w cmd/fleet/serve.go
+      - name: Commit migration
+        shell: bash
+        run: |
+          set -euo pipefail
+          git config user.name 'github-actions[bot]'
+          git config user.email '41898282+github-actions[bot]@users.noreply.github.com'
+          git add cmd/fleet/serve.go
+          git diff --cached --check
+          git commit -m 'refactor: move host identity imports off ee'
+          git push origin HEAD:community-plus/foundation
