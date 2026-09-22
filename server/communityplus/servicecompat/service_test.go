@@ -6,7 +6,7 @@ import (
 )
 
 func TestNewServicePreservesBaseService(t *testing.T) {
-	service, err := NewService(nil)
+	service, err := NewService(nil, struct{}{}, "ignored-startup-option", 42)
 	if err != nil {
 		t.Fatalf("new Community+ service: %v", err)
 	}
