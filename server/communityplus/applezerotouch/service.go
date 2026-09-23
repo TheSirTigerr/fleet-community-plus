@@ -11,19 +11,26 @@ import (
 
 	"github.com/fleetdm/fleet/v4/server/authz"
 	"github.com/fleetdm/fleet/v4/server/fleet"
-	apple_mdm "github.com/fleetdm/fleet/v4/server/mdm/apple"
 	"github.com/fleetdm/fleet/v4/server/mdm/nanodep/godep"
 )
+
+// depService is the narrow slice of Fleet's public Community DEPService needed
+// by the Community+ service. Keeping this boundary small makes the orchestration
+// independently testable without constructing an Apple network client.
+type depService interface {
+	GetDefaultProfile() *godep.Profile
+	RegisterProfileWithAppleDEPServer(context.Context, *fleet.Team, *fleet.MDMAppleSetupAssistant, string) (string, time.Time, error)
+}
 
 // Service owns the Apple ADE operations that replace the Community license
 // stubs. Apple protocol work remains in the public Community DEPService.
 type Service struct {
 	ds         fleet.Datastore
-	dep        *apple_mdm.DEPService
+	dep        depService
 	authorizer *authz.Authorizer
 }
 
-func New(ds fleet.Datastore, dep *apple_mdm.DEPService, authorizer *authz.Authorizer) (*Service, error) {
+func New(ds fleet.Datastore, dep depService, authorizer *authz.Authorizer) (*Service, error) {
 	if ds == nil {
 		return nil, errors.New("apple zero-touch datastore is nil")
 	}
