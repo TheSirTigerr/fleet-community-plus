@@ -14,7 +14,11 @@ import (
 // implemented Community+ capabilities on top when their dependencies are
 // available.
 func NewService(base fleet.Service, options ...any) (fleet.Service, error) {
-	return wrapApplePSSO(base, options)
+	svc, err := wrapApplePSSO(base, options)
+	if err != nil {
+		return nil, err
+	}
+	return wrapAppleZeroTouch(svc, options)
 }
 
 func UninstallSoftwareMigration(context.Context, fleet.Datastore, fleet.SoftwareInstallerStore, *slog.Logger) error {
