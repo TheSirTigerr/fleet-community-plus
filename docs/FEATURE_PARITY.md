@@ -18,7 +18,7 @@ This document tracks independently implemented equivalents for Fleet Premium cap
 - [x] SCIM provisioning
 - [x] IdP group mapping
 - [x] Conditional access integrations
-- [ ] Account/password synchronization where supported by platform APIs
+- [x] Account/password synchronization where supported by platform APIs
 
 ## Device enrollment and setup
 
