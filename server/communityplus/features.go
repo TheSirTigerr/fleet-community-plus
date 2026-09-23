@@ -27,6 +27,7 @@ const (
 	FeatureSSO                     Feature = "sso"
 	FeatureSCIM                    Feature = "scim"
 	FeatureConditionalAccess       Feature = "conditional_access"
+	FeatureAccountPasswordSync     Feature = "account_password_sync"
 	FeatureVulnerabilityEnrichment Feature = "vulnerability_enrichment"
 	FeatureGitOps                  Feature = "gitops"
 	FeatureDiskEncryption          Feature = "disk_encryption"
@@ -61,6 +62,7 @@ var knownFeatures = []Feature{
 	FeatureSSO,
 	FeatureSCIM,
 	FeatureConditionalAccess,
+	FeatureAccountPasswordSync,
 	FeatureVulnerabilityEnrichment,
 	FeatureGitOps,
 	FeatureDiskEncryption,
