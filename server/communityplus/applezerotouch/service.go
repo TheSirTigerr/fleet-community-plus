@@ -50,15 +50,18 @@ func (s *Service) SetOrUpdateSetupAssistant(ctx context.Context, asst *fleet.MDM
 	if asst == nil {
 		return nil, &fleet.BadRequestError{Message: "setup assistant is required"}
 	}
-	if err := s.authorizer.Authorize(ctx, asst, fleet.ActionWrite); err != nil {
-		return nil, err
-	}
 	if len(asst.Profile) == 0 {
 		return nil, &fleet.BadRequestError{Message: "enrollment profile is required"}
 	}
+	// Profile is json.RawMessage and the authorizer serializes its object for
+	// OPA. Validate syntax first so malformed input is reported as a bad request
+	// instead of being misclassified as an authorization failure.
 	var profile godep.Profile
 	if err := json.Unmarshal(asst.Profile, &profile); err != nil {
 		return nil, &fleet.BadRequestError{Message: "invalid Apple ADE enrollment profile", InternalErr: err}
+	}
+	if err := s.authorizer.Authorize(ctx, asst, fleet.ActionWrite); err != nil {
+		return nil, err
 	}
 	if asst.TeamID != nil {
 		if _, err := s.ds.TeamWithExtras(ctx, *asst.TeamID); err != nil {
