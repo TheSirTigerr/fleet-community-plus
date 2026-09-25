@@ -2,6 +2,7 @@ package servicecompat
 
 import (
 	"context"
+	"io"
 	"log/slog"
 	"time"
 
@@ -16,6 +17,7 @@ import (
 type appleZeroTouchWrapper struct {
 	fleet.Service
 	zeroTouch *applezerotouch.Service
+	abm       *applezerotouch.ABMService
 }
 
 func wrapAppleZeroTouch(base fleet.Service, options []any) (fleet.Service, error) {
@@ -43,11 +45,16 @@ func wrapAppleZeroTouch(base fleet.Service, options []any) (fleet.Service, error
 	if logger == nil {
 		logger = slog.New(slog.DiscardHandler)
 	}
-	service, err := applezerotouch.New(ds, apple_mdm.NewDEPService(ds, depStorage, logger), authz.Must())
+	authorizer := authz.Must()
+	zeroTouch, err := applezerotouch.New(ds, apple_mdm.NewDEPService(ds, depStorage, logger), authorizer)
 	if err != nil {
 		return nil, err
 	}
-	return &appleZeroTouchWrapper{Service: base, zeroTouch: service}, nil
+	abm, err := applezerotouch.NewABMService(ds, depStorage, authorizer, logger)
+	if err != nil {
+		return nil, err
+	}
+	return &appleZeroTouchWrapper{Service: base, zeroTouch: zeroTouch, abm: abm}, nil
 }
 
 func (s *appleZeroTouchWrapper) SetOrUpdateMDMAppleSetupAssistant(ctx context.Context, asst *fleet.MDMAppleSetupAssistant) (*fleet.MDMAppleSetupAssistant, error) {
@@ -64,4 +71,32 @@ func (s *appleZeroTouchWrapper) GetDefaultMDMAppleSetupAssistantProfile(ctx cont
 
 func (s *appleZeroTouchWrapper) DeleteMDMAppleSetupAssistant(ctx context.Context, teamID *uint) error {
 	return s.zeroTouch.DeleteSetupAssistant(ctx, teamID)
+}
+
+func (s *appleZeroTouchWrapper) UploadABMToken(ctx context.Context, token io.Reader) (*fleet.ABMToken, error) {
+	return s.abm.UploadToken(ctx, token)
+}
+
+func (s *appleZeroTouchWrapper) RenewABMToken(ctx context.Context, token io.Reader, tokenID uint) (*fleet.ABMToken, error) {
+	return s.abm.RenewToken(ctx, token, tokenID)
+}
+
+func (s *appleZeroTouchWrapper) ListABMTokens(ctx context.Context) ([]*fleet.ABMToken, error) {
+	return s.abm.ListTokens(ctx)
+}
+
+func (s *appleZeroTouchWrapper) CountABMTokens(ctx context.Context) (int, error) {
+	return s.abm.CountTokens(ctx)
+}
+
+func (s *appleZeroTouchWrapper) UpdateABMTokenTeams(ctx context.Context, tokenID uint, macOSTeamID, iOSTeamID, iPadOSTeamID, byodTeamID *uint) (*fleet.ABMToken, error) {
+	return s.abm.UpdateTokenTeams(ctx, tokenID, macOSTeamID, iOSTeamID, iPadOSTeamID, byodTeamID)
+}
+
+func (s *appleZeroTouchWrapper) SetABMTokenDefault(ctx context.Context, tokenID uint, isDefault *bool) (*fleet.ABMToken, error) {
+	return s.abm.SetDefaultToken(ctx, tokenID, isDefault)
+}
+
+func (s *appleZeroTouchWrapper) DeleteABMToken(ctx context.Context, tokenID uint) error {
+	return s.abm.DeleteToken(ctx, tokenID)
 }
