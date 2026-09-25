@@ -12,6 +12,15 @@ import (
 )
 
 func testABMService(ds *fleetmock.Store) *ABMService {
+	if ds.ListABMTokensFunc == nil {
+		ds.ListABMTokensFunc = func(context.Context) ([]*fleet.ABMToken, error) { return nil, nil }
+	}
+	if ds.AppConfigFunc == nil {
+		ds.AppConfigFunc = func(context.Context) (*fleet.AppConfig, error) { return &fleet.AppConfig{}, nil }
+	}
+	if ds.SaveAppConfigFunc == nil {
+		ds.SaveAppConfigFunc = func(context.Context, *fleet.AppConfig) error { return nil }
+	}
 	return &ABMService{ds: ds, authorizer: authz.Must(), logger: slog.New(slog.DiscardHandler)}
 }
 
@@ -98,7 +107,7 @@ func TestABMDeleteLastTokenDisablesABM(t *testing.T) {
 		deleted = true
 		return nil
 	}
-	ds.GetABMTokenCountFunc = func(context.Context) (int, error) { return 0, nil }
+	ds.ListABMTokensFunc = func(context.Context) ([]*fleet.ABMToken, error) { return nil, nil }
 	cfg := &fleet.AppConfig{}
 	cfg.MDM.AppleBMEnabledAndConfigured = true
 	ds.AppConfigFunc = func(context.Context) (*fleet.AppConfig, error) { return cfg, nil }
@@ -106,6 +115,8 @@ func TestABMDeleteLastTokenDisablesABM(t *testing.T) {
 	ds.SaveAppConfigFunc = func(_ context.Context, got *fleet.AppConfig) error {
 		saved = true
 		require.False(t, got.MDM.AppleBMEnabledAndConfigured)
+		require.True(t, got.MDM.AppleBusinessManager.Set)
+		require.Empty(t, got.MDM.AppleBusinessManager.Value)
 		return nil
 	}
 	svc := testABMService(ds)
@@ -113,4 +124,30 @@ func TestABMDeleteLastTokenDisablesABM(t *testing.T) {
 	require.NoError(t, svc.DeleteToken(testContext(fleet.RoleAdmin), 3))
 	require.True(t, deleted)
 	require.True(t, saved)
+}
+
+func TestABMSyncAppConfigMirrorsTokens(t *testing.T) {
+	ds := new(fleetmock.Store)
+	tokens := []*fleet.ABMToken{
+		{ID: 1, OrganizationName: "Org A", IsDefault: true, MacOSTeamName: "Mac fleet", IOSTeamName: "No team"},
+		{ID: 2, OrganizationName: "Org B", TermsExpired: true, IPadOSTeamName: "iPad fleet", BYODTeamName: "BYOD fleet"},
+	}
+	ds.ListABMTokensFunc = func(context.Context) ([]*fleet.ABMToken, error) { return tokens, nil }
+	cfg := &fleet.AppConfig{}
+	ds.AppConfigFunc = func(context.Context) (*fleet.AppConfig, error) { return cfg, nil }
+	ds.SaveAppConfigFunc = func(context.Context, *fleet.AppConfig) error { return nil }
+	svc := testABMService(ds)
+
+	require.NoError(t, svc.syncAppConfig(testContext(fleet.RoleAdmin)))
+	require.True(t, cfg.MDM.AppleBMEnabledAndConfigured)
+	require.True(t, cfg.MDM.AppleBMTermsExpired)
+	require.True(t, cfg.MDM.AppleBusinessManager.Set)
+	require.Len(t, cfg.MDM.AppleBusinessManager.Value, 2)
+	require.Equal(t, fleet.MDMAppleABMAssignmentInfo{
+		OrganizationName: "Org A",
+		Default:          true,
+		MacOSTeam:        "Mac fleet",
+	}, cfg.MDM.AppleBusinessManager.Value[0])
+	require.Equal(t, "iPad fleet", cfg.MDM.AppleBusinessManager.Value[1].IpadOSTeam)
+	require.Equal(t, "BYOD fleet", cfg.MDM.AppleBusinessManager.Value[1].BYODTeam)
 }
