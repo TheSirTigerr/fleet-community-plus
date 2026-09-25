@@ -7,6 +7,7 @@ import (
 	"io"
 	"log/slog"
 
+	"github.com/fleetdm/fleet/v4/pkg/optjson"
 	"github.com/fleetdm/fleet/v4/server/authz"
 	"github.com/fleetdm/fleet/v4/server/fleet"
 	apple_mdm "github.com/fleetdm/fleet/v4/server/mdm/apple"
@@ -59,7 +60,7 @@ func (s *ABMService) UploadToken(ctx context.Context, reader io.Reader) (*fleet.
 	if err != nil {
 		return nil, fmt.Errorf("store Apple Business Manager token: %w", err)
 	}
-	if err := s.setEnabled(ctx, true); err != nil {
+	if err := s.syncAppConfig(ctx); err != nil {
 		return nil, err
 	}
 	return token, nil
@@ -85,6 +86,9 @@ func (s *ABMService) RenewToken(ctx context.Context, reader io.Reader, tokenID u
 	token.TermsExpired = false
 	if err := s.ds.SaveABMToken(ctx, token); err != nil {
 		return nil, fmt.Errorf("save renewed Apple Business Manager token: %w", err)
+	}
+	if err := s.syncAppConfig(ctx); err != nil {
+		return nil, err
 	}
 	return token, nil
 }
@@ -136,6 +140,9 @@ func (s *ABMService) UpdateTokenTeams(ctx context.Context, tokenID uint, macOSTe
 	if err := s.ds.SaveABMToken(ctx, token); err != nil {
 		return nil, fmt.Errorf("save Apple Business Manager default fleets: %w", err)
 	}
+	if err := s.syncAppConfig(ctx); err != nil {
+		return nil, err
+	}
 	return token, nil
 }
 
@@ -158,6 +165,9 @@ func (s *ABMService) SetDefaultToken(ctx context.Context, tokenID uint, isDefaul
 			return nil, fmt.Errorf("clear default Apple Business Manager token: %w", err)
 		}
 	}
+	if err := s.syncAppConfig(ctx); err != nil {
+		return nil, err
+	}
 	token, err := s.ds.GetABMTokenByID(ctx, tokenID)
 	if err != nil {
 		return nil, fmt.Errorf("reload Apple Business Manager token: %w", err)
@@ -175,16 +185,7 @@ func (s *ABMService) DeleteToken(ctx context.Context, tokenID uint) error {
 	if err := s.ds.DeleteABMToken(ctx, tokenID); err != nil {
 		return fmt.Errorf("delete Apple Business Manager token: %w", err)
 	}
-	count, err := s.ds.GetABMTokenCount(ctx)
-	if err != nil {
-		return fmt.Errorf("count Apple Business Manager tokens after delete: %w", err)
-	}
-	if count == 0 {
-		if err := s.setEnabled(ctx, false); err != nil {
-			return err
-		}
-	}
-	return nil
+	return s.syncAppConfig(ctx)
 }
 
 func (s *ABMService) decryptUploadedToken(ctx context.Context, reader io.Reader) ([]byte, *depclient.OAuth1Tokens, error) {
@@ -217,19 +218,46 @@ func (s *ABMService) decryptUploadedToken(ctx context.Context, reader io.Reader)
 	return encrypted, decrypted, nil
 }
 
-func (s *ABMService) setEnabled(ctx context.Context, enabled bool) error {
+func (s *ABMService) syncAppConfig(ctx context.Context) error {
+	tokens, err := s.ds.ListABMTokens(ctx)
+	if err != nil {
+		return fmt.Errorf("list Apple Business Manager tokens for app config sync: %w", err)
+	}
 	appConfig, err := s.ds.AppConfig(ctx)
 	if err != nil {
 		return fmt.Errorf("load app config for Apple Business Manager: %w", err)
 	}
-	if appConfig.MDM.AppleBMEnabledAndConfigured == enabled {
-		return nil
+
+	entries := make([]fleet.MDMAppleABMAssignmentInfo, 0, len(tokens))
+	termsExpired := false
+	for _, token := range tokens {
+		if token == nil {
+			continue
+		}
+		entries = append(entries, fleet.MDMAppleABMAssignmentInfo{
+			OrganizationName: token.OrganizationName,
+			Default:          token.IsDefault,
+			MacOSTeam:        appConfigABMTeamName(token.MacOSTeamName),
+			IOSTeam:          appConfigABMTeamName(token.IOSTeamName),
+			IpadOSTeam:       appConfigABMTeamName(token.IPadOSTeamName),
+			BYODTeam:         appConfigABMTeamName(token.BYODTeamName),
+		})
+		termsExpired = termsExpired || token.TermsExpired
 	}
-	appConfig.MDM.AppleBMEnabledAndConfigured = enabled
+	appConfig.MDM.AppleBusinessManager = optjson.SetSlice(entries)
+	appConfig.MDM.AppleBMEnabledAndConfigured = len(entries) > 0
+	appConfig.MDM.AppleBMTermsExpired = termsExpired
 	if err := s.ds.SaveAppConfig(ctx, appConfig); err != nil {
-		return fmt.Errorf("save Apple Business Manager state: %w", err)
+		return fmt.Errorf("save Apple Business Manager app config: %w", err)
 	}
 	return nil
+}
+
+func appConfigABMTeamName(name string) string {
+	if name == "No team" {
+		return ""
+	}
+	return name
 }
 
 func normalizeTeamID(teamID *uint) *uint {
