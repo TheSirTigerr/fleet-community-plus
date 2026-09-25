@@ -11,6 +11,7 @@ import (
 	"github.com/fleetdm/fleet/v4/server/fleet"
 	apple_mdm "github.com/fleetdm/fleet/v4/server/mdm/apple"
 	"github.com/fleetdm/fleet/v4/server/mdm/assets"
+	depclient "github.com/fleetdm/fleet/v4/server/mdm/nanodep/client"
 	nanodep_storage "github.com/fleetdm/fleet/v4/server/mdm/nanodep/storage"
 )
 
@@ -186,8 +187,34 @@ func (s *ABMService) DeleteToken(ctx context.Context, tokenID uint) error {
 	return nil
 }
 
-func (s *ABMService) decryptUploadedToken(ctx context.Context, reader io.Reader) ([]byte, interface{ GetAccessToken() string }, error) {
-	panic("implemented in abm_crypto.go")
+func (s *ABMService) decryptUploadedToken(ctx context.Context, reader io.Reader) ([]byte, *depclient.OAuth1Tokens, error) {
+	if reader == nil {
+		return nil, nil, &fleet.BadRequestError{Message: "Apple Business Manager token is required"}
+	}
+	encrypted, err := io.ReadAll(reader)
+	if err != nil {
+		return nil, nil, fmt.Errorf("read Apple Business Manager token: %w", err)
+	}
+	if len(encrypted) == 0 {
+		return nil, nil, &fleet.BadRequestError{Message: "Apple Business Manager token is empty"}
+	}
+	cert, err := assets.X509Cert(ctx, s.ds, fleet.MDMAssetABMCert)
+	if err != nil {
+		return nil, nil, fmt.Errorf("load Apple Business Manager certificate: %w", err)
+	}
+	keyAssets, err := s.ds.GetAllMDMConfigAssetsByName(ctx, []fleet.MDMAssetName{fleet.MDMAssetABMKey}, nil)
+	if err != nil {
+		return nil, nil, fmt.Errorf("load Apple Business Manager private key: %w", err)
+	}
+	keyAsset, ok := keyAssets[fleet.MDMAssetABMKey]
+	if !ok || len(keyAsset.Value) == 0 {
+		return nil, nil, errors.New("Apple Business Manager private key is missing")
+	}
+	decrypted, err := assets.DecryptRawABMToken(encrypted, cert, keyAsset.Value)
+	if err != nil {
+		return nil, nil, &fleet.BadRequestError{Message: "Apple Business Manager token could not be decrypted", InternalErr: err}
+	}
+	return encrypted, decrypted, nil
 }
 
 func (s *ABMService) setEnabled(ctx context.Context, enabled bool) error {
