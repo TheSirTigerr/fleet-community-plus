@@ -109,4 +109,13 @@ jobs:
           git config user.email '41898282+github-actions[bot]@users.noreply.github.com'
           git add -A
           git commit -m 'fix: preserve Android fully-managed enrollment intent'
-          git push origin HEAD:community-plus/foundation
+
+          for attempt in 1 2 3; do
+            git fetch origin community-plus/foundation
+            if git rebase origin/community-plus/foundation && git push origin HEAD:community-plus/foundation; then
+              exit 0
+            fi
+            git rebase --abort || true
+            sleep 2
+          done
+          exit 1
