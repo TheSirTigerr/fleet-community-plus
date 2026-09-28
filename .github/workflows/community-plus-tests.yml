@@ -129,7 +129,7 @@ jobs:
       - name: Test Community+ core service regressions
         run: >-
           go test ./server/service
-          -run '^(TestCommunityPlusGetSSOUser|TestValidateMDMAllowsCommunityPlusMacOSMigrationWithoutPremiumLicense)$'
+          -run '^(TestCommunityPlusGetSSOUser|TestValidateMDMAllowsCommunityPlusMacOSMigrationWithoutPremiumLicense|TestValidateMDMAllowsCommunityPlusHostNameTemplateWithoutPremiumLicense|TestUpdateMDMHostNameTemplateIsNotPremiumLicenseGated)$'
 
       - name: Test Community+ fleetctl
         run: go test ./cmd/fleetctl/fleetctl -run 'TestCommunityPlus|TestFleetGitOps'
