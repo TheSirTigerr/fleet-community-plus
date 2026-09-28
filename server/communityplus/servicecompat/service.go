@@ -22,6 +22,10 @@ func NewService(base fleet.Service, options ...any) (fleet.Service, error) {
 	if err != nil {
 		return nil, err
 	}
+	svc, err = wrapBootstrapPackage(svc, options)
+	if err != nil {
+		return nil, err
+	}
 	return wrapAppleZeroTouch(svc, options)
 }
 
