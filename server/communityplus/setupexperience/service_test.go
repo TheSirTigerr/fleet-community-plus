@@ -2,10 +2,13 @@ package setupexperience
 
 import (
 	"context"
+	"encoding/json"
 	"errors"
 	"testing"
 
 	"github.com/fleetdm/fleet/v4/server/fleet"
+	"github.com/fleetdm/fleet/v4/server/mdm/nanodep/godep"
+	fleetmock "github.com/fleetdm/fleet/v4/server/mock"
 	"github.com/stretchr/testify/require"
 )
 
@@ -25,6 +28,22 @@ func TestValidateEnvironmentRequiresWindowsMDM(t *testing.T) {
 	cfg.MDM.EnabledAndConfigured = true
 	err := svc.validateEnvironment(context.Background(), cfg, fleet.MDMAppleSetupPayload{RequireAllSoftwareWindows: boolPtr(true)})
 	require.ErrorIs(t, err, fleet.ErrWindowsMDMNotConfigured)
+}
+
+func TestValidateEnvironmentRejectsCustomConfigurationWebURLWithEUA(t *testing.T) {
+	ds := new(fleetmock.Store)
+	profileJSON, err := json.Marshal(godep.Profile{ConfigurationWebURL: "https://custom.example/setup"})
+	require.NoError(t, err)
+	ds.GetMDMAppleSetupAssistantFunc = func(context.Context, *uint) (*fleet.MDMAppleSetupAssistant, error) {
+		return &fleet.MDMAppleSetupAssistant{Profile: profileJSON}, nil
+	}
+	svc := &Service{ds: ds}
+	cfg := &fleet.AppConfig{}
+	cfg.MDM.EnabledAndConfigured = true
+	cfg.MDM.EndUserAuthentication.SSOProviderSettings = fleet.SSOProviderSettings{EntityID: "https://idp.example"}
+
+	err = svc.validateEnvironment(context.Background(), cfg, fleet.MDMAppleSetupPayload{EnableEndUserAuthentication: boolPtr(true)})
+	require.Error(t, err)
 }
 
 func TestApplySynchronizesEndUserLock(t *testing.T) {
