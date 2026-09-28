@@ -17,7 +17,7 @@ type Service struct {
 
 	pushTopic func(context.Context, fleet.MDMAssetRetriever) (string, error)
 	generate  func(orgName, enrollURL, scepChallenge, topic, email string, freshEnrollment bool) ([]byte, error)
-	sign      func(context.Context, []byte, fleet.Datastore) ([]byte, error)
+	sign      func(context.Context, []byte, fleet.MDMAssetRetriever) ([]byte, error)
 }
 
 func New(ds fleet.Datastore) *Service {
