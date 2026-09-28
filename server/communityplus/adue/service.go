@@ -81,7 +81,7 @@ func (s *Service) EnrollmentProfile(ctx context.Context, enrollRef string) ([]by
 		return nil, fmt.Errorf("load SCEP challenge: %w", err)
 	}
 	asset, ok := assets[fleet.MDMAssetSCEPChallenge]
-	if !ok || asset == nil {
+	if !ok {
 		return nil, fmt.Errorf("load SCEP challenge: asset is missing")
 	}
 
