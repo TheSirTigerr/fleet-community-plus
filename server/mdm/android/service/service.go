@@ -679,6 +679,7 @@ func (svc *Service) CreateEnrollmentToken(ctx context.Context, enrollSecret, idp
 
 	enrollmentTokenRequest, err := json.Marshal(enrollmentTokenRequest{
 		EnrollSecret: enrollSecret,
+		FullyManaged: fullyManaged,
 		IdpUUID:      idpUUID,
 	})
 	if err != nil {
