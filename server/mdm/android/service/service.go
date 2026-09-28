@@ -102,6 +102,10 @@ func NewServiceWithClient(
 	androidAgentConfig config.AndroidAgentConfig,
 	opts ...ServiceOption,
 ) (android.Service, error) {
+	if client == nil {
+		return nil, errors.New("android management API client is not configured")
+	}
+
 	authorizer, err := authz.NewAuthorizer()
 	if err != nil {
 		return nil, fmt.Errorf("new authorizer: %w", err)
@@ -136,15 +140,30 @@ func NewServiceWithClient(
 	return svc, nil
 }
 
+const communityPlusAndroidGoogleCredentialsEnv = "FLEET_MDM_ANDROID_GOOGLE_SERVICE_CREDENTIALS"
+
+type amapiGoogleClientFactory func(context.Context, *slog.Logger, dev_mode.GetEnv) androidmgmt.Client
+type amapiProxyClientFactory func(context.Context, *slog.Logger, string, dev_mode.GetEnv) androidmgmt.Client
+
 func newAMAPIClient(ctx context.Context, logger *slog.Logger, licenseKey string) androidmgmt.Client {
-	var client androidmgmt.Client
-	getEnv := dev_mode.Env
-	if getEnv("FLEET_DEV_ANDROID_GOOGLE_CLIENT") == "1" || strings.ToUpper(getEnv("FLEET_DEV_ANDROID_GOOGLE_CLIENT")) == "ON" {
-		client = androidmgmt.NewGoogleClient(ctx, logger, getEnv)
-	} else {
-		client = androidmgmt.NewProxyClient(ctx, logger, licenseKey, getEnv)
+	return selectAMAPIClient(ctx, logger, licenseKey, dev_mode.Env, androidmgmt.NewGoogleClient, androidmgmt.NewProxyClient)
+}
+
+func selectAMAPIClient(ctx context.Context, logger *slog.Logger, licenseKey string, getEnv dev_mode.GetEnv, googleFactory amapiGoogleClientFactory, proxyFactory amapiProxyClientFactory) androidmgmt.Client {
+	if credentials := strings.TrimSpace(getEnv(communityPlusAndroidGoogleCredentialsEnv)); credentials != "" {
+		communityPlusEnv := func(name string) string {
+			if name == "FLEET_DEV_ANDROID_GOOGLE_SERVICE_CREDENTIALS" {
+				return credentials
+			}
+			return getEnv(name)
+		}
+		return googleFactory(ctx, logger, communityPlusEnv)
 	}
-	return client
+
+	if getEnv("FLEET_DEV_ANDROID_GOOGLE_CLIENT") == "1" || strings.ToUpper(getEnv("FLEET_DEV_ANDROID_GOOGLE_CLIENT")) == "ON" {
+		return googleFactory(ctx, logger, getEnv)
+	}
+	return proxyFactory(ctx, logger, licenseKey, getEnv)
 }
 
 func newErrResponse(err error) android.DefaultResponse {
