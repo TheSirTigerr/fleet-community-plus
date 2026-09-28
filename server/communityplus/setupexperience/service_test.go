@@ -9,19 +9,21 @@ import (
 	"github.com/stretchr/testify/require"
 )
 
-func boolPtr(v bool) *bool { return &v }
+func boolPtr(v bool) *bool       { return &v }
 func stringPtr(v string) *string { return &v }
 
 func TestValidateEnvironmentRequiresAppleMDM(t *testing.T) {
+	svc := &Service{}
 	cfg := &fleet.AppConfig{}
-	err := validateEnvironment(cfg, fleet.MDMAppleSetupPayload{RequireAllSoftware: boolPtr(true)})
+	err := svc.validateEnvironment(context.Background(), cfg, fleet.MDMAppleSetupPayload{RequireAllSoftware: boolPtr(true)})
 	require.ErrorIs(t, err, fleet.ErrMDMNotConfigured)
 }
 
 func TestValidateEnvironmentRequiresWindowsMDM(t *testing.T) {
+	svc := &Service{}
 	cfg := &fleet.AppConfig{}
 	cfg.MDM.EnabledAndConfigured = true
-	err := validateEnvironment(cfg, fleet.MDMAppleSetupPayload{RequireAllSoftwareWindows: boolPtr(true)})
+	err := svc.validateEnvironment(context.Background(), cfg, fleet.MDMAppleSetupPayload{RequireAllSoftwareWindows: boolPtr(true)})
 	require.ErrorIs(t, err, fleet.ErrWindowsMDMNotConfigured)
 }
 
