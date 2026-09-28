@@ -92,7 +92,7 @@ func TestEnrollmentProfileConsumesChallengeAndSignsProfile(t *testing.T) {
 		}
 		return []byte("unsigned-profile"), nil
 	}
-	svc.sign = func(_ context.Context, profile []byte, _ fleet.Datastore) ([]byte, error) {
+	svc.sign = func(_ context.Context, profile []byte, _ fleet.MDMAssetRetriever) ([]byte, error) {
 		if string(profile) != "unsigned-profile" {
 			t.Fatalf("unexpected unsigned profile %q", profile)
 		}
