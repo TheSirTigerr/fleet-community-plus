@@ -26,8 +26,8 @@ This document tracks independently implemented equivalents for Fleet Premium cap
 - [x] Setup experience configuration
 - [x] Bootstrap package handling
 - [x] MDM migration workflows
-- [ ] Host naming templates
-- [ ] iOS/iPadOS account-driven enrollment
+- [x] Host naming templates
+- [x] iOS/iPadOS account-driven enrollment
 - [ ] Android fully managed enrollment
 
 ## MDM and security controls
