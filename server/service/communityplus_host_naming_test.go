@@ -12,7 +12,9 @@ import (
 )
 
 func TestValidateMDMAllowsCommunityPlusHostNameTemplateWithoutPremiumLicense(t *testing.T) {
-	svc := &Service{ds: &mock.DataStore{}, authz: authz.Must()}
+	ds := &mock.DataStore{}
+	ds.ValidateReferencedCustomHostVitalsFunc = func(context.Context, []string) error { return nil }
+	svc := &Service{ds: ds, authz: authz.Must()}
 	oldMDM := &fleet.MDM{EnabledAndConfigured: true}
 	newMDM := *oldMDM
 	newMDM.HostNameTemplate = optjson.SetString("WS-$FLEET_VAR_HOST_HARDWARE_SERIAL")
