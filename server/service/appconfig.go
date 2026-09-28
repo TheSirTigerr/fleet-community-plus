@@ -2539,10 +2539,8 @@ func (svc *Service) validateMDM(
 		// TODO: Should we validate MDM configured on here too?
 
 		if mdm.MacOSMigration.Enable {
-			if !lic.IsPremium() {
-				invalid.Append("macos_migration.enable", ErrMissingLicense.Error())
-				return nil
-			}
+			// Community+ implements the macOS MDM migration workflow independently;
+			// do not gate this configuration on a Fleet Premium license token.
 			if !mdm.MacOSMigration.Mode.IsValid() {
 				invalid.Append("macos_migration.mode", "mode must be one of 'voluntary' or 'forced'")
 			}
