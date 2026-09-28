@@ -8,6 +8,7 @@ import (
 
 	"github.com/fleetdm/fleet/v4/server/authz"
 	"github.com/fleetdm/fleet/v4/server/communityplus/applezerotouch"
+	"github.com/fleetdm/fleet/v4/server/communityplus/setupexperience"
 	"github.com/fleetdm/fleet/v4/server/fleet"
 	apple_mdm "github.com/fleetdm/fleet/v4/server/mdm/apple"
 	"github.com/fleetdm/fleet/v4/server/mdm/nanodep/godep"
@@ -18,6 +19,7 @@ type appleZeroTouchWrapper struct {
 	fleet.Service
 	zeroTouch *applezerotouch.Service
 	abm       *applezerotouch.ABMService
+	setup     *setupexperience.Service
 }
 
 func wrapAppleZeroTouch(base fleet.Service, options []any) (fleet.Service, error) {
@@ -54,7 +56,11 @@ func wrapAppleZeroTouch(base fleet.Service, options []any) (fleet.Service, error
 	if err != nil {
 		return nil, err
 	}
-	return &appleZeroTouchWrapper{Service: base, zeroTouch: zeroTouch, abm: abm}, nil
+	setup, err := setupexperience.New(ds, authorizer)
+	if err != nil {
+		return nil, err
+	}
+	return &appleZeroTouchWrapper{Service: base, zeroTouch: zeroTouch, abm: abm, setup: setup}, nil
 }
 
 func (s *appleZeroTouchWrapper) SetOrUpdateMDMAppleSetupAssistant(ctx context.Context, asst *fleet.MDMAppleSetupAssistant) (*fleet.MDMAppleSetupAssistant, error) {
@@ -71,6 +77,10 @@ func (s *appleZeroTouchWrapper) GetDefaultMDMAppleSetupAssistantProfile(ctx cont
 
 func (s *appleZeroTouchWrapper) DeleteMDMAppleSetupAssistant(ctx context.Context, teamID *uint) error {
 	return s.zeroTouch.DeleteSetupAssistant(ctx, teamID)
+}
+
+func (s *appleZeroTouchWrapper) UpdateMDMAppleSetup(ctx context.Context, payload fleet.MDMAppleSetupPayload) error {
+	return s.setup.UpdateAppleSetup(ctx, payload)
 }
 
 func (s *appleZeroTouchWrapper) UploadABMToken(ctx context.Context, token io.Reader) (*fleet.ABMToken, error) {
