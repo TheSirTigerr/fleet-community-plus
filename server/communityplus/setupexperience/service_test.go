@@ -74,10 +74,10 @@ func TestApplyRejectsLockedEndUserInfoWithoutAuthentication(t *testing.T) {
 	require.Error(t, err)
 }
 
-func TestApplyRejectsLocalAccountTypeWithoutManagedAccount(t *testing.T) {
+func TestApplyRejectsUnsupportedLocalAccountType(t *testing.T) {
 	svc := &Service{}
 	setup := &fleet.MacOSSetup{}
-	err := svc.apply(context.Background(), setup, fleet.MDMAppleSetupPayload{EndUserLocalAccountType: stringPtr("admin")})
+	err := svc.apply(context.Background(), setup, fleet.MDMAppleSetupPayload{EndUserLocalAccountType: stringPtr("root")})
 	require.Error(t, err)
 	var invalid *fleet.InvalidArgumentError
 	require.True(t, errors.As(err, &invalid))
