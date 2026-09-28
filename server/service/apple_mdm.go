@@ -4429,11 +4429,7 @@ func initiateMDMSSOEndpoint(ctx context.Context, request any, svc fleet.Service)
 }
 
 func (svc *Service) InitiateMDMSSO(ctx context.Context, initiator, customOriginalURL string, hostUUID string) (sessionID string, sessionDurationSeconds int, idpURL string, err error) {
-	// skipauth: No authorization check needed due to implementation
-	// returning only license error.
-	svc.authz.SkipAuthorization(ctx)
-
-	return "", 0, "", fleet.ErrMissingLicense
+	return svc.communityPlusInitiateMDMSSO(ctx, initiator, customOriginalURL, hostUUID)
 }
 
 ////////////////////////////////////////////////////////////////////////////////
@@ -4513,11 +4509,7 @@ func callbackMDMSSOEndpoint(ctx context.Context, request interface{}, svc fleet.
 }
 
 func (svc *Service) MDMSSOCallback(ctx context.Context, sessionID string, samlResponse []byte) (redirectURL, byodCookieValue, deviceSSOSessionID string, deviceSSOSessionDurationSeconds int) {
-	// skipauth: No authorization check needed due to implementation
-	// returning only license error.
-	svc.authz.SkipAuthorization(ctx)
-
-	return apple_mdm.FleetUISSOCallbackPath + "?error=true", "", "", 0
+	return svc.communityPlusMDMSSOCallback(ctx, sessionID, samlResponse)
 }
 
 ////////////////////////////////////////////////////////////////////////////////
