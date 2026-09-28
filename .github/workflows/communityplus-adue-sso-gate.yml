@@ -38,9 +38,12 @@ jobs:
               r'(?:(?!\n\}).)*\n\}',
               re.S,
           )
-          initiate_replacement = '''func (svc *Service) InitiateMDMSSO(ctx context.Context, initiator, customOriginalURL string, hostUUID string) (sessionID string, sessionDurationSeconds int, idpURL string, err error) {
-\treturn svc.communityPlusInitiateMDMSSO(ctx, initiator, customOriginalURL, hostUUID)
-}'''
+          initiate_replacement = (
+              'func (svc *Service) InitiateMDMSSO(ctx context.Context, initiator, customOriginalURL string, hostUUID string) '
+              '(sessionID string, sessionDurationSeconds int, idpURL string, err error) {\n'
+              '\treturn svc.communityPlusInitiateMDMSSO(ctx, initiator, customOriginalURL, hostUUID)\n'
+              '}'
+          )
           text, count = initiate_pattern.subn(initiate_replacement, text, count=1)
           if count != 1:
               raise SystemExit(f'expected one InitiateMDMSSO stub, got {count}')
@@ -51,9 +54,12 @@ jobs:
               r'(?:(?!\n\}).)*\n\}',
               re.S,
           )
-          callback_replacement = '''func (svc *Service) MDMSSOCallback(ctx context.Context, sessionID string, samlResponse []byte) (redirectURL, byodCookieValue, deviceSSOSessionID string, deviceSSOSessionDurationSeconds int) {
-\treturn svc.communityPlusMDMSSOCallback(ctx, sessionID, samlResponse)
-}'''
+          callback_replacement = (
+              'func (svc *Service) MDMSSOCallback(ctx context.Context, sessionID string, samlResponse []byte) '
+              '(redirectURL, byodCookieValue, deviceSSOSessionID string, deviceSSOSessionDurationSeconds int) {\n'
+              '\treturn svc.communityPlusMDMSSOCallback(ctx, sessionID, samlResponse)\n'
+              '}'
+          )
           text, count = callback_pattern.subn(callback_replacement, text, count=1)
           if count != 1:
               raise SystemExit(f'expected one MDMSSOCallback stub, got {count}')
