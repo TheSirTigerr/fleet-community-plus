@@ -126,8 +126,10 @@ jobs:
           ./ee/server/webhooks
           ./server/vulnerabilities/nvd/tools/cvefeed/...
 
-      - name: Test Community+ JIT service
-        run: go test ./server/service -run '^TestCommunityPlusGetSSOUser'
+      - name: Test Community+ core service regressions
+        run: >-
+          go test ./server/service
+          -run '^(TestCommunityPlusGetSSOUser|TestValidateMDMAllowsCommunityPlusMacOSMigrationWithoutPremiumLicense)$'
 
       - name: Test Community+ fleetctl
         run: go test ./cmd/fleetctl/fleetctl -run 'TestCommunityPlus|TestFleetGitOps'
