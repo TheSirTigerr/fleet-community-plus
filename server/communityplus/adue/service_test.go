@@ -83,7 +83,7 @@ func TestEnrollmentProfileConsumesChallengeAndSignsProfile(t *testing.T) {
 	}
 
 	svc := New(ds)
-	svc.pushTopic = func(context.Context, fleet.Datastore) (string, error) {
+	svc.pushTopic = func(context.Context, fleet.MDMAssetRetriever) (string, error) {
 		return "com.apple.mgmt.External.example", nil
 	}
 	svc.generate = func(orgName, enrollURL, scepChallenge, topic, email string, fresh bool) ([]byte, error) {
