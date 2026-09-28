@@ -16,6 +16,7 @@ func newRuntimeRegistry() *Registry {
 	mustSetRuntimeStatus(registry, FeatureSCIM, StatusAvailable)
 	mustSetRuntimeStatus(registry, FeatureConditionalAccess, StatusAvailable)
 	mustSetRuntimeStatus(registry, FeatureAccountPasswordSync, StatusAvailable)
+	mustSetRuntimeStatus(registry, FeatureZeroTouch, StatusAvailable)
 	mustSetRuntimeStatus(registry, FeatureSoftwareAutomation, StatusExperimental)
 	mustSetRuntimeStatus(registry, FeaturePatchPolicies, StatusExperimental)
 	return registry
