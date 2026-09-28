@@ -7,7 +7,7 @@ import (
 
 	"github.com/fleetdm/fleet/v4/server/fleet"
 	apple_mdm "github.com/fleetdm/fleet/v4/server/mdm/apple"
-	"github.com/fleetdm/fleet/v4/server/mdm/crypto"
+	mdmcrypto "github.com/fleetdm/fleet/v4/server/mdm/crypto"
 )
 
 // Service implements the license-independent parts of Apple's account-driven
@@ -15,7 +15,7 @@ import (
 type Service struct {
 	ds fleet.Datastore
 
-	pushTopic func(context.Context, fleet.Datastore) (string, error)
+	pushTopic func(context.Context, fleet.MDMAssetRetriever) (string, error)
 	generate  func(orgName, enrollURL, scepChallenge, topic, email string, freshEnrollment bool) ([]byte, error)
 	sign      func(context.Context, []byte, fleet.Datastore) ([]byte, error)
 }
@@ -25,7 +25,7 @@ func New(ds fleet.Datastore) *Service {
 		ds:        ds,
 		pushTopic: apple_mdm.MDMPushCertTopic,
 		generate:  apple_mdm.GenerateAccountDrivenEnrollmentProfileMobileconfig,
-		sign:      crypto.Sign,
+		sign:      mdmcrypto.Sign,
 	}
 }
 
