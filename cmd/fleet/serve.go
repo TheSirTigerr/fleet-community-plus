@@ -542,6 +542,19 @@ func runServeCmd(cmd *cobra.Command, configManager configpkg.Manager, debug, dev
 	var bootstrapPackageStore fleet.MDMBootstrapPackageStore
 	var softwareTitleIconStore fleet.SoftwareTitleIconStore
 	var distributedLock fleet.Lock
+
+	// Community+ uses Fleet's free license identity. Initialize the bootstrap
+	// package object store independently of Fleet Premium so S3-backed bootstrap
+	// packages honor the configured storage backend in production.
+	if !license.IsPremium() && config.S3.SoftwareInstallersBucket != "" {
+		bstore, err := s3.NewBootstrapPackageStore(config.S3)
+		if err != nil {
+			initFatal(err, "initializing Community+ S3 bootstrap package store")
+		}
+		bootstrapPackageStore = bstore
+		logger.InfoContext(ctx, "using Community+ S3 bootstrap package store", "bucket", config.S3.SoftwareInstallersBucket)
+	}
+
 	if license.IsPremium() {
 		hydrantService := est.NewService(est.WithLogger(logger))
 		profileMatcher := apple_mdm.NewProfileMatcher(redisPool)
@@ -646,6 +659,23 @@ func runServeCmd(cmd *cobra.Command, configManager configpkg.Manager, debug, dev
 		)
 		if err != nil {
 			initFatal(err, "initial Fleet Premium service")
+		}
+	}
+
+	// Community+ capabilities are edition features, not Fleet Premium license
+	// features. Layer them onto the Community service when running with the
+	// normal Free license identity. Dev-Premium keeps the existing path above.
+	if !license.IsPremium() {
+		svc, err = eeservice.NewService(
+			svc,
+			ds,
+			logger,
+			depStorage,
+			bootstrapPackageStore,
+			psso.NewRedisNonceStore(redisPool),
+		)
+		if err != nil {
+			initFatal(err, "initial Community+ service")
 		}
 	}
 
