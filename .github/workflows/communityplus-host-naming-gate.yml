@@ -45,10 +45,28 @@ jobs:
               '\t\t\tsvc.authz.CanWriteSecretVariables(ctx)); err != nil {\n'
           )
           if text.count(old) != 1:
-              raise SystemExit(f'expected one host naming license gate, got {text.count(old)}')
+              raise SystemExit(f'expected one host naming config license gate, got {text.count(old)}')
+          p.write_text(text.replace(old, new, 1))
+
+          p = Path('server/service/mdm.go')
+          text = p.read_text()
+          old = (
+              'func (svc *Service) UpdateMDMHostNameTemplate(ctx context.Context, fleetID *uint, nameTemplate string) error {\n'
+              '\tif !license.IsPremium(ctx) {\n'
+              '\t\tsvc.authz.SkipAuthorization(ctx)\n'
+              '\t\treturn fleet.ErrMissingLicense\n'
+              '\t}\n'
+          )
+          new = (
+              'func (svc *Service) UpdateMDMHostNameTemplate(ctx context.Context, fleetID *uint, nameTemplate string) error {\n'
+              '\t// Community+ provides the fleet/global host naming implementation through\n'
+              '\t// EnterpriseOverrides, so this endpoint is not gated on a Premium token.\n'
+          )
+          if text.count(old) != 1:
+              raise SystemExit(f'expected one host naming API license gate, got {text.count(old)}')
           p.write_text(text.replace(old, new, 1))
           PY
-          gofmt -w server/service/appconfig.go
+          gofmt -w server/service/appconfig.go server/service/mdm.go
           git diff --check
           go test ./server/communityplus/... ./server/service -run 'TestNonExistent' -count=0
           go build ./cmd/fleet
@@ -62,6 +80,6 @@ jobs:
           set -euo pipefail
           git config user.name 'github-actions[bot]'
           git config user.email '41898282+github-actions[bot]@users.noreply.github.com'
-          git add server/service/appconfig.go
+          git add server/service/appconfig.go server/service/mdm.go
           git commit -m 'fix: allow Community+ host naming templates'
           git push origin HEAD:community-plus/foundation
