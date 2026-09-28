@@ -24,7 +24,7 @@ This document tracks independently implemented equivalents for Fleet Premium cap
 
 - [x] Zero-touch enrollment workflows
 - [x] Setup experience configuration
-- [ ] Bootstrap package handling
+- [x] Bootstrap package handling
 - [ ] MDM migration workflows
 - [ ] Host naming templates
 - [ ] iOS/iPadOS account-driven enrollment
