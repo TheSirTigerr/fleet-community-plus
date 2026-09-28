@@ -3,6 +3,7 @@ package setupexperience
 
 import (
 	"context"
+	"encoding/json"
 	"errors"
 	"fmt"
 	"net/http"
@@ -10,6 +11,7 @@ import (
 	"github.com/fleetdm/fleet/v4/pkg/optjson"
 	"github.com/fleetdm/fleet/v4/server/authz"
 	"github.com/fleetdm/fleet/v4/server/fleet"
+	"github.com/fleetdm/fleet/v4/server/mdm/nanodep/godep"
 )
 
 type Service struct {
@@ -38,7 +40,7 @@ func (s *Service) UpdateAppleSetup(ctx context.Context, payload fleet.MDMAppleSe
 	if err != nil {
 		return fmt.Errorf("load app config for setup experience: %w", err)
 	}
-	if err := validateEnvironment(appConfig, payload); err != nil {
+	if err := s.validateEnvironment(ctx, appConfig, payload); err != nil {
 		return err
 	}
 
@@ -65,7 +67,7 @@ func (s *Service) UpdateAppleSetup(ctx context.Context, payload fleet.MDMAppleSe
 	return nil
 }
 
-func validateEnvironment(appConfig *fleet.AppConfig, payload fleet.MDMAppleSetupPayload) error {
+func (s *Service) validateEnvironment(ctx context.Context, appConfig *fleet.AppConfig, payload fleet.MDMAppleSetupPayload) error {
 	if appConfig == nil {
 		return errors.New("app config is nil")
 	}
@@ -83,13 +85,40 @@ func validateEnvironment(appConfig *fleet.AppConfig, payload fleet.MDMAppleSetup
 		return fleet.ErrWindowsMDMNotConfigured
 	}
 
-	if payload.EnableEndUserAuthentication != nil && *payload.EnableEndUserAuthentication && appConfig.MDM.EndUserAuthentication.IsEmpty() {
-		return fleet.NewInvalidArgumentError(
-			"enable_end_user_authentication",
-			"Couldn't enable setup_experience.enable_end_user_authentication because no IdP is configured for MDM features.",
-		)
+	if payload.EnableEndUserAuthentication != nil && *payload.EnableEndUserAuthentication {
+		if appConfig.MDM.EndUserAuthentication.IsEmpty() {
+			return fleet.NewInvalidArgumentError(
+				"enable_end_user_authentication",
+				"Couldn't enable setup_experience.enable_end_user_authentication because no IdP is configured for MDM features.",
+			)
+		}
+		hasCustomWebURL, err := s.hasCustomConfigurationWebURL(ctx, payload.TeamID)
+		if err != nil {
+			return err
+		}
+		if hasCustomWebURL {
+			return fleet.NewInvalidArgumentError("setup_experience.enable_end_user_authentication", fleet.EndUserAuthDEPWebURLConfiguredErrMsg)
+		}
 	}
 	return nil
+}
+
+func (s *Service) hasCustomConfigurationWebURL(ctx context.Context, teamID *uint) (bool, error) {
+	assistant, err := s.ds.GetMDMAppleSetupAssistant(ctx, teamID)
+	if err != nil {
+		if fleet.IsNotFound(err) {
+			return false, nil
+		}
+		return false, fmt.Errorf("load Apple setup assistant: %w", err)
+	}
+	if assistant == nil || len(assistant.Profile) == 0 {
+		return false, nil
+	}
+	var profile godep.Profile
+	if err := json.Unmarshal(assistant.Profile, &profile); err != nil {
+		return false, fmt.Errorf("parse Apple setup assistant profile: %w", err)
+	}
+	return profile.ConfigurationWebURL != "", nil
 }
 
 func (s *Service) apply(ctx context.Context, setup *fleet.MacOSSetup, payload fleet.MDMAppleSetupPayload) error {
