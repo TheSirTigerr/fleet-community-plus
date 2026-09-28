@@ -3,6 +3,7 @@ package servicecompat
 import (
 	"context"
 
+	"github.com/fleetdm/fleet/v4/server/communityplus/hostnaming"
 	"github.com/fleetdm/fleet/v4/server/fleet"
 )
 
@@ -36,9 +37,15 @@ func installCommunityPlusOverrides(svc fleet.Service, options []any) {
 func newCommunityPlusOverrides(svc fleet.Service, ds fleet.Datastore) fleet.EnterpriseOverrides {
 	deleteSetupAssistant := func(context.Context, *uint) error { return fleet.ErrMissingLicense }
 	deleteBootstrapPackage := func(context.Context, *uint, bool) error { return fleet.ErrMissingLicense }
+	updateTeamHostNameTemplate := func(context.Context, *fleet.Team, string) error { return fleet.ErrMissingLicense }
+	applyHostNameTemplateChange := func(context.Context, *fleet.Team, string) error { return fleet.ErrMissingLicense }
 	if svc != nil {
 		deleteSetupAssistant = svc.DeleteMDMAppleSetupAssistant
 		deleteBootstrapPackage = svc.DeleteMDMAppleBootstrapPackage
+		if hostNaming, err := hostnaming.New(ds, svc); err == nil {
+			updateTeamHostNameTemplate = hostNaming.UpdateTeam
+			applyHostNameTemplateChange = hostNaming.Apply
+		}
 	}
 
 	return fleet.EnterpriseOverrides{
@@ -55,12 +62,8 @@ func newCommunityPlusOverrides(svc fleet.Service, ds fleet.Datastore) fleet.Ente
 		UpdateTeamMDMDiskEncryption: func(context.Context, *fleet.Team, fleet.DiskEncryptionSettingsChanges, *bool) error {
 			return fleet.ErrMissingLicense
 		},
-		UpdateTeamMDMHostNameTemplate: func(context.Context, *fleet.Team, string) error {
-			return fleet.ErrMissingLicense
-		},
-		ApplyHostNameTemplateChange: func(context.Context, *fleet.Team, string) error {
-			return fleet.ErrMissingLicense
-		},
+		UpdateTeamMDMHostNameTemplate: updateTeamHostNameTemplate,
+		ApplyHostNameTemplateChange:   applyHostNameTemplateChange,
 		MDMAppleReconcileFileVaultProfile: func(context.Context, *uint) error {
 			return fleet.ErrMissingLicense
 		},
