@@ -30,6 +30,10 @@ func NewService(base fleet.Service, options ...any) (fleet.Service, error) {
 	if err != nil {
 		return nil, err
 	}
+	svc, err = wrapAppleADUE(svc, options)
+	if err != nil {
+		return nil, err
+	}
 	svc, err = wrapMDMMigration(svc, options)
 	if err != nil {
 		return nil, err
