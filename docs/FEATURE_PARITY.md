@@ -22,7 +22,7 @@ This document tracks independently implemented equivalents for Fleet Premium cap
 
 ## Device enrollment and setup
 
-- [ ] Zero-touch enrollment workflows
+- [x] Zero-touch enrollment workflows
 - [ ] Setup experience configuration
 - [ ] Bootstrap package handling
 - [ ] MDM migration workflows
