@@ -28,7 +28,7 @@ This document tracks independently implemented equivalents for Fleet Premium cap
 - [x] MDM migration workflows
 - [x] Host naming templates
 - [x] iOS/iPadOS account-driven enrollment
-- [ ] Android fully managed enrollment
+- [x] Android fully managed enrollment
 
 ## MDM and security controls
 
