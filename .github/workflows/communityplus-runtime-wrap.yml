@@ -1,0 +1,114 @@
+name: Community+ runtime service wiring
+
+on:
+  push:
+    branches:
+      - community-plus/foundation
+    paths:
+      - '.github/workflows/communityplus-runtime-wrap.yml'
+
+permissions:
+  contents: write
+
+jobs:
+  patch:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          ref: community-plus/foundation
+          fetch-depth: 0
+      - uses: actions/setup-go@v5
+        with:
+          go-version-file: go.mod
+      - name: Wire Community+ service on Free runtime
+        shell: bash
+        run: |
+          set -euo pipefail
+          python3 - <<'PY'
+          from pathlib import Path
+
+          p = Path('cmd/fleet/serve.go')
+          text = p.read_text()
+
+          old_vars = '''\tvar softwareInstallStore fleet.SoftwareInstallerStore
+\tvar bootstrapPackageStore fleet.MDMBootstrapPackageStore
+\tvar softwareTitleIconStore fleet.SoftwareTitleIconStore
+\tvar distributedLock fleet.Lock
+\tif license.IsPremium() {
+'''
+          new_vars = '''\tvar softwareInstallStore fleet.SoftwareInstallerStore
+\tvar bootstrapPackageStore fleet.MDMBootstrapPackageStore
+\tvar softwareTitleIconStore fleet.SoftwareTitleIconStore
+\tvar distributedLock fleet.Lock
+
+\t// Community+ uses Fleet's free license identity. Initialize the bootstrap
+\t// package object store independently of Fleet Premium so S3-backed bootstrap
+\t// packages honor the configured storage backend in production.
+\tif !license.IsPremium() && config.S3.SoftwareInstallersBucket != "" {
+\t\tbstore, err := s3.NewBootstrapPackageStore(config.S3)
+\t\tif err != nil {
+\t\t\tinitFatal(err, "initializing Community+ S3 bootstrap package store")
+\t\t}
+\t\tbootstrapPackageStore = bstore
+\t\tlogger.InfoContext(ctx, "using Community+ S3 bootstrap package store", "bucket", config.S3.SoftwareInstallersBucket)
+\t}
+
+\tif license.IsPremium() {
+'''
+          if text.count(old_vars) != 1:
+              raise SystemExit(f'expected one store declaration block, got {text.count(old_vars)}')
+          text = text.replace(old_vars, new_vars, 1)
+
+          old_tail = '''\t\tif err != nil {
+\t\t\tinitFatal(err, "initial Fleet Premium service")
+\t\t}
+\t}
+
+\tinstanceID, err := server.GenerateRandomText(64)
+'''
+          new_tail = '''\t\tif err != nil {
+\t\t\tinitFatal(err, "initial Fleet Premium service")
+\t\t}
+\t}
+
+\t// Community+ capabilities are edition features, not Fleet Premium license
+\t// features. Layer them onto the Community service when running with the
+\t// normal Free license identity. Dev-Premium keeps the existing path above.
+\tif !license.IsPremium() {
+\t\tsvc, err = eeservice.NewService(
+\t\t\tsvc,
+\t\t\tds,
+\t\t\tlogger,
+\t\t\tdepStorage,
+\t\t\tbootstrapPackageStore,
+\t\t\tpsso.NewRedisNonceStore(redisPool),
+\t\t)
+\t\tif err != nil {
+\t\t\tinitFatal(err, "initial Community+ service")
+\t\t}
+\t}
+
+\tinstanceID, err := server.GenerateRandomText(64)
+'''
+          if text.count(old_tail) != 1:
+              raise SystemExit(f'expected one premium service tail, got {text.count(old_tail)}')
+          p.write_text(text.replace(old_tail, new_tail, 1))
+          PY
+          gofmt -w cmd/fleet/serve.go
+          git diff --check
+          go test ./server/communityplus/...
+          go build ./cmd/fleet
+          if git diff --quiet; then
+            echo 'No patch produced'
+            exit 1
+          fi
+      - name: Commit verified runtime wiring
+        shell: bash
+        run: |
+          set -euo pipefail
+          git config user.name 'github-actions[bot]'
+          git config user.email '41898282+github-actions[bot]@users.noreply.github.com'
+          git add cmd/fleet/serve.go
+          git commit -m 'fix: wire Community+ services on Free runtime'
+          git push origin HEAD:community-plus/foundation
