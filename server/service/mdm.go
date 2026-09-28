@@ -3609,10 +3609,8 @@ func updateHostNameTemplateEndpoint(ctx context.Context, request any, svc fleet.
 }
 
 func (svc *Service) UpdateMDMHostNameTemplate(ctx context.Context, fleetID *uint, nameTemplate string) error {
-	if !license.IsPremium(ctx) {
-		svc.authz.SkipAuthorization(ctx)
-		return fleet.ErrMissingLicense
-	}
+	// Community+ provides the fleet/global host naming implementation through
+	// EnterpriseOverrides, so this endpoint is not gated on a Premium token.
 
 	if err := svc.authz.Authorize(ctx,
 		fleet.MDMAppleSettingsPayload{TeamID: fleetID}, fleet.ActionWrite); err != nil {
