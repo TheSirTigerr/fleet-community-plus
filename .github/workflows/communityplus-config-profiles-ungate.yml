@@ -179,6 +179,43 @@ jobs:
               "\tt.Run(\"Fleet variables used in the upload are threaded through to the datastore call\"",
               windows_test,
           )
+
+          # The authorization matrixes exercise team-scoped profiles too. Once
+          # profile resolution uses the Community datastore directly, their
+          # shared setup needs the corresponding lightweight team lookup mock.
+          apple_lookup = (
+              "\t\tds.TeamWithExtrasFunc = func(ctx context.Context, teamID uint) (*fleet.Team, error) {\n"
+              "\t\t\treturn &fleet.Team{ID: teamID, Name: fmt.Sprintf(\"team-%d\", teamID)}, nil\n"
+              "\t\t}\n"
+          )
+          apple_lookup_with_lite = apple_lookup + (
+              "\t\tds.TeamLiteFunc = func(ctx context.Context, teamID uint) (*fleet.TeamLite, error) {\n"
+              "\t\t\treturn &fleet.TeamLite{ID: teamID, Name: fmt.Sprintf(\"team-%d\", teamID)}, nil\n"
+              "\t\t}\n"
+          )
+          replace_in_function(
+              "server/service/apple_mdm_test.go",
+              "func TestUpdateMDMAppleConfigProfile",
+              apple_lookup,
+              apple_lookup_with_lite,
+          )
+
+          windows_lookup = (
+              "\t\tds.TeamWithExtrasFunc = func(ctx context.Context, teamID uint) (*fleet.Team, error) {\n"
+              "\t\t\treturn &fleet.Team{ID: teamID, Name: fmt.Sprintf(\"team-%d\", teamID)}, nil\n"
+              "\t\t}\n"
+          )
+          windows_lookup_with_lite = windows_lookup + (
+              "\t\tds.TeamLiteFunc = func(ctx context.Context, teamID uint) (*fleet.TeamLite, error) {\n"
+              "\t\t\treturn &fleet.TeamLite{ID: teamID, Name: fmt.Sprintf(\"team-%d\", teamID)}, nil\n"
+              "\t\t}\n"
+          )
+          replace_in_function(
+              "server/service/windows_mdm_profiles_test.go",
+              "func TestUpdateMDMWindowsConfigProfile",
+              windows_lookup,
+              windows_lookup_with_lite,
+          )
           PY
           gofmt -w server/service/apple_mdm.go server/service/windows_mdm_profiles.go server/service/mdm.go server/service/apple_mdm_test.go server/service/windows_mdm_profiles_test.go
           git diff --check
