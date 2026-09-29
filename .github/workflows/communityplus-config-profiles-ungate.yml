@@ -1,0 +1,133 @@
+name: Community+ configuration profile scope ungate
+
+on:
+  push:
+    branches:
+      - community-plus/foundation
+    paths:
+      - '.github/workflows/communityplus-config-profiles-ungate.yml'
+  workflow_dispatch:
+
+permissions:
+  contents: write
+
+jobs:
+  patch:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          ref: community-plus/foundation
+          fetch-depth: 0
+      - uses: actions/setup-go@v5
+        with:
+          go-version-file: go.mod
+          cache: true
+      - name: Remove only fleet-scope profile license gates
+        shell: bash
+        run: |
+          set -euo pipefail
+          python3 - <<'PY'
+          from pathlib import Path
+
+          def function_chunk(path, marker):
+              p = Path(path)
+              text = p.read_text()
+              start = text.find(marker)
+              if start < 0:
+                  raise SystemExit(f"{path}: missing marker {marker}")
+              end = text.find("\nfunc ", start + len(marker))
+              if end < 0:
+                  end = len(text)
+              return p, text, start, end, text[start:end]
+
+          def replace_in_function(path, marker, old, new):
+              p, text, start, end, chunk = function_chunk(path, marker)
+              actual = chunk.count(old)
+              if actual != 1:
+                  raise SystemExit(f"{path} {marker}: expected 1 match, got {actual}")
+              chunk = chunk.replace(old, new, 1)
+              p.write_text(text[:start] + chunk + text[end:])
+
+          team_gate = (
+              "\tif teamID > 0 {\n"
+              "\t\tif lic == nil || !lic.IsPremium() {\n"
+              "\t\t\treturn nil, nil, \"\", ctxerr.Wrap(ctx, fleet.ErrMissingLicense)\n"
+              "\t\t}\n"
+              "\t\ttm, err := svc.EnterpriseOverrides.TeamByIDOrName(ctx, &teamID, nil)\n"
+              "\t\tif err != nil {\n"
+              "\t\t\treturn nil, nil, \"\", ctxerr.Wrap(ctx, err)\n"
+              "\t\t}\n"
+              "\t\tteamName = tm.Name\n"
+              "\t}\n"
+          )
+          team_free = (
+              "\tif teamID > 0 {\n"
+              "\t\ttm, err := svc.ds.TeamLite(ctx, teamID)\n"
+              "\t\tif err != nil {\n"
+              "\t\t\treturn nil, nil, \"\", ctxerr.Wrap(ctx, err)\n"
+              "\t\t}\n"
+              "\t\tteamName = tm.Name\n"
+              "\t}\n"
+          )
+          replace_in_function(
+              "server/service/apple_mdm.go",
+              "func (svc *Service) parseAndValidateAppleConfigProfile",
+              team_gate,
+              team_free,
+          )
+          replace_in_function(
+              "server/service/windows_mdm_profiles.go",
+              "func (svc *Service) parseAndValidateWindowsConfigProfile",
+              team_gate,
+              team_free,
+          )
+
+          old_resolve = (
+              "\tlic, err := svc.License(ctx)\n"
+              "\tif err != nil {\n"
+              "\t\treturn 0, \"\", ctxerr.Wrap(ctx, err, \"checking license\")\n"
+              "\t}\n"
+              "\tif lic == nil || !lic.IsPremium() {\n"
+              "\t\treturn 0, \"\", ctxerr.Wrap(ctx, fleet.ErrMissingLicense)\n"
+              "\t}\n"
+              "\ttm, err := svc.EnterpriseOverrides.TeamByIDOrName(ctx, &tmID, nil)\n"
+              "\tif err != nil {\n"
+              "\t\treturn 0, \"\", ctxerr.Wrap(ctx, err)\n"
+              "\t}\n"
+          )
+          new_resolve = (
+              "\ttm, err := svc.ds.TeamLite(ctx, tmID)\n"
+              "\tif err != nil {\n"
+              "\t\treturn 0, \"\", ctxerr.Wrap(ctx, err)\n"
+              "\t}\n"
+          )
+          replace_in_function(
+              "server/service/mdm.go",
+              "func (svc *Service) resolveProfileTeam",
+              old_resolve,
+              new_resolve,
+          )
+          PY
+          gofmt -w server/service/apple_mdm.go server/service/windows_mdm_profiles.go server/service/mdm.go
+          git diff --check
+          if git diff --quiet; then
+            echo 'No patch produced'
+            exit 1
+          fi
+      - name: Verify profile scope changes
+        shell: bash
+        run: |
+          set -euo pipefail
+          go test ./server/communityplus/servicecompat -count=1
+          go test ./server/service -run 'Test.*MDM.*Profile' -count=1
+          go build ./cmd/fleet
+      - name: Commit guarded patch
+        shell: bash
+        run: |
+          set -euo pipefail
+          git config user.name 'github-actions[bot]'
+          git config user.email '41898282+github-actions[bot]@users.noreply.github.com'
+          git add server/service/apple_mdm.go server/service/windows_mdm_profiles.go server/service/mdm.go
+          git commit -m 'feat: enable Community+ configuration profile fleet scope'
+          git push origin HEAD:community-plus/foundation
