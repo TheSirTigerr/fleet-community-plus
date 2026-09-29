@@ -49,6 +49,17 @@ jobs:
               chunk = chunk.replace(old, new, 1)
               p.write_text(text[:start] + chunk + text[end:])
 
+          def replace_test_block(path, start_marker, end_marker, replacement):
+              p = Path(path)
+              text = p.read_text()
+              start = text.find(start_marker)
+              if start < 0:
+                  raise SystemExit(f"{path}: missing test marker {start_marker}")
+              end = text.find(end_marker, start)
+              if end < 0:
+                  raise SystemExit(f"{path}: missing following test marker {end_marker}")
+              p.write_text(text[:start] + replacement + text[end:])
+
           team_gate = (
               "\tif teamID > 0 {\n"
               "\t\tif lic == nil || !lic.IsPremium() {\n"
@@ -108,8 +119,68 @@ jobs:
               old_resolve,
               new_resolve,
           )
+
+          apple_test = (
+              "\tt.Run(\"team-scoped content update succeeds on a free license\", func(t *testing.T) {\n"
+              "\t\tsvc, ctx, ds, _ := setup(t, &fleet.LicenseInfo{Tier: fleet.TierFree})\n"
+              "\t\texisting := newExistingProfile(\"com.fleetdm.test\", \"Test Profile\", 5)\n\n"
+              "\t\tds.GetMDMAppleConfigProfileFunc = func(ctx context.Context, puid string) (*fleet.MDMAppleConfigProfile, error) {\n"
+              "\t\t\treturn existing, nil\n"
+              "\t\t}\n"
+              "\t\tds.TeamLiteFunc = func(ctx context.Context, tid uint) (*fleet.TeamLite, error) {\n"
+              "\t\t\trequire.Equal(t, uint(5), tid)\n"
+              "\t\t\treturn &fleet.TeamLite{ID: tid, Name: \"Test Team\"}, nil\n"
+              "\t\t}\n"
+              "\t\tds.UpdateMDMAppleConfigProfileFunc = func(ctx context.Context, p fleet.MDMAppleConfigProfile, usesFleetVars []fleet.FleetVarName) (*fleet.MDMAppleConfigProfile, error) {\n"
+              "\t\t\trequire.Equal(t, uint(5), ptr.ValOrZero(p.TeamID))\n"
+              "\t\t\treturn &p, nil\n"
+              "\t\t}\n\n"
+              "\t\tmcBytes := mcBytesForTest(\"Test Profile\", \"com.fleetdm.test\", \"UUID\")\n"
+              "\t\terr := svc.UpdateMDMConfigProfile(ctx, existing.ProfileUUID, \"\", mcBytes, nil, fleet.LabelsIncludeAll, nil, optjson.Slice[byte]{})\n"
+              "\t\trequire.NoError(t, err)\n\n"
+              "\t\t// Label scoping remains a separate Community+ roadmap capability.\n"
+              "\t\terr = svc.UpdateMDMConfigProfile(ctx, existing.ProfileUUID, \"\", nil, []string{\"label1\"}, fleet.LabelsIncludeAny, nil, optjson.Slice[byte]{})\n"
+              "\t\trequire.ErrorIs(t, err, fleet.ErrMissingLicense)\n"
+              "\t})\n\n"
+          )
+          replace_test_block(
+              "server/service/apple_mdm_test.go",
+              "\tt.Run(\"team-scoped update on a free license returns a license error\"",
+              "\tt.Run(\"authorization outcome matches user role and team membership\"",
+              apple_test,
+          )
+
+          windows_test = (
+              "\tt.Run(\"team-scoped content update succeeds on a free license\", func(t *testing.T) {\n"
+              "\t\tsvc, ctx, ds, _ := setup(t, &fleet.LicenseInfo{Tier: fleet.TierFree})\n"
+              "\t\texisting := newExistingProfile(\"Test Profile\", 5)\n\n"
+              "\t\tds.GetMDMWindowsConfigProfileFunc = func(ctx context.Context, puid string) (*fleet.MDMWindowsConfigProfile, error) {\n"
+              "\t\t\treturn existing, nil\n"
+              "\t\t}\n"
+              "\t\tds.TeamLiteFunc = func(ctx context.Context, tid uint) (*fleet.TeamLite, error) {\n"
+              "\t\t\trequire.Equal(t, uint(5), tid)\n"
+              "\t\t\treturn &fleet.TeamLite{ID: tid, Name: \"Test Team\"}, nil\n"
+              "\t\t}\n"
+              "\t\tds.UpdateMDMWindowsConfigProfileFunc = func(ctx context.Context, p fleet.MDMWindowsConfigProfile, usesFleetVars []fleet.FleetVarName) (*fleet.MDMWindowsConfigProfile, error) {\n"
+              "\t\t\trequire.Equal(t, uint(5), ptr.ValOrZero(p.TeamID))\n"
+              "\t\t\treturn &p, nil\n"
+              "\t\t}\n\n"
+              "\t\tsyncML := syncMLForTest(\"./Device/Vendor/MSFT/Policy/Config/Bluetooth/AllowDiscoverableMode\")\n"
+              "\t\terr := svc.UpdateMDMConfigProfile(ctx, existing.ProfileUUID, existing.Name, syncML, nil, fleet.LabelsIncludeAll, nil, optjson.Slice[byte]{})\n"
+              "\t\trequire.NoError(t, err)\n\n"
+              "\t\t// Label scoping remains a separate Community+ roadmap capability.\n"
+              "\t\terr = svc.UpdateMDMConfigProfile(ctx, existing.ProfileUUID, \"\", nil, []string{\"label1\"}, fleet.LabelsIncludeAny, nil, optjson.Slice[byte]{})\n"
+              "\t\trequire.ErrorIs(t, err, fleet.ErrMissingLicense)\n"
+              "\t})\n\n"
+          )
+          replace_test_block(
+              "server/service/windows_mdm_profiles_test.go",
+              "\tt.Run(\"team-scoped update on a free license returns a license error\"",
+              "\tt.Run(\"Fleet variables used in the upload are threaded through to the datastore call\"",
+              windows_test,
+          )
           PY
-          gofmt -w server/service/apple_mdm.go server/service/windows_mdm_profiles.go server/service/mdm.go
+          gofmt -w server/service/apple_mdm.go server/service/windows_mdm_profiles.go server/service/mdm.go server/service/apple_mdm_test.go server/service/windows_mdm_profiles_test.go
           git diff --check
           if git diff --quiet; then
             echo 'No patch produced'
@@ -128,6 +199,6 @@ jobs:
           set -euo pipefail
           git config user.name 'github-actions[bot]'
           git config user.email '41898282+github-actions[bot]@users.noreply.github.com'
-          git add server/service/apple_mdm.go server/service/windows_mdm_profiles.go server/service/mdm.go
+          git add server/service/apple_mdm.go server/service/windows_mdm_profiles.go server/service/mdm.go server/service/apple_mdm_test.go server/service/windows_mdm_profiles_test.go
           git commit -m 'feat: enable Community+ configuration profile fleet scope'
           git push origin HEAD:community-plus/foundation
