@@ -1005,6 +1005,9 @@ func TestUpdateMDMAppleConfigProfile(t *testing.T) {
 		ds.TeamWithExtrasFunc = func(ctx context.Context, teamID uint) (*fleet.Team, error) {
 			return &fleet.Team{ID: teamID, Name: fmt.Sprintf("team-%d", teamID)}, nil
 		}
+		ds.TeamLiteFunc = func(ctx context.Context, teamID uint) (*fleet.TeamLite, error) {
+			return &fleet.TeamLite{ID: teamID, Name: fmt.Sprintf("team-%d", teamID)}, nil
+		}
 		ds.LabelIDsByNameFunc = func(ctx context.Context, labels []string, filter fleet.TeamFilter) (map[string]uint, error) {
 			m := make(map[string]uint)
 			for i, label := range labels {
@@ -1277,29 +1280,28 @@ func TestUpdateMDMAppleConfigProfile(t *testing.T) {
 		require.NoError(t, err)
 	})
 
-	t.Run("team-scoped update on a free license returns a license error", func(t *testing.T) {
-		// team profiles can survive a premium-to-free downgrade; the update
-		// must fail with a license error, not panic on the nil
-		// EnterpriseOverrides that free servers never populate.
+	t.Run("team-scoped content update succeeds on a free license", func(t *testing.T) {
 		svc, ctx, ds, _ := setup(t, &fleet.LicenseInfo{Tier: fleet.TierFree})
 		existing := newExistingProfile("com.fleetdm.test", "Test Profile", 5)
 
 		ds.GetMDMAppleConfigProfileFunc = func(ctx context.Context, puid string) (*fleet.MDMAppleConfigProfile, error) {
 			return existing, nil
 		}
+		ds.TeamLiteFunc = func(ctx context.Context, tid uint) (*fleet.TeamLite, error) {
+			require.Equal(t, uint(5), tid)
+			return &fleet.TeamLite{ID: tid, Name: "Test Team"}, nil
+		}
 		ds.UpdateMDMAppleConfigProfileFunc = func(ctx context.Context, p fleet.MDMAppleConfigProfile, usesFleetVars []fleet.FleetVarName) (*fleet.MDMAppleConfigProfile, error) {
-			t.Fatal("should not reach the datastore update")
-			return nil, nil
+			require.Equal(t, uint(5), ptr.ValOrZero(p.TeamID))
+			return &p, nil
 		}
 
 		mcBytes := mcBytesForTest("Test Profile", "com.fleetdm.test", "UUID")
 		err := svc.UpdateMDMConfigProfile(ctx, existing.ProfileUUID, "", mcBytes, nil, fleet.LabelsIncludeAll, nil, optjson.Slice[byte]{})
-		require.ErrorIs(t, err, fleet.ErrMissingLicense)
+		require.NoError(t, err)
 
+		// Label scoping remains a separate Community+ roadmap capability.
 		err = svc.UpdateMDMConfigProfile(ctx, existing.ProfileUUID, "", nil, []string{"label1"}, fleet.LabelsIncludeAny, nil, optjson.Slice[byte]{})
-		require.ErrorIs(t, err, fleet.ErrMissingLicense)
-
-		err = svc.UpdateMDMConfigProfile(ctx, existing.ProfileUUID, "", nil, nil, fleet.LabelsIncludeAll, nil, optjson.Slice[byte]{})
 		require.ErrorIs(t, err, fleet.ErrMissingLicense)
 	})
 
@@ -4761,6 +4763,9 @@ func TestMDMBatchSetAppleProfiles(t *testing.T) {
 	ds.TeamByNameFunc = func(ctx context.Context, name string) (*fleet.Team, error) {
 		return &fleet.Team{ID: 1, Name: name}, nil
 	}
+	ds.TeamLiteFunc = func(ctx context.Context, tid uint) (*fleet.TeamLite, error) {
+		return &fleet.TeamLite{ID: tid, Name: "team1"}, nil
+	}
 	ds.TeamWithExtrasFunc = func(ctx context.Context, id uint) (*fleet.Team, error) {
 		return &fleet.Team{ID: id, Name: "team"}, nil
 	}
@@ -4922,7 +4927,7 @@ func TestMDMBatchSetAppleProfiles(t *testing.T) {
 			ptr.Uint(1),
 			nil,
 			nil,
-			ErrMissingLicense.Error(),
+			"",
 		},
 		{
 			"team name with free license",
@@ -4931,7 +4936,7 @@ func TestMDMBatchSetAppleProfiles(t *testing.T) {
 			nil,
 			ptr.String("team"),
 			nil,
-			ErrMissingLicense.Error(),
+			"",
 		},
 		{
 			"team id and name specified",

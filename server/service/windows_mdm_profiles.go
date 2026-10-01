@@ -79,10 +79,7 @@ func (svc *Service) parseAndValidateWindowsConfigProfile(ctx context.Context, te
 
 	var teamName string
 	if teamID > 0 {
-		if lic == nil || !lic.IsPremium() {
-			return nil, nil, "", ctxerr.Wrap(ctx, fleet.ErrMissingLicense)
-		}
-		tm, err := svc.EnterpriseOverrides.TeamByIDOrName(ctx, &teamID, nil)
+		tm, err := svc.ds.TeamLite(ctx, teamID)
 		if err != nil {
 			return nil, nil, "", ctxerr.Wrap(ctx, err)
 		}

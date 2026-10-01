@@ -2163,14 +2163,7 @@ func (svc *Service) resolveProfileTeam(ctx context.Context, teamID *uint) (uint,
 	if tmID == 0 {
 		return 0, "", nil
 	}
-	lic, err := svc.License(ctx)
-	if err != nil {
-		return 0, "", ctxerr.Wrap(ctx, err, "checking license")
-	}
-	if lic == nil || !lic.IsPremium() {
-		return 0, "", ctxerr.Wrap(ctx, fleet.ErrMissingLicense)
-	}
-	tm, err := svc.EnterpriseOverrides.TeamByIDOrName(ctx, &tmID, nil)
+	tm, err := svc.ds.TeamLite(ctx, tmID)
 	if err != nil {
 		return 0, "", ctxerr.Wrap(ctx, err)
 	}
@@ -2293,10 +2286,7 @@ func (svc *Service) parseAndValidateAndroidConfigProfile(ctx context.Context, te
 	lic, _ := license.FromContext(ctx)
 	var teamName string
 	if teamID > 0 {
-		if lic == nil || !lic.IsPremium() {
-			return nil, "", ctxerr.Wrap(ctx, fleet.ErrMissingLicense)
-		}
-		tm, err := svc.EnterpriseOverrides.TeamByIDOrName(ctx, &teamID, nil)
+		tm, err := svc.ds.TeamLite(ctx, teamID)
 		if err != nil {
 			return nil, "", ctxerr.Wrap(ctx, err)
 		}
@@ -3038,31 +3028,21 @@ func (svc *Service) authorizeBatchProfiles(ctx context.Context, tmID *uint, tmNa
 		svc.authz.SkipAuthorization(ctx) // so that the error message is not replaced by "forbidden"
 		return nil, nil, ctxerr.Wrap(ctx, fleet.NewInvalidArgumentError("team_name", "cannot specify both team_id and team_name"))
 	}
-	if tmID != nil || tmName != nil {
-		license, _ := license.FromContext(ctx)
-		if !license.IsPremium() {
-			field := "team_id"
-			if tmName != nil {
-				field = "team_name"
-			}
-			svc.authz.SkipAuthorization(ctx) // so that the error message is not replaced by "forbidden"
-			return nil, nil, ctxerr.Wrap(ctx, fleet.NewInvalidArgumentError(field, ErrMissingLicense.Error()))
-		}
-	}
-
-	// if the team name is provided, load the corresponding team to get its id.
-	// vice-versa, if the id is provided, load it to get the name (required for
-	// the activity).
-	if tmName != nil || tmID != nil {
-		tm, err := svc.EnterpriseOverrides.TeamByIDOrName(ctx, tmID, tmName)
+	// Resolve the fleet/team directly through the Community datastore.
+	// Label targeting remains a separate capability and is validated later.
+	if tmID != nil {
+		tm, err := svc.ds.TeamLite(ctx, *tmID)
 		if err != nil {
 			return nil, nil, err
 		}
-		if tmID == nil {
-			tmID = &tm.ID
-		} else {
-			tmName = &tm.Name
+		tmName = &tm.Name
+	} else if tmName != nil {
+		tm, err := svc.ds.TeamByName(ctx, *tmName)
+		if err != nil {
+			return nil, nil, err
 		}
+		tmID = &tm.ID
+		tmName = &tm.Name
 	}
 
 	if err := svc.authz.Authorize(ctx, &fleet.MDMConfigProfileAuthz{TeamID: tmID}, fleet.ActionWrite); err != nil {

@@ -642,6 +642,9 @@ func TestUpdateMDMWindowsConfigProfile(t *testing.T) {
 		ds.TeamWithExtrasFunc = func(ctx context.Context, teamID uint) (*fleet.Team, error) {
 			return &fleet.Team{ID: teamID, Name: fmt.Sprintf("team-%d", teamID)}, nil
 		}
+		ds.TeamLiteFunc = func(ctx context.Context, teamID uint) (*fleet.TeamLite, error) {
+			return &fleet.TeamLite{ID: teamID, Name: fmt.Sprintf("team-%d", teamID)}, nil
+		}
 		ds.LabelIDsByNameFunc = func(ctx context.Context, labels []string, filter fleet.TeamFilter) (map[string]uint, error) {
 			m := make(map[string]uint)
 			for i, label := range labels {
@@ -924,25 +927,27 @@ func TestUpdateMDMWindowsConfigProfile(t *testing.T) {
 		require.NoError(t, err)
 	})
 
-	t.Run("team-scoped update on a free license returns a license error", func(t *testing.T) {
-		// team profiles can survive a premium-to-free downgrade; the update
-		// must fail with a license error, not panic on the nil
-		// EnterpriseOverrides that free servers never populate.
+	t.Run("team-scoped content update succeeds on a free license", func(t *testing.T) {
 		svc, ctx, ds, _ := setup(t, &fleet.LicenseInfo{Tier: fleet.TierFree})
 		existing := newExistingProfile("Test Profile", 5)
 
 		ds.GetMDMWindowsConfigProfileFunc = func(ctx context.Context, puid string) (*fleet.MDMWindowsConfigProfile, error) {
 			return existing, nil
 		}
+		ds.TeamLiteFunc = func(ctx context.Context, tid uint) (*fleet.TeamLite, error) {
+			require.Equal(t, uint(5), tid)
+			return &fleet.TeamLite{ID: tid, Name: "Test Team"}, nil
+		}
 		ds.UpdateMDMWindowsConfigProfileFunc = func(ctx context.Context, p fleet.MDMWindowsConfigProfile, usesFleetVars []fleet.FleetVarName) (*fleet.MDMWindowsConfigProfile, error) {
-			t.Fatal("should not reach the datastore update")
-			return nil, nil
+			require.Equal(t, uint(5), ptr.ValOrZero(p.TeamID))
+			return &p, nil
 		}
 
 		syncML := syncMLForTest("./Device/Vendor/MSFT/Policy/Config/Bluetooth/AllowDiscoverableMode")
-		err := svc.UpdateMDMConfigProfile(ctx, existing.ProfileUUID, "", syncML, nil, fleet.LabelsIncludeAll, nil, optjson.Slice[byte]{})
-		require.ErrorIs(t, err, fleet.ErrMissingLicense)
+		err := svc.UpdateMDMConfigProfile(ctx, existing.ProfileUUID, existing.Name, syncML, nil, fleet.LabelsIncludeAll, nil, optjson.Slice[byte]{})
+		require.NoError(t, err)
 
+		// Label scoping remains a separate Community+ roadmap capability.
 		err = svc.UpdateMDMConfigProfile(ctx, existing.ProfileUUID, "", nil, []string{"label1"}, fleet.LabelsIncludeAny, nil, optjson.Slice[byte]{})
 		require.ErrorIs(t, err, fleet.ErrMissingLicense)
 	})
