@@ -65,6 +65,12 @@ jobs:
               '\t}\n'
           )
           replace_exact('server/service/mdm.go', android_parse, '', 1)
+          replace_exact(
+              'server/service/mdm.go',
+              '\tlic, _ := license.FromContext(ctx)\n\tvar teamName string\n',
+              '\tvar teamName string\n',
+              1,
+          )
 
           labels_only = (
               '\tif len(labelsInclude) > 0 || len(labelsExcludeAny) > 0 {\n'
