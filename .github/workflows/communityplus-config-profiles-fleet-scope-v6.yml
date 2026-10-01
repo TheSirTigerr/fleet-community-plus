@@ -39,48 +39,50 @@ jobs:
 
           p = Path('server/service/mdm_test.go')
           text = p.read_text()
-          old = '''\tt.Run("team-scoped update on a free license returns a license error", func(t *testing.T) {
-\t\t// team profiles can survive a premium-to-free downgrade; the update
-\t\t// must fail with a license error, not panic on the nil
-\t\t// EnterpriseOverrides that free servers never populate.
-\t\tsvc, ctx, ds, _ := setup(t, &fleet.LicenseInfo{Tier: fleet.TierFree})
-\t\texisting := newExistingProfile("Test Profile", 5)
-
-\t\tds.GetMDMAndroidConfigProfileFunc = func(ctx context.Context, puid string) (*fleet.MDMAndroidConfigProfile, error) {
-\t\t\treturn existing, nil
-\t\t}
-\t\tds.UpdateMDMAndroidConfigProfileFunc = func(ctx context.Context, p fleet.MDMAndroidConfigProfile, usesFleetVars []fleet.FleetVarName) (*fleet.MDMAndroidConfigProfile, error) {
-\t\t\tt.Fatal("should not reach the datastore update")
-\t\t\treturn nil, nil
-\t\t}
-
-\t\tnewContent := []byte(`{"screenCaptureDisabled": false}`)
-\t\terr := svc.UpdateMDMConfigProfile(ctx, existing.ProfileUUID, "", newContent, nil, fleet.LabelsIncludeAll, nil, optjson.Slice[byte]{})
-\t\trequire.ErrorIs(t, err, fleet.ErrMissingLicense)
-
-\t\terr = svc.UpdateMDMConfigProfile(ctx, existing.ProfileUUID, "", nil, []string{"label1"}, fleet.LabelsIncludeAny, nil, optjson.Slice[byte]{})
-\t\trequire.ErrorIs(t, err, fleet.ErrMissingLicense)
-\t})
-'''
-          new = '''\tt.Run("team-scoped update on a free license allows content but not label scoping", func(t *testing.T) {
-\t\tsvc, ctx, ds, _ := setup(t, &fleet.LicenseInfo{Tier: fleet.TierFree})
-\t\texisting := newExistingProfile("Test Profile", 5)
-
-\t\tds.GetMDMAndroidConfigProfileFunc = func(ctx context.Context, puid string) (*fleet.MDMAndroidConfigProfile, error) {
-\t\t\treturn existing, nil
-\t\t}
-\t\tds.UpdateMDMAndroidConfigProfileFunc = func(ctx context.Context, p fleet.MDMAndroidConfigProfile, usesFleetVars []fleet.FleetVarName) (*fleet.MDMAndroidConfigProfile, error) {
-\t\t\treturn &p, nil
-\t\t}
-
-\t\tnewContent := []byte(`{"screenCaptureDisabled": false}`)
-\t\terr := svc.UpdateMDMConfigProfile(ctx, existing.ProfileUUID, "", newContent, nil, fleet.LabelsIncludeAll, nil, optjson.Slice[byte]{})
-\t\trequire.NoError(t, err)
-
-\t\terr = svc.UpdateMDMConfigProfile(ctx, existing.ProfileUUID, "", nil, []string{"label1"}, fleet.LabelsIncludeAny, nil, optjson.Slice[byte]{})
-\t\trequire.ErrorIs(t, err, fleet.ErrMissingLicense)
-\t})
-'''
+          old = ''.join([
+              '\tt.Run("team-scoped update on a free license returns a license error", func(t *testing.T) {\n',
+              '\t\t// team profiles can survive a premium-to-free downgrade; the update\n',
+              '\t\t// must fail with a license error, not panic on the nil\n',
+              '\t\t// EnterpriseOverrides that free servers never populate.\n',
+              '\t\tsvc, ctx, ds, _ := setup(t, &fleet.LicenseInfo{Tier: fleet.TierFree})\n',
+              '\t\texisting := newExistingProfile("Test Profile", 5)\n',
+              '\n',
+              '\t\tds.GetMDMAndroidConfigProfileFunc = func(ctx context.Context, puid string) (*fleet.MDMAndroidConfigProfile, error) {\n',
+              '\t\t\treturn existing, nil\n',
+              '\t\t}\n',
+              '\t\tds.UpdateMDMAndroidConfigProfileFunc = func(ctx context.Context, p fleet.MDMAndroidConfigProfile, usesFleetVars []fleet.FleetVarName) (*fleet.MDMAndroidConfigProfile, error) {\n',
+              '\t\t\tt.Fatal("should not reach the datastore update")\n',
+              '\t\t\treturn nil, nil\n',
+              '\t\t}\n',
+              '\n',
+              '\t\tnewContent := []byte(`{"screenCaptureDisabled": false}`)\n',
+              '\t\terr := svc.UpdateMDMConfigProfile(ctx, existing.ProfileUUID, "", newContent, nil, fleet.LabelsIncludeAll, nil, optjson.Slice[byte]{})\n',
+              '\t\trequire.ErrorIs(t, err, fleet.ErrMissingLicense)\n',
+              '\n',
+              '\t\terr = svc.UpdateMDMConfigProfile(ctx, existing.ProfileUUID, "", nil, []string{"label1"}, fleet.LabelsIncludeAny, nil, optjson.Slice[byte]{})\n',
+              '\t\trequire.ErrorIs(t, err, fleet.ErrMissingLicense)\n',
+              '\t})\n',
+          ])
+          new = ''.join([
+              '\tt.Run("team-scoped update on a free license allows content but not label scoping", func(t *testing.T) {\n',
+              '\t\tsvc, ctx, ds, _ := setup(t, &fleet.LicenseInfo{Tier: fleet.TierFree})\n',
+              '\t\texisting := newExistingProfile("Test Profile", 5)\n',
+              '\n',
+              '\t\tds.GetMDMAndroidConfigProfileFunc = func(ctx context.Context, puid string) (*fleet.MDMAndroidConfigProfile, error) {\n',
+              '\t\t\treturn existing, nil\n',
+              '\t\t}\n',
+              '\t\tds.UpdateMDMAndroidConfigProfileFunc = func(ctx context.Context, p fleet.MDMAndroidConfigProfile, usesFleetVars []fleet.FleetVarName) (*fleet.MDMAndroidConfigProfile, error) {\n',
+              '\t\t\treturn &p, nil\n',
+              '\t\t}\n',
+              '\n',
+              '\t\tnewContent := []byte(`{"screenCaptureDisabled": false}`)\n',
+              '\t\terr := svc.UpdateMDMConfigProfile(ctx, existing.ProfileUUID, "", newContent, nil, fleet.LabelsIncludeAll, nil, optjson.Slice[byte]{})\n',
+              '\t\trequire.NoError(t, err)\n',
+              '\n',
+              '\t\terr = svc.UpdateMDMConfigProfile(ctx, existing.ProfileUUID, "", nil, []string{"label1"}, fleet.LabelsIncludeAny, nil, optjson.Slice[byte]{})\n',
+              '\t\trequire.ErrorIs(t, err, fleet.ErrMissingLicense)\n',
+              '\t})\n',
+          ])
           if text.count(old) != 1:
               raise SystemExit(f'Android free-team update test: expected 1 match, got {text.count(old)}')
           p.write_text(text.replace(old, new, 1))
