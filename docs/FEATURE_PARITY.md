@@ -33,7 +33,7 @@ This document tracks independently implemented equivalents for Fleet Premium cap
 ## MDM and security controls
 
 - [x] Configuration profiles at fleet/device scope
-- [ ] Label/target-based profile assignment
+- [x] Label/target-based profile assignment
 - [ ] Disk encryption enforcement
 - [ ] Recovery key escrow
 - [ ] Recovery Lock management
