@@ -145,7 +145,7 @@ jobs:
       - name: Test Community+ configuration profile regressions
         run: >-
           go test ./server/service
-          -run '^(TestUpdateMDMAppleConfigProfile|TestUpdateMDMWindowsConfigProfile|TestUpdateMDMAndroidConfigProfile|TestNewMDMProfilePremiumOnlyAndroid|TestMDMBatchSetAppleProfiles|TestMDMBatchSetProfiles|TestBatchSetMDMProfilesLabels|TestBatchSetMDMProfilesOSUpdates|TestUploadWindowsMDMConfigProfileValidations|TestDeleteMDMConfigProfileFreeLicenseTeam)$'
+          -run '^(TestNewMDMAppleConfigProfile|TestUpdateMDMAppleConfigProfile|TestUpdateMDMWindowsConfigProfile|TestUpdateMDMAndroidConfigProfile|TestNewMDMProfilePremiumOnlyAndroid|TestMDMBatchSetAppleProfiles|TestMDMBatchSetProfiles|TestBatchSetMDMProfilesLabels|TestBatchSetMDMProfilesOSUpdates|TestUploadWindowsMDMConfigProfileValidations|TestDeleteMDMConfigProfileFreeLicenseTeam)$'
 
       - name: Test Community+ fleetctl
         run: go test ./cmd/fleetctl/fleetctl -run 'TestCommunityPlus|TestFleetGitOps'
