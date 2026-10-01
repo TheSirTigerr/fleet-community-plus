@@ -1,6 +1,5 @@
 name: Community+ configuration profile fleet scope v4
 
-# Current-head gate: execute the consolidated v3 patch exactly once.
 on:
   push:
     branches:
@@ -37,6 +36,32 @@ jobs:
           start = source.index(marker) + len(marker)
           end = source.index("\n          PY", start)
           exec(compile(textwrap.dedent(source[start:end]), 'fleet-scope-v3', 'exec'))
+
+          # Existing label-batch coverage uses fleet_id=1 and now passes through
+          # the same direct TeamLite resolution. Keep label license semantics
+          # unchanged; this only supplies the fleet lookup fixture.
+          p = Path('server/service/mdm_test.go')
+          text = p.read_text()
+          start = text.index('func TestBatchSetMDMProfilesLabels')
+          end = text.index('\nfunc ', start + 1)
+          chunk = text[start:end]
+          old = (
+              '\tds.TeamWithExtrasFunc = func(ctx context.Context, tid uint) (*fleet.Team, error) {\n'
+              '\t\treturn &fleet.Team{\n'
+              '\t\t\tID:   tid,\n'
+              '\t\t\tName: "team1",\n'
+              '\t\t}, nil\n'
+              '\t}\n'
+          )
+          if chunk.count(old) != 1:
+              raise SystemExit('unexpected TeamWithExtras fixture count in TestBatchSetMDMProfilesLabels')
+          new = old + (
+              '\tds.TeamLiteFunc = func(ctx context.Context, tid uint) (*fleet.TeamLite, error) {\n'
+              '\t\treturn &fleet.TeamLite{ID: tid, Name: "team1"}, nil\n'
+              '\t}\n'
+          )
+          chunk = chunk.replace(old, new, 1)
+          p.write_text(text[:start] + chunk + text[end:])
           PY
           gofmt -w server/service/apple_mdm.go server/service/windows_mdm_profiles.go server/service/mdm.go server/service/apple_mdm_test.go server/service/windows_mdm_profiles_test.go server/service/mdm_test.go
           git diff --check
@@ -49,7 +74,7 @@ jobs:
         run: |
           set -euo pipefail
           go test ./server/communityplus/servicecompat -count=1
-          go test ./server/service -run 'Test.*MDM.*Profile|TestMDMBatchSetProfiles|TestUploadWindowsMDMConfigProfileValidations|TestMDMBatchSetAppleProfiles|TestDeleteMDMConfigProfileFreeLicenseTeam' -count=1
+          go test ./server/service -run 'Test.*MDM.*Profile|TestMDMBatchSetProfiles|TestBatchSetMDMProfilesLabels|TestUploadWindowsMDMConfigProfileValidations|TestMDMBatchSetAppleProfiles|TestDeleteMDMConfigProfileFreeLicenseTeam' -count=1
           go build ./cmd/fleet
       - name: Commit guarded patch
         shell: bash
