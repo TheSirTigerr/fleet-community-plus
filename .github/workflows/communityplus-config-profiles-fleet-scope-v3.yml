@@ -29,6 +29,7 @@ jobs:
           set -euo pipefail
           python3 - <<'PY'
           from pathlib import Path
+          import re
           import textwrap
 
           source = Path('.github/workflows/communityplus-config-profiles-fleet-scope-v2.yml').read_text()
@@ -111,26 +112,28 @@ jobs:
           chunk = chunk.replace(old_labels_team, new_labels_team, 1)
           p.write_text(text[:fn_start] + chunk + text[fn_end:])
 
-          # OS-update batch coverage also uses a team ID. Add the same lookup
-          # fixture without changing the separate OS-update license behavior.
+          # OS-update batch coverage also uses a team ID. Match indentation
+          # dynamically because the fixture lives inside the table-test loop.
           p = Path('server/service/mdm_test.go')
           text = p.read_text()
           fn_start = text.index('func TestBatchSetMDMProfilesOSUpdates')
           fn_end = text.index('\nfunc ', fn_start + 1)
           chunk = text[fn_start:fn_end]
-          old_os_team = (
-              '\t\tds.TeamWithExtrasFunc = func(ctx context.Context, tid uint) (*fleet.Team, error) {\n'
-              '\t\t\treturn &fleet.Team{ID: tid, Name: "team1"}, nil\n'
-              '\t\t}\n'
+          pattern = re.compile(
+              r'(?P<indent>[\t ]*)ds\.TeamWithExtrasFunc = func\(ctx context\.Context, tid uint\) \(\*fleet\.Team, error\) \{\n'
+              r'(?P=indent)\treturn &fleet\.Team\{ID: tid, Name: "team1"\}, nil\n'
+              r'(?P=indent)\}'
           )
-          if chunk.count(old_os_team) != 1:
-              raise SystemExit(f'TestBatchSetMDMProfilesOSUpdates: expected TeamWithExtras fixture once, got {chunk.count(old_os_team)}')
-          new_os_team = old_os_team + (
-              '\t\tds.TeamLiteFunc = func(ctx context.Context, tid uint) (*fleet.TeamLite, error) {\n'
-              '\t\t\treturn &fleet.TeamLite{ID: tid, Name: "team1"}, nil\n'
-              '\t\t}\n'
+          match = pattern.search(chunk)
+          if not match:
+              raise SystemExit('TestBatchSetMDMProfilesOSUpdates: TeamWithExtras fixture not found')
+          indent = match.group('indent')
+          replacement = match.group(0) + (
+              f'\n{indent}ds.TeamLiteFunc = func(ctx context.Context, tid uint) (*fleet.TeamLite, error) {{\n'
+              f'{indent}\treturn &fleet.TeamLite{{ID: tid, Name: "team1"}}, nil\n'
+              f'{indent}}}'
           )
-          chunk = chunk.replace(old_os_team, new_os_team, 1)
+          chunk = chunk[:match.start()] + replacement + chunk[match.end():]
           p.write_text(text[:fn_start] + chunk + text[fn_end:])
 
           # Team-scoped profile deletes are valid on Free/Community+ too.
