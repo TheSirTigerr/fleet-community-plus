@@ -85,6 +85,32 @@ jobs:
               chunk = chunk[:err_pos] + '\t\t\t"",\n' + chunk[err_pos + len('\t\t\tErrMissingLicense.Error(),\n'):]
           p.write_text(text[:fn_start] + chunk + text[fn_end:])
 
+          # Existing label batch coverage uses a team ID. Fleet-scope resolution
+          # now happens through TeamLite before label validation, so mirror the
+          # test's TeamWithExtras fixture without changing label licensing yet.
+          p = Path('server/service/mdm_test.go')
+          text = p.read_text()
+          fn_start = text.index('func TestBatchSetMDMProfilesLabels')
+          fn_end = text.index('\nfunc ', fn_start + 1)
+          chunk = text[fn_start:fn_end]
+          old_labels_team = (
+              '\tds.TeamWithExtrasFunc = func(ctx context.Context, tid uint) (*fleet.Team, error) {\n'
+              '\t\treturn &fleet.Team{\n'
+              '\t\t\tID:   tid,\n'
+              '\t\t\tName: "team1",\n'
+              '\t\t}, nil\n'
+              '\t}\n'
+          )
+          if chunk.count(old_labels_team) != 1:
+              raise SystemExit(f'TestBatchSetMDMProfilesLabels: expected TeamWithExtras fixture once, got {chunk.count(old_labels_team)}')
+          new_labels_team = old_labels_team + (
+              '\tds.TeamLiteFunc = func(ctx context.Context, tid uint) (*fleet.TeamLite, error) {\n'
+              '\t\treturn &fleet.TeamLite{ID: tid, Name: "team1"}, nil\n'
+              '\t}\n'
+          )
+          chunk = chunk.replace(old_labels_team, new_labels_team, 1)
+          p.write_text(text[:fn_start] + chunk + text[fn_end:])
+
           # Team-scoped profile deletes are valid on Free/Community+ too.
           p = Path('server/service/mdm_test.go')
           text = p.read_text()
@@ -147,7 +173,7 @@ jobs:
         run: |
           set -euo pipefail
           go test ./server/communityplus/servicecompat -count=1
-          go test ./server/service -run 'Test.*MDM.*Profile|TestUploadWindowsMDMConfigProfileValidations|TestMDMBatchSetAppleProfiles|TestMDMBatchSetProfiles|TestDeleteMDMConfigProfileFreeLicenseTeam' -count=1
+          go test ./server/service -run 'Test.*MDM.*Profile|TestUploadWindowsMDMConfigProfileValidations|TestMDMBatchSetAppleProfiles|TestMDMBatchSetProfiles|TestBatchSetMDMProfilesLabels|TestDeleteMDMConfigProfileFreeLicenseTeam' -count=1
           go build ./cmd/fleet
       - name: Commit guarded patch
         shell: bash
