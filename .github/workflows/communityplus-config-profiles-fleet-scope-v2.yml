@@ -136,6 +136,25 @@ jobs:
               old_windows_validation,
               new_windows_validation,
           )
+
+          # Batch Apple profile tests also resolve team IDs via TeamLite after
+          # the Community+ ungating. Mirror the existing TeamByName fixture.
+          old_apple_batch = (
+              "\tds.TeamByNameFunc = func(ctx context.Context, name string) (*fleet.Team, error) {\n"
+              "\t\treturn &fleet.Team{ID: 1, Name: name}, nil\n"
+              "\t}\n"
+          )
+          new_apple_batch = old_apple_batch + (
+              "\tds.TeamLiteFunc = func(ctx context.Context, tid uint) (*fleet.TeamLite, error) {\n"
+              "\t\treturn &fleet.TeamLite{ID: tid, Name: \"team1\"}, nil\n"
+              "\t}\n"
+          )
+          replace_in_function(
+              'server/service/apple_mdm_test.go',
+              'func TestMDMBatchSetAppleProfiles',
+              old_apple_batch,
+              new_apple_batch,
+          )
           PY
           gofmt -w server/service/apple_mdm.go server/service/windows_mdm_profiles.go server/service/mdm.go server/service/apple_mdm_test.go server/service/windows_mdm_profiles_test.go server/service/mdm_test.go
           git diff --check
