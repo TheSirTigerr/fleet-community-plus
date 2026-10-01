@@ -1,0 +1,118 @@
+name: Community+ profile label scope v1
+
+on:
+  push:
+    branches:
+      - community-plus/foundation
+    paths:
+      - '.github/workflows/communityplus-profile-label-scope-v1.yml'
+  workflow_dispatch:
+
+permissions:
+  contents: write
+
+jobs:
+  patch:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          ref: community-plus/foundation
+          fetch-depth: 1
+      - uses: actions/setup-go@v5
+        with:
+          go-version-file: go.mod
+          cache: true
+      - name: Remove only profile label scope license gates
+        shell: bash
+        run: |
+          set -euo pipefail
+          python3 - <<'PY'
+          from pathlib import Path
+
+          def replace_exact(path, old, new, expected=1):
+              p = Path(path)
+              text = p.read_text()
+              actual = text.count(old)
+              if actual != expected:
+                  raise SystemExit(f'{path}: expected {expected} matches, got {actual}')
+              p.write_text(text.replace(old, new, expected))
+
+          common = (
+              '\tif len(labelsInclude) > 0 || len(labelsExcludeAny) > 0 {\n'
+              '\t\tif lic == nil || !lic.IsPremium() {\n'
+              '\t\t\treturn nil, nil, "", ctxerr.Wrap(ctx, fleet.NewLicenseErrorWithCause(fleet.ConfigProfileLabelScopingPremiumCauseMsg), "checking license for profile label scoping")\n'
+              '\t\t}\n'
+              '\t}\n'
+          )
+          replace_exact('server/service/apple_mdm.go', common, '', 1)
+          replace_exact('server/service/windows_mdm_profiles.go', common, '', 1)
+
+          declaration = (
+              '\tif len(labelsInclude) > 0 || len(labelsExcludeAny) > 0 {\n'
+              '\t\tif lic == nil || !lic.IsPremium() {\n'
+              '\t\t\treturn nil, nil, "", ctxerr.Wrap(ctx, fleet.NewLicenseErrorWithCause(fleet.ConfigProfileLabelScopingPremiumCauseMsg), "checking license for declaration profile label scoping")\n'
+              '\t\t}\n'
+              '\t}\n'
+          )
+          replace_exact('server/service/apple_mdm.go', declaration, '', 1)
+
+          android_parse = (
+              '\tif len(labelsInclude) > 0 || len(labelsExcludeAny) > 0 {\n'
+              '\t\tif lic == nil || !lic.IsPremium() {\n'
+              '\t\t\treturn nil, "", ctxerr.Wrap(ctx, fleet.NewLicenseErrorWithCause(fleet.ConfigProfileLabelScopingPremiumCauseMsg), "checking license for profile label scoping")\n'
+              '\t\t}\n'
+              '\t}\n'
+          )
+          replace_exact('server/service/mdm.go', android_parse, '', 1)
+
+          labels_only = (
+              '\tif len(labelsInclude) > 0 || len(labelsExcludeAny) > 0 {\n'
+              '\t\tlic, err := svc.License(ctx)\n'
+              '\t\tif err != nil {\n'
+              '\t\t\treturn ctxerr.Wrap(ctx, err, "checking license")\n'
+              '\t\t}\n'
+              '\t\tif lic == nil || !lic.IsPremium() {\n'
+              '\t\t\treturn ctxerr.Wrap(ctx, fleet.NewLicenseErrorWithCause(fleet.ConfigProfileLabelScopingPremiumCauseMsg), "checking license for profile label scoping")\n'
+              '\t\t}\n'
+              '\t}\n'
+          )
+          replace_exact('server/service/mdm.go', labels_only, '', 1)
+
+          batch = (
+              '\tif len(labels) > 0 && (lic == nil || !lic.IsPremium()) {\n'
+              '\t\treturn ctxerr.Wrap(ctx, fleet.NewLicenseErrorWithCause(fleet.ConfigProfileLabelScopingPremiumCauseMsg), "checking license for profile label scoping")\n'
+              '\t}\n'
+          )
+          replace_exact('server/service/mdm.go', batch, '', 1)
+
+          for path, expected in [
+              ('server/service/apple_mdm.go', 0),
+              ('server/service/windows_mdm_profiles.go', 0),
+              ('server/service/mdm.go', 0),
+          ]:
+              remaining = Path(path).read_text().count('ConfigProfileLabelScopingPremiumCauseMsg')
+              if remaining != expected:
+                  raise SystemExit(f'{path}: expected {expected} label-license references after patch, got {remaining}')
+          PY
+          gofmt -w server/service/apple_mdm.go server/service/windows_mdm_profiles.go server/service/mdm.go
+          git diff --check
+          if git diff --quiet; then
+            echo 'No patch produced'
+            exit 1
+          fi
+      - name: Verify profile label scope changes
+        shell: bash
+        run: |
+          set -euo pipefail
+          go test ./server/service -run '^(TestNewMDMAppleConfigProfile|TestUpdateMDMAppleConfigProfile|TestUpdateMDMWindowsConfigProfile|TestUpdateMDMAndroidConfigProfile|TestNewMDMProfilePremiumOnlyAndroid|TestMDMBatchSetAppleProfiles|TestMDMBatchSetProfiles|TestBatchSetMDMProfilesLabels)$' -count=1
+          go build ./cmd/fleet
+      - name: Commit guarded patch
+        shell: bash
+        run: |
+          set -euo pipefail
+          git config user.name 'github-actions[bot]'
+          git config user.email '41898282+github-actions[bot]@users.noreply.github.com'
+          git add server/service/apple_mdm.go server/service/windows_mdm_profiles.go server/service/mdm.go
+          git commit -m 'feat: enable Community+ profile label targeting'
+          git push origin HEAD:community-plus/foundation
