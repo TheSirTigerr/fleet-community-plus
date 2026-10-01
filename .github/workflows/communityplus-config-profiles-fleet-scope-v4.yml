@@ -1,5 +1,6 @@
 name: Community+ configuration profile fleet scope v4
 
+# Trigger marker: generic batch Fleet-scope coverage included.
 on:
   push:
     branches:
