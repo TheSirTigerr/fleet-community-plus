@@ -1,0 +1,131 @@
+name: Community+ configuration profile fleet scope v3
+
+on:
+  push:
+    branches:
+      - community-plus/foundation
+    paths:
+      - '.github/workflows/communityplus-config-profiles-fleet-scope-v3.yml'
+  workflow_dispatch:
+
+permissions:
+  contents: write
+
+jobs:
+  patch:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          ref: community-plus/foundation
+          fetch-depth: 1
+      - uses: actions/setup-go@v5
+        with:
+          go-version-file: go.mod
+          cache: true
+      - name: Apply final guarded fleet-scope changes
+        shell: bash
+        run: |
+          set -euo pipefail
+          python3 - <<'PY'
+          from pathlib import Path
+          import textwrap
+
+          source = Path('.github/workflows/communityplus-config-profiles-fleet-scope-v2.yml').read_text()
+          marker = "          python3 - <<'PY'\n"
+          start = source.index(marker) + len(marker)
+          end = source.index("\n          PY", start)
+          exec(compile(textwrap.dedent(source[start:end]), 'fleet-scope-v2', 'exec'))
+
+          # The feature is now available on Free/Community+, so the old batch
+          # tests must no longer expect a missing-license error for fleet scope.
+          p = Path('server/service/apple_mdm_test.go')
+          text = p.read_text()
+          fn_start = text.index('func TestMDMBatchSetAppleProfiles')
+          fn_end = text.index('\nfunc ', fn_start + 1)
+          chunk = text[fn_start:fn_end]
+          for name in ('team id with free license', 'team name with free license'):
+              old = (
+                  f'\t\t{{\n\t\t\t"{name}",\n'
+                  '\t\t\t&fleet.User{GlobalRole: ptr.String(fleet.RoleAdmin)},\n'
+                  '\t\t\tfalse,\n'
+              )
+              pos = chunk.find(old)
+              if pos < 0:
+                  raise SystemExit(f'missing Apple batch case: {name}')
+              err_pos = chunk.find('\t\t\tErrMissingLicense.Error(),\n', pos)
+              if err_pos < 0:
+                  raise SystemExit(f'missing old license expectation: {name}')
+              chunk = chunk[:err_pos] + '\t\t\t"",\n' + chunk[err_pos + len('\t\t\tErrMissingLicense.Error(),\n'):]
+          p.write_text(text[:fn_start] + chunk + text[fn_end:])
+
+          # Team-scoped profile deletes are also valid on Free/Community+.
+          p = Path('server/service/mdm_test.go')
+          text = p.read_text()
+          start = text.index('func TestDeleteMDMConfigProfileFreeLicenseTeam')
+          end = text.index('\nfunc ', start + 1)
+          replacement = '''func TestDeleteMDMConfigProfileFreeLicenseTeam(t *testing.T) {
+\tsvc, ctx, ds, _ := setupAppleMDMService(t, &fleet.LicenseInfo{Tier: fleet.TierFree})
+\tctx = viewer.NewContext(ctx, viewer.Viewer{User: &fleet.User{GlobalRole: new(fleet.RoleAdmin)}})
+\tteamID := uint(5)
+
+\tds.TeamLiteFunc = func(ctx context.Context, tid uint) (*fleet.TeamLite, error) {
+\t\trequire.Equal(t, teamID, tid)
+\t\treturn &fleet.TeamLite{ID: tid, Name: "team5"}, nil
+\t}
+\tds.DeleteMDMWindowsConfigProfileFunc = func(context.Context, string) error { return nil }
+\tds.DeleteMDMAndroidConfigProfileFunc = func(context.Context, string) error { return nil }
+\tds.DeleteMDMAppleConfigProfileFunc = func(context.Context, string) error { return nil }
+\tds.DeleteMDMAppleDeclarationFunc = func(context.Context, string) error { return nil }
+
+\tds.GetMDMWindowsConfigProfileFunc = func(ctx context.Context, puid string) (*fleet.MDMWindowsConfigProfile, error) {
+\t\treturn &fleet.MDMWindowsConfigProfile{ProfileUUID: puid, Name: "Test Profile", TeamID: &teamID}, nil
+\t}
+\trequire.NoError(t, svc.DeleteMDMWindowsConfigProfile(ctx, "w"+uuid.NewString()))
+
+\tds.GetMDMAndroidConfigProfileFunc = func(ctx context.Context, puid string) (*fleet.MDMAndroidConfigProfile, error) {
+\t\treturn &fleet.MDMAndroidConfigProfile{ProfileUUID: puid, Name: "Test Profile", TeamID: &teamID}, nil
+\t}
+\trequire.NoError(t, svc.DeleteMDMAndroidConfigProfile(ctx, "g"+uuid.NewString()))
+
+\tds.GetMDMAppleConfigProfileFunc = func(ctx context.Context, puid string) (*fleet.MDMAppleConfigProfile, error) {
+\t\treturn &fleet.MDMAppleConfigProfile{ProfileUUID: puid, Identifier: "com.fleetdm.test", Name: "Test Profile", TeamID: &teamID}, nil
+\t}
+\trequire.NoError(t, svc.DeleteMDMAppleConfigProfile(ctx, "a"+uuid.NewString()))
+
+\tds.GetMDMAppleDeclarationFunc = func(ctx context.Context, duid string) (*fleet.MDMAppleDeclaration, error) {
+\t\treturn &fleet.MDMAppleDeclaration{
+\t\t\tDeclarationUUID: duid,
+\t\t\tIdentifier:      "com.fleet.configD1",
+\t\t\tName:            "Test Declaration",
+\t\t\tTeamID:          &teamID,
+\t\t\tRawJSON:         declBytesForTest("D1", "d1content"),
+\t\t}, nil
+\t}
+\trequire.NoError(t, svc.DeleteMDMAppleDeclaration(ctx, "d"+uuid.NewString()))
+}
+'''
+          p.write_text(text[:start] + replacement + text[end:])
+          PY
+          gofmt -w server/service/apple_mdm.go server/service/windows_mdm_profiles.go server/service/mdm.go server/service/apple_mdm_test.go server/service/windows_mdm_profiles_test.go server/service/mdm_test.go
+          git diff --check
+          if git diff --quiet; then
+            echo 'No patch produced'
+            exit 1
+          fi
+      - name: Verify fleet-scope profile changes
+        shell: bash
+        run: |
+          set -euo pipefail
+          go test ./server/communityplus/servicecompat -count=1
+          go test ./server/service -run 'Test.*MDM.*Profile|TestUploadWindowsMDMConfigProfileValidations|TestMDMBatchSetAppleProfiles|TestDeleteMDMConfigProfileFreeLicenseTeam' -count=1
+          go build ./cmd/fleet
+      - name: Commit guarded patch
+        shell: bash
+        run: |
+          set -euo pipefail
+          git config user.name 'github-actions[bot]'
+          git config user.email '41898282+github-actions[bot]@users.noreply.github.com'
+          git add server/service/apple_mdm.go server/service/windows_mdm_profiles.go server/service/mdm.go server/service/apple_mdm_test.go server/service/windows_mdm_profiles_test.go server/service/mdm_test.go
+          git commit -m 'feat: enable Community+ configuration profile fleet scope'
+          git push origin HEAD:community-plus/foundation
