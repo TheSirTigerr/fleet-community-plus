@@ -448,12 +448,6 @@ func (svc *Service) parseAndValidateAppleConfigProfile(ctx context.Context, team
 		teamName = tm.Name
 	}
 
-	if len(labelsInclude) > 0 || len(labelsExcludeAny) > 0 {
-		if lic == nil || !lic.IsPremium() {
-			return nil, nil, "", ctxerr.Wrap(ctx, fleet.NewLicenseErrorWithCause(fleet.ConfigProfileLabelScopingPremiumCauseMsg), "checking license for profile label scoping")
-		}
-	}
-
 	// Check for secrets in profile name before expansion
 	if err := fleet.ValidateNoSecretsInProfileName(data); err != nil {
 		return nil, nil, "", ctxerr.Wrap(ctx, fleet.NewInvalidArgumentError("profile", err.Error()))
@@ -1121,11 +1115,6 @@ func (svc *Service) parseAndValidateAppleDeclaration(ctx context.Context, teamID
 			return nil, nil, "", ctxerr.Wrap(ctx, err)
 		}
 		teamName = tm.Name
-	}
-	if len(labelsInclude) > 0 || len(labelsExcludeAny) > 0 {
-		if lic == nil || !lic.IsPremium() {
-			return nil, nil, "", ctxerr.Wrap(ctx, fleet.NewLicenseErrorWithCause(fleet.ConfigProfileLabelScopingPremiumCauseMsg), "checking license for declaration profile label scoping")
-		}
 	}
 
 	if overlap := fleet.LabelOverlap(labelsInclude, labelsExcludeAny); overlap != "" {

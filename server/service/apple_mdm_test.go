@@ -882,16 +882,20 @@ func TestNewMDMAppleConfigProfile(t *testing.T) {
 	_, err = svc.NewMDMAppleConfigProfile(ctx, 0, mcBytes, nil, fleet.LabelsIncludeAll, nil)
 	assert.ErrorContains(t, err, "PayloadDisplayName cannot contain FLEET_SECRET variables")
 
-	// Fails on free license with labels
+	// Label targeting is available on Community+.
 	mcBytes = mcBytesForTest("Foo", "identifier", "UUID")
-	svc, ctx, _, _ = setup(t, &fleet.LicenseInfo{Tier: fleet.TierFree}, "identifier")
+	svc, ctx, ds, _ := setup(t, &fleet.LicenseInfo{Tier: fleet.TierFree}, "identifier")
+	ds.LabelsByNameFunc = func(_ context.Context, labels []string, _ fleet.TeamFilter) (map[string]*fleet.Label, error) {
+		return map[string]*fleet.Label{"test-label": &fleet.Label{ID: 1, Name: "test-label"}}, nil
+	}
+	ds.LabelIDsByNameFunc = func(_ context.Context, labels []string, _ fleet.TeamFilter) (map[string]uint, error) {
+		return map[string]uint{"test-label": 1}, nil
+	}
 	_, err = svc.NewMDMAppleConfigProfile(ctx, 0, mcBytes, []string{"test-label"}, fleet.LabelsIncludeAll, nil)
-	require.ErrorIs(t, err, fleet.ErrMissingLicense)
-	require.ErrorContains(t, err, "Scoping configuration profiles")
+	require.NoError(t, err)
 
 	_, err = svc.NewMDMAppleConfigProfile(ctx, 0, mcBytes, nil, fleet.LabelsIncludeAll, []string{"test-label"})
-	require.ErrorIs(t, err, fleet.ErrMissingLicense)
-	require.ErrorContains(t, err, "Scoping configuration profiles")
+	require.NoError(t, err)
 
 	// succeeds without labels on free license
 	_, err = svc.NewMDMAppleConfigProfile(ctx, 0, mcBytes, nil, fleet.LabelsIncludeAll, nil)
@@ -1255,7 +1259,7 @@ func TestUpdateMDMAppleConfigProfile(t *testing.T) {
 		assert.ErrorIs(t, err, wantErr)
 	})
 
-	t.Run("labels require a premium license, content-only edits do not", func(t *testing.T) {
+	t.Run("label and content edits succeed on a free license", func(t *testing.T) {
 		svc, ctx, ds, _ := setup(t, &fleet.LicenseInfo{Tier: fleet.TierFree})
 		existing := newExistingProfile("com.fleetdm.test", "Test Profile", 0)
 
@@ -1263,13 +1267,11 @@ func TestUpdateMDMAppleConfigProfile(t *testing.T) {
 			return existing, nil
 		}
 		ds.UpdateMDMAppleConfigProfileFunc = func(ctx context.Context, p fleet.MDMAppleConfigProfile, usesFleetVars []fleet.FleetVarName) (*fleet.MDMAppleConfigProfile, error) {
-			t.Fatal("should not reach the datastore update")
-			return nil, nil
+			return &p, nil
 		}
 
 		err := svc.UpdateMDMConfigProfile(ctx, existing.ProfileUUID, "", nil, []string{"label1"}, fleet.LabelsIncludeAny, nil, optjson.Slice[byte]{})
-		require.ErrorIs(t, err, fleet.ErrMissingLicense)
-		require.ErrorContains(t, err, "Scoping configuration profiles")
+		require.NoError(t, err)
 
 		// content-only edit (no labels) still succeeds on a free license
 		ds.UpdateMDMAppleConfigProfileFunc = func(ctx context.Context, p fleet.MDMAppleConfigProfile, usesFleetVars []fleet.FleetVarName) (*fleet.MDMAppleConfigProfile, error) {
@@ -1300,9 +1302,9 @@ func TestUpdateMDMAppleConfigProfile(t *testing.T) {
 		err := svc.UpdateMDMConfigProfile(ctx, existing.ProfileUUID, "", mcBytes, nil, fleet.LabelsIncludeAll, nil, optjson.Slice[byte]{})
 		require.NoError(t, err)
 
-		// Label scoping remains a separate Community+ roadmap capability.
+		// Label scoping is also available on Community+.
 		err = svc.UpdateMDMConfigProfile(ctx, existing.ProfileUUID, "", nil, []string{"label1"}, fleet.LabelsIncludeAny, nil, optjson.Slice[byte]{})
-		require.ErrorIs(t, err, fleet.ErrMissingLicense)
+		require.NoError(t, err)
 	})
 
 	t.Run("authorization outcome matches user role and team membership", func(t *testing.T) {

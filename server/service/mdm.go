@@ -2174,15 +2174,6 @@ func (svc *Service) resolveProfileTeam(ctx context.Context, teamID *uint) (uint,
 // by the labels-only branches of the profile update paths (label scoping is a
 // premium feature, matching the create paths).
 func (svc *Service) checkLabelsOnlyProfileUpdate(ctx context.Context, labelsInclude, labelsExcludeAny []string) error {
-	if len(labelsInclude) > 0 || len(labelsExcludeAny) > 0 {
-		lic, err := svc.License(ctx)
-		if err != nil {
-			return ctxerr.Wrap(ctx, err, "checking license")
-		}
-		if lic == nil || !lic.IsPremium() {
-			return ctxerr.Wrap(ctx, fleet.NewLicenseErrorWithCause(fleet.ConfigProfileLabelScopingPremiumCauseMsg), "checking license for profile label scoping")
-		}
-	}
 	if overlap := fleet.LabelOverlap(labelsInclude, labelsExcludeAny); overlap != "" {
 		return ctxerr.Wrap(ctx, fleet.NewInvalidArgumentError("labels", fmt.Sprintf("label %q cannot appear in both include and exclude lists", overlap)))
 	}
@@ -2283,7 +2274,6 @@ func (svc *Service) parseAndValidateAndroidConfigProfile(ctx context.Context, te
 		return nil, "", ctxerr.Wrap(ctx, err, "check android MDM enabled")
 	}
 
-	lic, _ := license.FromContext(ctx)
 	var teamName string
 	if teamID > 0 {
 		tm, err := svc.ds.TeamLite(ctx, teamID)
@@ -2291,12 +2281,6 @@ func (svc *Service) parseAndValidateAndroidConfigProfile(ctx context.Context, te
 			return nil, "", ctxerr.Wrap(ctx, err)
 		}
 		teamName = tm.Name
-	}
-
-	if len(labelsInclude) > 0 || len(labelsExcludeAny) > 0 {
-		if lic == nil || !lic.IsPremium() {
-			return nil, "", ctxerr.Wrap(ctx, fleet.NewLicenseErrorWithCause(fleet.ConfigProfileLabelScopingPremiumCauseMsg), "checking license for profile label scoping")
-		}
 	}
 
 	cp := fleet.MDMAndroidConfigProfile{
@@ -2655,10 +2639,6 @@ func (svc *Service) BatchSetMDMProfiles(
 		labels = append(labels, profiles[i].LabelsIncludeAll...)
 		labels = append(labels, profiles[i].LabelsIncludeAny...)
 		labels = append(labels, profiles[i].LabelsExcludeAny...)
-	}
-
-	if len(labels) > 0 && (lic == nil || !lic.IsPremium()) {
-		return ctxerr.Wrap(ctx, fleet.NewLicenseErrorWithCause(fleet.ConfigProfileLabelScopingPremiumCauseMsg), "checking license for profile label scoping")
 	}
 
 	var labelMap map[string]fleet.ConfigurationProfileLabel

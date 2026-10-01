@@ -902,7 +902,7 @@ func TestUpdateMDMWindowsConfigProfile(t *testing.T) {
 		assert.ErrorIs(t, err, wantErr)
 	})
 
-	t.Run("labels require a premium license, content-only edits do not", func(t *testing.T) {
+	t.Run("label and content edits succeed on a free license", func(t *testing.T) {
 		svc, ctx, ds, _ := setup(t, &fleet.LicenseInfo{Tier: fleet.TierFree})
 		existing := newExistingProfile("Test Profile", 0)
 
@@ -910,13 +910,11 @@ func TestUpdateMDMWindowsConfigProfile(t *testing.T) {
 			return existing, nil
 		}
 		ds.UpdateMDMWindowsConfigProfileFunc = func(ctx context.Context, p fleet.MDMWindowsConfigProfile, usesFleetVars []fleet.FleetVarName) (*fleet.MDMWindowsConfigProfile, error) {
-			t.Fatal("should not reach the datastore update")
-			return nil, nil
+			return &p, nil
 		}
 
 		err := svc.UpdateMDMConfigProfile(ctx, existing.ProfileUUID, "", nil, []string{"label1"}, fleet.LabelsIncludeAny, nil, optjson.Slice[byte]{})
-		require.ErrorIs(t, err, fleet.ErrMissingLicense)
-		require.ErrorContains(t, err, "Scoping configuration profiles with labels requires Fleet Premium license")
+		require.NoError(t, err)
 
 		// content-only edit (no labels) still succeeds on a free license
 		ds.UpdateMDMWindowsConfigProfileFunc = func(ctx context.Context, p fleet.MDMWindowsConfigProfile, usesFleetVars []fleet.FleetVarName) (*fleet.MDMWindowsConfigProfile, error) {
@@ -947,9 +945,9 @@ func TestUpdateMDMWindowsConfigProfile(t *testing.T) {
 		err := svc.UpdateMDMConfigProfile(ctx, existing.ProfileUUID, existing.Name, syncML, nil, fleet.LabelsIncludeAll, nil, optjson.Slice[byte]{})
 		require.NoError(t, err)
 
-		// Label scoping remains a separate Community+ roadmap capability.
+		// Label scoping is also available on Community+.
 		err = svc.UpdateMDMConfigProfile(ctx, existing.ProfileUUID, "", nil, []string{"label1"}, fleet.LabelsIncludeAny, nil, optjson.Slice[byte]{})
-		require.ErrorIs(t, err, fleet.ErrMissingLicense)
+		require.NoError(t, err)
 	})
 
 	t.Run("Fleet variables used in the upload are threaded through to the datastore call", func(t *testing.T) {

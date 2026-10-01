@@ -2126,6 +2126,20 @@ func TestMDMBatchSetProfiles(t *testing.T) {
 	ds.ListAppleDDMAssetsFunc = func(ctx context.Context, teamID *uint) ([]*fleet.DDMAsset, error) {
 		return nil, nil
 	}
+	ds.LabelIDsByNameFunc = func(_ context.Context, labels []string, _ fleet.TeamFilter) (map[string]uint, error) {
+		result := make(map[string]uint, len(labels))
+		for i, name := range labels {
+			result[name] = uint(i + 1)
+		}
+		return result, nil
+	}
+	ds.LabelsByNameFunc = func(_ context.Context, labels []string, _ fleet.TeamFilter) (map[string]*fleet.Label, error) {
+		result := make(map[string]*fleet.Label, len(labels))
+		for i, name := range labels {
+			result[name] = &fleet.Label{ID: uint(i + 1), Name: name}
+		}
+		return result, nil
+	}
 
 	testCases := []struct {
 		name     string
@@ -2538,7 +2552,7 @@ func TestMDMBatchSetProfiles(t *testing.T) {
 			true,
 		},
 		{
-			"profiles with include all labels fails on free license",
+			"profiles with include all labels succeed on free license",
 			&fleet.User{GlobalRole: new(fleet.RoleAdmin)},
 			false,
 			nil,
@@ -2546,11 +2560,11 @@ func TestMDMBatchSetProfiles(t *testing.T) {
 			[]fleet.MDMProfileBatchPayload{
 				{Name: "N1", Contents: mobileconfigForTest("N1", "I1"), LabelsIncludeAll: []string{"a"}},
 			},
-			"Scoping configuration profiles with labels requires Fleet Premium license",
-			true,
+			"",
+			false,
 		},
 		{
-			"profiles with include any labels fails on free license",
+			"profiles with include any labels succeed on free license",
 			&fleet.User{GlobalRole: new(fleet.RoleAdmin)},
 			false,
 			nil,
@@ -2558,11 +2572,11 @@ func TestMDMBatchSetProfiles(t *testing.T) {
 			[]fleet.MDMProfileBatchPayload{
 				{Name: "N1", Contents: mobileconfigForTest("N1", "I1"), LabelsIncludeAny: []string{"a"}},
 			},
-			"Scoping configuration profiles with labels requires Fleet Premium license",
-			true,
+			"",
+			false,
 		},
 		{
-			"profiles with exclude labels fails on free license",
+			"profiles with exclude labels succeed on free license",
 			&fleet.User{GlobalRole: new(fleet.RoleAdmin)},
 			false,
 			nil,
@@ -2570,8 +2584,8 @@ func TestMDMBatchSetProfiles(t *testing.T) {
 			[]fleet.MDMProfileBatchPayload{
 				{Name: "N1", Contents: mobileconfigForTest("N1", "I1"), LabelsExcludeAny: []string{"a"}},
 			},
-			"Scoping configuration profiles with labels requires Fleet Premium license",
-			true,
+			"",
+			false,
 		},
 	}
 
@@ -4527,7 +4541,7 @@ func TestUpdateMDMAndroidConfigProfile(t *testing.T) {
 		assert.ErrorIs(t, err, wantErr)
 	})
 
-	t.Run("labels require a premium license, content-only edits do not", func(t *testing.T) {
+	t.Run("label and content edits succeed on a free license", func(t *testing.T) {
 		svc, ctx, ds, _ := setup(t, &fleet.LicenseInfo{Tier: fleet.TierFree})
 		existing := newExistingProfile("Test Profile", 0)
 
@@ -4535,13 +4549,11 @@ func TestUpdateMDMAndroidConfigProfile(t *testing.T) {
 			return existing, nil
 		}
 		ds.UpdateMDMAndroidConfigProfileFunc = func(ctx context.Context, p fleet.MDMAndroidConfigProfile, usesFleetVars []fleet.FleetVarName) (*fleet.MDMAndroidConfigProfile, error) {
-			t.Fatal("should not reach the datastore update")
-			return nil, nil
+			return &p, nil
 		}
 
 		err := svc.UpdateMDMConfigProfile(ctx, existing.ProfileUUID, "", nil, []string{"label1"}, fleet.LabelsIncludeAny, nil, optjson.Slice[byte]{})
-		require.ErrorIs(t, err, fleet.ErrMissingLicense)
-		require.ErrorContains(t, err, "Scoping configuration profiles with labels requires Fleet Premium license")
+		require.NoError(t, err)
 
 		// content-only edit (no labels) still succeeds on a free license
 		ds.UpdateMDMAndroidConfigProfileFunc = func(ctx context.Context, p fleet.MDMAndroidConfigProfile, usesFleetVars []fleet.FleetVarName) (*fleet.MDMAndroidConfigProfile, error) {
@@ -4581,7 +4593,7 @@ func TestUpdateMDMAndroidConfigProfile(t *testing.T) {
 		assert.Empty(t, capturedVars)
 	})
 
-	t.Run("team-scoped update on a free license allows content but not label scoping", func(t *testing.T) {
+	t.Run("team-scoped content and label updates succeed on a free license", func(t *testing.T) {
 		svc, ctx, ds, _ := setup(t, &fleet.LicenseInfo{Tier: fleet.TierFree})
 		existing := newExistingProfile("Test Profile", 5)
 
@@ -4597,7 +4609,7 @@ func TestUpdateMDMAndroidConfigProfile(t *testing.T) {
 		require.NoError(t, err)
 
 		err = svc.UpdateMDMConfigProfile(ctx, existing.ProfileUUID, "", nil, []string{"label1"}, fleet.LabelsIncludeAny, nil, optjson.Slice[byte]{})
-		require.ErrorIs(t, err, fleet.ErrMissingLicense)
+		require.NoError(t, err)
 	})
 
 	t.Run("authorization outcome matches user role and team membership", func(t *testing.T) {
