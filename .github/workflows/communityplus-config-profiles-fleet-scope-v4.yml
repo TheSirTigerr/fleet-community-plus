@@ -1,6 +1,6 @@
 name: Community+ configuration profile fleet scope v4
 
-# Trigger marker: generic batch Fleet-scope coverage included.
+# Current-head gate: execute the consolidated v3 patch exactly once.
 on:
   push:
     branches:
@@ -24,7 +24,7 @@ jobs:
         with:
           go-version-file: go.mod
           cache: true
-      - name: Apply final fleet-scope patch and regression updates
+      - name: Apply consolidated fleet-scope patch
         shell: bash
         run: |
           set -euo pipefail
@@ -37,37 +37,6 @@ jobs:
           start = source.index(marker) + len(marker)
           end = source.index("\n          PY", start)
           exec(compile(textwrap.dedent(source[start:end]), 'fleet-scope-v3', 'exec'))
-
-          p = Path('server/service/mdm_test.go')
-          text = p.read_text()
-          fn_start = text.index('func TestMDMBatchSetProfiles')
-          fn_end = text.index('\nfunc ', fn_start + 1)
-          chunk = text[fn_start:fn_end]
-
-          old_lookup = (
-              '\tds.TeamByNameFunc = func(ctx context.Context, name string) (*fleet.Team, error) {\n'
-              '\t\treturn &fleet.Team{ID: 1, Name: name}, nil\n'
-              '\t}\n'
-          )
-          if chunk.count(old_lookup) != 1:
-              raise SystemExit(f'TestMDMBatchSetProfiles: expected TeamByName fixture once, got {chunk.count(old_lookup)}')
-          new_lookup = old_lookup + (
-              '\tds.TeamLiteFunc = func(ctx context.Context, id uint) (*fleet.TeamLite, error) {\n'
-              '\t\treturn &fleet.TeamLite{ID: id, Name: "team"}, nil\n'
-              '\t}\n'
-          )
-          chunk = chunk.replace(old_lookup, new_lookup, 1)
-
-          for name in ('team id with free license', 'team name with free license'):
-              case_start = chunk.find(f'\t\t{{\n\t\t\t"{name}",\n')
-              if case_start < 0:
-                  raise SystemExit(f'missing generic batch case: {name}')
-              err_pos = chunk.find('\t\t\tErrMissingLicense.Error(),\n', case_start)
-              if err_pos < 0:
-                  raise SystemExit(f'missing old generic batch license expectation: {name}')
-              chunk = chunk[:err_pos] + '\t\t\t"",\n' + chunk[err_pos + len('\t\t\tErrMissingLicense.Error(),\n'):]
-
-          p.write_text(text[:fn_start] + chunk + text[fn_end:])
           PY
           gofmt -w server/service/apple_mdm.go server/service/windows_mdm_profiles.go server/service/mdm.go server/service/apple_mdm_test.go server/service/windows_mdm_profiles_test.go server/service/mdm_test.go
           git diff --check
