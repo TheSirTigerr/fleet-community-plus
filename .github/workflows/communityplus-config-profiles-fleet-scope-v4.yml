@@ -37,32 +37,36 @@ jobs:
           end = source.index("\n          PY", start)
           exec(compile(textwrap.dedent(source[start:end]), 'fleet-scope-v3', 'exec'))
 
-          def add_team_lite_after_team_with_extras(function_name):
+          def add_team_lite_after_team_with_extras(function_name, indent):
               p = Path('server/service/mdm_test.go')
               text = p.read_text()
               start = text.index(f'func {function_name}')
               end = text.index('\nfunc ', start + 1)
               chunk = text[start:end]
+              i = '\t' * indent
               old = (
-                  '\tds.TeamWithExtrasFunc = func(ctx context.Context, tid uint) (*fleet.Team, error) {\n'
-                  '\t\treturn &fleet.Team{ID: tid, Name: "team1"}, nil\n'
-                  '\t}\n'
+                  f'{i}ds.TeamWithExtrasFunc = func(ctx context.Context, tid uint) (*fleet.Team, error) {{\n'
+                  f'{i}\treturn &fleet.Team{{ID: tid, Name: "team1"}}, nil\n'
+                  f'{i}}}\n'
               )
               old_multiline = (
-                  '\tds.TeamWithExtrasFunc = func(ctx context.Context, tid uint) (*fleet.Team, error) {\n'
-                  '\t\treturn &fleet.Team{\n'
-                  '\t\t\tID:   tid,\n'
-                  '\t\t\tName: "team1",\n'
-                  '\t\t}, nil\n'
-                  '\t}\n'
+                  f'{i}ds.TeamWithExtrasFunc = func(ctx context.Context, tid uint) (*fleet.Team, error) {{\n'
+                  f'{i}\treturn &fleet.Team{{\n'
+                  f'{i}\t\tID:   tid,\n'
+                  f'{i}\t\tName: "team1",\n'
+                  f'{i}\t}}, nil\n'
+                  f'{i}}}\n'
               )
-              fixture = old if chunk.count(old) == 1 else old_multiline
-              if chunk.count(fixture) != 1:
+              if chunk.count(old) == 1:
+                  fixture = old
+              elif chunk.count(old_multiline) == 1:
+                  fixture = old_multiline
+              else:
                   raise SystemExit(f'unexpected TeamWithExtras fixture count in {function_name}')
               new = fixture + (
-                  '\tds.TeamLiteFunc = func(ctx context.Context, tid uint) (*fleet.TeamLite, error) {\n'
-                  '\t\treturn &fleet.TeamLite{ID: tid, Name: "team1"}, nil\n'
-                  '\t}\n'
+                  f'{i}ds.TeamLiteFunc = func(ctx context.Context, tid uint) (*fleet.TeamLite, error) {{\n'
+                  f'{i}\treturn &fleet.TeamLite{{ID: tid, Name: "team1"}}, nil\n'
+                  f'{i}}}\n'
               )
               chunk = chunk.replace(fixture, new, 1)
               p.write_text(text[:start] + chunk + text[end:])
@@ -70,8 +74,8 @@ jobs:
           # Existing label and OS-update batch coverage use fleet_id=1 and now
           # pass through direct TeamLite resolution. Their feature semantics
           # remain unchanged; only provide the lookup fixture.
-          add_team_lite_after_team_with_extras('TestBatchSetMDMProfilesLabels')
-          add_team_lite_after_team_with_extras('TestBatchSetMDMProfilesOSUpdates')
+          add_team_lite_after_team_with_extras('TestBatchSetMDMProfilesLabels', 1)
+          add_team_lite_after_team_with_extras('TestBatchSetMDMProfilesOSUpdates', 3)
           PY
           gofmt -w server/service/apple_mdm.go server/service/windows_mdm_profiles.go server/service/mdm.go server/service/apple_mdm_test.go server/service/windows_mdm_profiles_test.go server/service/mdm_test.go
           git diff --check
