@@ -92,6 +92,34 @@ jobs:
           )
           replace_exact('server/service/mdm.go', batch, '', 1)
 
+          old_apple_test = ''.join([
+              '\t// Fails on free license with labels\n',
+              '\tmcBytes = mcBytesForTest("Foo", "identifier", "UUID")\n',
+              '\tsvc, ctx, _, _ = setup(t, &fleet.LicenseInfo{Tier: fleet.TierFree}, "identifier")\n',
+              '\t_, err = svc.NewMDMAppleConfigProfile(ctx, 0, mcBytes, []string{"test-label"}, fleet.LabelsIncludeAll, nil)\n',
+              '\trequire.ErrorIs(t, err, fleet.ErrMissingLicense)\n',
+              '\trequire.ErrorContains(t, err, "Scoping configuration profiles")\n',
+              '\n',
+              '\t_, err = svc.NewMDMAppleConfigProfile(ctx, 0, mcBytes, nil, fleet.LabelsIncludeAll, []string{"test-label"})\n',
+              '\trequire.ErrorIs(t, err, fleet.ErrMissingLicense)\n',
+              '\trequire.ErrorContains(t, err, "Scoping configuration profiles")\n',
+          ])
+          new_apple_test = ''.join([
+              '\t// Label targeting is available on Community+.\n',
+              '\tmcBytes = mcBytesForTest("Foo", "identifier", "UUID")\n',
+              '\tsvc, ctx, ds, _ := setup(t, &fleet.LicenseInfo{Tier: fleet.TierFree}, "identifier")\n',
+              '\tds.LabelIDsByNameFunc = func(_ context.Context, labels []string, _ fleet.TeamFilter) (map[string]uint, error) {\n',
+              '\t\trequire.Equal(t, []string{"test-label"}, labels)\n',
+              '\t\treturn map[string]uint{"test-label": 1}, nil\n',
+              '\t}\n',
+              '\t_, err = svc.NewMDMAppleConfigProfile(ctx, 0, mcBytes, []string{"test-label"}, fleet.LabelsIncludeAll, nil)\n',
+              '\trequire.NoError(t, err)\n',
+              '\n',
+              '\t_, err = svc.NewMDMAppleConfigProfile(ctx, 0, mcBytes, nil, fleet.LabelsIncludeAll, []string{"test-label"})\n',
+              '\trequire.NoError(t, err)\n',
+          ])
+          replace_exact('server/service/apple_mdm_test.go', old_apple_test, new_apple_test, 1)
+
           for path, expected in [
               ('server/service/apple_mdm.go', 0),
               ('server/service/windows_mdm_profiles.go', 0),
@@ -101,7 +129,7 @@ jobs:
               if remaining != expected:
                   raise SystemExit(f'{path}: expected {expected} label-license references after patch, got {remaining}')
           PY
-          gofmt -w server/service/apple_mdm.go server/service/windows_mdm_profiles.go server/service/mdm.go
+          gofmt -w server/service/apple_mdm.go server/service/windows_mdm_profiles.go server/service/mdm.go server/service/apple_mdm_test.go
           git diff --check
           if git diff --quiet; then
             echo 'No patch produced'
@@ -119,6 +147,6 @@ jobs:
           set -euo pipefail
           git config user.name 'github-actions[bot]'
           git config user.email '41898282+github-actions[bot]@users.noreply.github.com'
-          git add server/service/apple_mdm.go server/service/windows_mdm_profiles.go server/service/mdm.go
+          git add server/service/apple_mdm.go server/service/windows_mdm_profiles.go server/service/mdm.go server/service/apple_mdm_test.go
           git commit -m 'feat: enable Community+ profile label targeting'
           git push origin HEAD:community-plus/foundation
