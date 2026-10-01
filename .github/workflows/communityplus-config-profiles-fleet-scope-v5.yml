@@ -1,0 +1,166 @@
+name: Community+ configuration profile fleet scope v5
+
+on:
+  push:
+    branches:
+      - community-plus/foundation
+    paths:
+      - '.github/workflows/communityplus-config-profiles-fleet-scope-v5.yml'
+  workflow_dispatch:
+
+permissions:
+  contents: write
+
+jobs:
+  patch:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          ref: community-plus/foundation
+          fetch-depth: 1
+      - uses: actions/setup-go@v5
+        with:
+          go-version-file: go.mod
+          cache: true
+      - name: Apply consolidated fleet-scope patch
+        shell: bash
+        run: |
+          set -euo pipefail
+          python3 - <<'PY'
+          from pathlib import Path
+          import textwrap
+
+          # Apply the already-reviewed Apple/Windows/batch patch first.
+          source = Path('.github/workflows/communityplus-config-profiles-fleet-scope-v3.yml').read_text()
+          marker = "          python3 - <<'PY'\n"
+          start = source.index(marker) + len(marker)
+          end = source.index("\n          PY", start)
+          exec(compile(textwrap.dedent(source[start:end]), 'fleet-scope-v3', 'exec'))
+
+          def function_chunk(path, marker):
+              p = Path(path)
+              text = p.read_text()
+              start = text.find(marker)
+              if start < 0:
+                  raise SystemExit(f'{path}: missing marker {marker}')
+              end = text.find('\nfunc ', start + len(marker))
+              if end < 0:
+                  end = len(text)
+              return p, text, start, end, text[start:end]
+
+          # Android create/update must resolve fleet scope through the Community
+          # datastore too. Keep label scoping and Android OS-update validation
+          # separately gated for their own roadmap items.
+          p, text, start, end, chunk = function_chunk(
+              'server/service/mdm.go',
+              'func (svc *Service) parseAndValidateAndroidConfigProfile',
+          )
+          old_android_team = (
+              '\tif teamID > 0 {\n'
+              '\t\tif lic == nil || !lic.IsPremium() {\n'
+              '\t\t\treturn nil, "", ctxerr.Wrap(ctx, fleet.ErrMissingLicense)\n'
+              '\t\t}\n'
+              '\t\ttm, err := svc.EnterpriseOverrides.TeamByIDOrName(ctx, &teamID, nil)\n'
+              '\t\tif err != nil {\n'
+              '\t\t\treturn nil, "", ctxerr.Wrap(ctx, err)\n'
+              '\t\t}\n'
+              '\t\tteamName = tm.Name\n'
+              '\t}\n'
+          )
+          new_android_team = (
+              '\tif teamID > 0 {\n'
+              '\t\ttm, err := svc.ds.TeamLite(ctx, teamID)\n'
+              '\t\tif err != nil {\n'
+              '\t\t\treturn nil, "", ctxerr.Wrap(ctx, err)\n'
+              '\t\t}\n'
+              '\t\tteamName = tm.Name\n'
+              '\t}\n'
+          )
+          if chunk.count(old_android_team) != 1:
+              raise SystemExit(f'Android fleet gate: expected 1 match, got {chunk.count(old_android_team)}')
+          chunk = chunk.replace(old_android_team, new_android_team, 1)
+          p.write_text(text[:start] + chunk + text[end:])
+
+          # Android create tests now use TeamLite and Free/Community+ fleet
+          # scope is expected to succeed for non-premium profile content.
+          p, text, start, end, chunk = function_chunk(
+              'server/service/mdm_test.go',
+              'func TestNewMDMProfilePremiumOnlyAndroid',
+          )
+          old_fixture = (
+              '\tds.TeamWithExtrasFunc = func(ctx context.Context, id uint) (*fleet.Team, error) {\n'
+              '\t\treturn &fleet.Team{ID: id, Name: "team"}, nil\n'
+              '\t}\n'
+          )
+          if chunk.count(old_fixture) != 1:
+              raise SystemExit(f'Android create fixture: expected 1 TeamWithExtras match, got {chunk.count(old_fixture)}')
+          chunk = chunk.replace(
+              old_fixture,
+              old_fixture + (
+                  '\tds.TeamLiteFunc = func(ctx context.Context, id uint) (*fleet.TeamLite, error) {\n'
+                  '\t\treturn &fleet.TeamLite{ID: id, Name: "team"}, nil\n'
+                  '\t}\n'
+              ),
+              1,
+          )
+          case_marker = '\t\t\t"android profile with team and free license",\n'
+          case_start = chunk.find(case_marker)
+          if case_start < 0:
+              raise SystemExit('Android free-team case not found')
+          next_case = chunk.find('\n\t\t{', case_start + len(case_marker))
+          case_end = next_case if next_case >= 0 else len(chunk)
+          case_chunk = chunk[case_start:case_end]
+          old_expectation = '\t\t\t"Requires Fleet Premium license",\n'
+          if case_chunk.count(old_expectation) != 1:
+              raise SystemExit('Android free-team license expectation not found exactly once')
+          case_chunk = case_chunk.replace(old_expectation, '\t\t\t"",\n', 1)
+          chunk = chunk[:case_start] + case_chunk + chunk[case_end:]
+          p.write_text(text[:start] + chunk + text[end:])
+
+          # Android update tests share a setup helper. Mirror its TeamWithExtras
+          # fixture with the new lightweight lookup used by resolveProfileTeam.
+          p, text, start, end, chunk = function_chunk(
+              'server/service/mdm_test.go',
+              'func TestUpdateMDMAndroidConfigProfile',
+          )
+          old_update_fixture = (
+              '\t\tds.TeamWithExtrasFunc = func(ctx context.Context, teamID uint) (*fleet.Team, error) {\n'
+              '\t\t\treturn &fleet.Team{ID: teamID, Name: fmt.Sprintf("team-%d", teamID)}, nil\n'
+              '\t\t}\n'
+          )
+          if chunk.count(old_update_fixture) != 1:
+              raise SystemExit(f'Android update fixture: expected 1 TeamWithExtras match, got {chunk.count(old_update_fixture)}')
+          chunk = chunk.replace(
+              old_update_fixture,
+              old_update_fixture + (
+                  '\t\tds.TeamLiteFunc = func(ctx context.Context, teamID uint) (*fleet.TeamLite, error) {\n'
+                  '\t\t\treturn &fleet.TeamLite{ID: teamID, Name: fmt.Sprintf("team-%d", teamID)}, nil\n'
+                  '\t\t}\n'
+              ),
+              1,
+          )
+          p.write_text(text[:start] + chunk + text[end:])
+          PY
+          gofmt -w server/service/apple_mdm.go server/service/windows_mdm_profiles.go server/service/mdm.go server/service/apple_mdm_test.go server/service/windows_mdm_profiles_test.go server/service/mdm_test.go
+          git diff --check
+          if git diff --quiet; then
+            echo 'No patch produced'
+            exit 1
+          fi
+      - name: Verify fleet-scope profile changes
+        shell: bash
+        run: |
+          set -euo pipefail
+          go test ./server/communityplus/servicecompat -count=1
+          go test ./server/service -run '^(TestUpdateMDMAppleConfigProfile|TestUpdateMDMWindowsConfigProfile|TestUpdateMDMAndroidConfigProfile|TestNewMDMProfilePremiumOnlyAndroid|TestMDMBatchSetAppleProfiles|TestMDMBatchSetProfiles|TestBatchSetMDMProfilesLabels|TestBatchSetMDMProfilesOSUpdates|TestUploadWindowsMDMConfigProfileValidations|TestDeleteMDMConfigProfileFreeLicenseTeam)$' -count=1
+          go build ./cmd/fleet
+      - name: Commit guarded patch
+        shell: bash
+        run: |
+          set -euo pipefail
+          git config user.name 'github-actions[bot]'
+          git config user.email '41898282+github-actions[bot]@users.noreply.github.com'
+          git add server/service/apple_mdm.go server/service/windows_mdm_profiles.go server/service/mdm.go server/service/apple_mdm_test.go server/service/windows_mdm_profiles_test.go server/service/mdm_test.go
+          git commit -m 'feat: enable Community+ configuration profile fleet scope'
+          git push origin HEAD:community-plus/foundation
