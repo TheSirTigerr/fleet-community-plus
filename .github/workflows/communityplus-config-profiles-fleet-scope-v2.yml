@@ -1,5 +1,6 @@
 name: Community+ configuration profile fleet scope v2
 
+# Retry marker: includes Apple batch TeamLite fixture.
 on:
   push:
     branches:
