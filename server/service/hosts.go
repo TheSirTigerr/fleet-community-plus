@@ -4864,11 +4864,7 @@ func rotateRecoveryLockPasswordEndpoint(ctx context.Context, request any, svc fl
 }
 
 func (svc *Service) RotateRecoveryLockPassword(ctx context.Context, hostID uint) error {
-	// skipauth: No authorization check needed due to implementation returning
-	// only license error.
-	svc.authz.SkipAuthorization(ctx)
-
-	return fleet.ErrMissingLicense
+	return svc.communityPlusRotateRecoveryLockPassword(ctx, hostID, svc.mdmAppleCommander)
 }
 
 // //////////////////////////////////////////////////////////////////////////////
