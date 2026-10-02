@@ -26,10 +26,10 @@ func wrapCertificateAuthorities(base fleet.Service, options []any) fleet.Service
 		return nil
 	}
 	var (
-		ds       fleet.Datastore
-		cfg      *config.FleetConfig
-		scepSvc  fleet.SCEPConfigService
-		digiSvc  fleet.DigiCertService
+		ds      fleet.Datastore
+		cfg     *config.FleetConfig
+		scepSvc fleet.SCEPConfigService
+		digiSvc fleet.DigiCertService
 	)
 	for _, option := range options {
 		switch value := option.(type) {
