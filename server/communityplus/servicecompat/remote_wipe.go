@@ -149,7 +149,6 @@ func (s *remoteLockWrapper) WipeHost(ctx context.Context, hostID uint, metadata 
 			return err
 		}
 
-
 	default:
 		return fleet.NewInvalidArgumentError("host_id", fmt.Sprintf("Unsupported host platform: %s", host.Platform))
 	}
