@@ -10,6 +10,7 @@ import (
 	"github.com/fleetdm/fleet/v4/server/authz"
 	"github.com/fleetdm/fleet/v4/server/contexts/ctxerr"
 	"github.com/fleetdm/fleet/v4/server/fleet"
+	common_mysql "github.com/fleetdm/fleet/v4/server/platform/mysql"
 	"github.com/fleetdm/fleet/v4/server/mdm/android"
 	"github.com/google/uuid"
 )
@@ -136,6 +137,9 @@ func (s *remoteLockWrapper) LockHost(ctx context.Context, hostID uint, viewPIN b
 	case "windows", "linux":
 		if platform == "windows" {
 			if err := s.VerifyMDMWindowsConfigured(ctx); err != nil {
+				if errors.Is(err, fleet.ErrMDMNotConfigured) {
+					err = fleet.NewInvalidArgumentError("host_id", fleet.WindowsMDMNotConfiguredMessage).WithStatus(http.StatusBadRequest)
+				}
 				return "", ctxerr.Wrap(ctx, err, "check Windows MDM enabled")
 			}
 		}
@@ -144,6 +148,9 @@ func (s *remoteLockWrapper) LockHost(ctx context.Context, hostID uint, viewPIN b
 		}
 	case "android":
 		if err := s.VerifyMDMAndroidConfigured(ctx); err != nil {
+			if errors.Is(err, fleet.ErrMDMNotConfigured) {
+				err = fleet.NewInvalidArgumentError("host_id", fleet.AndroidMDMNotConfiguredMessage).WithStatus(http.StatusBadRequest)
+			}
 			return "", ctxerr.Wrap(ctx, err, "check Android MDM enabled")
 		}
 		if s.android == nil {
@@ -229,6 +236,9 @@ func (s *remoteLockWrapper) UnlockHost(ctx context.Context, hostID uint) (string
 	case "windows", "linux":
 		if platform == "windows" {
 			if err := s.VerifyMDMWindowsConfigured(ctx); err != nil {
+				if errors.Is(err, fleet.ErrMDMNotConfigured) {
+					err = fleet.NewInvalidArgumentError("host_id", fleet.WindowsMDMNotConfiguredMessage).WithStatus(http.StatusBadRequest)
+				}
 				return "", ctxerr.Wrap(ctx, err, "check Windows MDM enabled")
 			}
 		}
@@ -302,7 +312,8 @@ func (s *remoteLockWrapper) authorizedHost(ctx context.Context, hostID uint) (*f
 	if err != nil {
 		return nil, ctxerr.Wrap(ctx, err, "get host")
 	}
-	if err := s.authorizer.Authorize(ctx, fleet.MDMCommandAuthz{TeamID: host.TeamID}, fleet.ActionWrite); err != nil {
+	notFoundErr := ctxerr.Wrap(ctx, common_mysql.NotFound("Host").WithID(hostID), "remote host action")
+	if err := s.authorizer.AuthorizeOrNotFound(ctx, fleet.MDMCommandAuthz{TeamID: host.TeamID}, fleet.ActionWrite, notFoundErr); err != nil {
 		return nil, err
 	}
 	return host, nil
