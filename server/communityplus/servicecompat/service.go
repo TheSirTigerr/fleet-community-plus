@@ -46,6 +46,7 @@ func NewService(base fleet.Service, options ...any) (fleet.Service, error) {
 	if err != nil {
 		return nil, err
 	}
+	svc = wrapRemoteLock(svc, options)
 	svc = wrapTeamSettings(svc, options)
 	svc = wrapConfigurationProfiles(svc)
 	installCommunityPlusOverrides(svc, options)
