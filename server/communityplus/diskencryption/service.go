@@ -173,12 +173,12 @@ func (s *Service) Summary(ctx context.Context, teamID *uint) (*fleet.MDMDiskEncr
 	}
 
 	return &fleet.MDMDiskEncryptionSummary{
-		Verified:             fleet.MDMPlatformsCounts{MacOS: macOS.Verified, Windows: windows.Verified, Linux: linux.Verified},
-		Verifying:            fleet.MDMPlatformsCounts{MacOS: macOS.Verifying, Windows: windows.Verifying},
-		ActionRequired:       fleet.MDMPlatformsCounts{MacOS: macOS.ActionRequired, Windows: windows.ActionRequired, Linux: linux.ActionRequired},
-		Enforcing:            fleet.MDMPlatformsCounts{MacOS: macOS.Enforcing, Windows: windows.Enforcing},
-		Failed:               fleet.MDMPlatformsCounts{MacOS: macOS.Failed, Windows: windows.Failed, Linux: linux.Failed},
-		RemovingEnforcement:  fleet.MDMPlatformsCounts{MacOS: macOS.RemovingEnforcement, Windows: windows.RemovingEnforcement},
+		Verified:            fleet.MDMPlatformsCounts{MacOS: macOS.Verified, Windows: windows.Verified, Linux: linux.Verified},
+		Verifying:           fleet.MDMPlatformsCounts{MacOS: macOS.Verifying, Windows: windows.Verifying},
+		ActionRequired:      fleet.MDMPlatformsCounts{MacOS: macOS.ActionRequired, Windows: windows.ActionRequired, Linux: linux.ActionRequired},
+		Enforcing:           fleet.MDMPlatformsCounts{MacOS: macOS.Enforcing, Windows: windows.Enforcing},
+		Failed:              fleet.MDMPlatformsCounts{MacOS: macOS.Failed, Windows: windows.Failed, Linux: linux.Failed},
+		RemovingEnforcement: fleet.MDMPlatformsCounts{MacOS: macOS.RemovingEnforcement, Windows: windows.RemovingEnforcement},
 	}, nil
 }
 

@@ -1972,26 +1972,24 @@ func (svc *Service) getHostDetails(ctx context.Context, host *fleet.Host, opts f
 				break
 			}
 
-			if license.IsPremium(ctx) {
-				// we include disk encryption status only for premium so initialize it to default struct
-				host.MDM.OSSettings.DiskEncryption = fleet.HostMDMDiskEncryption{}
-				// ensure host mdm info is loaded (we don't know if our caller populated it)
-				_, err := svc.ds.GetHostMDM(ctx, host.ID)
-				switch {
-				case err != nil && fleet.IsNotFound(err):
-					// assume host is unmanaged, log for debugging, and move on
-					svc.logger.DebugContext(ctx, "cannot determine bitlocker status because no mdm info for host", "host_id", host.ID)
-				case err != nil:
-					return nil, ctxerr.Wrap(ctx, err, "ensure host mdm info")
-				default:
-					hde, err := svc.ds.GetMDMWindowsBitLockerStatus(ctx, host)
-					if err != nil {
-						return nil, ctxerr.Wrap(ctx, err, "get host mdm bitlocker status")
-					}
-					if hde != nil {
-						// overwrite the default disk encryption status
-						host.MDM.OSSettings.DiskEncryption = *hde
-					}
+			// we include disk encryption status only for premium so initialize it to default struct
+			host.MDM.OSSettings.DiskEncryption = fleet.HostMDMDiskEncryption{}
+			// ensure host mdm info is loaded (we don't know if our caller populated it)
+			_, err := svc.ds.GetHostMDM(ctx, host.ID)
+			switch {
+			case err != nil && fleet.IsNotFound(err):
+				// assume host is unmanaged, log for debugging, and move on
+				svc.logger.DebugContext(ctx, "cannot determine bitlocker status because no mdm info for host", "host_id", host.ID)
+			case err != nil:
+				return nil, ctxerr.Wrap(ctx, err, "ensure host mdm info")
+			default:
+				hde, err := svc.ds.GetMDMWindowsBitLockerStatus(ctx, host)
+				if err != nil {
+					return nil, ctxerr.Wrap(ctx, err, "get host mdm bitlocker status")
+				}
+				if hde != nil {
+					// overwrite the default disk encryption status
+					host.MDM.OSSettings.DiskEncryption = *hde
 				}
 			}
 

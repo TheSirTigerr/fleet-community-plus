@@ -3510,12 +3510,6 @@ func (svc *Service) UpdateMDMDiskEncryption(ctx context.Context, teamID *uint, p
 	// `PATCH /api/v1/fleet/mdm/apple/settings` endpoint, but for now it's better
 	// leave here so both endpoints can reuse the same logic.
 
-	lic, _ := license.FromContext(ctx)
-	if lic == nil || !lic.IsPremium() {
-		svc.authz.SkipAuthorization(ctx) // so that the error message is not replaced by "forbidden"
-		return fleet.ErrMissingLicense
-	}
-
 	// for historical reasons (the deprecated PATCH /mdm/apple/settings
 	// endpoint), this uses an Apple-specific struct for authorization. Can be improved
 	// once we remove the deprecated endpoint.

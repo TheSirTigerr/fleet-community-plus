@@ -670,6 +670,7 @@ func runServeCmd(cmd *cobra.Command, configManager configpkg.Manager, debug, dev
 			svc,
 			ds,
 			logger,
+			config,
 			depStorage,
 			bootstrapPackageStore,
 			psso.NewRedisNonceStore(redisPool),

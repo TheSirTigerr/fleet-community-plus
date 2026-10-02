@@ -2240,23 +2240,6 @@ func (svc *Service) validateMDM(
 	invalid *fleet.InvalidArgumentError,
 	overwrite bool,
 ) error {
-	if !lic.IsPremium() {
-		// gated on newly enabling (not the stored value) so a downgraded
-		// license with settings still on can save unrelated config changes
-		// and turn the settings off
-		if mdm.MacOSSettings.EnableDiskEncryption.Value && !oldMdm.MacOSSettings.EnableDiskEncryption.Value {
-			invalid.Append("apple_settings.enable_disk_encryption", ErrMissingLicense.Error())
-		}
-		if mdm.MacOSSettings.EnableEscrowDiskEncryptionKey.Value && !oldMdm.MacOSSettings.EnableEscrowDiskEncryptionKey.Value {
-			invalid.Append("apple_settings.enable_escrow_disk_encryption_key", ErrMissingLicense.Error())
-		}
-		if mdm.WindowsSettings.EnableDiskEncryption.Value && !oldMdm.WindowsSettings.EnableDiskEncryption.Value {
-			invalid.Append("windows_settings.enable_disk_encryption", ErrMissingLicense.Error())
-		}
-		if mdm.LinuxSettings.EnableEscrowDiskEncryptionKey.Value && !oldMdm.LinuxSettings.EnableEscrowDiskEncryptionKey.Value {
-			invalid.Append("linux_settings.enable_escrow_disk_encryption_key", ErrMissingLicense.Error())
-		}
-	}
 	if mdm.MacOSSetup.MacOSSetupAssistant.Value != "" && oldMdm.MacOSSetup.MacOSSetupAssistant.Value != mdm.MacOSSetup.MacOSSetupAssistant.Value && !lic.IsPremium() {
 		invalid.Append("setup_experience.apple_setup_assistant", ErrMissingLicense.Error())
 	}
