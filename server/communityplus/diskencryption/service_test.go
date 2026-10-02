@@ -144,7 +144,6 @@ func TestReconcileFileVaultBuildsEnforcementOnlyProfileWithoutCertificate(t *tes
 	}
 }
 
-
 func TestReconcileFileVaultBuildsEscrowProfileWithCertificate(t *testing.T) {
 	ds := new(mock.DataStore)
 	cert, _, err := apple_mdm.NewSCEPCACertKey()
