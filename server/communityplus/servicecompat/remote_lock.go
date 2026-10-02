@@ -66,10 +66,10 @@ exit 0
 
 type remoteLockWrapper struct {
 	fleet.Service
-	ds        fleet.Datastore
+	ds         fleet.Datastore
 	authorizer *authz.Authorizer
-	apple     fleet.MDMAppleCommandIssuer
-	android   android.Service
+	apple      fleet.MDMAppleCommandIssuer
+	android    android.Service
 }
 
 func wrapRemoteLock(base fleet.Service, options []any) fleet.Service {
