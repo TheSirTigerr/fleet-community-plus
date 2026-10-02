@@ -1,0 +1,75 @@
+name: Community+ Recovery Lock gate
+
+on:
+  push:
+    branches:
+      - community-plus/foundation
+    paths:
+      - '.github/workflows/communityplus-recovery-lock-gate.yml'
+  workflow_dispatch:
+
+permissions:
+  contents: write
+
+jobs:
+  patch:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          ref: community-plus/foundation
+          fetch-depth: 0
+
+      - name: Enable Community+ Recovery Lock rotation
+        shell: bash
+        run: |
+          set -euo pipefail
+          python3 - <<'PY'
+          from pathlib import Path
+
+          p = Path("server/service/hosts.go")
+          text = p.read_text()
+          old = (
+              "func (svc *Service) RotateRecoveryLockPassword(ctx context.Context, hostID uint) error {\n"
+              "\t// skipauth: No authorization check needed due to implementation returning\n"
+              "\t// only license error.\n"
+              "\tsvc.authz.SkipAuthorization(ctx)\n\n"
+              "\treturn fleet.ErrMissingLicense\n"
+              "}\n"
+          )
+          new = (
+              "func (svc *Service) RotateRecoveryLockPassword(ctx context.Context, hostID uint) error {\n"
+              "\treturn svc.communityPlusRotateRecoveryLockPassword(ctx, hostID, svc.mdmAppleCommander)\n"
+              "}\n"
+          )
+          count = text.count(old)
+          if count != 1:
+              raise SystemExit(f"server/service/hosts.go: expected 1 Recovery Lock stub, got {count}")
+          p.write_text(text.replace(old, new))
+          PY
+
+          gofmt -w             server/service/communityplus_recovery_lock.go             server/service/communityplus_recovery_lock_test.go             server/communityplus/servicecompat/team_settings.go             server/communityplus/servicecompat/team_settings_test.go             server/communityplus/servicecompat/service.go             server/service/hosts.go
+
+          git diff --check
+          if git diff --quiet; then
+            echo "No patch produced"
+            exit 1
+          fi
+
+      - name: Verify Community+ Recovery Lock
+        shell: bash
+        run: |
+          set -euo pipefail
+          go test ./server/service -run 'TestCommunityPlusRotateRecoveryLock' -count=1
+          go test ./server/communityplus/servicecompat -run 'TestTeamSettingsWrapper' -count=1
+          go build ./cmd/fleet
+
+      - name: Commit verified patch
+        shell: bash
+        run: |
+          set -euo pipefail
+          git config user.name 'github-actions[bot]'
+          git config user.email '41898282+github-actions[bot]@users.noreply.github.com'
+          git add             server/service/communityplus_recovery_lock.go             server/service/communityplus_recovery_lock_test.go             server/service/hosts.go             server/communityplus/servicecompat/team_settings.go             server/communityplus/servicecompat/team_settings_test.go             server/communityplus/servicecompat/service.go
+          git commit -m 'feat: enable Community+ Recovery Lock management'
+          git push origin HEAD:community-plus/foundation
