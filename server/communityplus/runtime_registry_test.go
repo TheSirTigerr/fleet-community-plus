@@ -17,6 +17,7 @@ func TestRuntimeRegistryPublishesOnlyWiredCapabilities(t *testing.T) {
 		FeatureConditionalAccess:    StatusAvailable,
 		FeatureAccountPasswordSync:  StatusAvailable,
 		FeatureZeroTouch:            StatusAvailable,
+		FeatureDiskEncryption:       StatusAvailable,
 		FeatureSoftwareAutomation:   StatusExperimental,
 		FeaturePatchPolicies:        StatusExperimental,
 	}
