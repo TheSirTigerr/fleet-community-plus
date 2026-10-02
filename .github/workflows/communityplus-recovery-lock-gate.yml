@@ -56,6 +56,7 @@ jobs:
             exit 1
           fi
 
+      # Re-run after fixing the Apple MDM package import.
       - name: Verify Community+ Recovery Lock
         shell: bash
         run: |
