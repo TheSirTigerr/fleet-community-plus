@@ -110,7 +110,7 @@ func (s *remoteLockWrapper) LockHost(ctx context.Context, hostID uint, viewPIN b
 
 	switch platform {
 	case "darwin", "ios", "ipados":
-		if host.MDM.EnrollmentStatus != nil && fleet.IsPersonalEnrollmentStatus(*host.MDM.EnrollmentStatus) {
+		if host.MDM.EnrollmentStatus != nil && *host.MDM.EnrollmentStatus == fleet.MDMEnrollmentStatusPersonal {
 			return "", &fleet.BadRequestError{Message: fleet.CantLockPersonalHostsMessage}
 		}
 		if host.MDM.EnrollmentStatus != nil && *host.MDM.EnrollmentStatus == fleet.MDMEnrollmentStatusManual &&
