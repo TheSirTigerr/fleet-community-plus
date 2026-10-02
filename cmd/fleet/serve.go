@@ -675,6 +675,8 @@ func runServeCmd(cmd *cobra.Command, configManager configpkg.Manager, debug, dev
 			bootstrapPackageStore,
 			apple_mdm.NewMDMAppleCommander(mdmStorage, mdmPushService),
 			androidSvc,
+			scepConfigMgr,
+			digiCertService,
 			psso.NewRedisNonceStore(redisPool),
 		)
 		if err != nil {
