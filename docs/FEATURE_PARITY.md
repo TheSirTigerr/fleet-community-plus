@@ -35,9 +35,9 @@ This document tracks independently implemented equivalents for Fleet Premium cap
 - [x] Configuration profiles at fleet/device scope
 - [x] Label/target-based profile assignment
 - [x] Disk encryption enforcement
-- [ ] Recovery key escrow
+- [x] Recovery key escrow
 - [x] Recovery Lock management
-- [ ] OS update enforcement
+- [x] OS update enforcement
 - [ ] Remote lock
 - [ ] Remote wipe
 - [ ] Certificate distribution and renewal
