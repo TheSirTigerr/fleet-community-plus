@@ -166,3 +166,34 @@ func TestRemoteWipeDelegatesAndroidToCommunityCore(t *testing.T) {
 		t.Fatal("expected Android wipe to delegate to Fleet Community core")
 	}
 }
+
+func TestRemoteWipeRejectsPendingLock(t *testing.T) {
+	ds := new(storemock.Store)
+	base := new(servicemock.Service)
+	host := &fleet.Host{ID: 55, Platform: "linux"}
+
+	ds.HostFunc = func(context.Context, uint) (*fleet.Host, error) {
+		return host, nil
+	}
+	ds.GetHostOrbitInfoFunc = func(context.Context, uint) (*fleet.HostOrbitInfo, error) {
+		return &fleet.HostOrbitInfo{}, nil
+	}
+	ds.GetHostLockWipeStatusFunc = func(context.Context, *fleet.Host) (*fleet.HostLockWipeStatus, error) {
+		return &fleet.HostLockWipeStatus{
+			HostFleetPlatform: "linux",
+			LockScript:        &fleet.HostScriptResult{},
+		}, nil
+	}
+
+	svc := wrapRemoteLock(base, []any{fleet.Datastore(ds)})
+	err := svc.WipeHost(recoveryLockAdminContext(), host.ID, nil)
+	if err == nil {
+		t.Fatal("expected pending lock to block wipe")
+	}
+	if !strings.Contains(err.Error(), "pending lock request") {
+		t.Fatalf("unexpected pending-lock wipe error: %v", err)
+	}
+	if ds.WipeHostViaScriptFuncInvoked {
+		t.Fatal("pending lock must not queue a wipe script")
+	}
+}
