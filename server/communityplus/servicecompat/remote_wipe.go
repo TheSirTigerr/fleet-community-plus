@@ -112,6 +112,11 @@ func (s *remoteLockWrapper) WipeHost(ctx context.Context, hostID uint, metadata 
 		return err
 	}
 	platform := host.FleetPlatform()
+	if platform == "android" {
+		// Android wipe is already part of Fleet Community. Keep that implementation
+		// authoritative instead of duplicating its COBO/BYO validation and activity flow.
+		return s.Service.WipeHost(ctx, hostID, metadata)
+	}
 
 	requireMDM := false
 	switch platform {
@@ -144,14 +149,6 @@ func (s *remoteLockWrapper) WipeHost(ctx context.Context, hostID uint, metadata 
 			return err
 		}
 
-	case "android":
-		if err := fleet.ValidateAndroidWipeRequest(ctx, s.ds, host); err != nil {
-			return ctxerr.Wrap(ctx, err, "validate Android wipe request")
-		}
-		if s.android == nil {
-			return errors.New("Community+ remote wipe: Android MDM service is unavailable")
-		}
-		requireMDM = true
 
 	default:
 		return fleet.NewInvalidArgumentError("host_id", fmt.Sprintf("Unsupported host platform: %s", host.Platform))
@@ -220,10 +217,6 @@ func (s *remoteLockWrapper) WipeHost(ctx context.Context, hostID uint, metadata 
 			return ctxerr.Wrap(ctx, err, "queue Linux wipe")
 		}
 
-	case "android":
-		if err := s.android.WipeAndroidHost(ctx, host.ID); err != nil {
-			return ctxerr.Wrap(ctx, err, "queue Android wipe")
-		}
 	}
 
 	if err := s.NewActivity(ctx, user, fleet.ActivityTypeWipedHost{
