@@ -140,7 +140,7 @@ jobs:
       - name: Test Community+ core service regressions
         run: >-
           go test ./server/service
-          -run '^(TestCommunityPlusGetSSOUser|TestValidateMDMAllowsCommunityPlusMacOSMigrationWithoutPremiumLicense|TestValidateMDMAllowsCommunityPlusHostNameTemplateWithoutPremiumLicense|TestUpdateMDMHostNameTemplateIsNotPremiumLicenseGated|TestCommunityPlusRotateRecoveryLock.*)$'
+          -run '^(TestCommunityPlusGetSSOUser|TestValidateMDMAllowsCommunityPlusMacOSMigrationWithoutPremiumLicense|TestValidateMDMAllowsCommunityPlusHostNameTemplateWithoutPremiumLicense|TestUpdateMDMHostNameTemplateIsNotPremiumLicenseGated|TestValidateMDMAllowsCommunityPlusDiskEncryptionWithoutPremiumLicense|TestUpdateMDMDiskEncryptionIsNotPremiumLicenseGated|TestHostEncryptionKey|TestCommunityPlusRotateRecoveryLock.*)$'
       - name: Test Community+ configuration profile regressions
         run: >-
           go test ./server/service
