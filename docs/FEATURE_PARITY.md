@@ -38,7 +38,7 @@ This document tracks independently implemented equivalents for Fleet Premium cap
 - [x] Recovery key escrow
 - [x] Recovery Lock management
 - [x] OS update enforcement
-- [ ] Remote lock
+- [x] Remote lock
 - [ ] Remote wipe
 - [ ] Certificate distribution and renewal
 
