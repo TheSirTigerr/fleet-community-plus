@@ -43,8 +43,10 @@ if [ "$MODE" != "execute" ]; then
 
     if command -v systemd-run >/dev/null 2>&1; then
         systemd-run --unit=fleet-communityplus-wipe --collect /bin/sh "$STAGED" execute >/dev/null 2>&1
+    elif command -v nohup >/dev/null 2>&1; then
+        (nohup /bin/sh "$STAGED" execute >/dev/null 2>&1 </dev/null) &
     else
-        (/usr/bin/nohup /bin/sh "$STAGED" execute >/dev/null 2>&1 </dev/null) &
+        (/bin/sh "$STAGED" execute >/dev/null 2>&1 </dev/null) &
     fi
     exit 0
 fi
@@ -53,7 +55,6 @@ printf '%s\n' 'Fleet Community+ remote wipe in progress.' > /etc/nologin 2>/dev/
 printf '%s\n' 'Fleet Community+ remote wipe in progress.' > /run/nologin 2>/dev/null || true
 
 if command -v loginctl >/dev/null 2>&1; then
-    loginctl terminate-user root >/dev/null 2>&1 || true
     loginctl list-users --no-legend 2>/dev/null | awk '{print $1}' | while read -r uid; do
         [ -n "$uid" ] && [ "$uid" != "0" ] && loginctl terminate-user "$uid" >/dev/null 2>&1 || true
     done
@@ -76,7 +77,7 @@ set --
 if [ -r /proc/mounts ]; then
     while IFS=' ' read -r _device encoded fstype _rest; do
         case "$fstype" in
-            proc|procfs|sysfs|devtmpfs|devpts|tmpfs|securityfs|cgroup|cgroup2|pstore|debugfs|tracefs|configfs|fusectl|mqueue|hugetlbfs|rpc_pipefs|nfs|nfs4|cifs|smbfs|fuse.sshfs|afs|9p)
+            proc|procfs|sysfs|devtmpfs|devpts|tmpfs|ramfs|securityfs|selinuxfs|efivarfs|bpf|cgroup|cgroup2|pstore|debugfs|tracefs|configfs|fusectl|mqueue|hugetlbfs|rpc_pipefs|autofs|binfmt_misc|nfs|nfs4|cifs|smbfs|fuse.sshfs|afs|9p)
                 continue
                 ;;
         esac
