@@ -2,14 +2,18 @@ package diskencryption
 
 import (
 	"context"
+	"encoding/base64"
 	"strings"
 	"testing"
 
 	"github.com/fleetdm/fleet/v4/pkg/optjson"
 	"github.com/fleetdm/fleet/v4/server/config"
 	"github.com/fleetdm/fleet/v4/server/fleet"
+	apple_mdm "github.com/fleetdm/fleet/v4/server/mdm/apple"
 	"github.com/fleetdm/fleet/v4/server/mdm/apple/mobileconfig"
+	"github.com/fleetdm/fleet/v4/server/mdm/nanodep/tokenpki"
 	"github.com/fleetdm/fleet/v4/server/mock"
+	"github.com/jmoiron/sqlx"
 )
 
 type activityRecorder struct {
@@ -137,5 +141,57 @@ func TestReconcileFileVaultBuildsEnforcementOnlyProfileWithoutCertificate(t *tes
 	}
 	if strings.Contains(body, "FileVault Recovery Key Escrow") {
 		t.Fatal("enforcement-only profile must not include escrow payload")
+	}
+}
+
+
+func TestReconcileFileVaultBuildsEscrowProfileWithCertificate(t *testing.T) {
+	ds := new(mock.DataStore)
+	cert, _, err := apple_mdm.NewSCEPCACertKey()
+	if err != nil {
+		t.Fatalf("create test CA: %v", err)
+	}
+	certPEM := tokenpki.PEMCertificate(cert.Raw)
+
+	ds.AppConfigFunc = func(context.Context) (*fleet.AppConfig, error) {
+		cfg := &fleet.AppConfig{}
+		cfg.MDM.MacOSSettings.EnableEscrowDiskEncryptionKey = optjson.SetBool(true)
+		return cfg, nil
+	}
+	ds.GetAllMDMConfigAssetsByNameFunc = func(
+		_ context.Context,
+		names []fleet.MDMAssetName,
+		_ sqlx.QueryerContext,
+	) (map[fleet.MDMAssetName]fleet.MDMConfigAsset, error) {
+		if len(names) != 1 || names[0] != fleet.MDMAssetCACert {
+			t.Fatalf("unexpected asset request: %v", names)
+		}
+		return map[fleet.MDMAssetName]fleet.MDMConfigAsset{
+			fleet.MDMAssetCACert: {Name: fleet.MDMAssetCACert, Value: certPEM},
+		}, nil
+	}
+	var profile *fleet.MDMAppleConfigProfile
+	ds.UpsertMDMAppleFleetConfigProfileFunc = func(_ context.Context, value fleet.MDMAppleConfigProfile) error {
+		profile = &value
+		return nil
+	}
+
+	svc := &Service{ds: ds}
+	if err := svc.ReconcileFileVault(context.Background(), nil); err != nil {
+		t.Fatalf("reconcile FileVault escrow profile: %v", err)
+	}
+	if profile == nil {
+		t.Fatal("expected FileVault escrow profile to be upserted")
+	}
+
+	body := string(profile.Mobileconfig)
+	if !strings.Contains(body, "FileVault Recovery Key Escrow") {
+		t.Fatal("expected FileVault recovery-key escrow payload")
+	}
+	if !strings.Contains(body, base64.StdEncoding.EncodeToString(cert.Raw)) {
+		t.Fatal("expected escrow profile to embed the Fleet CA certificate")
+	}
+	if strings.Contains(body, "dontAllowFDEDisable") {
+		t.Fatal("escrow-only profile must not enable FileVault enforcement")
 	}
 }
