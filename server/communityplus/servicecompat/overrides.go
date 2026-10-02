@@ -6,6 +6,7 @@ import (
 	"github.com/fleetdm/fleet/v4/server/authz"
 	"github.com/fleetdm/fleet/v4/server/communityplus/diskencryption"
 	"github.com/fleetdm/fleet/v4/server/communityplus/hostnaming"
+	"github.com/fleetdm/fleet/v4/server/communityplus/osupdates"
 	"github.com/fleetdm/fleet/v4/server/config"
 	"github.com/fleetdm/fleet/v4/server/fleet"
 )
@@ -56,6 +57,9 @@ func newCommunityPlusOverrides(svc fleet.Service, ds fleet.Datastore, diskServic
 		return fleet.ErrMissingLicense
 	}
 	reconcileFileVault := func(context.Context, *uint) error { return fleet.ErrMissingLicense }
+	windowsEnableOSUpdates := func(context.Context, *uint, fleet.WindowsUpdates) error { return fleet.ErrMissingLicense }
+	windowsDisableOSUpdates := func(context.Context, *uint) error { return fleet.ErrMissingLicense }
+	appleEditedOSUpdates := func(context.Context, *uint, fleet.AppleDevice, fleet.AppleOSUpdateSettings) error { return fleet.ErrMissingLicense }
 
 	if svc != nil {
 		deleteSetupAssistant = svc.DeleteMDMAppleSetupAssistant
@@ -70,6 +74,11 @@ func newCommunityPlusOverrides(svc fleet.Service, ds fleet.Datastore, diskServic
 		teamByIDOrName = disk.TeamByIDOrName
 		updateTeamDiskEncryption = disk.UpdateTeam
 		reconcileFileVault = disk.ReconcileFileVault
+	}
+	if updates, err := osupdates.New(ds); err == nil {
+		windowsEnableOSUpdates = updates.WindowsEnable
+		windowsDisableOSUpdates = updates.WindowsDisable
+		appleEditedOSUpdates = updates.AppleEdited
 	}
 
 	return fleet.EnterpriseOverrides{
@@ -90,15 +99,9 @@ func newCommunityPlusOverrides(svc fleet.Service, ds fleet.Datastore, diskServic
 			return fleet.ErrMissingLicense
 		},
 		DeleteMDMAppleBootstrapPackage: deleteBootstrapPackage,
-		MDMWindowsEnableOSUpdates: func(context.Context, *uint, fleet.WindowsUpdates) error {
-			return fleet.ErrMissingLicense
-		},
-		MDMWindowsDisableOSUpdates: func(context.Context, *uint) error {
-			return fleet.ErrMissingLicense
-		},
-		MDMAppleEditedAppleOSUpdates: func(context.Context, *uint, fleet.AppleDevice, fleet.AppleOSUpdateSettings) error {
-			return fleet.ErrMissingLicense
-		},
+		MDMWindowsEnableOSUpdates:    windowsEnableOSUpdates,
+		MDMWindowsDisableOSUpdates:   windowsDisableOSUpdates,
+		MDMAppleEditedAppleOSUpdates: appleEditedOSUpdates,
 		SetupExperienceNextStep: func(context.Context, *fleet.Host) (bool, error) {
 			return false, fleet.ErrMissingLicense
 		},
