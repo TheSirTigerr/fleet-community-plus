@@ -59,7 +59,9 @@ func newCommunityPlusOverrides(svc fleet.Service, ds fleet.Datastore, diskServic
 	reconcileFileVault := func(context.Context, *uint) error { return fleet.ErrMissingLicense }
 	windowsEnableOSUpdates := func(context.Context, *uint, fleet.WindowsUpdates) error { return fleet.ErrMissingLicense }
 	windowsDisableOSUpdates := func(context.Context, *uint) error { return fleet.ErrMissingLicense }
-	appleEditedOSUpdates := func(context.Context, *uint, fleet.AppleDevice, fleet.AppleOSUpdateSettings) error { return fleet.ErrMissingLicense }
+	appleEditedOSUpdates := func(context.Context, *uint, fleet.AppleDevice, fleet.AppleOSUpdateSettings) error {
+		return fleet.ErrMissingLicense
+	}
 
 	if svc != nil {
 		deleteSetupAssistant = svc.DeleteMDMAppleSetupAssistant
@@ -99,9 +101,9 @@ func newCommunityPlusOverrides(svc fleet.Service, ds fleet.Datastore, diskServic
 			return fleet.ErrMissingLicense
 		},
 		DeleteMDMAppleBootstrapPackage: deleteBootstrapPackage,
-		MDMWindowsEnableOSUpdates:    windowsEnableOSUpdates,
-		MDMWindowsDisableOSUpdates:   windowsDisableOSUpdates,
-		MDMAppleEditedAppleOSUpdates: appleEditedOSUpdates,
+		MDMWindowsEnableOSUpdates:      windowsEnableOSUpdates,
+		MDMWindowsDisableOSUpdates:     windowsDisableOSUpdates,
+		MDMAppleEditedAppleOSUpdates:   appleEditedOSUpdates,
 		SetupExperienceNextStep: func(context.Context, *fleet.Host) (bool, error) {
 			return false, fleet.ErrMissingLicense
 		},
