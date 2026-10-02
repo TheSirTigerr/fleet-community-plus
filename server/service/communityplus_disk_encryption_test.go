@@ -13,8 +13,7 @@ import (
 func TestValidateMDMAllowsCommunityPlusDiskEncryptionWithoutPremiumLicense(t *testing.T) {
 	svc := &Service{}
 	oldMDM := &fleet.MDM{
-		EnabledAndConfigured:        true,
-		WindowsEnabledAndConfigured: true,
+		EnabledAndConfigured: true,
 	}
 	newMDM := *oldMDM
 	newMDM.MacOSSettings.EnableDiskEncryption = optjson.SetBool(true)
