@@ -3,7 +3,10 @@ package servicecompat
 import (
 	"context"
 
+	"github.com/fleetdm/fleet/v4/server/authz"
+	"github.com/fleetdm/fleet/v4/server/communityplus/diskencryption"
 	"github.com/fleetdm/fleet/v4/server/communityplus/hostnaming"
+	"github.com/fleetdm/fleet/v4/server/config"
 	"github.com/fleetdm/fleet/v4/server/fleet"
 )
 
@@ -17,28 +20,43 @@ func installCommunityPlusOverrides(svc fleet.Service, options []any) {
 	}
 
 	var ds fleet.Datastore
+	var cfg *config.FleetConfig
 	for _, option := range options {
-		if value, ok := option.(fleet.Datastore); ok {
+		switch value := option.(type) {
+		case fleet.Datastore:
 			ds = value
-			break
+		case *config.FleetConfig:
+			cfg = value
 		}
 	}
 	if ds == nil {
 		return
 	}
 
-	svc.SetEnterpriseOverrides(newCommunityPlusOverrides(svc, ds))
+	var disk *diskencryption.Service
+	if cfg != nil {
+		if value, err := diskencryption.New(ds, authz.Must(), svc, cfg); err == nil {
+			disk = value
+		}
+	}
+	svc.SetEnterpriseOverrides(newCommunityPlusOverrides(svc, ds, disk))
 }
 
 // newCommunityPlusOverrides always returns a fully-populated callback table.
 // Some core service paths only check that EnterpriseOverrides itself is non-nil
 // before invoking a callback, so leaving unsupported entries nil would turn a
 // clean feature-gate error into a runtime panic.
-func newCommunityPlusOverrides(svc fleet.Service, ds fleet.Datastore) fleet.EnterpriseOverrides {
+func newCommunityPlusOverrides(svc fleet.Service, ds fleet.Datastore, diskServices ...*diskencryption.Service) fleet.EnterpriseOverrides {
 	deleteSetupAssistant := func(context.Context, *uint) error { return fleet.ErrMissingLicense }
 	deleteBootstrapPackage := func(context.Context, *uint, bool) error { return fleet.ErrMissingLicense }
 	updateTeamHostNameTemplate := func(context.Context, *fleet.Team, string) error { return fleet.ErrMissingLicense }
 	applyHostNameTemplateChange := func(context.Context, *fleet.Team, string) error { return fleet.ErrMissingLicense }
+	teamByIDOrName := func(context.Context, *uint, *string) (*fleet.Team, error) { return nil, fleet.ErrMissingLicense }
+	updateTeamDiskEncryption := func(context.Context, *fleet.Team, fleet.DiskEncryptionSettingsChanges, *bool) error {
+		return fleet.ErrMissingLicense
+	}
+	reconcileFileVault := func(context.Context, *uint) error { return fleet.ErrMissingLicense }
+
 	if svc != nil {
 		deleteSetupAssistant = svc.DeleteMDMAppleSetupAssistant
 		deleteBootstrapPackage = svc.DeleteMDMAppleBootstrapPackage
@@ -46,6 +64,12 @@ func newCommunityPlusOverrides(svc fleet.Service, ds fleet.Datastore) fleet.Ente
 			updateTeamHostNameTemplate = hostNaming.UpdateTeam
 			applyHostNameTemplateChange = hostNaming.Apply
 		}
+	}
+	if len(diskServices) > 0 && diskServices[0] != nil {
+		disk := diskServices[0]
+		teamByIDOrName = disk.TeamByIDOrName
+		updateTeamDiskEncryption = disk.UpdateTeam
+		reconcileFileVault = disk.ReconcileFileVault
 	}
 
 	return fleet.EnterpriseOverrides{
@@ -56,18 +80,12 @@ func newCommunityPlusOverrides(svc fleet.Service, ds fleet.Datastore) fleet.Ente
 			}
 			return &appConfig.Features, nil
 		},
-		TeamByIDOrName: func(context.Context, *uint, *string) (*fleet.Team, error) {
-			return nil, fleet.ErrMissingLicense
-		},
-		UpdateTeamMDMDiskEncryption: func(context.Context, *fleet.Team, fleet.DiskEncryptionSettingsChanges, *bool) error {
-			return fleet.ErrMissingLicense
-		},
-		UpdateTeamMDMHostNameTemplate: updateTeamHostNameTemplate,
-		ApplyHostNameTemplateChange:   applyHostNameTemplateChange,
-		MDMAppleReconcileFileVaultProfile: func(context.Context, *uint) error {
-			return fleet.ErrMissingLicense
-		},
-		DeleteMDMAppleSetupAssistant: deleteSetupAssistant,
+		TeamByIDOrName:                    teamByIDOrName,
+		UpdateTeamMDMDiskEncryption:       updateTeamDiskEncryption,
+		UpdateTeamMDMHostNameTemplate:     updateTeamHostNameTemplate,
+		ApplyHostNameTemplateChange:       applyHostNameTemplateChange,
+		MDMAppleReconcileFileVaultProfile: reconcileFileVault,
+		DeleteMDMAppleSetupAssistant:      deleteSetupAssistant,
 		MDMAppleSyncDEPProfiles: func(context.Context) error {
 			return fleet.ErrMissingLicense
 		},
