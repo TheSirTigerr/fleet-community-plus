@@ -475,6 +475,7 @@ func runServeCmd(cmd *cobra.Command, configManager configpkg.Manager, debug, dev
 
 	eh := errorstore.NewHandler(ctx, redisPool, logger, config.Logging.ErrorRetentionPeriod)
 	scepConfigMgr := scep.NewSCEPConfigService(logger, nil)
+	scepEnrollmentClient := scep.NewEnrollmentClient(logger)
 	digiCertService := digicert.NewFleetService(logger)
 	estService := est.NewService(est.WithLogger(logger))
 	ctx = ctxerr.NewContext(ctx, eh)
@@ -654,6 +655,7 @@ func runServeCmd(cmd *cobra.Command, configManager configpkg.Manager, debug, dev
 			digiCertService,
 			androidSvc,
 			estService,
+			scepEnrollmentClient,
 			psso.NewRedisNonceStore(redisPool),
 			msgraph.NewClient,
 		)
@@ -678,6 +680,7 @@ func runServeCmd(cmd *cobra.Command, configManager configpkg.Manager, debug, dev
 			scepConfigMgr,
 			digiCertService,
 			estService,
+			scepEnrollmentClient,
 			psso.NewRedisNonceStore(redisPool),
 		)
 		if err != nil {
