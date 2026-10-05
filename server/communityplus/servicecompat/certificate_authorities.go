@@ -17,9 +17,10 @@ type certificateAuthorityWrapper struct {
 	ds         fleet.Datastore
 	authorizer *authz.Authorizer
 	cfg        *config.FleetConfig
-	scep       fleet.SCEPConfigService
-	digicert   fleet.DigiCertService
-	est        fleet.ESTService
+	scep           fleet.SCEPConfigService
+	digicert       fleet.DigiCertService
+	est            fleet.ESTService
+	scepEnrollment fleet.SCEPEnrollmentClient
 }
 
 func wrapCertificateAuthorities(base fleet.Service, options []any) fleet.Service {
@@ -29,9 +30,10 @@ func wrapCertificateAuthorities(base fleet.Service, options []any) fleet.Service
 	var (
 		ds      fleet.Datastore
 		cfg     *config.FleetConfig
-		scepSvc fleet.SCEPConfigService
-		digiSvc fleet.DigiCertService
-		estSvc  fleet.ESTService
+		scepSvc        fleet.SCEPConfigService
+		digiSvc        fleet.DigiCertService
+		estSvc         fleet.ESTService
+		scepEnrollment fleet.SCEPEnrollmentClient
 	)
 	for _, option := range options {
 		switch value := option.(type) {
@@ -45,6 +47,8 @@ func wrapCertificateAuthorities(base fleet.Service, options []any) fleet.Service
 			digiSvc = value
 		case fleet.ESTService:
 			estSvc = value
+		case fleet.SCEPEnrollmentClient:
+			scepEnrollment = value
 		}
 	}
 	if ds == nil || cfg == nil {
@@ -56,8 +60,9 @@ func wrapCertificateAuthorities(base fleet.Service, options []any) fleet.Service
 		authorizer: authz.Must(),
 		cfg:        cfg,
 		scep:       scepSvc,
-		digicert:   digiSvc,
-		est:        estSvc,
+		digicert:       digiSvc,
+		est:            estSvc,
+		scepEnrollment: scepEnrollment,
 	}
 }
 
