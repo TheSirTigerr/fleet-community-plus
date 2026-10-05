@@ -476,6 +476,7 @@ func runServeCmd(cmd *cobra.Command, configManager configpkg.Manager, debug, dev
 	eh := errorstore.NewHandler(ctx, redisPool, logger, config.Logging.ErrorRetentionPeriod)
 	scepConfigMgr := scep.NewSCEPConfigService(logger, nil)
 	digiCertService := digicert.NewFleetService(logger)
+	estService := est.NewService(est.WithLogger(logger))
 	ctx = ctxerr.NewContext(ctx, eh)
 
 	// Declare svc early so the closure below can capture it.
@@ -556,7 +557,6 @@ func runServeCmd(cmd *cobra.Command, configManager configpkg.Manager, debug, dev
 	}
 
 	if license.IsPremium() {
-		hydrantService := est.NewService(est.WithLogger(logger))
 		profileMatcher := apple_mdm.NewProfileMatcher(redisPool)
 		if config.S3.SoftwareInstallersBucket != "" {
 			if config.S3.BucketsAndPrefixesMatch() {
@@ -653,7 +653,7 @@ func runServeCmd(cmd *cobra.Command, configManager configpkg.Manager, debug, dev
 			scepConfigMgr,
 			digiCertService,
 			androidSvc,
-			hydrantService,
+			estService,
 			psso.NewRedisNonceStore(redisPool),
 			msgraph.NewClient,
 		)
@@ -677,6 +677,7 @@ func runServeCmd(cmd *cobra.Command, configManager configpkg.Manager, debug, dev
 			androidSvc,
 			scepConfigMgr,
 			digiCertService,
+			estService,
 			psso.NewRedisNonceStore(redisPool),
 		)
 		if err != nil {
