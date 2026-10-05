@@ -19,6 +19,7 @@ type certificateAuthorityWrapper struct {
 	cfg        *config.FleetConfig
 	scep       fleet.SCEPConfigService
 	digicert   fleet.DigiCertService
+	est        fleet.ESTService
 }
 
 func wrapCertificateAuthorities(base fleet.Service, options []any) fleet.Service {
@@ -30,6 +31,7 @@ func wrapCertificateAuthorities(base fleet.Service, options []any) fleet.Service
 		cfg     *config.FleetConfig
 		scepSvc fleet.SCEPConfigService
 		digiSvc fleet.DigiCertService
+		estSvc  fleet.ESTService
 	)
 	for _, option := range options {
 		switch value := option.(type) {
@@ -41,6 +43,8 @@ func wrapCertificateAuthorities(base fleet.Service, options []any) fleet.Service
 			scepSvc = value
 		case fleet.DigiCertService:
 			digiSvc = value
+		case fleet.ESTService:
+			estSvc = value
 		}
 	}
 	if ds == nil || cfg == nil {
@@ -53,6 +57,7 @@ func wrapCertificateAuthorities(base fleet.Service, options []any) fleet.Service
 		cfg:        cfg,
 		scep:       scepSvc,
 		digicert:   digiSvc,
+		est:        estSvc,
 	}
 }
 
@@ -202,6 +207,50 @@ func (s *certificateAuthorityWrapper) NewCertificateAuthority(ctx context.Contex
 		}
 		activity = fleet.ActivityAddedSmallstep{Name: item.Name}
 
+	case payload.Hydrant != nil:
+		if s.est == nil {
+			return nil, errors.New("Community+ certificate authorities: EST service is unavailable")
+		}
+		item := payload.Hydrant
+		item.Preprocess()
+		if item.Name == "" || item.URL == "" || item.ClientID == "" || item.ClientSecret == "" || item.ClientSecret == fleet.MaskedPassword {
+			return nil, &fleet.BadRequestError{Message: "Couldn't add certificate authority. Hydrant fields are incomplete."}
+		}
+		if err := s.est.ValidateESTURL(ctx, fleet.ESTProxyCA{
+			Name: item.Name, URL: item.URL, Username: item.ClientID, Password: item.ClientSecret,
+		}); err != nil {
+			return nil, &fleet.BadRequestError{Message: "Couldn't add certificate authority. Invalid Hydrant EST URL."}
+		}
+		ca = fleet.CertificateAuthority{
+			Type:         string(fleet.CATypeHydrant),
+			Name:         &item.Name,
+			URL:          &item.URL,
+			ClientID:     &item.ClientID,
+			ClientSecret: &item.ClientSecret,
+		}
+		activity = fleet.ActivityAddedHydrant{Name: item.Name}
+
+	case payload.CustomESTProxy != nil:
+		if s.est == nil {
+			return nil, errors.New("Community+ certificate authorities: EST service is unavailable")
+		}
+		item := payload.CustomESTProxy
+		item.Preprocess()
+		if item.Name == "" || item.URL == "" || item.Username == "" || item.Password == "" || item.Password == fleet.MaskedPassword {
+			return nil, &fleet.BadRequestError{Message: "Couldn't add certificate authority. Custom EST fields are incomplete."}
+		}
+		if err := s.est.ValidateESTURL(ctx, *item); err != nil {
+			return nil, &fleet.BadRequestError{Message: "Couldn't add certificate authority. Invalid EST URL."}
+		}
+		ca = fleet.CertificateAuthority{
+			Type:     string(fleet.CATypeCustomESTProxy),
+			Name:     &item.Name,
+			URL:      &item.URL,
+			Username: &item.Username,
+			Password: &item.Password,
+		}
+		activity = fleet.ActivityAddedCustomESTProxy{Name: item.Name}
+
 	default:
 		return nil, &fleet.BadRequestError{Message: "Couldn't add certificate authority. This certificate authority type is not implemented in Community+ yet."}
 	}
@@ -241,6 +290,10 @@ func (s *certificateAuthorityWrapper) DeleteCertificateAuthority(ctx context.Con
 		activity = fleet.ActivityDeletedCustomSCEPProxy{Name: deleted.Name}
 	case string(fleet.CATypeSmallstep):
 		activity = fleet.ActivityDeletedSmallstep{Name: deleted.Name}
+	case string(fleet.CATypeHydrant):
+		activity = fleet.ActivityDeletedHydrant{Name: deleted.Name}
+	case string(fleet.CATypeCustomESTProxy):
+		activity = fleet.ActivityDeletedCustomESTProxy{Name: deleted.Name}
 	}
 	if activity != nil {
 		return s.Service.NewActivity(ctx, authz.UserFromContext(ctx), activity)
@@ -503,6 +556,92 @@ func (s *certificateAuthorityWrapper) UpdateCertificateAuthority(ctx context.Con
 			Password:     item.Password,
 		}
 		activity = fleet.ActivityEditedSmallstep{Name: merged.Name}
+
+	case payload.HydrantCAUpdatePayload != nil:
+		if oldCA.Type != string(fleet.CATypeHydrant) {
+			return &fleet.BadRequestError{Message: prefix + "The certificate authority types must be the same."}
+		}
+		item := payload.HydrantCAUpdatePayload
+		if item.IsEmpty() {
+			return &fleet.BadRequestError{Message: prefix + "Hydrant CA update payload is empty."}
+		}
+		if err := item.ValidateRelatedFields(prefix, *oldCA.Name); err != nil {
+			return err
+		}
+		item.Preprocess()
+		if item.ClientSecret != nil && *item.ClientSecret == fleet.MaskedPassword {
+			item.ClientSecret = nil
+		}
+		if item.Name != nil && *item.Name == *oldCA.Name {
+			item.Name = nil
+		}
+		merged := fleet.HydrantCA{
+			Name:         certificateValue(oldCA.Name),
+			URL:          certificateValue(oldCA.URL),
+			ClientID:     certificateValue(oldCA.ClientID),
+			ClientSecret: certificateValue(oldCA.ClientSecret),
+		}
+		if item.Name != nil { merged.Name = *item.Name }
+		if item.URL != nil { merged.URL = *item.URL }
+		if item.ClientID != nil { merged.ClientID = *item.ClientID }
+		if item.ClientSecret != nil { merged.ClientSecret = *item.ClientSecret }
+		if merged.Name == "" || merged.URL == "" || merged.ClientID == "" || merged.ClientSecret == "" {
+			return &fleet.BadRequestError{Message: prefix + "Hydrant fields are incomplete."}
+		}
+		if s.est == nil {
+			return errors.New("Community+ certificate authorities: EST service is unavailable")
+		}
+		if err := s.est.ValidateESTURL(ctx, fleet.ESTProxyCA{
+			Name: merged.Name, URL: merged.URL, Username: merged.ClientID, Password: merged.ClientSecret,
+		}); err != nil {
+			return &fleet.BadRequestError{Message: prefix + "Invalid Hydrant EST URL."}
+		}
+		update = fleet.CertificateAuthority{
+			Type: string(fleet.CATypeHydrant), Name: item.Name, URL: item.URL,
+			ClientID: item.ClientID, ClientSecret: item.ClientSecret,
+		}
+		activity = fleet.ActivityEditedHydrant{Name: merged.Name}
+
+	case payload.CustomESTCAUpdatePayload != nil:
+		if oldCA.Type != string(fleet.CATypeCustomESTProxy) {
+			return &fleet.BadRequestError{Message: prefix + "The certificate authority types must be the same."}
+		}
+		item := payload.CustomESTCAUpdatePayload
+		if item.IsEmpty() {
+			return &fleet.BadRequestError{Message: prefix + "Custom EST CA update payload is empty."}
+		}
+		if err := item.ValidateRelatedFields(prefix, *oldCA.Name); err != nil {
+			return err
+		}
+		item.Preprocess()
+		if item.Password != nil && *item.Password == fleet.MaskedPassword {
+			item.Password = nil
+		}
+		if item.Name != nil && *item.Name == *oldCA.Name {
+			item.Name = nil
+		}
+		merged := fleet.ESTProxyCA{
+			Name: certificateValue(oldCA.Name), URL: certificateValue(oldCA.URL),
+			Username: certificateValue(oldCA.Username), Password: certificateValue(oldCA.Password),
+		}
+		if item.Name != nil { merged.Name = *item.Name }
+		if item.URL != nil { merged.URL = *item.URL }
+		if item.Username != nil { merged.Username = *item.Username }
+		if item.Password != nil { merged.Password = *item.Password }
+		if merged.Name == "" || merged.URL == "" || merged.Username == "" || merged.Password == "" {
+			return &fleet.BadRequestError{Message: prefix + "Custom EST fields are incomplete."}
+		}
+		if s.est == nil {
+			return errors.New("Community+ certificate authorities: EST service is unavailable")
+		}
+		if err := s.est.ValidateESTURL(ctx, merged); err != nil {
+			return &fleet.BadRequestError{Message: prefix + "Invalid EST URL."}
+		}
+		update = fleet.CertificateAuthority{
+			Type: string(fleet.CATypeCustomESTProxy), Name: item.Name, URL: item.URL,
+			Username: item.Username, Password: item.Password,
+		}
+		activity = fleet.ActivityEditedCustomESTProxy{Name: merged.Name}
 
 	default:
 		return &fleet.BadRequestError{Message: prefix + "This certificate authority type is not implemented in Community+ yet."}
