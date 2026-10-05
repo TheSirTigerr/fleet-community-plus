@@ -87,15 +87,7 @@ func (svc *Service) CreateCertificateTemplate(ctx context.Context, name string, 
 		return nil, err
 	}
 
-	// Certificate templates require a custom SCEP CA, and CAs are Premium-only (see
-	// server/service/certificate_authorities.go core stubs). Reject any create on Free up front.
-	lic, err := svc.License(ctx)
-	if err != nil {
-		return nil, ctxerr.Wrap(ctx, err, "getting license")
-	}
-	if !lic.IsPremium() {
-		return nil, fleet.ErrMissingLicense
-	}
+	// Community+ exposes certificate templates independently of Fleet's license tier.
 
 	// Validate certificate template name
 	if err := validateCertificateTemplateName(name); err != nil {
@@ -480,16 +472,7 @@ func (svc *Service) ApplyCertificateTemplateSpecs(ctx context.Context, specs []*
 		return err
 	}
 
-	// Certificate templates require a custom SCEP CA, and CAs are Premium-only.
-	if len(specs) > 0 {
-		lic, err := svc.License(ctx)
-		if err != nil {
-			return ctxerr.Wrap(ctx, err, "getting license")
-		}
-		if !lic.IsPremium() {
-			return fleet.ErrMissingLicense
-		}
-	}
+	// Community+ exposes certificate template GitOps independently of Fleet's license tier.
 
 	// Get all of the CAs.
 	cas, err := svc.ds.ListCertificateAuthorities(ctx)
