@@ -586,10 +586,18 @@ func (s *certificateAuthorityWrapper) UpdateCertificateAuthority(ctx context.Con
 			ClientID:     certificateValue(oldCA.ClientID),
 			ClientSecret: certificateValue(oldCA.ClientSecret),
 		}
-		if item.Name != nil { merged.Name = *item.Name }
-		if item.URL != nil { merged.URL = *item.URL }
-		if item.ClientID != nil { merged.ClientID = *item.ClientID }
-		if item.ClientSecret != nil { merged.ClientSecret = *item.ClientSecret }
+		if item.Name != nil {
+			merged.Name = *item.Name
+		}
+		if item.URL != nil {
+			merged.URL = *item.URL
+		}
+		if item.ClientID != nil {
+			merged.ClientID = *item.ClientID
+		}
+		if item.ClientSecret != nil {
+			merged.ClientSecret = *item.ClientSecret
+		}
 		if merged.Name == "" || merged.URL == "" || merged.ClientID == "" || merged.ClientSecret == "" {
 			return &fleet.BadRequestError{Message: prefix + "Hydrant fields are incomplete."}
 		}
@@ -629,10 +637,18 @@ func (s *certificateAuthorityWrapper) UpdateCertificateAuthority(ctx context.Con
 			Name: certificateValue(oldCA.Name), URL: certificateValue(oldCA.URL),
 			Username: certificateValue(oldCA.Username), Password: certificateValue(oldCA.Password),
 		}
-		if item.Name != nil { merged.Name = *item.Name }
-		if item.URL != nil { merged.URL = *item.URL }
-		if item.Username != nil { merged.Username = *item.Username }
-		if item.Password != nil { merged.Password = *item.Password }
+		if item.Name != nil {
+			merged.Name = *item.Name
+		}
+		if item.URL != nil {
+			merged.URL = *item.URL
+		}
+		if item.Username != nil {
+			merged.Username = *item.Username
+		}
+		if item.Password != nil {
+			merged.Password = *item.Password
+		}
 		if merged.Name == "" || merged.URL == "" || merged.Username == "" || merged.Password == "" {
 			return &fleet.BadRequestError{Message: prefix + "Custom EST fields are incomplete."}
 		}
