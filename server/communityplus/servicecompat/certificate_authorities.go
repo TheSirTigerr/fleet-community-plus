@@ -14,9 +14,9 @@ import (
 
 type certificateAuthorityWrapper struct {
 	fleet.Service
-	ds         fleet.Datastore
-	authorizer *authz.Authorizer
-	cfg        *config.FleetConfig
+	ds             fleet.Datastore
+	authorizer     *authz.Authorizer
+	cfg            *config.FleetConfig
 	scep           fleet.SCEPConfigService
 	digicert       fleet.DigiCertService
 	est            fleet.ESTService
@@ -28,8 +28,8 @@ func wrapCertificateAuthorities(base fleet.Service, options []any) fleet.Service
 		return nil
 	}
 	var (
-		ds      fleet.Datastore
-		cfg     *config.FleetConfig
+		ds             fleet.Datastore
+		cfg            *config.FleetConfig
 		scepSvc        fleet.SCEPConfigService
 		digiSvc        fleet.DigiCertService
 		estSvc         fleet.ESTService
@@ -55,11 +55,11 @@ func wrapCertificateAuthorities(base fleet.Service, options []any) fleet.Service
 		return base
 	}
 	return &certificateAuthorityWrapper{
-		Service:    base,
-		ds:         ds,
-		authorizer: authz.Must(),
-		cfg:        cfg,
-		scep:       scepSvc,
+		Service:        base,
+		ds:             ds,
+		authorizer:     authz.Must(),
+		cfg:            cfg,
+		scep:           scepSvc,
 		digicert:       digiSvc,
 		est:            estSvc,
 		scepEnrollment: scepEnrollment,
