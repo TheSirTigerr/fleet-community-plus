@@ -23,12 +23,12 @@ const (
 type AutomationAction string
 
 const (
-	AutomationRunScript       AutomationAction = "run_script"
+	AutomationRunScript         AutomationAction = "run_script"
 	AutomationInstallSoftware   AutomationAction = "install_software"
 	AutomationUninstallSoftware AutomationAction = "uninstall_software"
-	AutomationLockDevice      AutomationAction = "lock_device"
-	AutomationNotify          AutomationAction = "notify"
-	AutomationAssignFleet     AutomationAction = "assign_fleet"
+	AutomationLockDevice        AutomationAction = "lock_device"
+	AutomationNotify            AutomationAction = "notify"
+	AutomationAssignFleet       AutomationAction = "assign_fleet"
 )
 
 // AutomationRule is a clean-room orchestration primitive shared by policy
