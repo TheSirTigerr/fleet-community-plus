@@ -175,7 +175,6 @@ func TestAutomationEngineStopsOnExecutorError(t *testing.T) {
 	}
 }
 
-
 func TestAutomationEngineContinuousOnlyDispatch(t *testing.T) {
 	executor := &recordingExecutor{}
 	engine, err := NewAutomationEngine(executor)

@@ -34,10 +34,10 @@ func automationScopeForHost(host *fleet.Host) Scope {
 }
 
 // DispatchPolicyResults feeds real policy membership results into the Community+
- // automation engine. Newly failing policies dispatch all matching rules once.
- // Policies that remain failed dispatch only rules explicitly marked continuous.
- // If Community+ routes have not been initialized, this is a no-op so core
- // osquery ingestion remains independent of the extension.
+// automation engine. Newly failing policies dispatch all matching rules once.
+// Policies that remain failed dispatch only rules explicitly marked continuous.
+// If Community+ routes have not been initialized, this is a no-op so core
+// osquery ingestion remains independent of the extension.
 func DispatchPolicyResults(
 	ctx context.Context,
 	host *fleet.Host,
