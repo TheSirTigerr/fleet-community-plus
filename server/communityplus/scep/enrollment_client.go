@@ -6,14 +6,12 @@ import (
 	"errors"
 	"fmt"
 	"log/slog"
-	"net/http"
 	"sync"
 	"time"
 
 	"github.com/fleetdm/fleet/v4/server/fleet"
 	scepclient "github.com/fleetdm/fleet/v4/server/mdm/scep/client"
 	"github.com/fleetdm/fleet/v4/server/mdm/scep/enrollment"
-	scepserver "github.com/fleetdm/fleet/v4/server/mdm/scep/server"
 	smallstepscep "github.com/smallstep/scep"
 )
 
@@ -70,7 +68,6 @@ func (c *EnrollmentClient) GetCertificate(ctx context.Context, rawURL string, cs
 		CSR:        csr,
 		SignerKey:  key,
 		SignerCert: signer,
-		Logger:     c.logger,
 	})
 	if err != nil {
 		c.mu.Lock()
@@ -114,16 +111,6 @@ func normalizeEnrollmentError(err error) error {
 		return err
 	}
 	if errors.Is(err, context.Canceled) {
-		return err
-	}
-
-	transient := true
-	if statusErr, ok := errors.AsType[scepserver.ResponseStatusError](err); ok {
-		transient = statusErr.Code == http.StatusRequestTimeout ||
-			statusErr.Code == http.StatusTooManyRequests ||
-			statusErr.Code >= http.StatusInternalServerError
-	}
-	if !transient {
 		return err
 	}
 

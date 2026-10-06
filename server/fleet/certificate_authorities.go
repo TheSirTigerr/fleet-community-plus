@@ -2,6 +2,7 @@ package fleet
 
 import (
 	"context"
+	"crypto/x509"
 	"encoding/json"
 	"errors"
 	"fmt"
@@ -232,6 +233,24 @@ type SCEPConfigService interface {
 	ValidateSCEPURL(ctx context.Context, url string) error
 	ValidateSmallstepChallengeURL(ctx context.Context, ca SmallstepSCEPProxyCA) error
 	GetSmallstepSCEPChallenge(ctx context.Context, ca SmallstepSCEPProxyCA) (string, error)
+}
+
+// SCEPEnrollmentClient performs client-side enrollment against a configured SCEP endpoint.
+type SCEPEnrollmentClient interface {
+	GetCertificate(ctx context.Context, url string, csr *x509.CertificateRequest) (*x509.Certificate, error)
+}
+
+// CertificateAuthorityTransientError marks a certificate-authority failure that can be retried.
+type CertificateAuthorityTransientError struct {
+	Message           string
+	RetryAfterSeconds int
+}
+
+func (e CertificateAuthorityTransientError) Error() string {
+	if e.Message == "" {
+		return "certificate authority request failed temporarily"
+	}
+	return e.Message
 }
 
 type CustomSCEPProxyCA struct {

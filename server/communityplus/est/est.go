@@ -40,7 +40,7 @@ func WithTimeout(timeout time.Duration) Option {
 	}
 }
 
-func NewService(opts ...Option) *Service {
+func NewService(opts ...Option) fleet.ESTService {
 	svc := &Service{}
 	for _, opt := range opts {
 		opt(svc)
