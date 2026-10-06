@@ -110,6 +110,7 @@ func TestHTTPAPIAutomationRuleLifecycle(t *testing.T) {
         "trigger":"policy_failed",
         "action":"run_script",
         "enabled":true,
+        "continuous":true,
         "conditions":{"policy":"disk-encryption"},
         "config":{"script_id":"12"}
     }`)
@@ -122,6 +123,9 @@ func TestHTTPAPIAutomationRuleLifecycle(t *testing.T) {
 	}
 	if len(engine.Rules()) != 1 || len(store.rules) != 1 {
 		t.Fatalf("rule was not stored and activated")
+	}
+	if !engine.Rules()[0].Continuous || !store.rules["encryption"].Continuous {
+		t.Fatal("continuous automation flag was not stored and activated")
 	}
 	if len(store.events) != 1 || store.events[0].ActorID != "user-42" || store.events[0].Action != "automation_rule.upsert" {
 		t.Fatalf("unexpected audit events: %#v", store.events)
