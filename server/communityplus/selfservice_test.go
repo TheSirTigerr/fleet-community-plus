@@ -87,8 +87,13 @@ func TestPendingDeploymentIDsForProviderIncludesRequestedSelfService(t *testing.
 		t.Fatal(err)
 	}
 
+	mock.ExpectQuery("SELECT id, fleet_id, timezone, weekdays").
+		WithArgs(uint(7)).
+		WillReturnRows(sqlmock.NewRows([]string{
+			"id", "fleet_id", "timezone", "weekdays", "start_minute", "duration_minutes", "enabled", "created_at", "created_by",
+		}))
 	mock.ExpectQuery("SELECT d.id").
-		WithArgs(uint(42), uint(42), uint(42), uint(7), CatalogProviderWinget).
+		WithArgs(uint(42), uint(42), uint(42), uint(7), CatalogProviderWinget, true).
 		WillReturnRows(sqlmock.NewRows([]string{"id"}).AddRow("deployment-1"))
 
 	ids, err := store.PendingDeploymentIDsForProvider(context.Background(), 42, 7, CatalogProviderWinget)
