@@ -75,3 +75,31 @@ func TestRequestSelfServiceDeployment(t *testing.T) {
 		t.Fatal(err)
 	}
 }
+
+
+func TestPendingDeploymentIDsForProviderIncludesRequestedSelfService(t *testing.T) {
+	db, mock, err := sqlmock.New()
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer db.Close()
+	store, err := NewSQLStore(db)
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	mock.ExpectQuery("SELECT d.id").
+		WithArgs(uint(42), uint(42), uint(7), CatalogProviderWinget).
+		WillReturnRows(sqlmock.NewRows([]string{"id"}).AddRow("deployment-1"))
+
+	ids, err := store.PendingDeploymentIDsForProvider(context.Background(), 42, 7, CatalogProviderWinget)
+	if err != nil {
+		t.Fatalf("pending deployments: %v", err)
+	}
+	if len(ids) != 1 || ids[0] != "deployment-1" {
+		t.Fatalf("unexpected pending deployment ids: %#v", ids)
+	}
+	if err := mock.ExpectationsWereMet(); err != nil {
+		t.Fatal(err)
+	}
+}
