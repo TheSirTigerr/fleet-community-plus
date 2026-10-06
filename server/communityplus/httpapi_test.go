@@ -294,7 +294,6 @@ func TestHTTPAPICatalogSearchAndFleetDeployment(t *testing.T) {
 	}
 }
 
-
 type retryCatalogStore struct {
 	*memoryCatalogStore
 	retryDeploymentID string

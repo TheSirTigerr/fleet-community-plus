@@ -231,7 +231,6 @@ func TestSQLStoreRejectsDeploymentScopeChange(t *testing.T) {
 	}
 }
 
-
 func TestSQLStoreRetriesFailedDeployment(t *testing.T) {
 	db, mock, err := sqlmock.New()
 	if err != nil {

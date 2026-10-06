@@ -478,7 +478,6 @@ func writeJSON(w http.ResponseWriter, status int, value any) {
 	_ = json.NewEncoder(w).Encode(value)
 }
 
-
 func (a *HTTPAPI) retryCatalogDeployment(w http.ResponseWriter, r *http.Request) {
 	store, err := a.requireCatalogStore()
 	if err != nil {
