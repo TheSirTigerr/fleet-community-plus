@@ -1,0 +1,49 @@
+name: Community+ setup software gofmt
+
+on:
+  push:
+    branches:
+      - community-plus/foundation
+    paths:
+      - '.github/workflows/communityplus-setup-software-gofmt.yml'
+  workflow_dispatch:
+
+permissions:
+  contents: write
+
+jobs:
+  format:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          ref: community-plus/foundation
+          fetch-depth: 0
+      - uses: actions/setup-go@v5
+        with:
+          go-version-file: go.mod
+      - name: Format setup experience software implementation
+        shell: bash
+        run: |
+          set -euo pipefail
+          gofmt -w \
+            server/communityplus/servicecompat/setup_experience.go \
+            server/communityplus/setupexperience/service.go \
+            server/communityplus/setupexperience/service_test.go
+          git diff --check
+      - name: Commit formatting
+        shell: bash
+        run: |
+          set -euo pipefail
+          if git diff --quiet; then
+            echo "Already formatted"
+            exit 0
+          fi
+          git config user.name 'github-actions[bot]'
+          git config user.email '41898282+github-actions[bot]@users.noreply.github.com'
+          git add \
+            server/communityplus/servicecompat/setup_experience.go \
+            server/communityplus/setupexperience/service.go \
+            server/communityplus/setupexperience/service_test.go
+          git commit -m 'style: gofmt Community+ setup experience software'
+          git push origin HEAD:community-plus/foundation
