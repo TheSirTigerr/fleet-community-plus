@@ -76,7 +76,6 @@ func TestRequestSelfServiceDeployment(t *testing.T) {
 	}
 }
 
-
 func TestPendingDeploymentIDsForProviderIncludesRequestedSelfService(t *testing.T) {
 	db, mock, err := sqlmock.New()
 	if err != nil {
