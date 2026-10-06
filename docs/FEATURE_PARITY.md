@@ -54,10 +54,10 @@ This document tracks independently implemented equivalents for Fleet Premium cap
 ## Patching and remediation
 
 - [x] Patch policies
-- [ ] Automated remediation
-- [ ] Policy-triggered scripts
-- [ ] Policy-triggered software installs
-- [ ] Continuous policy remediation
+- [x] Automated remediation
+- [x] Policy-triggered scripts
+- [x] Policy-triggered software installs
+- [x] Continuous policy remediation
 - [ ] Maintenance windows
 
 ## Vulnerability management
