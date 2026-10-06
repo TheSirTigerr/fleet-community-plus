@@ -27,13 +27,14 @@ func (a roleAccessController) Authorize(_ context.Context, request Request) (str
 }
 
 type memoryFoundationStore struct {
-	mu     sync.Mutex
-	rules  map[string]AutomationRule
-	events []AuditEvent
+	mu      sync.Mutex
+	rules   map[string]AutomationRule
+	events  []AuditEvent
+	windows map[string]MaintenanceWindow
 }
 
 func newMemoryFoundationStore() *memoryFoundationStore {
-	return &memoryFoundationStore{rules: make(map[string]AutomationRule)}
+	return &memoryFoundationStore{rules: make(map[string]AutomationRule), windows: make(map[string]MaintenanceWindow)}
 }
 
 func (s *memoryFoundationStore) UpsertAutomationRule(_ context.Context, rule AutomationRule) error {
@@ -414,5 +415,85 @@ func TestHTTPAPIDispatchAutomationEvent(t *testing.T) {
 	if len(store.events) != 1 || store.events[0].Action != "automation.dispatch" ||
 		store.events[0].Scope != FleetScope(7) || store.events[0].Metadata["host_id"] != "42" {
 		t.Fatalf("unexpected automation audit event: %#v", store.events)
+	}
+}
+
+
+func (s *memoryFoundationStore) UpsertMaintenanceWindow(_ context.Context, window MaintenanceWindow) error {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	s.windows[window.ID] = window
+	return nil
+}
+
+func (s *memoryFoundationStore) DeleteMaintenanceWindow(_ context.Context, id string) error {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	delete(s.windows, id)
+	return nil
+}
+
+func (s *memoryFoundationStore) GetMaintenanceWindow(_ context.Context, id string) (MaintenanceWindow, error) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	window, ok := s.windows[id]
+	if !ok {
+		return MaintenanceWindow{}, errors.New("maintenance window not found")
+	}
+	return window, nil
+}
+
+func (s *memoryFoundationStore) ListMaintenanceWindows(_ context.Context, fleetID uint) ([]MaintenanceWindow, error) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	var result []MaintenanceWindow
+	for _, window := range s.windows {
+		if window.Scope == FleetScope(fleetID) {
+			result = append(result, window)
+		}
+	}
+	sortMaintenanceWindows(result)
+	return result, nil
+}
+
+func TestHTTPAPIMaintenanceWindowLifecycle(t *testing.T) {
+	role, err := FleetAdminRole(7)
+	if err != nil {
+		t.Fatal(err)
+	}
+	api, _, store := newTestHTTPAPI(t, roleAccessController{actor: "fleet-7-admin", roles: []Role{role}})
+	body := []byte(`{
+		"scope":{"kind":"fleet","fleet_id":7},
+		"timezone":"Europe/Berlin",
+		"weekdays":[1,2,3,4,5],
+		"start_minute":120,
+		"duration_minutes":90,
+		"enabled":true
+	}`)
+	req := httptest.NewRequest(http.MethodPut, "/api/latest/fleet/communityplus/maintenance-windows/night", bytes.NewReader(body))
+	res := httptest.NewRecorder()
+	api.Handler().ServeHTTP(res, req)
+	if res.Code != http.StatusOK {
+		t.Fatalf("put maintenance window status=%d body=%s", res.Code, res.Body.String())
+	}
+	if len(store.windows) != 1 || store.windows["night"].CreatedBy != "fleet-7-admin" {
+		t.Fatalf("maintenance window not persisted: %#v", store.windows)
+	}
+
+	req = httptest.NewRequest(http.MethodGet, "/api/latest/fleet/communityplus/maintenance-windows?fleet_id=7", nil)
+	res = httptest.NewRecorder()
+	api.Handler().ServeHTTP(res, req)
+	if res.Code != http.StatusOK || !bytes.Contains(res.Body.Bytes(), []byte(`"id":"night"`)) {
+		t.Fatalf("list maintenance windows status=%d body=%s", res.Code, res.Body.String())
+	}
+
+	req = httptest.NewRequest(http.MethodDelete, "/api/latest/fleet/communityplus/maintenance-windows/night", nil)
+	res = httptest.NewRecorder()
+	api.Handler().ServeHTTP(res, req)
+	if res.Code != http.StatusNoContent {
+		t.Fatalf("delete maintenance window status=%d body=%s", res.Code, res.Body.String())
+	}
+	if len(store.windows) != 0 {
+		t.Fatalf("maintenance window was not deleted: %#v", store.windows)
 	}
 }
