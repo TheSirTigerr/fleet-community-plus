@@ -79,7 +79,6 @@ func (e *productionAutomationExecutor) installSoftware(ctx context.Context, rule
 
 var _ AutomationExecutor = (*productionAutomationExecutor)(nil)
 
-
 const maxAutomationPendingScripts = 1000
 
 func (e *productionAutomationExecutor) runScript(ctx context.Context, rule AutomationRule, event AutomationEvent) error {

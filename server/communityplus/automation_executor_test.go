@@ -66,7 +66,6 @@ func TestProductionAutomationExecutorRejectsCrossFleetDeployment(t *testing.T) {
 	}
 }
 
-
 type memoryAutomationScriptStore struct {
 	config  *fleet.AppConfig
 	host    *fleet.Host
