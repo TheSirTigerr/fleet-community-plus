@@ -384,7 +384,6 @@ func TestHTTPAPIRetryCatalogDeploymentEnforcesFleetScope(t *testing.T) {
 	}
 }
 
-
 func TestHTTPAPIDispatchAutomationEvent(t *testing.T) {
 	role, err := FleetAdminRole(7)
 	if err != nil {
