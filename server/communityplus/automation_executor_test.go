@@ -9,9 +9,11 @@ import (
 )
 
 type memoryAutomationDeploymentStore struct {
-	deployment Deployment
-	queuedID   string
-	queuedHost uint
+	deployment         Deployment
+	queuedID           string
+	queuedHost         uint
+	maintenanceBlocked bool
+	deferredScript     *DeferredScriptAutomation
 }
 
 func (s *memoryAutomationDeploymentStore) GetDeployment(context.Context, string) (Deployment, error) {
@@ -21,6 +23,16 @@ func (s *memoryAutomationDeploymentStore) GetDeployment(context.Context, string)
 func (s *memoryAutomationDeploymentStore) QueueAutomationDeployment(_ context.Context, deploymentID string, hostID uint) error {
 	s.queuedID = deploymentID
 	s.queuedHost = hostID
+	return nil
+}
+
+func (s *memoryAutomationDeploymentStore) AutomaticDeploymentsAllowed(context.Context, uint, time.Time) (bool, error) {
+	return !s.maintenanceBlocked, nil
+}
+
+func (s *memoryAutomationDeploymentStore) QueueDeferredScriptAutomation(_ context.Context, req DeferredScriptAutomation) error {
+	copy := req
+	s.deferredScript = &copy
 	return nil
 }
 
@@ -227,5 +239,50 @@ func TestProductionAutomationExecutorRejectsDisabledScripts(t *testing.T) {
 	}
 	if scriptStore.request != nil {
 		t.Fatal("disabled script automation queued a script")
+	}
+}
+
+
+func TestProductionAutomationExecutorDefersPolicyScriptOutsideMaintenanceWindow(t *testing.T) {
+	teamID := uint(7)
+	orbitKey := "orbit-key"
+	scriptsEnabled := true
+	scriptStore := &memoryAutomationScriptStore{
+		config: &fleet.AppConfig{},
+		host: &fleet.Host{
+			ID: 42, TeamID: &teamID, Platform: "windows",
+			OrbitNodeKey: &orbitKey, ScriptsEnabled: &scriptsEnabled,
+		},
+		script: &fleet.Script{
+			ID: 9, TeamID: &teamID, Name: "repair.ps1", ScriptContentID: 12,
+		},
+		content: []byte("Write-Output 'repair'"),
+	}
+	deploymentStore := &memoryAutomationDeploymentStore{maintenanceBlocked: true}
+	executor, err := newProductionAutomationExecutor(deploymentStore, scriptStore)
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	err = executor.ExecuteAutomation(context.Background(), AutomationRule{
+		ID: "script-rule", Name: "Repair", Scope: FleetScope(7),
+		Trigger: TriggerPolicyFailed, Action: AutomationRunScript, Enabled: true,
+		Config: map[string]string{"script_id": "9"},
+	}, AutomationEvent{
+		Trigger: TriggerPolicyFailed, Scope: FleetScope(7), HostID: 42,
+		Data: map[string]string{"policy_id": "10"},
+	})
+	if err != nil {
+		t.Fatalf("defer script automation: %v", err)
+	}
+	if scriptStore.request != nil {
+		t.Fatal("script was queued while maintenance window was closed")
+	}
+	if deploymentStore.deferredScript == nil {
+		t.Fatal("script automation was not deferred")
+	}
+	got := deploymentStore.deferredScript
+	if got.RuleID != "script-rule" || got.HostID != 42 || got.FleetID != 7 || got.ScriptID != 9 || got.PolicyID != 10 {
+		t.Fatalf("unexpected deferred script automation: %#v", got)
 	}
 }
