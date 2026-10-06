@@ -58,3 +58,5 @@ func (s *setupExperienceWrapper) ListSetupExperienceSoftware(
 ) ([]fleet.SoftwareTitleListResult, int, *fleet.PaginationMetadata, error) {
 	return s.setup.ListSoftware(ctx, platform, teamID, opts)
 }
+
+var _ fleet.Service = (*setupExperienceWrapper)(nil)
