@@ -88,7 +88,7 @@ func TestPendingDeploymentIDsForProviderIncludesRequestedSelfService(t *testing.
 	}
 
 	mock.ExpectQuery("SELECT d.id").
-		WithArgs(uint(42), uint(42), uint(7), CatalogProviderWinget).
+		WithArgs(uint(42), uint(42), uint(42), uint(7), CatalogProviderWinget).
 		WillReturnRows(sqlmock.NewRows([]string{"id"}).AddRow("deployment-1"))
 
 	ids, err := store.PendingDeploymentIDsForProvider(context.Background(), 42, 7, CatalogProviderWinget)

@@ -47,11 +47,20 @@ func OrbitWindowsPlan(ctx context.Context, host *fleet.Host, id string) (*fleet.
 		return nil, fmt.Errorf("Community+ deployment is not assigned to this host")
 	}
 	if !d.Automatic {
-		requested, err := OrbitDelivery.IsSelfServiceRequested(ctx, d.ID, host.ID)
-		if err != nil {
-			return nil, err
+		requested := false
+		if d.SelfService {
+			requested, err = OrbitDelivery.IsSelfServiceRequested(ctx, d.ID, host.ID)
+			if err != nil {
+				return nil, err
+			}
 		}
-		if !d.SelfService || !requested {
+		if !requested {
+			requested, err = OrbitDelivery.IsAutomationDeploymentRequested(ctx, d.ID, host.ID)
+			if err != nil {
+				return nil, err
+			}
+		}
+		if !requested {
 			return nil, fmt.Errorf("Community+ deployment is not assigned to this host")
 		}
 	}
