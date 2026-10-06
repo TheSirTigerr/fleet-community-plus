@@ -28,6 +28,7 @@ import (
 	"github.com/fleetdm/fleet/v4/server/contexts/license"
 	"github.com/fleetdm/fleet/v4/server/contexts/logging"
 	"github.com/fleetdm/fleet/v4/server/contexts/viewer"
+	"github.com/fleetdm/fleet/v4/server/communityplus"
 	"github.com/fleetdm/fleet/v4/server/fleet"
 	"github.com/fleetdm/fleet/v4/server/mdm"
 	apple_mdm "github.com/fleetdm/fleet/v4/server/mdm/apple"
@@ -4644,6 +4645,38 @@ func (svc *Service) ListHostSoftware(ctx context.Context, hostID uint, opts flee
 				softwareByTitleID[id].SoftwarePackage.Categories = c
 			}
 
+		}
+	}
+
+	if opts.SelfServiceOnly || opts.IncludeAvailableForInstall {
+		items, configured, err := communityplus.ListSelfServiceForHost(ctx, host, opts.ListOptions.MatchQuery)
+		if err != nil {
+			return nil, nil, ctxerr.Wrap(ctx, err, "list Community+ self-service software")
+		}
+		if configured {
+			for _, item := range items {
+				selfService := true
+				platform, source := "windows", "programs"
+				if item.Provider == communityplus.CatalogProviderHomebrew {
+					platform, source = "darwin", "apps"
+				}
+				software = append(software, &fleet.HostSoftwareWithInstaller{
+					ID:          item.TitleID,
+					Name:        item.Name,
+					DisplayName: item.Name,
+					Source:      source,
+					Status:      item.Status,
+					SoftwarePackage: &fleet.SoftwarePackageOrApp{
+						Name:        item.PackageIdentifier,
+						Version:     item.Version,
+						Platform:    platform,
+						SelfService: &selfService,
+					},
+				})
+			}
+			if meta != nil {
+				meta.TotalResults += uint(len(items))
+			}
 		}
 	}
 

@@ -18,6 +18,7 @@ import (
 	hostctx "github.com/fleetdm/fleet/v4/server/contexts/host"
 	"github.com/fleetdm/fleet/v4/server/contexts/installersize"
 	"github.com/fleetdm/fleet/v4/server/contexts/logging"
+	"github.com/fleetdm/fleet/v4/server/communityplus"
 	"github.com/fleetdm/fleet/v4/server/fleet"
 	"github.com/fleetdm/fleet/v4/server/platform/endpointer"
 	platform_http "github.com/fleetdm/fleet/v4/server/platform/http"
@@ -997,10 +998,11 @@ func submitSelfServiceSoftwareInstall(ctx context.Context, request interface{}, 
 }
 
 func (svc *Service) SelfServiceInstallSoftwareTitle(ctx context.Context, host *fleet.Host, softwareTitleID uint) error {
-	// skipauth: No authorization check needed due to implementation returning
-	// only license error.
 	svc.authz.SkipAuthorization(ctx)
 
+	if handled, err := communityplus.RequestSelfServiceForHost(ctx, host, softwareTitleID); handled || err != nil {
+		return err
+	}
 	return fleet.ErrMissingLicense
 }
 
@@ -1041,10 +1043,13 @@ func submitSelfServiceSoftwareInstallAll(ctx context.Context, request any, svc f
 }
 
 func (svc *Service) SelfServiceInstallAllSoftwareTitles(ctx context.Context, host *fleet.Host, categoryID *uint, matchQuery string) error {
-	// skipauth: No authorization check needed due to implementation returning
-	// only license error.
 	svc.authz.SkipAuthorization(ctx)
 
+	if categoryID == nil {
+		if handled, err := communityplus.RequestAllSelfServiceForHost(ctx, host, matchQuery); handled || err != nil {
+			return err
+		}
+	}
 	return fleet.ErrMissingLicense
 }
 
@@ -1088,6 +1093,11 @@ func (svc *Service) HasSelfServiceSoftwareInstallers(ctx context.Context, host *
 		}
 	}
 
+	if available, configured, err := communityplus.HasSelfServiceForHost(ctx, host); err != nil {
+		return false, err
+	} else if configured && available {
+		return true, nil
+	}
 	return svc.ds.HasSelfServiceSoftwareInstallers(ctx, host.Platform, host.TeamID)
 }
 

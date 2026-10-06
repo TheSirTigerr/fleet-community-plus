@@ -3,6 +3,7 @@ package communityplus
 import (
 	"context"
 	"database/sql"
+	"errors"
 	"fmt"
 	"strings"
 
@@ -158,4 +159,57 @@ func (s *SQLStore) IsSelfServiceRequested(ctx context.Context, deploymentID stri
 		return false, fmt.Errorf("communityplus: check self-service request: %w", err)
 	}
 	return requested, nil
+}
+
+
+// ListSelfServiceForHost exposes the Community+ self-service catalog for a host.
+// configured is false when Community+ self-service is unavailable for the host platform.
+func ListSelfServiceForHost(ctx context.Context, host *fleet.Host, matchQuery string) (items []SelfServiceItem, configured bool, err error) {
+	provider, ok := providerForHost(host)
+	if OrbitDelivery == nil || !ok || host == nil || host.TeamID == nil {
+		return nil, false, nil
+	}
+	items, err = OrbitDelivery.ListSelfServiceItemsForHost(ctx, host.ID, *host.TeamID, provider, matchQuery)
+	return items, true, err
+}
+
+// RequestSelfServiceForHost queues one Community+ self-service deployment using
+// the stable numeric title ID presented by Fleet Desktop.
+func RequestSelfServiceForHost(ctx context.Context, host *fleet.Host, titleID uint) (handled bool, err error) {
+	provider, ok := providerForHost(host)
+	if OrbitDelivery == nil || !ok || host == nil || host.TeamID == nil {
+		return false, nil
+	}
+	_, err = OrbitDelivery.RequestSelfServiceDeployment(ctx, host.ID, *host.TeamID, titleID, provider)
+	if errors.Is(err, sql.ErrNoRows) {
+		return false, nil
+	}
+	if err != nil {
+		return true, err
+	}
+	return true, nil
+}
+
+// RequestAllSelfServiceForHost queues every matching Community+ self-service
+// deployment. It deliberately does not emulate Fleet's category IDs.
+func RequestAllSelfServiceForHost(ctx context.Context, host *fleet.Host, matchQuery string) (handled bool, err error) {
+	items, configured, err := ListSelfServiceForHost(ctx, host, matchQuery)
+	if err != nil || !configured {
+		return configured, err
+	}
+	provider, _ := providerForHost(host)
+	for _, item := range items {
+		if _, err := OrbitDelivery.RequestSelfServiceDeployment(ctx, host.ID, *host.TeamID, item.TitleID, provider); err != nil {
+			return true, err
+		}
+	}
+	return true, nil
+}
+
+func HasSelfServiceForHost(ctx context.Context, host *fleet.Host) (available, configured bool, err error) {
+	items, configured, err := ListSelfServiceForHost(ctx, host, "")
+	if err != nil || !configured {
+		return false, configured, err
+	}
+	return len(items) > 0, true, nil
 }
