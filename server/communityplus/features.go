@@ -22,6 +22,7 @@ const (
 	FeatureFleetPoliciesQueries    Feature = "fleet_policies_queries"
 	FeatureSoftwareAutomation      Feature = "software_automation"
 	FeaturePatchPolicies           Feature = "patch_policies"
+	FeatureMaintenanceWindows      Feature = "maintenance_windows"
 	FeatureAdvancedMDM             Feature = "advanced_mdm"
 	FeatureZeroTouch               Feature = "zero_touch"
 	FeatureSSO                     Feature = "sso"
@@ -57,6 +58,7 @@ var knownFeatures = []Feature{
 	FeatureFleetPoliciesQueries,
 	FeatureSoftwareAutomation,
 	FeaturePatchPolicies,
+	FeatureMaintenanceWindows,
 	FeatureAdvancedMDM,
 	FeatureZeroTouch,
 	FeatureSSO,
