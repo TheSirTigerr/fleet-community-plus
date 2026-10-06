@@ -202,7 +202,6 @@ func TestProductionAutomationExecutorRejectsCrossFleetScript(t *testing.T) {
 	}
 }
 
-
 func TestProductionAutomationExecutorRejectsDisabledScripts(t *testing.T) {
 	teamID := uint(7)
 	orbitKey := "orbit-key"
