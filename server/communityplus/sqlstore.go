@@ -6,6 +6,7 @@ import (
 	"encoding/json"
 	"fmt"
 	"strings"
+	"time"
 
 	"github.com/fleetdm/fleet/v4/server/fleet"
 )
@@ -409,7 +410,11 @@ func (s *SQLStore) GetDeployment(ctx context.Context, id string) (Deployment, er
 	return d, nil
 }
 func (s *SQLStore) PendingDeploymentIDs(ctx context.Context, hostID, fleetID uint) ([]string, error) {
-	rows, err := s.db.QueryContext(ctx, `SELECT d.id FROM communityplus_catalog_deployments d LEFT JOIN communityplus_deployment_results r ON r.deployment_id = d.id AND r.host_id = ? LEFT JOIN communityplus_self_service_requests q ON q.deployment_id = d.id AND q.host_id = ? LEFT JOIN communityplus_automation_deployment_requests a ON a.deployment_id = d.id AND a.host_id = ? WHERE d.fleet_id = ? AND (d.automatic_install = 1 OR (d.self_service = 1 AND q.deployment_id IS NOT NULL) OR a.deployment_id IS NOT NULL) AND (r.deployment_id IS NULL OR (r.exit_code <> 0 AND r.attempt_count < 3 AND r.updated_at <= DATE_SUB(NOW(6), INTERVAL 5 MINUTE))) ORDER BY d.created_at, d.id`, hostID, hostID, hostID, fleetID)
+	automaticAllowed, err := s.AutomaticDeploymentsAllowed(ctx, fleetID, time.Now())
+	if err != nil {
+		return nil, err
+	}
+	rows, err := s.db.QueryContext(ctx, `SELECT d.id FROM communityplus_catalog_deployments d LEFT JOIN communityplus_deployment_results r ON r.deployment_id = d.id AND r.host_id = ? LEFT JOIN communityplus_self_service_requests q ON q.deployment_id = d.id AND q.host_id = ? LEFT JOIN communityplus_automation_deployment_requests a ON a.deployment_id = d.id AND a.host_id = ? WHERE d.fleet_id = ? AND ((? = 1 AND (d.automatic_install = 1 OR a.deployment_id IS NOT NULL)) OR (d.self_service = 1 AND q.deployment_id IS NOT NULL)) AND (r.deployment_id IS NULL OR (r.exit_code <> 0 AND r.attempt_count < 3 AND r.updated_at <= DATE_SUB(NOW(6), INTERVAL 5 MINUTE))) ORDER BY d.created_at, d.id`, hostID, hostID, hostID, fleetID, automaticAllowed)
 	if err != nil {
 		return nil, fmt.Errorf("communityplus: list pending deployments: %w", err)
 	}
