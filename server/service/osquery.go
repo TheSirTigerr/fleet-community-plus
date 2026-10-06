@@ -31,6 +31,7 @@ import (
 	hostctx "github.com/fleetdm/fleet/v4/server/contexts/host"
 	"github.com/fleetdm/fleet/v4/server/contexts/license"
 	"github.com/fleetdm/fleet/v4/server/contexts/logging"
+	"github.com/fleetdm/fleet/v4/server/communityplus"
 	"github.com/fleetdm/fleet/v4/server/fleet"
 	"github.com/fleetdm/fleet/v4/server/ptr"
 	"github.com/fleetdm/fleet/v4/server/pubsub"
@@ -2056,6 +2057,10 @@ func (svc *Service) SubmitDistributedQueryResults(
 			"new_passing", newPassing,
 			"results_in_scope", len(policyResults),
 		)
+
+		if _, err := communityplus.DispatchPolicyTransitions(ctx, host, newFailing, newPassing); err != nil {
+			logging.WithErr(ctx, ctxerr.Wrap(ctx, err, "dispatch Community+ policy automations"))
+		}
 
 		if err := processCalendarPolicies(ctx, svc.ds, ac, host, policyResults, svc.logger); err != nil {
 			logging.WithErr(ctx, err)

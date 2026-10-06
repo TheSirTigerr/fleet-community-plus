@@ -46,6 +46,7 @@ func GetRoutes(fleetSvc fleet.Service, store *SQLStore) endpointer.HandlerRoutes
 		if err := RestoreAutomationRules(context.Background(), store, engine); err != nil {
 			panic(err)
 		}
+		setRuntimeAutomationEngine(engine)
 		registry := newRuntimeRegistry()
 		catalogStore := newPatchingCatalogStore(store)
 		api, err := NewHTTPAPI(registry, engine, store, store, ViewerAccess{}, catalogStore)
