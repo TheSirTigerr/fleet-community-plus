@@ -383,3 +383,33 @@ func TestHTTPAPIRetryCatalogDeploymentEnforcesFleetScope(t *testing.T) {
 		t.Fatal("cross-fleet retry reached deployment store")
 	}
 }
+
+
+func TestHTTPAPIDispatchAutomationEvent(t *testing.T) {
+	role, err := FleetAdminRole(7)
+	if err != nil {
+		t.Fatal(err)
+	}
+	api, engine, store := newTestHTTPAPI(t, roleAccessController{actor: "fleet-7-admin", roles: []Role{role}})
+	if err := engine.UpsertRule(AutomationRule{
+		ID: "repair", Name: "Repair", Scope: FleetScope(7),
+		Trigger: TriggerPolicyFailed, Action: AutomationInstallSoftware, Enabled: true,
+	}); err != nil {
+		t.Fatal(err)
+	}
+
+	body := []byte(`{"trigger":"policy_failed","scope":{"kind":"fleet","fleet_id":7},"host_id":42}`)
+	req := httptest.NewRequest(http.MethodPost, "/api/latest/fleet/communityplus/automation-events", bytes.NewReader(body))
+	res := httptest.NewRecorder()
+	api.Handler().ServeHTTP(res, req)
+	if res.Code != http.StatusAccepted {
+		t.Fatalf("dispatch status=%d body=%s", res.Code, res.Body.String())
+	}
+	if !bytes.Contains(res.Body.Bytes(), []byte(`"repair"`)) {
+		t.Fatalf("missing executed rule: %s", res.Body.String())
+	}
+	if len(store.events) != 1 || store.events[0].Action != "automation.dispatch" ||
+		store.events[0].Scope != FleetScope(7) || store.events[0].Metadata["host_id"] != "42" {
+		t.Fatalf("unexpected automation audit event: %#v", store.events)
+	}
+}

@@ -35,7 +35,11 @@ func (ViewerAccess) Authorize(ctx context.Context, request Request) (string, err
 // service methods and has no license dependency.
 func GetRoutes(fleetSvc fleet.Service, store *SQLStore) endpointer.HandlerRoutesFunc {
 	return func(r *mux.Router, _ []kithttp.ServerOption) {
-		engine, err := NewAutomationEngine(&noopAutomationExecutor{})
+		executor, err := newProductionAutomationExecutor(store)
+		if err != nil {
+			panic(err)
+		}
+		engine, err := NewAutomationEngine(executor)
 		if err != nil {
 			panic(err)
 		}
@@ -85,10 +89,4 @@ func GetRoutes(fleetSvc fleet.Service, store *SQLStore) endpointer.HandlerRoutes
 		handler := auth.AuthenticatedUserMiddleware(fleetSvc, authError, communityPlusHandler)
 		r.PathPrefix("/api/").Handler(handler).Methods(http.MethodGet, http.MethodPost, http.MethodPut, http.MethodDelete)
 	}
-}
-
-type noopAutomationExecutor struct{}
-
-func (noopAutomationExecutor) ExecuteAutomation(context.Context, AutomationRule, AutomationEvent) error {
-	return nil
 }

@@ -81,6 +81,7 @@ func (a *HTTPAPI) Handler() http.Handler {
 		mux.HandleFunc("GET "+base+"/automation-rules", a.listAutomationRules)
 		mux.HandleFunc("PUT "+base+"/automation-rules/{id}", a.putAutomationRule)
 		mux.HandleFunc("DELETE "+base+"/automation-rules/{id}", a.deleteAutomationRule)
+		mux.HandleFunc("POST "+base+"/automation-events", a.dispatchAutomationEvent)
 		mux.HandleFunc("GET "+base+"/audit", a.listAuditEvents)
 		mux.HandleFunc("GET "+base+"/catalog/winget", a.searchWingetCatalog)
 		mux.HandleFunc("GET "+base+"/catalog/winget/upstream", a.searchWingetUpstream)
@@ -418,6 +419,45 @@ func (a *HTTPAPI) deleteAutomationRule(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	w.WriteHeader(http.StatusNoContent)
+}
+
+func (a *HTTPAPI) dispatchAutomationEvent(w http.ResponseWriter, r *http.Request) {
+	var event AutomationEvent
+	if err := decodeJSONBody(w, r, &event); err != nil {
+		writeAPIError(w, err)
+		return
+	}
+	if err := event.Validate(); err != nil {
+		writeAPIError(w, err)
+		return
+	}
+	actor, err := a.access.Authorize(r.Context(), Request{
+		Resource: ResourceAutomations, Action: ActionExecute, Scope: event.Scope,
+	})
+	if err != nil {
+		writeAPIError(w, err)
+		return
+	}
+	executed, err := a.engine.Dispatch(r.Context(), event)
+	if err != nil {
+		writeAPIError(w, err)
+		return
+	}
+	metadata := map[string]string{"trigger": string(event.Trigger)}
+	if event.HostID != 0 {
+		metadata["host_id"] = strconv.FormatUint(uint64(event.HostID), 10)
+	}
+	if len(executed) > 0 {
+		metadata["rules"] = strings.Join(executed, ",")
+	}
+	if err := a.auditRecorder.Record(r.Context(), AuditEvent{
+		ActorID: actor, Action: "automation.dispatch", Resource: ResourceAutomations,
+		ResourceID: string(event.Trigger), Scope: event.Scope, Metadata: metadata,
+	}); err != nil {
+		writeAPIError(w, err)
+		return
+	}
+	writeJSON(w, http.StatusAccepted, map[string]any{"executed_rules": executed})
 }
 
 func (a *HTTPAPI) listAuditEvents(w http.ResponseWriter, r *http.Request) {
