@@ -590,7 +590,6 @@ func (a *HTTPAPI) listCatalogDeploymentResults(w http.ResponseWriter, r *http.Re
 	writeJSON(w, http.StatusOK, map[string]any{"deployment": deployment, "results": results})
 }
 
-
 func (a *HTTPAPI) requireMaintenanceWindowStore() (MaintenanceWindowStore, error) {
 	store, ok := a.automationStore.(MaintenanceWindowStore)
 	if !ok {

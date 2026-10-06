@@ -418,7 +418,6 @@ func TestHTTPAPIDispatchAutomationEvent(t *testing.T) {
 	}
 }
 
-
 func (s *memoryFoundationStore) UpsertMaintenanceWindow(_ context.Context, window MaintenanceWindow) error {
 	s.mu.Lock()
 	defer s.mu.Unlock()

@@ -7,15 +7,15 @@ import (
 
 func TestMaintenanceWindowOpenAt(t *testing.T) {
 	window := MaintenanceWindow{
-		ID: "sunday-night",
-		Scope: FleetScope(7),
-		Timezone: "Europe/Berlin",
-		Weekdays: []int{0},
-		StartMinute: 23 * 60,
+		ID:              "sunday-night",
+		Scope:           FleetScope(7),
+		Timezone:        "Europe/Berlin",
+		Weekdays:        []int{0},
+		StartMinute:     23 * 60,
 		DurationMinutes: 120,
-		Enabled: true,
-		CreatedAt: time.Date(2026, time.October, 1, 0, 0, 0, 0, time.UTC),
-		CreatedBy: "admin",
+		Enabled:         true,
+		CreatedAt:       time.Date(2026, time.October, 1, 0, 0, 0, 0, time.UTC),
+		CreatedBy:       "admin",
 	}
 
 	tests := []struct {
