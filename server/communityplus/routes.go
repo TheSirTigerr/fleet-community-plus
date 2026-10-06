@@ -33,9 +33,13 @@ func (ViewerAccess) Authorize(ctx context.Context, request Request) (string, err
 // GetRoutes exposes Community+ APIs through Fleet's normal user authentication
 // middleware. The implementation is deliberately separate from Fleet's premium
 // service methods and has no license dependency.
-func GetRoutes(fleetSvc fleet.Service, store *SQLStore) endpointer.HandlerRoutesFunc {
+func GetRoutes(fleetSvc fleet.Service, store *SQLStore, datastores ...fleet.Datastore) endpointer.HandlerRoutesFunc {
 	return func(r *mux.Router, _ []kithttp.ServerOption) {
-		executor, err := newProductionAutomationExecutor(store)
+		var scriptStore automationScriptStore
+		if len(datastores) > 0 {
+			scriptStore = datastores[0]
+		}
+		executor, err := newProductionAutomationExecutor(store, scriptStore)
 		if err != nil {
 			panic(err)
 		}

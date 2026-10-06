@@ -888,7 +888,7 @@ func runServeCmd(cmd *cobra.Command, configManager configpkg.Manager, debug, dev
 		}
 		communityplus.OrbitDelivery = communityStore
 		apiHandler, err = service.MakeHandler(svc, config, httpLogger, limiterStore, redisPool, carveStore,
-			[]endpointer.HandlerRoutesFunc{android_service.GetRoutes(svc, androidSvc), activityRoutes, acmeRoutes, chartRoutes, communityplus.GetRoutes(svc, communityStore)}, extra...)
+			[]endpointer.HandlerRoutesFunc{android_service.GetRoutes(svc, androidSvc), activityRoutes, acmeRoutes, chartRoutes, communityplus.GetRoutes(svc, communityStore, ds)}, extra...)
 		if err != nil {
 			initFatal(err, "initializing the API handler")
 		}
