@@ -191,7 +191,6 @@ func (s *Service) apply(ctx context.Context, setup *fleet.MacOSSetup, payload fl
 	return nil
 }
 
-
 func setupExperienceSoftwareTeamID(teamID uint) *uint {
 	if teamID == 0 {
 		return nil

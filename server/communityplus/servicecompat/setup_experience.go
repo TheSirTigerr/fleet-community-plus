@@ -38,7 +38,6 @@ func (s *setupExperienceWrapper) UpdateMDMAppleSetup(ctx context.Context, payloa
 	return s.setup.UpdateAppleSetup(ctx, payload)
 }
 
-
 func (s *setupExperienceWrapper) SetSetupExperienceSoftware(ctx context.Context, platform string, teamID uint, titleIDs []uint) error {
 	teamName, err := s.setup.SetSoftware(ctx, platform, teamID, titleIDs)
 	if err != nil {

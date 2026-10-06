@@ -85,7 +85,6 @@ func TestApplyRejectsUnsupportedLocalAccountType(t *testing.T) {
 	require.True(t, errors.As(err, &invalid))
 }
 
-
 func TestValidateSetupExperienceSoftwarePlatform(t *testing.T) {
 	for _, platform := range []string{"darwin", "windows", "linux", "ios", "ipados", "android", "darwin,windows"} {
 		require.NoError(t, validateSetupExperienceSoftwarePlatform(platform), platform)
