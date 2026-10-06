@@ -6,6 +6,7 @@ import (
 	"path/filepath"
 	"strconv"
 	"strings"
+	"time"
 
 	"github.com/fleetdm/fleet/v4/server/fleet"
 )
@@ -28,6 +29,7 @@ type automationScriptStore interface {
 type productionAutomationExecutor struct {
 	deployments automationDeploymentStore
 	scripts     automationScriptStore
+	deferrals   automationScriptDeferralStore
 }
 
 func newProductionAutomationExecutor(store automationDeploymentStore, scriptStores ...automationScriptStore) (*productionAutomationExecutor, error) {
@@ -38,6 +40,9 @@ func newProductionAutomationExecutor(store automationDeploymentStore, scriptStor
 		return nil, fmt.Errorf("communityplus: only one automation script store may be configured")
 	}
 	executor := &productionAutomationExecutor{deployments: store}
+	if deferrals, ok := store.(automationScriptDeferralStore); ok {
+		executor.deferrals = deferrals
+	}
 	if len(scriptStores) == 1 {
 		executor.scripts = scriptStores[0]
 	}
@@ -152,6 +157,26 @@ func (e *productionAutomationExecutor) runScript(ctx context.Context, rule Autom
 		return nil
 	}
 
+	policyID, err := automationEventPolicyID(event)
+	if err != nil {
+		return err
+	}
+	if event.Scope.Kind == ScopeFleet && e.deferrals != nil {
+		allowed, err := e.deferrals.AutomaticDeploymentsAllowed(ctx, event.Scope.FleetID, time.Now())
+		if err != nil {
+			return fmt.Errorf("check maintenance window for script automation: %w", err)
+		}
+		if !allowed {
+			if err := e.deferrals.QueueDeferredScriptAutomation(ctx, DeferredScriptAutomation{
+				RuleID: rule.ID, HostID: event.HostID, FleetID: event.Scope.FleetID,
+				ScriptID: scriptID, PolicyID: policyID, RequestedAt: time.Now().UTC(),
+			}); err != nil {
+				return err
+			}
+			return nil
+		}
+	}
+
 	pendingScripts, err := e.scripts.ListPendingHostScriptExecutions(ctx, event.HostID, false)
 	if err != nil {
 		return fmt.Errorf("list pending automation scripts: %w", err)
@@ -175,12 +200,7 @@ func (e *productionAutomationExecutor) runScript(ctx context.Context, rule Autom
 		ScriptContentID: script.ScriptContentID,
 		TeamID:          hostFleetID,
 	}
-	if rawPolicyID := strings.TrimSpace(event.Data["policy_id"]); rawPolicyID != "" {
-		policyID64, err := strconv.ParseUint(rawPolicyID, 10, 0)
-		if err != nil || policyID64 == 0 {
-			return fmt.Errorf("invalid policy_id in automation event")
-		}
-		policyID := uint(policyID64)
+	if policyID != 0 {
 		request.PolicyID = &policyID
 	}
 
@@ -188,4 +208,17 @@ func (e *productionAutomationExecutor) runScript(ctx context.Context, rule Autom
 		return fmt.Errorf("queue automation script: %w", err)
 	}
 	return nil
+}
+
+
+func automationEventPolicyID(event AutomationEvent) (uint, error) {
+	rawPolicyID := strings.TrimSpace(event.Data["policy_id"])
+	if rawPolicyID == "" {
+		return 0, nil
+	}
+	policyID64, err := strconv.ParseUint(rawPolicyID, 10, 0)
+	if err != nil || policyID64 == 0 {
+		return 0, fmt.Errorf("invalid policy_id in automation event")
+	}
+	return uint(policyID64), nil
 }
