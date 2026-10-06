@@ -161,7 +161,6 @@ func (s *SQLStore) IsSelfServiceRequested(ctx context.Context, deploymentID stri
 	return requested, nil
 }
 
-
 // ListSelfServiceForHost exposes the Community+ self-service catalog for a host.
 // configured is false when Community+ self-service is unavailable for the host platform.
 func ListSelfServiceForHost(ctx context.Context, host *fleet.Host, matchQuery string) (items []SelfServiceItem, configured bool, err error) {
