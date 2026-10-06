@@ -11,7 +11,7 @@ import (
 
 func TestValidateAgentOptionsAllowsUpdateChannelsWithoutPremium(t *testing.T) {
 	raw := json.RawMessage(`{
-		"config":{"options":{"logger_plugin":"tls"}},
+		"config":{},
 		"update_channels":{"orbit":"stable","osqueryd":"stable","desktop":"stable"}
 	}`)
 	if err := ValidateAgentOptions(context.Background(), nil, raw, false, 0); err != nil {
