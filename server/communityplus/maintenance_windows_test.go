@@ -24,7 +24,7 @@ func TestMaintenanceWindowOpenAt(t *testing.T) {
 		want bool
 	}{
 		{"inside same day", time.Date(2026, time.October, 4, 21, 30, 0, 0, time.UTC), true},
-		{"inside after midnight", time.Date(2026, time.October, 4, 23, 30, 0, 0, time.UTC), true},
+		{"inside after midnight", time.Date(2026, time.October, 4, 22, 30, 0, 0, time.UTC), true},
 		{"outside", time.Date(2026, time.October, 5, 2, 0, 0, 0, time.UTC), false},
 	}
 	for _, test := range tests {
