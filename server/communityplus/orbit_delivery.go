@@ -3,6 +3,7 @@ package communityplus
 import (
 	"context"
 	"fmt"
+	"time"
 
 	"github.com/fleetdm/fleet/v4/server/fleet"
 )
@@ -46,22 +47,30 @@ func OrbitWindowsPlan(ctx context.Context, host *fleet.Host, id string) (*fleet.
 	if d.Scope.FleetID != *host.TeamID {
 		return nil, fmt.Errorf("Community+ deployment is not assigned to this host")
 	}
-	if !d.Automatic {
-		requested := false
-		if d.SelfService {
-			requested, err = OrbitDelivery.IsSelfServiceRequested(ctx, d.ID, host.ID)
-			if err != nil {
-				return nil, err
-			}
+	selfServiceRequested := false
+	if d.SelfService {
+		selfServiceRequested, err = OrbitDelivery.IsSelfServiceRequested(ctx, d.ID, host.ID)
+		if err != nil {
+			return nil, err
 		}
-		if !requested {
-			requested, err = OrbitDelivery.IsAutomationDeploymentRequested(ctx, d.ID, host.ID)
-			if err != nil {
-				return nil, err
-			}
+	}
+	automationRequested := false
+	if !selfServiceRequested && !d.Automatic {
+		automationRequested, err = OrbitDelivery.IsAutomationDeploymentRequested(ctx, d.ID, host.ID)
+		if err != nil {
+			return nil, err
 		}
-		if !requested {
+		if !automationRequested {
 			return nil, fmt.Errorf("Community+ deployment is not assigned to this host")
+		}
+	}
+	if !selfServiceRequested && (d.Automatic || automationRequested) {
+		allowed, err := OrbitDelivery.AutomaticDeploymentsAllowed(ctx, d.Scope.FleetID, time.Now())
+		if err != nil {
+			return nil, err
+		}
+		if !allowed {
+			return nil, fmt.Errorf("Community+ deployment is outside the Fleet maintenance window")
 		}
 	}
 	e, err := OrbitDelivery.GetCatalogEntry(ctx, d.CatalogEntryID)
