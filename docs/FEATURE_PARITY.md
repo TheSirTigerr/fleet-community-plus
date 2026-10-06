@@ -40,11 +40,11 @@ This document tracks independently implemented equivalents for Fleet Premium cap
 - [x] OS update enforcement
 - [x] Remote lock
 - [x] Remote wipe
-- [ ] Certificate distribution and renewal
+- [x] Certificate distribution and renewal
 
 ## Software management
 
-- [ ] Software package deployment
+- [x] Software package deployment
 - [ ] Self-service software catalog
 - [ ] Setup-experience software
 - [ ] Install/uninstall automation

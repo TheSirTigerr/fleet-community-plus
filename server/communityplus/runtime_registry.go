@@ -19,6 +19,7 @@ func newRuntimeRegistry() *Registry {
 	mustSetRuntimeStatus(registry, FeatureZeroTouch, StatusAvailable)
 	mustSetRuntimeStatus(registry, FeatureDiskEncryption, StatusAvailable)
 	mustSetRuntimeStatus(registry, FeatureRemoteActions, StatusAvailable)
+	mustSetRuntimeStatus(registry, FeatureCertificates, StatusAvailable)
 	mustSetRuntimeStatus(registry, FeatureSoftwareAutomation, StatusExperimental)
 	mustSetRuntimeStatus(registry, FeaturePatchPolicies, StatusExperimental)
 	return registry

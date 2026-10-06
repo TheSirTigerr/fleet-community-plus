@@ -19,6 +19,7 @@ func TestRuntimeRegistryPublishesOnlyWiredCapabilities(t *testing.T) {
 		FeatureZeroTouch:            StatusAvailable,
 		FeatureDiskEncryption:       StatusAvailable,
 		FeatureRemoteActions:        StatusAvailable,
+		FeatureCertificates:         StatusAvailable,
 		FeatureSoftwareAutomation:   StatusExperimental,
 		FeaturePatchPolicies:        StatusExperimental,
 	}
