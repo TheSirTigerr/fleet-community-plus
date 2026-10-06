@@ -14,6 +14,8 @@ type memoryAutomationDeploymentStore struct {
 	queuedHost         uint
 	maintenanceBlocked bool
 	deferredScript     *DeferredScriptAutomation
+	deferredUninstall  *DeferredSoftwareUninstallAutomation
+	uninstallPending   bool
 }
 
 func (s *memoryAutomationDeploymentStore) GetDeployment(context.Context, string) (Deployment, error) {
@@ -33,6 +35,16 @@ func (s *memoryAutomationDeploymentStore) AutomaticDeploymentsAllowed(context.Co
 func (s *memoryAutomationDeploymentStore) QueueDeferredScriptAutomation(_ context.Context, req DeferredScriptAutomation) error {
 	copy := req
 	s.deferredScript = &copy
+	return nil
+}
+
+func (s *memoryAutomationDeploymentStore) IsSoftwareUninstallPending(context.Context, uint, uint) (bool, error) {
+	return s.uninstallPending, nil
+}
+
+func (s *memoryAutomationDeploymentStore) QueueDeferredSoftwareUninstallAutomation(_ context.Context, req DeferredSoftwareUninstallAutomation) error {
+	copy := req
+	s.deferredUninstall = &copy
 	return nil
 }
 
@@ -79,12 +91,15 @@ func TestProductionAutomationExecutorRejectsCrossFleetDeployment(t *testing.T) {
 }
 
 type memoryAutomationScriptStore struct {
-	config  *fleet.AppConfig
-	host    *fleet.Host
-	script  *fleet.Script
-	content []byte
-	pending bool
-	request *fleet.HostScriptRequestPayload
+	config          *fleet.AppConfig
+	host            *fleet.Host
+	script          *fleet.Script
+	content         []byte
+	pending         bool
+	request         *fleet.HostScriptRequestPayload
+	installer       *fleet.SoftwareInstaller
+	lastInstall     *fleet.HostLastInstallData
+	uninstallExecID string
 }
 
 func (s *memoryAutomationScriptStore) AppConfig(context.Context) (*fleet.AppConfig, error) {
@@ -283,5 +298,122 @@ func TestProductionAutomationExecutorDefersPolicyScriptOutsideMaintenanceWindow(
 	got := deploymentStore.deferredScript
 	if got.RuleID != "script-rule" || got.HostID != 42 || got.FleetID != 7 || got.ScriptID != 9 || got.PolicyID != 10 {
 		t.Fatalf("unexpected deferred script automation: %#v", got)
+	}
+}
+
+
+func (s *memoryAutomationScriptStore) GetSoftwareInstallerMetadataByID(context.Context, uint) (*fleet.SoftwareInstaller, error) {
+	return s.installer, nil
+}
+
+func (s *memoryAutomationScriptStore) GetSoftwareInstallerMetadataByTeamTitleAndInstallerID(context.Context, *uint, uint, uint, bool) (*fleet.SoftwareInstaller, error) {
+	return s.installer, nil
+}
+
+func (s *memoryAutomationScriptStore) GetHostLastInstallData(context.Context, uint, uint) (*fleet.HostLastInstallData, error) {
+	return s.lastInstall, nil
+}
+
+func (s *memoryAutomationScriptStore) InsertFleetInitiatedSoftwareUninstallRequest(_ context.Context, executionID string, _ uint, _ uint) error {
+	s.uninstallExecID = executionID
+	return nil
+}
+
+func TestProductionAutomationExecutorQueuesSoftwareUninstall(t *testing.T) {
+	teamID := uint(7)
+	titleID := uint(55)
+	orbitKey := "orbit-key"
+	installed := fleet.SoftwareInstalled
+	deploymentStore := &memoryAutomationDeploymentStore{}
+	scriptStore := &memoryAutomationScriptStore{
+		host: &fleet.Host{ID: 42, TeamID: &teamID, Platform: "windows", OrbitNodeKey: &orbitKey},
+		installer: &fleet.SoftwareInstaller{
+			InstallerID: 9, TitleID: &titleID, TeamID: &teamID, Platform: "windows",
+			UninstallScript: "Write-Output 'remove'", UninstallScriptContentID: 77,
+		},
+		lastInstall: &fleet.HostLastInstallData{Status: &installed},
+	}
+	executor, err := newProductionAutomationExecutor(deploymentStore, scriptStore)
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	err = executor.ExecuteAutomation(context.Background(), AutomationRule{
+		ID: "remove-app", Name: "Remove app", Scope: FleetScope(7),
+		Trigger: TriggerPolicyFailed, Action: AutomationUninstallSoftware, Enabled: true,
+		Config: map[string]string{"installer_id": "9"},
+	}, AutomationEvent{Trigger: TriggerPolicyFailed, Scope: FleetScope(7), HostID: 42})
+	if err != nil {
+		t.Fatalf("execute uninstall automation: %v", err)
+	}
+	if scriptStore.uninstallExecID == "" {
+		t.Fatal("software uninstall was not queued")
+	}
+}
+
+func TestProductionAutomationExecutorDefersSoftwareUninstallOutsideMaintenanceWindow(t *testing.T) {
+	teamID := uint(7)
+	titleID := uint(55)
+	orbitKey := "orbit-key"
+	installed := fleet.SoftwareInstalled
+	deploymentStore := &memoryAutomationDeploymentStore{maintenanceBlocked: true}
+	scriptStore := &memoryAutomationScriptStore{
+		host: &fleet.Host{ID: 42, TeamID: &teamID, Platform: "darwin", OrbitNodeKey: &orbitKey},
+		installer: &fleet.SoftwareInstaller{
+			InstallerID: 9, TitleID: &titleID, TeamID: &teamID, Platform: "darwin",
+			UninstallScript: "#!/bin/sh\necho remove", UninstallScriptContentID: 77,
+		},
+		lastInstall: &fleet.HostLastInstallData{Status: &installed},
+	}
+	executor, err := newProductionAutomationExecutor(deploymentStore, scriptStore)
+	if err != nil {
+		t.Fatal(err)
+	}
+	err = executor.ExecuteAutomation(context.Background(), AutomationRule{
+		ID: "remove-app", Name: "Remove app", Scope: FleetScope(7),
+		Trigger: TriggerPolicyFailed, Action: AutomationUninstallSoftware, Enabled: true,
+		Config: map[string]string{"installer_id": "9"},
+	}, AutomationEvent{Trigger: TriggerPolicyFailed, Scope: FleetScope(7), HostID: 42})
+	if err != nil {
+		t.Fatalf("defer uninstall automation: %v", err)
+	}
+	if scriptStore.uninstallExecID != "" {
+		t.Fatal("software uninstall was queued outside maintenance window")
+	}
+	if deploymentStore.deferredUninstall == nil ||
+		deploymentStore.deferredUninstall.RuleID != "remove-app" ||
+		deploymentStore.deferredUninstall.HostID != 42 ||
+		deploymentStore.deferredUninstall.InstallerID != 9 {
+		t.Fatalf("unexpected deferred uninstall: %#v", deploymentStore.deferredUninstall)
+	}
+}
+
+func TestProductionAutomationExecutorDeduplicatesSuccessfulSoftwareUninstall(t *testing.T) {
+	teamID := uint(7)
+	titleID := uint(55)
+	orbitKey := "orbit-key"
+	deploymentStore := &memoryAutomationDeploymentStore{}
+	scriptStore := &memoryAutomationScriptStore{
+		host: &fleet.Host{ID: 42, TeamID: &teamID, Platform: "windows", OrbitNodeKey: &orbitKey},
+		installer: &fleet.SoftwareInstaller{
+			InstallerID: 9, TitleID: &titleID, TeamID: &teamID, Platform: "windows",
+			UninstallScript: "Write-Output 'remove'", UninstallScriptContentID: 77,
+		},
+		lastInstall: &fleet.HostLastInstallData{Status: nil},
+	}
+	executor, err := newProductionAutomationExecutor(deploymentStore, scriptStore)
+	if err != nil {
+		t.Fatal(err)
+	}
+	err = executor.ExecuteAutomation(context.Background(), AutomationRule{
+		ID: "remove-app", Name: "Remove app", Scope: FleetScope(7),
+		Trigger: TriggerPolicyFailed, Action: AutomationUninstallSoftware, Enabled: true,
+		Config: map[string]string{"installer_id": "9"},
+	}, AutomationEvent{Trigger: TriggerPolicyFailed, Scope: FleetScope(7), HostID: 42})
+	if err != nil {
+		t.Fatalf("idempotent uninstall automation: %v", err)
+	}
+	if scriptStore.uninstallExecID != "" {
+		t.Fatal("already successful uninstall was queued again")
 	}
 }

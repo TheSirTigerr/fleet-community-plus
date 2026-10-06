@@ -760,6 +760,10 @@ func (svc *Service) GetOrbitConfig(ctx context.Context) (fleet.OrbitConfig, erro
 		return fleet.OrbitConfig{}, ctxerr.Wrap(ctx, err, "release Community+ deferred script automations")
 	}
 
+	if err := communityplus.ReleasePendingSoftwareUninstallAutomations(ctx, host, svc.ds); err != nil {
+		return fleet.OrbitConfig{}, ctxerr.Wrap(ctx, err, "release Community+ deferred software uninstall automations")
+	}
+
 	// load the (active, ready to execute) pending script executions for that host
 	pending, err := svc.ds.ListReadyToExecuteScriptsForHost(ctx, host.ID, appConfig.ServerSettings.ScriptsDisabled)
 	if err != nil {

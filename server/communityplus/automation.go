@@ -24,7 +24,8 @@ type AutomationAction string
 
 const (
 	AutomationRunScript       AutomationAction = "run_script"
-	AutomationInstallSoftware AutomationAction = "install_software"
+	AutomationInstallSoftware   AutomationAction = "install_software"
+	AutomationUninstallSoftware AutomationAction = "uninstall_software"
 	AutomationLockDevice      AutomationAction = "lock_device"
 	AutomationNotify          AutomationAction = "notify"
 	AutomationAssignFleet     AutomationAction = "assign_fleet"
@@ -60,7 +61,7 @@ func (r AutomationRule) Validate() error {
 		return fmt.Errorf("communityplus: invalid automation trigger %q", r.Trigger)
 	}
 	switch r.Action {
-	case AutomationRunScript, AutomationInstallSoftware, AutomationLockDevice, AutomationNotify, AutomationAssignFleet:
+	case AutomationRunScript, AutomationInstallSoftware, AutomationUninstallSoftware, AutomationLockDevice, AutomationNotify, AutomationAssignFleet:
 	default:
 		return fmt.Errorf("communityplus: invalid automation action %q", r.Action)
 	}

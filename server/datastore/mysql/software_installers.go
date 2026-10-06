@@ -2195,6 +2195,16 @@ func (ds *Datastore) deleteInstallerInBatch(ctx context.Context, tx sqlx.ExtCont
 }
 
 func (ds *Datastore) InsertSoftwareUninstallRequest(ctx context.Context, executionID string, hostID uint, softwareInstallerID uint, selfService bool) error {
+	return ds.insertSoftwareUninstallRequest(ctx, executionID, hostID, softwareInstallerID, selfService, fleet.UserInitiatedActivityPriority, false)
+}
+
+// InsertFleetInitiatedSoftwareUninstallRequest queues an automated uninstall at
+// Fleet-initiated priority while preserving the native uninstall result/activity pipeline.
+func (ds *Datastore) InsertFleetInitiatedSoftwareUninstallRequest(ctx context.Context, executionID string, hostID uint, softwareInstallerID uint) error {
+	return ds.insertSoftwareUninstallRequest(ctx, executionID, hostID, softwareInstallerID, false, 0, true)
+}
+
+func (ds *Datastore) insertSoftwareUninstallRequest(ctx context.Context, executionID string, hostID uint, softwareInstallerID uint, selfService bool, priority int, fleetInitiated bool) error {
 	const (
 		getInstallerStmt = `SELECT title_id, COALESCE(st.name, '[deleted title]') title_name, st.source
 			FROM software_installers si LEFT JOIN software_titles st ON si.title_id = st.id WHERE si.id = ?`
@@ -2254,11 +2264,9 @@ VALUES
 	err = ds.withRetryTxx(ctx, func(tx sqlx.ExtContext) error {
 		res, err := tx.ExecContext(ctx, insertUAStmt,
 			hostID,
-			// uninstalls are always user-initiated (never setup experience, never
-			// policy automations), so they rank with other user-initiated activities
-			fleet.UserInitiatedActivityPriority,
+			priority,
 			userID,
-			false,
+			fleetInitiated,
 			executionID,
 			installerDetails.TitleName,
 			installerDetails.Source,
