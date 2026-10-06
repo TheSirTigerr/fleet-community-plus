@@ -82,6 +82,9 @@ func (a *HTTPAPI) Handler() http.Handler {
 		mux.HandleFunc("PUT "+base+"/automation-rules/{id}", a.putAutomationRule)
 		mux.HandleFunc("DELETE "+base+"/automation-rules/{id}", a.deleteAutomationRule)
 		mux.HandleFunc("POST "+base+"/automation-events", a.dispatchAutomationEvent)
+		mux.HandleFunc("GET "+base+"/maintenance-windows", a.listMaintenanceWindows)
+		mux.HandleFunc("PUT "+base+"/maintenance-windows/{id}", a.putMaintenanceWindow)
+		mux.HandleFunc("DELETE "+base+"/maintenance-windows/{id}", a.deleteMaintenanceWindow)
 		mux.HandleFunc("GET "+base+"/audit", a.listAuditEvents)
 		mux.HandleFunc("GET "+base+"/catalog/winget", a.searchWingetCatalog)
 		mux.HandleFunc("GET "+base+"/catalog/winget/upstream", a.searchWingetUpstream)
@@ -585,4 +588,114 @@ func (a *HTTPAPI) listCatalogDeploymentResults(w http.ResponseWriter, r *http.Re
 		return
 	}
 	writeJSON(w, http.StatusOK, map[string]any{"deployment": deployment, "results": results})
+}
+
+
+func (a *HTTPAPI) requireMaintenanceWindowStore() (MaintenanceWindowStore, error) {
+	store, ok := a.automationStore.(MaintenanceWindowStore)
+	if !ok {
+		return nil, fmt.Errorf("communityplus: maintenance window store is not configured")
+	}
+	return store, nil
+}
+
+func (a *HTTPAPI) listMaintenanceWindows(w http.ResponseWriter, r *http.Request) {
+	store, err := a.requireMaintenanceWindowStore()
+	if err != nil {
+		writeAPIError(w, err)
+		return
+	}
+	fleetID64, err := strconv.ParseUint(r.URL.Query().Get("fleet_id"), 10, 0)
+	if err != nil || fleetID64 == 0 {
+		writeAPIError(w, fmt.Errorf("communityplus: fleet_id is required"))
+		return
+	}
+	scope := FleetScope(uint(fleetID64))
+	if _, err := a.access.Authorize(r.Context(), Request{Resource: ResourceAutomations, Action: ActionRead, Scope: scope}); err != nil {
+		writeAPIError(w, err)
+		return
+	}
+	windows, err := store.ListMaintenanceWindows(r.Context(), scope.FleetID)
+	if err != nil {
+		writeAPIError(w, err)
+		return
+	}
+	writeJSON(w, http.StatusOK, map[string]any{"maintenance_windows": windows})
+}
+
+func (a *HTTPAPI) putMaintenanceWindow(w http.ResponseWriter, r *http.Request) {
+	store, err := a.requireMaintenanceWindowStore()
+	if err != nil {
+		writeAPIError(w, err)
+		return
+	}
+	id := r.PathValue("id")
+	if id == "" || strings.Contains(id, "/") {
+		writeAPIError(w, fmt.Errorf("communityplus: invalid maintenance window id"))
+		return
+	}
+	var window MaintenanceWindow
+	if err := decodeJSONBody(w, r, &window); err != nil {
+		writeAPIError(w, err)
+		return
+	}
+	if window.ID != "" && window.ID != id {
+		writeAPIError(w, fmt.Errorf("communityplus: body id must match path id"))
+		return
+	}
+	window.ID = id
+	actor, err := a.access.Authorize(r.Context(), Request{Resource: ResourceAutomations, Action: ActionWrite, Scope: window.Scope})
+	if err != nil {
+		writeAPIError(w, err)
+		return
+	}
+	window.CreatedAt = time.Now().UTC()
+	window.CreatedBy = actor
+	if err := window.Validate(); err != nil {
+		writeAPIError(w, err)
+		return
+	}
+	if err := store.UpsertMaintenanceWindow(r.Context(), window); err != nil {
+		writeAPIError(w, err)
+		return
+	}
+	if err := a.auditRecorder.Record(r.Context(), AuditEvent{
+		ActorID: actor, Action: "maintenance_window.upsert", Resource: ResourceAutomations,
+		ResourceID: window.ID, Scope: window.Scope,
+		Metadata: map[string]string{"timezone": window.Timezone, "enabled": strconv.FormatBool(window.Enabled)},
+	}); err != nil {
+		writeAPIError(w, err)
+		return
+	}
+	writeJSON(w, http.StatusOK, map[string]any{"maintenance_window": window})
+}
+
+func (a *HTTPAPI) deleteMaintenanceWindow(w http.ResponseWriter, r *http.Request) {
+	store, err := a.requireMaintenanceWindowStore()
+	if err != nil {
+		writeAPIError(w, err)
+		return
+	}
+	window, err := store.GetMaintenanceWindow(r.Context(), r.PathValue("id"))
+	if err != nil {
+		writeAPIError(w, err)
+		return
+	}
+	actor, err := a.access.Authorize(r.Context(), Request{Resource: ResourceAutomations, Action: ActionWrite, Scope: window.Scope})
+	if err != nil {
+		writeAPIError(w, err)
+		return
+	}
+	if err := store.DeleteMaintenanceWindow(r.Context(), window.ID); err != nil {
+		writeAPIError(w, err)
+		return
+	}
+	if err := a.auditRecorder.Record(r.Context(), AuditEvent{
+		ActorID: actor, Action: "maintenance_window.delete", Resource: ResourceAutomations,
+		ResourceID: window.ID, Scope: window.Scope,
+	}); err != nil {
+		writeAPIError(w, err)
+		return
+	}
+	w.WriteHeader(http.StatusNoContent)
 }
