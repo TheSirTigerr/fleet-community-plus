@@ -7,6 +7,7 @@ import (
 	"errors"
 	"fmt"
 	"net/http"
+	"strings"
 
 	"github.com/fleetdm/fleet/v4/pkg/optjson"
 	"github.com/fleetdm/fleet/v4/server/authz"
@@ -188,4 +189,94 @@ func (s *Service) apply(ctx context.Context, setup *fleet.MacOSSetup, payload fl
 		return err
 	}
 	return nil
+}
+
+
+func setupExperienceSoftwareTeamID(teamID uint) *uint {
+	if teamID == 0 {
+		return nil
+	}
+	return &teamID
+}
+
+func validateSetupExperienceSoftwarePlatform(platforms string) error {
+	if strings.TrimSpace(platforms) == "" {
+		return fmt.Errorf("setup experience software platform is required")
+	}
+	for platform := range strings.SplitSeq(platforms, ",") {
+		switch strings.TrimSpace(platform) {
+		case string(fleet.MacOSPlatform), "windows", "linux", string(fleet.IOSPlatform), string(fleet.IPadOSPlatform), string(fleet.AndroidPlatform):
+			// supported
+		default:
+			return fmt.Errorf("unsupported setup experience software platform %q", platform)
+		}
+	}
+	return nil
+}
+
+func (s *Service) setupExperienceSoftwareTeam(ctx context.Context, teamID uint) (string, *fleet.MacOSSetup, error) {
+	if teamID == 0 {
+		cfg, err := s.ds.AppConfig(ctx)
+		if err != nil {
+			return "", nil, fmt.Errorf("load app config for setup experience software: %w", err)
+		}
+		if cfg == nil {
+			return "", nil, errors.New("app config is nil")
+		}
+		return "", &cfg.MDM.MacOSSetup, nil
+	}
+
+	team, err := s.ds.TeamWithExtras(ctx, teamID)
+	if err != nil {
+		return "", nil, fmt.Errorf("load fleet for setup experience software: %w", err)
+	}
+	return team.Name, &team.Config.MDM.MacOSSetup, nil
+}
+
+// SetSoftware replaces the software selected for one platform during setup experience.
+func (s *Service) SetSoftware(ctx context.Context, platform string, teamID uint, titleIDs []uint) (string, error) {
+	if err := validateSetupExperienceSoftwarePlatform(platform); err != nil {
+		return "", err
+	}
+
+	target := &fleet.SoftwareInstaller{TeamID: setupExperienceSoftwareTeamID(teamID)}
+	if err := s.authorizer.Authorize(ctx, target, fleet.ActionWrite); err != nil {
+		return "", err
+	}
+
+	teamName, setup, err := s.setupExperienceSoftwareTeam(ctx, teamID)
+	if err != nil {
+		return "", err
+	}
+	if platform == string(fleet.MacOSPlatform) && len(titleIDs) > 0 &&
+		setup.ManualAgentInstall.Valid && setup.ManualAgentInstall.Value {
+		return "", fleet.NewUserMessageError(
+			errors.New("Couldn’t add setup experience software while macos_manual_agent_install is enabled. Disable macos_manual_agent_install first."),
+			http.StatusUnprocessableEntity,
+		)
+	}
+
+	if err := s.ds.SetSetupExperienceSoftwareTitles(ctx, platform, teamID, titleIDs); err != nil {
+		return "", fmt.Errorf("set setup experience software: %w", err)
+	}
+	return teamName, nil
+}
+
+// ListSoftware returns software eligible for setup experience using Fleet's existing datastore contract.
+func (s *Service) ListSoftware(
+	ctx context.Context,
+	platform string,
+	teamID uint,
+	opts fleet.ListOptions,
+) ([]fleet.SoftwareTitleListResult, int, *fleet.PaginationMetadata, error) {
+	if err := validateSetupExperienceSoftwarePlatform(platform); err != nil {
+		return nil, 0, nil, err
+	}
+
+	target := &fleet.SoftwareInstaller{TeamID: setupExperienceSoftwareTeamID(teamID)}
+	if err := s.authorizer.Authorize(ctx, target, fleet.ActionRead); err != nil {
+		return nil, 0, nil, err
+	}
+
+	return s.ds.ListSetupExperienceSoftwareTitles(ctx, platform, teamID, opts)
 }

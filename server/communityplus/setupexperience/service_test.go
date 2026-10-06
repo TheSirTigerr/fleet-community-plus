@@ -6,6 +6,8 @@ import (
 	"errors"
 	"testing"
 
+	"github.com/fleetdm/fleet/v4/pkg/optjson"
+
 	"github.com/fleetdm/fleet/v4/server/fleet"
 	"github.com/fleetdm/fleet/v4/server/mdm/nanodep/godep"
 	fleetmock "github.com/fleetdm/fleet/v4/server/mock"
@@ -81,4 +83,46 @@ func TestApplyRejectsUnsupportedLocalAccountType(t *testing.T) {
 	require.Error(t, err)
 	var invalid *fleet.InvalidArgumentError
 	require.True(t, errors.As(err, &invalid))
+}
+
+
+func TestValidateSetupExperienceSoftwarePlatform(t *testing.T) {
+	for _, platform := range []string{"darwin", "windows", "linux", "ios", "ipados", "android", "darwin,windows"} {
+		require.NoError(t, validateSetupExperienceSoftwarePlatform(platform), platform)
+	}
+	for _, platform := range []string{"", "freebsd", "windows,freebsd"} {
+		require.Error(t, validateSetupExperienceSoftwarePlatform(platform), platform)
+	}
+}
+
+func TestSetupExperienceSoftwareTeamUsesGlobalConfig(t *testing.T) {
+	ds := new(fleetmock.Store)
+	ds.AppConfigFunc = func(context.Context) (*fleet.AppConfig, error) {
+		cfg := &fleet.AppConfig{}
+		cfg.MDM.MacOSSetup.ManualAgentInstall = optjson.SetBool(true)
+		return cfg, nil
+	}
+	svc := &Service{ds: ds}
+	name, setup, err := svc.setupExperienceSoftwareTeam(context.Background(), 0)
+	require.NoError(t, err)
+	require.Empty(t, name)
+	require.NotNil(t, setup)
+	require.True(t, setup.ManualAgentInstall.Valid)
+	require.True(t, setup.ManualAgentInstall.Value)
+}
+
+func TestSetupExperienceSoftwareTeamUsesFleetConfig(t *testing.T) {
+	ds := new(fleetmock.Store)
+	ds.TeamWithExtrasFunc = func(context.Context, uint) (*fleet.Team, error) {
+		team := &fleet.Team{ID: 7, Name: "Workstations"}
+		team.Config.MDM.MacOSSetup.ManualAgentInstall = optjson.SetBool(false)
+		return team, nil
+	}
+	svc := &Service{ds: ds}
+	name, setup, err := svc.setupExperienceSoftwareTeam(context.Background(), 7)
+	require.NoError(t, err)
+	require.Equal(t, "Workstations", name)
+	require.NotNil(t, setup)
+	require.True(t, setup.ManualAgentInstall.Valid)
+	require.False(t, setup.ManualAgentInstall.Value)
 }
