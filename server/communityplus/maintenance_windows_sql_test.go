@@ -2,6 +2,7 @@ package communityplus
 
 import (
 	"context"
+	"errors"
 	"testing"
 	"time"
 
@@ -94,7 +95,7 @@ func TestSQLStoreMaintenanceWindowScopeConflict(t *testing.T) {
 		WithArgs(window.ID).
 		WillReturnRows(sqlmock.NewRows([]string{"fleet_id"}).AddRow(8))
 
-	if err := store.UpsertMaintenanceWindow(context.Background(), window); err != ErrScopeConflict {
+	if err := store.UpsertMaintenanceWindow(context.Background(), window); !errors.Is(err, ErrScopeConflict) {
 		t.Fatalf("expected ErrScopeConflict, got %v", err)
 	}
 	if err := mock.ExpectationsWereMet(); err != nil {
