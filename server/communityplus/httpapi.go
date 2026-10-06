@@ -88,6 +88,7 @@ func (a *HTTPAPI) Handler() http.Handler {
 		mux.HandleFunc("POST "+base+"/catalog/deployments", a.createCatalogDeployment)
 		mux.HandleFunc("GET "+base+"/catalog/deployments", a.listCatalogDeployments)
 		mux.HandleFunc("GET "+base+"/catalog/deployments/{id}/results", a.listCatalogDeploymentResults)
+		mux.HandleFunc("POST "+base+"/catalog/deployments/{id}/hosts/{host_id}/retry", a.retryCatalogDeployment)
 	}
 	return mux
 }
@@ -475,6 +476,53 @@ func writeJSON(w http.ResponseWriter, status int, value any) {
 	w.Header().Set("Content-Type", "application/json; charset=utf-8")
 	w.WriteHeader(status)
 	_ = json.NewEncoder(w).Encode(value)
+}
+
+
+func (a *HTTPAPI) retryCatalogDeployment(w http.ResponseWriter, r *http.Request) {
+	store, err := a.requireCatalogStore()
+	if err != nil {
+		writeAPIError(w, err)
+		return
+	}
+	retryStore, ok := store.(DeploymentRetryStore)
+	if !ok {
+		writeAPIError(w, fmt.Errorf("communityplus: deployment retry is not configured"))
+		return
+	}
+	deployment, err := store.GetDeployment(r.Context(), r.PathValue("id"))
+	if err != nil {
+		writeAPIError(w, err)
+		return
+	}
+	actor, err := a.access.Authorize(r.Context(), Request{Resource: ResourceSoftware, Action: ActionExecute, Scope: deployment.Scope})
+	if err != nil {
+		writeAPIError(w, err)
+		return
+	}
+	hostID64, err := strconv.ParseUint(r.PathValue("host_id"), 10, 0)
+	if err != nil || hostID64 == 0 {
+		writeAPIError(w, fmt.Errorf("communityplus: invalid host_id"))
+		return
+	}
+	hostID := uint(hostID64)
+	if err := retryStore.RetryDeployment(r.Context(), deployment.ID, hostID); err != nil {
+		writeAPIError(w, err)
+		return
+	}
+	if err := a.auditRecorder.Record(r.Context(), AuditEvent{
+		ActorID: actor, Action: "catalog_deployment.retry", Resource: ResourceSoftware,
+		ResourceID: deployment.ID, Scope: deployment.Scope,
+		Metadata: map[string]string{"host_id": strconv.FormatUint(uint64(hostID), 10)},
+	}); err != nil {
+		writeAPIError(w, err)
+		return
+	}
+	writeJSON(w, http.StatusAccepted, map[string]any{
+		"deployment_id": deployment.ID,
+		"host_id":       hostID,
+		"status":        "retry_queued",
+	})
 }
 
 func (a *HTTPAPI) listCatalogDeploymentResults(w http.ResponseWriter, r *http.Request) {

@@ -9,6 +9,7 @@ import (
 	"net/http/httptest"
 	"sync"
 	"testing"
+	"time"
 )
 
 type roleAccessController struct {
@@ -290,5 +291,96 @@ func TestHTTPAPICatalogSearchAndFleetDeployment(t *testing.T) {
 	api.Handler().ServeHTTP(res, req)
 	if res.Code != http.StatusOK || !bytes.Contains(res.Body.Bytes(), []byte("team-seven-powertoys")) {
 		t.Fatalf("deployment listing failed: status=%d body=%s", res.Code, res.Body.String())
+	}
+}
+
+
+type retryCatalogStore struct {
+	*memoryCatalogStore
+	retryDeploymentID string
+	retryHostID       uint
+	retryErr          error
+}
+
+func (s *retryCatalogStore) RetryDeployment(_ context.Context, deploymentID string, hostID uint) error {
+	if s.retryErr != nil {
+		return s.retryErr
+	}
+	s.retryDeploymentID = deploymentID
+	s.retryHostID = hostID
+	return nil
+}
+
+func TestHTTPAPIRetryCatalogDeployment(t *testing.T) {
+	role, err := FleetAdminRole(7)
+	if err != nil {
+		t.Fatal(err)
+	}
+	foundation := newMemoryFoundationStore()
+	engine, err := NewAutomationEngine(&recordingExecutor{})
+	if err != nil {
+		t.Fatal(err)
+	}
+	catalog := &retryCatalogStore{memoryCatalogStore: &memoryCatalogStore{
+		entries: []CatalogEntry{validCatalogEntry()},
+		deployments: []Deployment{{
+			ID: "deployment-1", CatalogEntryID: "entry-1", Scope: FleetScope(7),
+			Automatic: true, CreatedAt: time.Now().UTC(), CreatedBy: "admin",
+		}},
+	}}
+	api, err := NewHTTPAPI(NewRegistry(), engine, foundation, foundation, roleAccessController{
+		actor: "fleet-7-admin", roles: []Role{role},
+	}, catalog)
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	req := httptest.NewRequest(http.MethodPost, "/api/latest/fleet/communityplus/catalog/deployments/deployment-1/hosts/42/retry", nil)
+	res := httptest.NewRecorder()
+	api.Handler().ServeHTTP(res, req)
+	if res.Code != http.StatusAccepted {
+		t.Fatalf("retry status=%d body=%s", res.Code, res.Body.String())
+	}
+	if catalog.retryDeploymentID != "deployment-1" || catalog.retryHostID != 42 {
+		t.Fatalf("unexpected retry target: deployment=%q host=%d", catalog.retryDeploymentID, catalog.retryHostID)
+	}
+	if len(foundation.events) != 1 || foundation.events[0].Action != "catalog_deployment.retry" ||
+		foundation.events[0].Scope != FleetScope(7) || foundation.events[0].Metadata["host_id"] != "42" {
+		t.Fatalf("unexpected retry audit event: %#v", foundation.events)
+	}
+}
+
+func TestHTTPAPIRetryCatalogDeploymentEnforcesFleetScope(t *testing.T) {
+	role, err := FleetAdminRole(8)
+	if err != nil {
+		t.Fatal(err)
+	}
+	foundation := newMemoryFoundationStore()
+	engine, err := NewAutomationEngine(&recordingExecutor{})
+	if err != nil {
+		t.Fatal(err)
+	}
+	catalog := &retryCatalogStore{memoryCatalogStore: &memoryCatalogStore{
+		entries: []CatalogEntry{validCatalogEntry()},
+		deployments: []Deployment{{
+			ID: "deployment-1", CatalogEntryID: "entry-1", Scope: FleetScope(7),
+			Automatic: true, CreatedAt: time.Now().UTC(), CreatedBy: "admin",
+		}},
+	}}
+	api, err := NewHTTPAPI(NewRegistry(), engine, foundation, foundation, roleAccessController{
+		actor: "fleet-8-admin", roles: []Role{role},
+	}, catalog)
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	req := httptest.NewRequest(http.MethodPost, "/api/latest/fleet/communityplus/catalog/deployments/deployment-1/hosts/42/retry", nil)
+	res := httptest.NewRecorder()
+	api.Handler().ServeHTTP(res, req)
+	if res.Code != http.StatusForbidden {
+		t.Fatalf("retry cross-fleet status=%d body=%s", res.Code, res.Body.String())
+	}
+	if catalog.retryDeploymentID != "" || catalog.retryHostID != 0 {
+		t.Fatal("cross-fleet retry reached deployment store")
 	}
 }

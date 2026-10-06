@@ -230,3 +230,48 @@ func TestSQLStoreRejectsDeploymentScopeChange(t *testing.T) {
 		t.Fatal(err)
 	}
 }
+
+
+func TestSQLStoreRetriesFailedDeployment(t *testing.T) {
+	db, mock, err := sqlmock.New()
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer db.Close()
+	store, err := NewSQLStore(db)
+	if err != nil {
+		t.Fatal(err)
+	}
+	mock.ExpectExec("UPDATE communityplus_deployment_results").
+		WithArgs("deployment-1", uint(42)).
+		WillReturnResult(sqlmock.NewResult(0, 1))
+
+	if err := store.RetryDeployment(context.Background(), "deployment-1", 42); err != nil {
+		t.Fatalf("retry deployment: %v", err)
+	}
+	if err := mock.ExpectationsWereMet(); err != nil {
+		t.Fatal(err)
+	}
+}
+
+func TestSQLStoreRetryDeploymentRejectsMissingResult(t *testing.T) {
+	db, mock, err := sqlmock.New()
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer db.Close()
+	store, err := NewSQLStore(db)
+	if err != nil {
+		t.Fatal(err)
+	}
+	mock.ExpectExec("UPDATE communityplus_deployment_results").
+		WithArgs("deployment-1", uint(42)).
+		WillReturnResult(sqlmock.NewResult(0, 0))
+
+	if err := store.RetryDeployment(context.Background(), "deployment-1", 42); err == nil {
+		t.Fatal("expected missing failed deployment result to be rejected")
+	}
+	if err := mock.ExpectationsWereMet(); err != nil {
+		t.Fatal(err)
+	}
+}
