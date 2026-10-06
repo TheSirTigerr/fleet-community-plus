@@ -301,7 +301,6 @@ func TestProductionAutomationExecutorDefersPolicyScriptOutsideMaintenanceWindow(
 	}
 }
 
-
 func (s *memoryAutomationScriptStore) GetSoftwareInstallerMetadataByID(context.Context, uint) (*fleet.SoftwareInstaller, error) {
 	return s.installer, nil
 }
