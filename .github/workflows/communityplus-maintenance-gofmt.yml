@@ -1,0 +1,69 @@
+name: Community+ maintenance windows gofmt
+
+on:
+  push:
+    branches:
+      - community-plus/foundation
+    paths:
+      - '.github/workflows/communityplus-maintenance-gofmt.yml'
+  workflow_dispatch:
+
+permissions:
+  contents: write
+
+jobs:
+  format:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          ref: community-plus/foundation
+          fetch-depth: 0
+      - uses: actions/setup-go@v5
+        with:
+          go-version-file: go.mod
+      - name: Format maintenance window implementation
+        shell: bash
+        run: |
+          set -euo pipefail
+          gofmt -w \
+            server/communityplus/maintenance_windows.go \
+            server/communityplus/maintenance_windows_sql.go \
+            server/communityplus/maintenance_windows_test.go \
+            server/communityplus/httpapi.go \
+            server/communityplus/httpapi_test.go \
+            server/communityplus/features.go \
+            server/communityplus/runtime_registry.go \
+            server/communityplus/runtime_registry_test.go \
+            server/communityplus/sqlstore.go \
+            server/communityplus/sqlstore_platform.go \
+            server/communityplus/orbit_delivery.go \
+            server/communityplus/selfservice_test.go \
+            server/datastore/mysql/migrations/tables/20261007002000_AddCommunityPlusMaintenanceWindows.go
+          git diff --check
+      - name: Commit formatting
+        shell: bash
+        run: |
+          set -euo pipefail
+          if git diff --quiet; then
+            echo "Already formatted"
+            exit 0
+          fi
+          git config user.name 'github-actions[bot]'
+          git config user.email '41898282+github-actions[bot]@users.noreply.github.com'
+          git add \
+            server/communityplus/maintenance_windows.go \
+            server/communityplus/maintenance_windows_sql.go \
+            server/communityplus/maintenance_windows_test.go \
+            server/communityplus/httpapi.go \
+            server/communityplus/httpapi_test.go \
+            server/communityplus/features.go \
+            server/communityplus/runtime_registry.go \
+            server/communityplus/runtime_registry_test.go \
+            server/communityplus/sqlstore.go \
+            server/communityplus/sqlstore_platform.go \
+            server/communityplus/orbit_delivery.go \
+            server/communityplus/selfservice_test.go \
+            server/datastore/mysql/migrations/tables/20261007002000_AddCommunityPlusMaintenanceWindows.go
+          git commit -m 'style: gofmt Community+ maintenance windows'
+          git push origin HEAD:community-plus/foundation
