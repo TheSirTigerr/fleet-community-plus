@@ -247,7 +247,6 @@ func automationEventPolicyID(event AutomationEvent) (uint, error) {
 	return uint(policyID64), nil
 }
 
-
 func sameAutomationTeam(a, b *uint) bool {
 	if a == nil || b == nil {
 		return a == nil && b == nil
