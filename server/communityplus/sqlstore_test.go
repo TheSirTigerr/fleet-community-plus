@@ -189,7 +189,7 @@ func TestSQLStoreRejectsAutomationRuleScopeChange(t *testing.T) {
 		Trigger: TriggerPolicyFailed, Action: AutomationNotify, Enabled: true,
 	}
 	mock.ExpectExec("name = IF\\(scope_kind = VALUES\\(scope_kind\\) AND fleet_id <=> VALUES\\(fleet_id\\)").
-		WithArgs(rule.ID, rule.Name, ScopeFleet, uint(12), rule.Trigger, rule.Action, true, sqlmock.AnyArg(), sqlmock.AnyArg()).
+		WithArgs(rule.ID, rule.Name, ScopeFleet, uint(12), rule.Trigger, rule.Action, true, false, sqlmock.AnyArg(), sqlmock.AnyArg()).
 		WillReturnResult(sqlmock.NewResult(0, 0))
 	mock.ExpectQuery("SELECT scope_kind, fleet_id FROM communityplus_automation_rules").
 		WithArgs(rule.ID).
