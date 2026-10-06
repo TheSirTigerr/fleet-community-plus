@@ -39,6 +39,7 @@ type AutomationRule struct {
 	Trigger    Trigger           `json:"trigger"`
 	Action     AutomationAction  `json:"action"`
 	Enabled    bool              `json:"enabled"`
+	Continuous bool              `json:"continuous,omitempty"`
 	Conditions map[string]string `json:"conditions,omitempty"`
 	Config     map[string]string `json:"config,omitempty"`
 }
@@ -63,6 +64,9 @@ func (r AutomationRule) Validate() error {
 	default:
 		return fmt.Errorf("communityplus: invalid automation action %q", r.Action)
 	}
+	if r.Continuous && r.Trigger != TriggerPolicyFailed {
+		return fmt.Errorf("communityplus: continuous automation is only supported for policy_failed rules")
+	}
 	return nil
 }
 
@@ -71,7 +75,8 @@ type AutomationEvent struct {
 	Trigger Trigger           `json:"trigger"`
 	Scope   Scope             `json:"scope"`
 	HostID  uint              `json:"host_id,omitempty"`
-	Data    map[string]string `json:"data,omitempty"`
+	Data           map[string]string `json:"data,omitempty"`
+	ContinuousOnly bool              `json:"-"`
 }
 
 func (e AutomationEvent) Validate() error {
@@ -80,6 +85,9 @@ func (e AutomationEvent) Validate() error {
 	}
 	switch e.Trigger {
 	case TriggerPolicyFailed, TriggerPolicyPassed, TriggerVulnerabilityDetected, TriggerDeviceEnrolled, TriggerPatchDue, TriggerSoftwareMissing:
+		if e.ContinuousOnly && e.Trigger != TriggerPolicyFailed {
+			return fmt.Errorf("communityplus: continuous-only dispatch requires policy_failed trigger")
+		}
 		return nil
 	default:
 		return fmt.Errorf("communityplus: invalid automation event trigger %q", e.Trigger)
@@ -166,6 +174,9 @@ func (e *AutomationEngine) Dispatch(ctx context.Context, event AutomationEvent) 
 	candidates := make([]AutomationRule, 0, len(e.rules))
 	for _, rule := range e.rules {
 		if !rule.Enabled || rule.Trigger != event.Trigger || !rule.Scope.Contains(event.Scope) || !conditionsMatch(rule.Conditions, event.Data) {
+			continue
+		}
+		if event.ContinuousOnly && !rule.Continuous {
 			continue
 		}
 		candidates = append(candidates, rule)

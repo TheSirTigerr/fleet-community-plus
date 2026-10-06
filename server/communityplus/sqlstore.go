@@ -178,17 +178,18 @@ func (s *SQLStore) UpsertAutomationRule(ctx context.Context, rule AutomationRule
 	}
 	_, err = s.db.ExecContext(ctx, `
 INSERT INTO communityplus_automation_rules
-    (id, name, scope_kind, fleet_id, trigger_name, action_name, enabled, conditions, config)
-VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
+    (id, name, scope_kind, fleet_id, trigger_name, action_name, enabled, continuous, conditions, config)
+VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
 ON DUPLICATE KEY UPDATE
     name = IF(scope_kind = VALUES(scope_kind) AND fleet_id <=> VALUES(fleet_id), VALUES(name), name),
     trigger_name = IF(scope_kind = VALUES(scope_kind) AND fleet_id <=> VALUES(fleet_id), VALUES(trigger_name), trigger_name),
     action_name = IF(scope_kind = VALUES(scope_kind) AND fleet_id <=> VALUES(fleet_id), VALUES(action_name), action_name),
     enabled = IF(scope_kind = VALUES(scope_kind) AND fleet_id <=> VALUES(fleet_id), VALUES(enabled), enabled),
+    continuous = IF(scope_kind = VALUES(scope_kind) AND fleet_id <=> VALUES(fleet_id), VALUES(continuous), continuous),
     conditions = IF(scope_kind = VALUES(scope_kind) AND fleet_id <=> VALUES(fleet_id), VALUES(conditions), conditions),
     config = IF(scope_kind = VALUES(scope_kind) AND fleet_id <=> VALUES(fleet_id), VALUES(config), config)`,
 		rule.ID, rule.Name, rule.Scope.Kind, fleetID, rule.Trigger, rule.Action,
-		rule.Enabled, conditions, config,
+		rule.Enabled, rule.Continuous, conditions, config,
 	)
 	if err != nil {
 		return fmt.Errorf("communityplus: upsert automation rule: %w", err)
@@ -229,7 +230,7 @@ func (s *SQLStore) DeleteAutomationRule(ctx context.Context, id string) error {
 // ListAutomationRules returns all rules in stable ID order for deterministic startup.
 func (s *SQLStore) ListAutomationRules(ctx context.Context) ([]AutomationRule, error) {
 	rows, err := s.db.QueryContext(ctx, `
-SELECT id, name, scope_kind, fleet_id, trigger_name, action_name, enabled, conditions, config
+SELECT id, name, scope_kind, fleet_id, trigger_name, action_name, enabled, continuous, conditions, config
 FROM communityplus_automation_rules
 ORDER BY id`)
 	if err != nil {
@@ -244,7 +245,7 @@ ORDER BY id`)
 		var conditions, config []byte
 		if err := rows.Scan(
 			&rule.ID, &rule.Name, &rule.Scope.Kind, &fleetID, &rule.Trigger,
-			&rule.Action, &rule.Enabled, &conditions, &config,
+			&rule.Action, &rule.Enabled, &rule.Continuous, &conditions, &config,
 		); err != nil {
 			return nil, fmt.Errorf("communityplus: scan automation rule: %w", err)
 		}

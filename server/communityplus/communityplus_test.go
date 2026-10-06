@@ -174,3 +174,40 @@ func TestAutomationEngineStopsOnExecutorError(t *testing.T) {
 		t.Fatal("expected executor error")
 	}
 }
+
+
+func TestAutomationEngineContinuousOnlyDispatch(t *testing.T) {
+	executor := &recordingExecutor{}
+	engine, err := NewAutomationEngine(executor)
+	if err != nil {
+		t.Fatal(err)
+	}
+	for _, rule := range []AutomationRule{
+		{ID: "once", Name: "Once", Scope: FleetScope(7), Trigger: TriggerPolicyFailed, Action: AutomationNotify, Enabled: true},
+		{ID: "continuous", Name: "Continuous", Scope: FleetScope(7), Trigger: TriggerPolicyFailed, Action: AutomationNotify, Enabled: true, Continuous: true},
+	} {
+		if err := engine.UpsertRule(rule); err != nil {
+			t.Fatal(err)
+		}
+	}
+
+	executed, err := engine.Dispatch(context.Background(), AutomationEvent{
+		Trigger: TriggerPolicyFailed, Scope: FleetScope(7), HostID: 42, ContinuousOnly: true,
+	})
+	if err != nil {
+		t.Fatalf("continuous dispatch: %v", err)
+	}
+	if len(executed) != 1 || executed[0] != "continuous" {
+		t.Fatalf("continuous dispatch executed %#v", executed)
+	}
+}
+
+func TestAutomationRuleRejectsContinuousNonPolicyTrigger(t *testing.T) {
+	rule := AutomationRule{
+		ID: "invalid", Name: "Invalid", Scope: FleetScope(7),
+		Trigger: TriggerPatchDue, Action: AutomationNotify, Enabled: true, Continuous: true,
+	}
+	if err := rule.Validate(); err == nil {
+		t.Fatal("expected continuous non-policy rule to be rejected")
+	}
+}

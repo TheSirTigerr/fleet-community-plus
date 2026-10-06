@@ -33,12 +33,15 @@ func automationScopeForHost(host *fleet.Host) Scope {
 	return GlobalScope()
 }
 
-// DispatchPolicyTransitions feeds real policy membership transitions into the
-// Community+ automation engine. If Community+ routes have not been initialized,
-// this is a no-op so core osquery ingestion remains independent of the extension.
-func DispatchPolicyTransitions(
+// DispatchPolicyResults feeds real policy membership results into the Community+
+ // automation engine. Newly failing policies dispatch all matching rules once.
+ // Policies that remain failed dispatch only rules explicitly marked continuous.
+ // If Community+ routes have not been initialized, this is a no-op so core
+ // osquery ingestion remains independent of the extension.
+func DispatchPolicyResults(
 	ctx context.Context,
 	host *fleet.Host,
+	failing []uint,
 	newFailing []uint,
 	newPassing []uint,
 ) ([]string, error) {
@@ -49,13 +52,15 @@ func DispatchPolicyTransitions(
 
 	scope := automationScopeForHost(host)
 	executed := make([]string, 0)
-	dispatch := func(trigger Trigger, policyID uint) error {
+	dispatch := func(trigger Trigger, policyID uint, transition string, continuousOnly bool) error {
 		rules, err := engine.Dispatch(ctx, AutomationEvent{
-			Trigger: trigger,
-			Scope:   scope,
-			HostID:  host.ID,
+			Trigger:        trigger,
+			Scope:          scope,
+			HostID:         host.ID,
+			ContinuousOnly: continuousOnly,
 			Data: map[string]string{
-				"policy_id": strconv.FormatUint(uint64(policyID), 10),
+				"policy_id":  strconv.FormatUint(uint64(policyID), 10),
+				"transition": transition,
 			},
 		})
 		if err != nil {
@@ -65,15 +70,35 @@ func DispatchPolicyTransitions(
 		return nil
 	}
 
+	newFailingSet := make(map[uint]struct{}, len(newFailing))
 	for _, policyID := range newFailing {
-		if err := dispatch(TriggerPolicyFailed, policyID); err != nil {
+		newFailingSet[policyID] = struct{}{}
+		if err := dispatch(TriggerPolicyFailed, policyID, "new_failed", false); err != nil {
+			return executed, err
+		}
+	}
+	for _, policyID := range failing {
+		if _, newlyFailed := newFailingSet[policyID]; newlyFailed {
+			continue
+		}
+		if err := dispatch(TriggerPolicyFailed, policyID, "still_failed", true); err != nil {
 			return executed, err
 		}
 	}
 	for _, policyID := range newPassing {
-		if err := dispatch(TriggerPolicyPassed, policyID); err != nil {
+		if err := dispatch(TriggerPolicyPassed, policyID, "passed", false); err != nil {
 			return executed, err
 		}
 	}
 	return executed, nil
+}
+
+// DispatchPolicyTransitions preserves the transition-only integration surface.
+func DispatchPolicyTransitions(
+	ctx context.Context,
+	host *fleet.Host,
+	newFailing []uint,
+	newPassing []uint,
+) ([]string, error) {
+	return DispatchPolicyResults(ctx, host, newFailing, newFailing, newPassing)
 }

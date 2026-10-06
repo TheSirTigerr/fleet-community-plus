@@ -64,13 +64,14 @@ func TestSQLStoreUpsertsAndListsAutomationRules(t *testing.T) {
 		Trigger:    TriggerPolicyFailed,
 		Action:     AutomationRunScript,
 		Enabled:    true,
+		Continuous: true,
 		Conditions: map[string]string{"policy": "disk-encryption"},
 		Config:     map[string]string{"script_id": "42"},
 	}
 	mock.ExpectExec("INSERT INTO communityplus_automation_rules").
 		WithArgs(
 			rule.ID, rule.Name, ScopeFleet, uint(12), rule.Trigger, rule.Action,
-			true, sqlmock.AnyArg(), sqlmock.AnyArg(),
+			true, true, sqlmock.AnyArg(), sqlmock.AnyArg(),
 		).
 		WillReturnResult(sqlmock.NewResult(1, 1))
 	mock.ExpectQuery("SELECT scope_kind, fleet_id FROM communityplus_automation_rules").
@@ -82,11 +83,11 @@ func TestSQLStoreUpsertsAndListsAutomationRules(t *testing.T) {
 
 	columns := []string{
 		"id", "name", "scope_kind", "fleet_id", "trigger_name",
-		"action_name", "enabled", "conditions", "config",
+		"action_name", "enabled", "continuous", "conditions", "config",
 	}
 	mock.ExpectQuery("SELECT id, name, scope_kind, fleet_id").
 		WillReturnRows(sqlmock.NewRows(columns).AddRow(
-			rule.ID, rule.Name, ScopeFleet, 12, rule.Trigger, rule.Action, true,
+			rule.ID, rule.Name, ScopeFleet, 12, rule.Trigger, rule.Action, true, true,
 			[]byte(`{"policy":"disk-encryption"}`), []byte(`{"script_id":"42"}`),
 		))
 	rules, err := store.ListAutomationRules(context.Background())
@@ -96,7 +97,7 @@ func TestSQLStoreUpsertsAndListsAutomationRules(t *testing.T) {
 	if len(rules) != 1 {
 		t.Fatalf("expected one rule, got %d", len(rules))
 	}
-	if got := rules[0]; got.ID != rule.ID || got.Scope != rule.Scope || got.Config["script_id"] != "42" {
+	if got := rules[0]; got.ID != rule.ID || got.Scope != rule.Scope || !got.Continuous || got.Config["script_id"] != "42" {
 		t.Fatalf("unexpected restored rule: %#v", got)
 	}
 	if err := mock.ExpectationsWereMet(); err != nil {

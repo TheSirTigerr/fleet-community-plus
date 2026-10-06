@@ -2058,7 +2058,8 @@ func (svc *Service) SubmitDistributedQueryResults(
 			"results_in_scope", len(policyResults),
 		)
 
-		if _, err := communityplus.DispatchPolicyTransitions(ctx, host, newFailing, newPassing); err != nil {
+		failingPolicyIDs, _, _ := summarizePolicyResults(policyResults)
+		if _, err := communityplus.DispatchPolicyResults(ctx, host, failingPolicyIDs, newFailing, newPassing); err != nil {
 			logging.WithErr(ctx, ctxerr.Wrap(ctx, err, "dispatch Community+ policy automations"))
 		}
 

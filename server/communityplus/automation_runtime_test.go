@@ -32,6 +32,13 @@ func TestDispatchPolicyTransitions(t *testing.T) {
 		t.Fatal(err)
 	}
 	if err := engine.UpsertRule(AutomationRule{
+		ID: "continuous-repair", Name: "Continuous repair", Scope: FleetScope(7),
+		Trigger: TriggerPolicyFailed, Action: AutomationNotify, Enabled: true, Continuous: true,
+		Conditions: map[string]string{"policy_id": "12"},
+	}); err != nil {
+		t.Fatal(err)
+	}
+	if err := engine.UpsertRule(AutomationRule{
 		ID: "notify-on-pass", Name: "Notify on pass", Scope: FleetScope(7),
 		Trigger: TriggerPolicyPassed, Action: AutomationNotify, Enabled: true,
 		Conditions: map[string]string{"policy_id": "11"},
@@ -44,21 +51,25 @@ func TestDispatchPolicyTransitions(t *testing.T) {
 
 	teamID := uint(7)
 	host := &fleet.Host{ID: 42, TeamID: &teamID}
-	executed, err := DispatchPolicyTransitions(context.Background(), host, []uint{10, 12}, []uint{11})
+	executed, err := DispatchPolicyResults(context.Background(), host, []uint{10, 12}, []uint{10}, []uint{11})
 	if err != nil {
 		t.Fatalf("dispatch policy transitions: %v", err)
 	}
-	if len(executed) != 2 {
-		t.Fatalf("executed rules = %#v, want two matches", executed)
+	if len(executed) != 3 {
+		t.Fatalf("executed rules = %#v, want three matches", executed)
 	}
-	if len(executor.events) != 2 {
-		t.Fatalf("events = %#v, want two matching events", executor.events)
+	if len(executor.events) != 3 {
+		t.Fatalf("events = %#v, want three matching events", executor.events)
 	}
 	if executor.events[0].Trigger != TriggerPolicyFailed || executor.events[0].Data["policy_id"] != "10" {
 		t.Fatalf("unexpected failure event: %#v", executor.events[0])
 	}
-	if executor.events[1].Trigger != TriggerPolicyPassed || executor.events[1].Data["policy_id"] != "11" {
-		t.Fatalf("unexpected passing event: %#v", executor.events[1])
+	if executor.events[1].Trigger != TriggerPolicyFailed || executor.events[1].Data["policy_id"] != "12" ||
+		!executor.events[1].ContinuousOnly || executor.events[1].Data["transition"] != "still_failed" {
+		t.Fatalf("unexpected continuous failure event: %#v", executor.events[1])
+	}
+	if executor.events[2].Trigger != TriggerPolicyPassed || executor.events[2].Data["policy_id"] != "11" {
+		t.Fatalf("unexpected passing event: %#v", executor.events[2])
 	}
 	for _, event := range executor.events {
 		if event.Scope != FleetScope(7) || event.HostID != 42 {
