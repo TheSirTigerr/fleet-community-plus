@@ -68,7 +68,7 @@ func comparePatchVersions(current, candidate string) (int, bool) {
 }
 
 func safePatchUpgrade(current, candidate CatalogEntry) bool {
-	if current.Provider != candidate.Provider || current.Provider != CatalogProviderWinget {
+	if current.Provider != candidate.Provider || !supportedCatalogProvider(current.Provider) {
 		return false
 	}
 	if !strings.EqualFold(current.PackageIdentifier, candidate.PackageIdentifier) {

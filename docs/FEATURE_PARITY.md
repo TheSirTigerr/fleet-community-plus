@@ -53,7 +53,7 @@ This document tracks independently implemented equivalents for Fleet Premium cap
 
 ## Patching and remediation
 
-- [ ] Patch policies
+- [x] Patch policies
 - [ ] Automated remediation
 - [ ] Policy-triggered scripts
 - [ ] Policy-triggered software installs

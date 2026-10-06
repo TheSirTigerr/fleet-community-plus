@@ -40,4 +40,11 @@ func TestSafePatchUpgradeRejectsDowngradeAndInstallerSwitch(t *testing.T) {
 	if safePatchUpgrade(current, candidate) {
 		t.Fatal("installer type switch must be rejected")
 	}
+
+	homebrewCurrent := CatalogEntry{Provider: CatalogProviderHomebrew, PackageIdentifier: "example", Version: "2.4.0", InstallerType: "pkg"}
+	homebrewCandidate := homebrewCurrent
+	homebrewCandidate.Version = "2.4.1"
+	if !safePatchUpgrade(homebrewCurrent, homebrewCandidate) {
+		t.Fatal("expected newer Homebrew direct PKG version to be accepted")
+	}
 }

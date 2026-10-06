@@ -21,7 +21,7 @@ func newRuntimeRegistry() *Registry {
 	mustSetRuntimeStatus(registry, FeatureRemoteActions, StatusAvailable)
 	mustSetRuntimeStatus(registry, FeatureCertificates, StatusAvailable)
 	mustSetRuntimeStatus(registry, FeatureSoftwareAutomation, StatusExperimental)
-	mustSetRuntimeStatus(registry, FeaturePatchPolicies, StatusExperimental)
+	mustSetRuntimeStatus(registry, FeaturePatchPolicies, StatusAvailable)
 	return registry
 }
 
