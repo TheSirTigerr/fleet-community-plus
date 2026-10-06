@@ -175,7 +175,7 @@ func ReleasePendingSoftwareUninstallAutomations(ctx context.Context, host *fleet
 		if installer == nil || strings.TrimSpace(installer.UninstallScript) == "" || installer.UninstallScriptContentID == 0 {
 			return fmt.Errorf("communityplus: software installer %d has no uninstall script", req.InstallerID)
 		}
-		if err := fleet.ValidateHostScriptContents(installer.UninstallScript, true); err != nil {
+		if err := fleet.ValidateSoftwareInstallerScript(installer.UninstallScript, installer.Platform); err != nil {
 			return fmt.Errorf("communityplus: validate deferred uninstall script: %w", err)
 		}
 
