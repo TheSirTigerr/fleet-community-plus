@@ -47,7 +47,7 @@ This document tracks independently implemented equivalents for Fleet Premium cap
 - [x] Software package deployment
 - [x] Self-service software catalog
 - [x] Setup-experience software
-- [ ] Install/uninstall automation
+- [x] Install/uninstall automation
 - [ ] Munki integration
 - [ ] Private software/update registry support
 
