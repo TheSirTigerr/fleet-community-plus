@@ -367,6 +367,9 @@ ON DUPLICATE KEY UPDATE
 	if storedFleetID != deployment.Scope.FleetID {
 		return fmt.Errorf("%w: catalog deployment %q", ErrScopeConflict, deployment.ID)
 	}
+	if err := s.syncSelfServiceDeployment(ctx, deployment); err != nil {
+		return err
+	}
 	return nil
 }
 
@@ -405,7 +408,7 @@ func (s *SQLStore) GetDeployment(ctx context.Context, id string) (Deployment, er
 	return d, nil
 }
 func (s *SQLStore) PendingDeploymentIDs(ctx context.Context, hostID, fleetID uint) ([]string, error) {
-	rows, err := s.db.QueryContext(ctx, `SELECT d.id FROM communityplus_catalog_deployments d LEFT JOIN communityplus_deployment_results r ON r.deployment_id = d.id AND r.host_id = ? WHERE d.fleet_id = ? AND d.automatic_install = 1 AND (r.deployment_id IS NULL OR (r.exit_code <> 0 AND r.attempt_count < 3 AND r.updated_at <= DATE_SUB(NOW(6), INTERVAL 5 MINUTE))) ORDER BY d.created_at, d.id`, hostID, fleetID)
+	rows, err := s.db.QueryContext(ctx, `SELECT d.id FROM communityplus_catalog_deployments d LEFT JOIN communityplus_deployment_results r ON r.deployment_id = d.id AND r.host_id = ? LEFT JOIN communityplus_self_service_requests q ON q.deployment_id = d.id AND q.host_id = ? WHERE d.fleet_id = ? AND (d.automatic_install = 1 OR (d.self_service = 1 AND q.deployment_id IS NOT NULL)) AND (r.deployment_id IS NULL OR (r.exit_code <> 0 AND r.attempt_count < 3 AND r.updated_at <= DATE_SUB(NOW(6), INTERVAL 5 MINUTE))) ORDER BY d.created_at, d.id`, hostID, hostID, fleetID)
 	if err != nil {
 		return nil, fmt.Errorf("communityplus: list pending deployments: %w", err)
 	}

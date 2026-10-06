@@ -17,9 +17,11 @@ SELECT d.id
 FROM communityplus_catalog_deployments d
 JOIN communityplus_catalog_entries e ON e.id = d.catalog_entry_id
 LEFT JOIN communityplus_deployment_results r ON r.deployment_id = d.id AND r.host_id = ?
-WHERE d.fleet_id = ? AND d.automatic_install = 1 AND e.provider = ?
+LEFT JOIN communityplus_self_service_requests q ON q.deployment_id = d.id AND q.host_id = ?
+WHERE d.fleet_id = ? AND e.provider = ?
+  AND (d.automatic_install = 1 OR (d.self_service = 1 AND q.deployment_id IS NOT NULL))
   AND (r.deployment_id IS NULL OR (r.exit_code <> 0 AND r.attempt_count < 3 AND r.updated_at <= DATE_SUB(NOW(6), INTERVAL 5 MINUTE)))
-ORDER BY d.created_at, d.id`, hostID, fleetID, provider)
+ORDER BY d.created_at, d.id`, hostID, hostID, fleetID, provider)
 	if err != nil {
 		return nil, fmt.Errorf("communityplus: list pending provider deployments: %w", err)
 	}
