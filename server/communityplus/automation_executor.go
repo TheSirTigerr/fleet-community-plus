@@ -210,7 +210,6 @@ func (e *productionAutomationExecutor) runScript(ctx context.Context, rule Autom
 	return nil
 }
 
-
 func automationEventPolicyID(event AutomationEvent) (uint, error) {
 	rawPolicyID := strings.TrimSpace(event.Data["policy_id"])
 	if rawPolicyID == "" {

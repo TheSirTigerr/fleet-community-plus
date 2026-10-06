@@ -242,7 +242,6 @@ func TestProductionAutomationExecutorRejectsDisabledScripts(t *testing.T) {
 	}
 }
 
-
 func TestProductionAutomationExecutorDefersPolicyScriptOutsideMaintenanceWindow(t *testing.T) {
 	teamID := uint(7)
 	orbitKey := "orbit-key"

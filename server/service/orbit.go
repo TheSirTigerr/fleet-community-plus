@@ -2092,17 +2092,20 @@ func (svc *Service) OrbitDownloadSoftwareInstaller(ctx context.Context, installe
 	return nil, fleet.ErrMissingLicense
 }
 
-
 func getOrbitCommunityPlusDeploymentEndpoint(ctx context.Context, request interface{}, _ fleet.Service) (fleet.Errorer, error) {
 	host, ok := hostctx.FromContext(ctx)
-	if !ok { return fleet.OrbitGetCommunityPlusDeploymentResponse{Err: fmt.Errorf("missing Orbit host")}, nil }
+	if !ok {
+		return fleet.OrbitGetCommunityPlusDeploymentResponse{Err: fmt.Errorf("missing Orbit host")}, nil
+	}
 	plan, err := communityplus.OrbitWindowsPlan(ctx, host, request.(*fleet.OrbitGetCommunityPlusDeploymentRequest).DeploymentID)
 	return fleet.OrbitGetCommunityPlusDeploymentResponse{Err: err, Plan: plan}, nil
 }
 
 func postOrbitCommunityPlusDeploymentResultEndpoint(ctx context.Context, request interface{}, _ fleet.Service) (fleet.Errorer, error) {
 	host, ok := hostctx.FromContext(ctx)
-	if !ok { return fleet.OrbitPostCommunityPlusDeploymentResultResponse{Err: fmt.Errorf("missing Orbit host")}, nil }
+	if !ok {
+		return fleet.OrbitPostCommunityPlusDeploymentResultResponse{Err: fmt.Errorf("missing Orbit host")}, nil
+	}
 	err := communityplus.RecordOrbitDeploymentResult(ctx, host, request.(*fleet.OrbitPostCommunityPlusDeploymentResultRequest).CommunityPlusDeploymentResult)
 	return fleet.OrbitPostCommunityPlusDeploymentResultResponse{Err: err}, nil
 }
