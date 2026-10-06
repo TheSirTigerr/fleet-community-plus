@@ -302,7 +302,7 @@ func (e *productionAutomationExecutor) uninstallSoftware(ctx context.Context, ru
 	if installer == nil || strings.TrimSpace(installer.UninstallScript) == "" || installer.UninstallScriptContentID == 0 {
 		return fmt.Errorf("software installer %d has no uninstall script", installerID)
 	}
-	if err := fleet.ValidateHostScriptContents(installer.UninstallScript, true); err != nil {
+	if err := fleet.ValidateSoftwareInstallerScript(installer.UninstallScript, installer.Platform); err != nil {
 		return fmt.Errorf("validate automation uninstall script: %w", err)
 	}
 
