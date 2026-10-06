@@ -201,3 +201,32 @@ func TestProductionAutomationExecutorRejectsCrossFleetScript(t *testing.T) {
 		t.Fatal("expected cross-Fleet script to be rejected")
 	}
 }
+
+
+func TestProductionAutomationExecutorRejectsDisabledScripts(t *testing.T) {
+	teamID := uint(7)
+	orbitKey := "orbit-key"
+	cfg := &fleet.AppConfig{}
+	cfg.ServerSettings.ScriptsDisabled = true
+	scriptStore := &memoryAutomationScriptStore{
+		config:  cfg,
+		host:    &fleet.Host{ID: 42, TeamID: &teamID, Platform: "windows", OrbitNodeKey: &orbitKey},
+		script:  &fleet.Script{ID: 9, TeamID: &teamID, Name: "repair.ps1"},
+		content: []byte("Write-Output 'repair'"),
+	}
+	executor, err := newProductionAutomationExecutor(&memoryAutomationDeploymentStore{}, scriptStore)
+	if err != nil {
+		t.Fatal(err)
+	}
+	err = executor.ExecuteAutomation(context.Background(), AutomationRule{
+		ID: "script-rule", Name: "Repair", Scope: FleetScope(7),
+		Trigger: TriggerPolicyFailed, Action: AutomationRunScript, Enabled: true,
+		Config: map[string]string{"script_id": "9"},
+	}, AutomationEvent{Trigger: TriggerPolicyFailed, Scope: FleetScope(7), HostID: 42})
+	if err == nil {
+		t.Fatal("expected globally disabled scripts to reject automation")
+	}
+	if scriptStore.request != nil {
+		t.Fatal("disabled script automation queued a script")
+	}
+}
