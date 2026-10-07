@@ -16,7 +16,6 @@ import (
 
 	"github.com/fleetdm/fleet/v4/pkg/download"
 	"github.com/fleetdm/fleet/v4/pkg/fleethttp"
-	"github.com/fleetdm/fleet/v4/server/contexts/license"
 	"github.com/fleetdm/fleet/v4/server/fleet"
 	"github.com/fleetdm/fleet/v4/server/ptr"
 	"github.com/fleetdm/fleet/v4/server/vulnerabilities/nvd/tools/cvefeed"
@@ -313,11 +312,6 @@ func CVEMetaFromFiles(ctx context.Context, vulnPath string, logger *slog.Logger)
 // LoadCVEMeta loads the cvss scores, epss scores, and known exploits from the previously downloaded feeds and saves
 // them to the database.
 func LoadCVEMeta(ctx context.Context, logger *slog.Logger, vulnPath string, ds fleet.Datastore) error {
-	if !license.IsPremium(ctx) {
-		logger.InfoContext(ctx, "skipping cve_meta parsing due to license check")
-		return nil
-	}
-
 	metaMap, err := CVEMetaFromFiles(ctx, vulnPath, logger)
 	if err != nil {
 		return err

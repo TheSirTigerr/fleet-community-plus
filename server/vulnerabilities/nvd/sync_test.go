@@ -8,7 +8,6 @@ import (
 	"testing"
 
 	"github.com/fleetdm/fleet/v4/pkg/nettest"
-	"github.com/fleetdm/fleet/v4/server/contexts/license"
 	"github.com/fleetdm/fleet/v4/server/fleet"
 	"github.com/fleetdm/fleet/v4/server/mock"
 	"github.com/stretchr/testify/require"
@@ -58,9 +57,7 @@ func TestLoadCVEMeta(t *testing.T) {
 	}
 
 	logger := slog.New(slog.DiscardHandler)
-	err := LoadCVEMeta(license.NewContext(context.Background(), &fleet.LicenseInfo{
-		Tier: "premium",
-	}), logger, "../testdata", ds)
+	err := LoadCVEMeta(context.Background(), logger, "../testdata", ds)
 	require.NoError(t, err)
 	require.True(t, ds.InsertCVEMetaFuncInvoked)
 
