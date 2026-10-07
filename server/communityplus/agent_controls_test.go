@@ -44,7 +44,6 @@ func TestValidateAgentOptionsRejectsInvalidUpdateChannels(t *testing.T) {
 	}
 }
 
-
 func TestValidateAgentOptionsAllowsControlledUpdateRollout(t *testing.T) {
 	raw := json.RawMessage(`{
 		"config":{},
