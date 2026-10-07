@@ -158,7 +158,6 @@ func TestVulnerabilityEnrichmentWrapperScopesSoftwareFilters(t *testing.T) {
 	}
 }
 
-
 func TestVulnerabilityEnrichmentWrapperUnlocksHostSoftwareSeverityFilters(t *testing.T) {
 	base := new(servicemock.Service)
 	var gotCtx context.Context
