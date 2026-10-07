@@ -104,14 +104,13 @@ func (s *vulnerabilityEnrichmentWrapper) CountSoftware(
 	return s.ds.CountSoftware(ctx, opt)
 }
 
-
 type communityPlusVulnerabilityLicense struct{}
 
-func (communityPlusVulnerabilityLicense) IsPremium() bool                 { return true }
-func (communityPlusVulnerabilityLicense) IsAllowDisableTelemetry() bool   { return false }
-func (communityPlusVulnerabilityLicense) GetTier() string                 { return "community-plus" }
-func (communityPlusVulnerabilityLicense) GetOrganization() string         { return "" }
-func (communityPlusVulnerabilityLicense) GetDeviceCount() int             { return 0 }
+func (communityPlusVulnerabilityLicense) IsPremium() bool { return true }
+func (communityPlusVulnerabilityLicense) IsAllowDisableTelemetry() bool { return false }
+func (communityPlusVulnerabilityLicense) GetTier() string { return "community-plus" }
+func (communityPlusVulnerabilityLicense) GetOrganization() string { return "" }
+func (communityPlusVulnerabilityLicense) GetDeviceCount() int { return 0 }
 
 func hasCommunityPlusHostVulnerabilityFilter(opt fleet.HostSoftwareTitleListOptions) bool {
 	return opt.MaximumCVSS > 0 || opt.MinimumCVSS > 0 || opt.KnownExploit
