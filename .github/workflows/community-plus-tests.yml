@@ -138,7 +138,36 @@ jobs:
           ./server/vulnerabilities/nvd/tools/cvefeed/...
 
       - name: Test Community+ vulnerability enrichment
-        run: go test ./server/vulnerabilities/nvd -run '^TestLoadCVEMeta$'
+        run: go test ./server/vulnerabilities/nvd -run '^TestLoadCVEMeta      - name: Test Community+ core service regressions
+        run: >-
+          go test ./server/service
+          -run '^(TestCommunityPlusGetSSOUser|TestValidateMDMAllowsCommunityPlusMacOSMigrationWithoutPremiumLicense|TestValidateMDMAllowsCommunityPlusHostNameTemplateWithoutPremiumLicense|TestUpdateMDMHostNameTemplateIsNotPremiumLicenseGated|TestValidateMDMAllowsCommunityPlusDiskEncryptionWithoutPremiumLicense|TestUpdateMDMDiskEncryptionIsNotPremiumLicenseGated|TestHostEncryptionKey|TestCommunityPlusRotateRecoveryLock.*|TestCommunityPlusPolicyScriptRetry.*)$'
+      - name: Test Community+ configuration profile regressions
+        run: >-
+          go test ./server/service
+          -run '^(TestNewMDMAppleConfigProfile|TestUpdateMDMAppleConfigProfile|TestUpdateMDMWindowsConfigProfile|TestUpdateMDMAndroidConfigProfile|TestNewMDMProfilePremiumOnlyAndroid|TestMDMBatchSetAppleProfiles|TestMDMBatchSetProfiles|TestBatchSetMDMProfilesLabels|TestBatchSetMDMProfilesOSUpdates|TestUploadWindowsMDMConfigProfileValidations|TestDeleteMDMConfigProfileFreeLicenseTeam)$'
+
+      - name: Test Community+ fleetctl
+        run: go test ./cmd/fleetctl/fleetctl -run 'TestCommunityPlus|TestFleetGitOps'
+
+      - name: Build fleetctl
+        run: go build ./cmd/fleetctl/fleetctl
+
+      - name: Build Fleet server
+        run: go build ./cmd/fleet
+
+      - name: Build auxiliary tools
+        run: go build ./cmd/maintained-apps ./tools/calendar
+
+      - name: Validate Community+ maintained app catalog
+        run: go run ./cmd/maintained-apps --check
+
+      - name: Build Orbit binaries
+        run: go build ./orbit/cmd/fetch_cert ./orbit/cmd/orbit
+
+
+      - name: Test Community+ Munki integration
+        run: go test ./server/service/osquery_utils -run '^TestCommunityPlusMunki'
 
       - name: Test Community+ core service regressions
         run: >-
