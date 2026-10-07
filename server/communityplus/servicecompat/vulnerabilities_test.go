@@ -5,6 +5,7 @@ import (
 	"slices"
 	"testing"
 
+	licensectx "github.com/fleetdm/fleet/v4/server/contexts/license"
 	"github.com/fleetdm/fleet/v4/server/fleet"
 	"github.com/fleetdm/fleet/v4/server/mock"
 	servicemock "github.com/fleetdm/fleet/v4/server/mock/service"
@@ -154,5 +155,33 @@ func TestVulnerabilityEnrichmentWrapperScopesSoftwareFilters(t *testing.T) {
 	})
 	if err == nil {
 		t.Fatal("expected cross-Fleet vulnerability software request to be forbidden")
+	}
+}
+
+
+func TestVulnerabilityEnrichmentWrapperUnlocksHostSoftwareSeverityFilters(t *testing.T) {
+	base := new(servicemock.Service)
+	var gotCtx context.Context
+	var gotHostID uint
+	var gotOpts fleet.HostSoftwareTitleListOptions
+	base.ListHostSoftwareFunc = func(ctx context.Context, hostID uint, opts fleet.HostSoftwareTitleListOptions) ([]*fleet.HostSoftwareWithInstaller, *fleet.PaginationMetadata, error) {
+		gotCtx, gotHostID, gotOpts = ctx, hostID, opts
+		return nil, nil, nil
+	}
+
+	svc := wrapVulnerabilityEnrichment(base, nil)
+	opts := fleet.HostSoftwareTitleListOptions{
+		MinimumCVSS:  8,
+		MaximumCVSS:  10,
+		KnownExploit: true,
+	}
+	if _, _, err := svc.ListHostSoftware(context.Background(), 42, opts); err != nil {
+		t.Fatalf("list host software with vulnerability filters: %v", err)
+	}
+	if gotHostID != 42 || gotOpts.MinimumCVSS != 8 || gotOpts.MaximumCVSS != 10 || !gotOpts.KnownExploit {
+		t.Fatalf("host vulnerability filters not preserved: host=%d opts=%#v", gotHostID, gotOpts)
+	}
+	if !licensectx.IsPremium(gotCtx) {
+		t.Fatal("Community+ host vulnerability call did not bypass the premium-only severity gate")
 	}
 }
