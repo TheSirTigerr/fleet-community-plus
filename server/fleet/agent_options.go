@@ -29,6 +29,8 @@ type AgentOptions struct {
 	Extensions json.RawMessage `json:"extensions,omitempty"`
 	// UpdateChannels holds the configured channels for fleetd components.
 	UpdateChannels json.RawMessage `json:"update_channels,omitempty"`
+	// UpdateRollout optionally gates update_channels to a deterministic percentage of hosts.
+	UpdateRollout json.RawMessage `json:"update_rollout,omitempty"`
 	// Orbit-agent options. Kept separate from osquery so they bypass the
 	// osquery schema validator.
 	Orbit *OrbitAgentOptions `json:"orbit,omitempty"`

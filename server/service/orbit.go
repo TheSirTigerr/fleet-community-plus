@@ -895,13 +895,9 @@ func (svc *Service) GetOrbitConfig(ctx context.Context) (fleet.OrbitConfig, erro
 			return fleet.OrbitConfig{}, ctxerr.Wrap(ctx, err, "setting team disk encryption notifications")
 		}
 
-		var updateChannels *fleet.OrbitUpdateChannels
-		if len(opts.UpdateChannels) > 0 {
-			var uc fleet.OrbitUpdateChannels
-			if err := json.Unmarshal(opts.UpdateChannels, &uc); err != nil {
-				return fleet.OrbitConfig{}, err
-			}
-			updateChannels = &uc
+		updateChannels, err := communityplus.AgentUpdateChannelsForHost(host.ID, opts.UpdateChannels, opts.UpdateRollout)
+		if err != nil {
+			return fleet.OrbitConfig{}, ctxerr.Wrap(ctx, err, "resolve Community+ agent update rollout")
 		}
 
 		// only unset this flag once we know there were no errors so this notification will be picked up by the agent
@@ -977,13 +973,9 @@ func (svc *Service) GetOrbitConfig(ctx context.Context) (fleet.OrbitConfig, erro
 		return fleet.OrbitConfig{}, ctxerr.Wrap(ctx, err, "setting no-team disk encryption notifications")
 	}
 
-	var updateChannels *fleet.OrbitUpdateChannels
-	if len(opts.UpdateChannels) > 0 {
-		var uc fleet.OrbitUpdateChannels
-		if err := json.Unmarshal(opts.UpdateChannels, &uc); err != nil {
-			return fleet.OrbitConfig{}, err
-		}
-		updateChannels = &uc
+	updateChannels, err := communityplus.AgentUpdateChannelsForHost(host.ID, opts.UpdateChannels, opts.UpdateRollout)
+	if err != nil {
+		return fleet.OrbitConfig{}, ctxerr.Wrap(ctx, err, "resolve Community+ agent update rollout")
 	}
 
 	// only unset this flag once we know there were no errors so this notification will be picked up by the agent
