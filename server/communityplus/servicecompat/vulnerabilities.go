@@ -112,6 +112,8 @@ func (communityPlusVulnerabilityLicense) GetTier() string               { return
 func (communityPlusVulnerabilityLicense) GetOrganization() string       { return "" }
 func (communityPlusVulnerabilityLicense) GetDeviceCount() int           { return 0 }
 
+var _ licensectx.LicenseChecker = communityPlusVulnerabilityLicense{}
+
 func hasCommunityPlusHostVulnerabilityFilter(opt fleet.HostSoftwareTitleListOptions) bool {
 	return opt.MaximumCVSS > 0 || opt.MinimumCVSS > 0 || opt.KnownExploit
 }
