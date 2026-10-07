@@ -131,3 +131,29 @@ func TestVulnerabilityEnrichmentWrapperKeepsNormalSoftwarePath(t *testing.T) {
 		t.Fatal("normal software request did not delegate to base service")
 	}
 }
+
+
+func TestVulnerabilityEnrichmentWrapperScopesSoftwareFilters(t *testing.T) {
+	base := new(servicemock.Service)
+	ds := new(mock.Store)
+	ds.ListSoftwareFunc = func(_ context.Context, _ fleet.SoftwareListOptions) ([]fleet.Software, *fleet.PaginationMetadata, error) {
+		t.Fatal("cross-Fleet vulnerability software request reached datastore")
+		return nil, nil, nil
+	}
+
+	svc := wrapVulnerabilityEnrichment(base, []any{ds})
+	ctx := test.UserContext(context.Background(), &fleet.User{
+		Teams: []fleet.UserTeam{{
+			Team: fleet.Team{ID: 8},
+			Role: fleet.RoleObserver,
+		}},
+	})
+	teamID := uint(7)
+	_, _, err := svc.ListSoftware(ctx, fleet.SoftwareListOptions{
+		TeamID:      &teamID,
+		MinimumCVSS: 7,
+	})
+	if err == nil {
+		t.Fatal("expected cross-Fleet vulnerability software request to be forbidden")
+	}
+}
