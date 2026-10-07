@@ -132,7 +132,6 @@ func TestVulnerabilityEnrichmentWrapperKeepsNormalSoftwarePath(t *testing.T) {
 	}
 }
 
-
 func TestVulnerabilityEnrichmentWrapperScopesSoftwareFilters(t *testing.T) {
 	base := new(servicemock.Service)
 	ds := new(mock.Store)
