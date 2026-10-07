@@ -3,6 +3,7 @@ package servicecompat
 import (
 	"context"
 
+	"github.com/fleetdm/fleet/v4/server/authz"
 	"github.com/fleetdm/fleet/v4/server/fleet"
 )
 
@@ -23,13 +24,22 @@ var communityPlusVulnerabilitySortColumns = []string{
 // vulnerability metadata queries without changing authorization or scope rules.
 type vulnerabilityEnrichmentWrapper struct {
 	fleet.Service
+	ds         fleet.Datastore
+	authorizer *authz.Authorizer
 }
 
-func wrapVulnerabilityEnrichment(base fleet.Service) fleet.Service {
+func wrapVulnerabilityEnrichment(base fleet.Service, options []any) fleet.Service {
 	if base == nil {
 		return nil
 	}
-	return &vulnerabilityEnrichmentWrapper{Service: base}
+	var ds fleet.Datastore
+	for _, option := range options {
+		if value, ok := option.(fleet.Datastore); ok {
+			ds = value
+			break
+		}
+	}
+	return &vulnerabilityEnrichmentWrapper{Service: base, ds: ds, authorizer: authz.Must()}
 }
 
 func (s *vulnerabilityEnrichmentWrapper) ListVulnerabilities(
@@ -53,3 +63,43 @@ func (s *vulnerabilityEnrichmentWrapper) Vulnerability(
 }
 
 var _ fleet.Service = (*vulnerabilityEnrichmentWrapper)(nil)
+
+
+func hasCommunityPlusVulnerabilitySoftwareFilter(opt fleet.SoftwareListOptions) bool {
+	return opt.MaximumCVSS > 0 || opt.MinimumCVSS > 0 || opt.KnownExploit
+}
+
+func (s *vulnerabilityEnrichmentWrapper) ListSoftware(
+	ctx context.Context,
+	opt fleet.SoftwareListOptions,
+) ([]fleet.Software, *fleet.PaginationMetadata, error) {
+	if !hasCommunityPlusVulnerabilitySoftwareFilter(opt) || s.ds == nil {
+		return s.Service.ListSoftware(ctx, opt)
+	}
+	if err := s.authorizer.Authorize(ctx, &fleet.AuthzSoftwareInventory{TeamID: opt.TeamID}, fleet.ActionRead); err != nil {
+		return nil, nil, err
+	}
+
+	opt.IncludeCVEScores = true
+	if opt.ListOptions.OrderKey == "" {
+		opt.ListOptions.OrderKey = "hosts_count"
+		opt.ListOptions.OrderDirection = fleet.OrderDescending
+	}
+	opt.WithHostCounts = true
+	return s.ds.ListSoftware(ctx, opt)
+}
+
+func (s *vulnerabilityEnrichmentWrapper) CountSoftware(
+	ctx context.Context,
+	opt fleet.SoftwareListOptions,
+) (int, error) {
+	if !hasCommunityPlusVulnerabilitySoftwareFilter(opt) || s.ds == nil {
+		return s.Service.CountSoftware(ctx, opt)
+	}
+	if err := s.authorizer.Authorize(ctx, &fleet.AuthzSoftwareInventory{TeamID: opt.TeamID}, fleet.ActionRead); err != nil {
+		return 0, err
+	}
+
+	opt.IncludeCVEScores = true
+	return s.ds.CountSoftware(ctx, opt)
+}
