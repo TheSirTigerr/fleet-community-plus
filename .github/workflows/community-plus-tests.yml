@@ -138,10 +138,16 @@ jobs:
           ./server/vulnerabilities/nvd/tools/cvefeed/...
 
       - name: Test Community+ vulnerability enrichment
-        run: go test ./server/vulnerabilities/nvd -run '^TestLoadCVEMeta      - name: Test Community+ core service regressions
+        run: go test ./server/vulnerabilities/nvd -run '^TestLoadCVEMeta$'
+
+      - name: Test Community+ Munki integration
+        run: go test ./server/service/osquery_utils -run '^TestCommunityPlusMunki'
+
+      - name: Test Community+ core service regressions
         run: >-
           go test ./server/service
           -run '^(TestCommunityPlusGetSSOUser|TestValidateMDMAllowsCommunityPlusMacOSMigrationWithoutPremiumLicense|TestValidateMDMAllowsCommunityPlusHostNameTemplateWithoutPremiumLicense|TestUpdateMDMHostNameTemplateIsNotPremiumLicenseGated|TestValidateMDMAllowsCommunityPlusDiskEncryptionWithoutPremiumLicense|TestUpdateMDMDiskEncryptionIsNotPremiumLicenseGated|TestHostEncryptionKey|TestCommunityPlusRotateRecoveryLock.*|TestCommunityPlusPolicyScriptRetry.*)$'
+
       - name: Test Community+ configuration profile regressions
         run: >-
           go test ./server/service
