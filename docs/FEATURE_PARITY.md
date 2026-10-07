@@ -70,10 +70,10 @@ This document tracks independently implemented equivalents for Fleet Premium cap
 
 ## Agent management
 
-- [ ] Agent version control
-- [ ] Controlled fleetd rollout
-- [ ] Script execution orchestration
-- [ ] Reliable result collection/retry
+- [x] Agent version control
+- [x] Controlled fleetd rollout
+- [x] Script execution orchestration
+- [x] Reliable result collection/retry
 
 ## Implementation phases
 
