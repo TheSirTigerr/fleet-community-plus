@@ -64,7 +64,6 @@ func (s *vulnerabilityEnrichmentWrapper) Vulnerability(
 
 var _ fleet.Service = (*vulnerabilityEnrichmentWrapper)(nil)
 
-
 func hasCommunityPlusVulnerabilitySoftwareFilter(opt fleet.SoftwareListOptions) bool {
 	return opt.MaximumCVSS > 0 || opt.MinimumCVSS > 0 || opt.KnownExploit
 }

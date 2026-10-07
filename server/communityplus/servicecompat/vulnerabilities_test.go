@@ -67,7 +67,6 @@ func TestVulnerabilityEnrichmentWrapperGetsEnrichedDetail(t *testing.T) {
 	}
 }
 
-
 func TestVulnerabilityEnrichmentWrapperUnlocksSoftwareCVSSAndKEVFilters(t *testing.T) {
 	base := new(servicemock.Service)
 	ds := new(mock.Store)
